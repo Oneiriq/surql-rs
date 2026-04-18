@@ -17,9 +17,14 @@
 //!   [`NamespaceCredentials`](connection::NamespaceCredentials),
 //!   [`DatabaseCredentials`](connection::DatabaseCredentials),
 //!   [`ScopeCredentials`](connection::ScopeCredentials)).
+//! - [`schema`]: Schema definition layer —
+//!   [`FieldDefinition`](schema::FieldDefinition),
+//!   [`TableDefinition`](schema::TableDefinition),
+//!   [`EdgeDefinition`](schema::EdgeDefinition), and
+//!   [`AccessDefinition`](schema::AccessDefinition).
 //!
-//! Additional modules (`query`, `schema`, `migration`, `cache`,
-//! `orchestration`) are under active port and will land incrementally.
+//! Additional modules (`migration`, `cache`, `orchestration`) are under
+//! active port and will land incrementally.
 
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
@@ -36,6 +41,7 @@
 pub mod connection;
 pub mod error;
 pub mod query;
+pub mod schema;
 pub mod types;
 
 pub use error::{Result, SurqlError};

@@ -1,0 +1,46 @@
+//! Schema definition layer.
+//!
+//! Port of `surql/schema/` from `oneiriq-surql` (Python). This module currently
+//! covers the pure definition types:
+//!
+//! - [`fields`]: [`FieldDefinition`] + [`FieldType`] enum and builder helpers
+//!   ([`string_field`], [`int_field`], [`float_field`], [`bool_field`],
+//!   [`datetime_field`], [`record_field`], [`array_field`], [`object_field`],
+//!   [`computed_field`]).
+//! - [`table`]: [`TableDefinition`] + [`TableMode`], [`IndexDefinition`] /
+//!   [`IndexType`] / [`MTreeDistanceType`] / [`HnswDistanceType`] /
+//!   [`MTreeVectorType`], and [`EventDefinition`]; plus [`table_schema`],
+//!   [`index`], [`unique_index`], [`search_index`], [`mtree_index`],
+//!   [`hnsw_index`], [`event`] builders.
+//! - [`edge`]: [`EdgeDefinition`] + [`EdgeMode`] and [`edge_schema`] /
+//!   [`typed_edge`] / [`bidirectional_edge`] helpers.
+//! - [`access`]: [`AccessDefinition`] + [`AccessType`], [`JwtConfig`] /
+//!   [`RecordAccessConfig`] credential-config types, and the
+//!   [`access_schema`] / [`jwt_access`] / [`record_access`] helpers.
+//!
+//! Each value object exposes a `to_surql*` method that renders the matching
+//! `DEFINE` statement.
+//!
+//! The SQL generator, schema registry, schema validator, parser, and the
+//! visualiser (themes / visualize / utils) land in follow-up PRs.
+
+pub mod access;
+pub mod edge;
+pub mod fields;
+pub mod table;
+
+pub use access::{
+    access_schema, jwt_access, record_access, AccessDefinition, AccessSchemaBuilder, AccessType,
+    JwtConfig, RecordAccessConfig,
+};
+pub use edge::{bidirectional_edge, edge_schema, typed_edge, EdgeDefinition, EdgeMode};
+pub use fields::{
+    array_field, bool_field, computed_field, datetime_field, field, float_field, int_field,
+    object_field, record_field, string_field, validate_field_name, FieldBuilder, FieldDefinition,
+    FieldType,
+};
+pub use table::{
+    event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,
+    EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
+    MTreeVectorType, TableDefinition, TableMode,
+};
