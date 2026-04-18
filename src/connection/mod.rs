@@ -1,19 +1,28 @@
 //! Connection-level types for the `surql` crate.
 //!
-//! Port of `surql/connection/` from `oneiriq-surql` (Python). This module
-//! currently exposes the pure data types (configuration, credentials)
-//! needed to describe how to talk to SurrealDB; the runtime
-//! [`DatabaseClient`] and [`AuthManager`] live behind the `client` cargo
-//! feature and land in a follow-up increment.
-//!
-//! [`DatabaseClient`]: crate::connection::DatabaseClient "stub"
-//! [`AuthManager`]: crate::connection::AuthManager "stub"
+//! Port of `surql/connection/` from `oneiriq-surql` (Python). The
+//! pure data types ([`ConnectionConfig`], credentials, etc.) are always
+//! available. The runtime [`DatabaseClient`], [`Transaction`], and
+//! [`LiveQuery`] live behind the `client` cargo feature.
 
 pub mod auth;
+#[cfg(feature = "client")]
+pub mod client;
 pub mod config;
+#[cfg(feature = "client")]
+pub mod streaming;
+#[cfg(feature = "client")]
+pub mod transaction;
 
 pub use auth::{
-    AuthType, DatabaseCredentials, NamespaceCredentials, RootCredentials, ScopeCredentials,
-    TokenAuth,
+    AuthType, Credentials, DatabaseCredentials, NamespaceCredentials, RootCredentials,
+    ScopeCredentials, TokenAuth,
 };
 pub use config::{ConnectionConfig, NamedConnectionConfig, Protocol};
+
+#[cfg(feature = "client")]
+pub use client::DatabaseClient;
+#[cfg(feature = "client")]
+pub use streaming::LiveQuery;
+#[cfg(feature = "client")]
+pub use transaction::{Transaction, TransactionState};
