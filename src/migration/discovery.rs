@@ -464,7 +464,7 @@ fn resolve_identity(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::many_single_char_names)]
-mod sha2_lite {
+pub(crate) mod sha2_lite {
     // FIPS 180-4 SHA-256. Pure-safe Rust; no unsafe. Written for checksum
     // use only: we do NOT rely on this for cryptographic security.
     use std::fmt::Write as _;
