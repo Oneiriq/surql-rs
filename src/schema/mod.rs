@@ -21,12 +21,22 @@
 //! Each value object exposes a `to_surql*` method that renders the matching
 //! `DEFINE` statement.
 //!
-//! The SQL generator, schema registry, schema validator, parser, and the
-//! visualiser (themes / visualize / utils) land in follow-up PRs.
+//! - [`sql`]: free functions ([`generate_table_sql`], [`generate_edge_sql`],
+//!   [`generate_access_sql`], [`generate_schema_sql`]) composing full
+//!   DEFINE-statement scripts from the definitions above.
+//! - [`registry`]: process-wide [`SchemaRegistry`] singleton plus the
+//!   [`get_registry`], [`register_table`], [`register_edge`],
+//!   [`clear_registry`], [`get_registered_tables`], and
+//!   [`get_registered_edges`] helpers.
+//!
+//! The schema validator, parser, and the visualiser (themes / visualize /
+//! utils) land in follow-up PRs.
 
 pub mod access;
 pub mod edge;
 pub mod fields;
+pub mod registry;
+pub mod sql;
 pub mod table;
 
 pub use access::{
@@ -39,6 +49,11 @@ pub use fields::{
     object_field, record_field, string_field, validate_field_name, FieldBuilder, FieldDefinition,
     FieldType,
 };
+pub use registry::{
+    clear_registry, get_registered_edges, get_registered_tables, get_registry, register_edge,
+    register_table, SchemaRegistry,
+};
+pub use sql::{generate_access_sql, generate_edge_sql, generate_schema_sql, generate_table_sql};
 pub use table::{
     event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
