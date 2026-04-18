@@ -31,9 +31,15 @@
 
 pub mod diff;
 pub mod discovery;
+#[cfg(feature = "client")]
+pub mod executor;
 pub mod generator;
+#[cfg(feature = "client")]
+pub mod history;
 pub mod hooks;
 pub mod models;
+#[cfg(feature = "client")]
+pub mod rollback;
 pub mod versioning;
 
 pub use diff::{
@@ -61,4 +67,23 @@ pub use models::{
 pub use versioning::{
     compare_snapshots, create_snapshot, list_snapshots, load_snapshot, store_snapshot,
     SnapshotComparison, VersionGraph, VersionNode, VersionedSnapshot, VersionedSnapshotBuilder,
+};
+
+#[cfg(feature = "client")]
+pub use executor::{
+    create_migration_plan, execute_migration, execute_migration_plan,
+    get_applied_migrations_ordered, get_migration_status, get_pending_migrations, migrate_down,
+    migrate_up, validate_migrations, version_is_applied, MigrateUpOptions, MigrationStatusReport,
+};
+#[cfg(feature = "client")]
+pub use history::{
+    auto_snapshot_after_apply, create_migration_table, disable_auto_snapshots,
+    enable_auto_snapshots, ensure_migration_table, get_applied_migrations, get_migration_history,
+    is_auto_snapshot_enabled, is_migration_applied, record_migration, remove_migration_record,
+    MIGRATION_TABLE_NAME,
+};
+#[cfg(feature = "client")]
+pub use rollback::{
+    analyze_rollback_safety, create_rollback_plan, execute_rollback, plan_rollback_to_version,
+    RollbackIssue, RollbackPlan, RollbackResult, RollbackSafety,
 };
