@@ -35,6 +35,7 @@
 
 pub mod connection;
 pub mod error;
+pub mod query;
 pub mod types;
 
 pub use error::{Result, SurqlError};
