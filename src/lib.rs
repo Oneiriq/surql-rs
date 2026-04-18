@@ -12,8 +12,13 @@
 //! - [`types`]: Type-safe wrappers ([`RecordID`](types::RecordID),
 //!   [`RecordRef`](types::RecordRef), [`SurrealFn`](types::SurrealFn),
 //!   operators, reserved-word checks, datetime coercion).
+//! - [`connection`]: Connection [`ConnectionConfig`](connection::ConnectionConfig)
+//!   and credential types ([`RootCredentials`](connection::RootCredentials),
+//!   [`NamespaceCredentials`](connection::NamespaceCredentials),
+//!   [`DatabaseCredentials`](connection::DatabaseCredentials),
+//!   [`ScopeCredentials`](connection::ScopeCredentials)).
 //!
-//! Additional modules (`connection`, `query`, `schema`, `migration`, `cache`,
+//! Additional modules (`query`, `schema`, `migration`, `cache`,
 //! `orchestration`) are under active port and will land incrementally.
 
 #![warn(clippy::all)]
@@ -24,9 +29,11 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::uninlined_format_args)]
+#![allow(clippy::return_self_not_must_use)]
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod connection;
 pub mod error;
 pub mod types;
 
