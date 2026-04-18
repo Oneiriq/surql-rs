@@ -75,7 +75,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run integration tests
-        run: cargo test --test '*' --all-features
+        run: |
+          if [ -d tests ] && ls tests/*.rs >/dev/null 2>&1; then
+            cargo test --all-features --tests
+          else
+            echo "No integration tests yet; skipping."
+          fi
         env:
           SURREAL_URL: ws://localhost:8000
           SURREAL_USER: root
