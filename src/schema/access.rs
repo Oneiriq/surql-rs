@@ -266,8 +266,7 @@ impl AccessDefinition {
             if let Some(token) = &self.duration_token {
                 parts.push(format!("FOR TOKEN {}", token));
             }
-            write!(sql, " DURATION {}", parts.join(", "))
-                .expect("writing to String cannot fail");
+            write!(sql, " DURATION {}", parts.join(", ")).expect("writing to String cannot fail");
         }
 
         sql.push(';');

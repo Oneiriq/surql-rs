@@ -265,8 +265,7 @@ impl IndexDefinition {
                 reason: format!("Index {:?} must have at least one column", self.name),
             });
         }
-        if matches!(self.index_type, IndexType::Mtree | IndexType::Hnsw)
-            && self.dimension.is_none()
+        if matches!(self.index_type, IndexType::Mtree | IndexType::Hnsw) && self.dimension.is_none()
         {
             return Err(SurqlError::Validation {
                 reason: format!("Vector index {:?} requires a dimension", self.name),
