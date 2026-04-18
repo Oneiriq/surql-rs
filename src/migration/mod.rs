@@ -1,0 +1,42 @@
+//! Migration subsystem.
+//!
+//! Port of `surql/migration/` from `oneiriq-surql` (Python). This module
+//! currently covers the pure data model (tracked in [`models`]) and
+//! filesystem-level discovery/loading of migration files (tracked in
+//! [`discovery`]).
+//!
+//! Additional submodules (`diff`, `executor`, `generator`, `history`,
+//! `hooks`, `rollback`, `squash`, `versioning`, `watcher`) will land in
+//! follow-up PRs.
+//!
+//! ## Migration file format
+//!
+//! Unlike the Python implementation — which imports `.py` migration
+//! modules at runtime — the Rust port stores migrations as plain `.surql`
+//! files with section markers:
+//!
+//! ```surql,ignore
+//! -- @metadata
+//! -- version: 20260102_120000
+//! -- description: Create user table
+//! -- author: surql
+//! -- depends_on: [20260101_000000_init]
+//! -- @up
+//! DEFINE TABLE user SCHEMAFULL;
+//! -- @down
+//! REMOVE TABLE user;
+//! ```
+//!
+//! See [`discovery`] for the exact grammar.
+
+pub mod discovery;
+pub mod models;
+
+pub use discovery::{
+    discover_migrations, get_description_from_filename, get_version_from_filename, load_migration,
+    validate_migration_name,
+};
+pub use models::{
+    DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
+    MigrationPlan, MigrationState, MigrationStatus, SchemaDiff,
+};

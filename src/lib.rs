@@ -22,9 +22,17 @@
 //!   [`TableDefinition`](schema::TableDefinition),
 //!   [`EdgeDefinition`](schema::EdgeDefinition), and
 //!   [`AccessDefinition`](schema::AccessDefinition).
+//! - [`migration`]: Migration data model ([`Migration`](migration::Migration),
+//!   [`MigrationHistory`](migration::MigrationHistory),
+//!   [`MigrationPlan`](migration::MigrationPlan),
+//!   [`MigrationState`](migration::MigrationState),
+//!   [`MigrationDirection`](migration::MigrationDirection),
+//!   [`SchemaDiff`](migration::SchemaDiff)) and filesystem-level discovery
+//!   ([`discover_migrations`](migration::discover_migrations),
+//!   [`load_migration`](migration::load_migration)).
 //!
-//! Additional modules (`migration`, `cache`, `orchestration`) are under
-//! active port and will land incrementally.
+//! Additional modules (`cache`, `orchestration`, migration execution)
+//! are under active port and will land incrementally.
 
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
@@ -40,6 +48,7 @@
 
 pub mod connection;
 pub mod error;
+pub mod migration;
 pub mod query;
 pub mod schema;
 pub mod types;
