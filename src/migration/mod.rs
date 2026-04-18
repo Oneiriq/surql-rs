@@ -32,6 +32,7 @@ pub mod diff;
 pub mod discovery;
 pub mod generator;
 pub mod models;
+pub mod versioning;
 
 pub use diff::{
     diff_edge_pair, diff_edges, diff_events, diff_fields, diff_indexes, diff_permissions,
@@ -49,4 +50,8 @@ pub use generator::{
 pub use models::{
     DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
     MigrationPlan, MigrationState, MigrationStatus, SchemaDiff,
+};
+pub use versioning::{
+    compare_snapshots, create_snapshot, list_snapshots, load_snapshot, store_snapshot,
+    SnapshotComparison, VersionGraph, VersionNode, VersionedSnapshot, VersionedSnapshotBuilder,
 };
