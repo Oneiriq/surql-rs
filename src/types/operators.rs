@@ -392,6 +392,12 @@ pub fn not_(operand: Operator) -> Operator {
 // Value quoting (mirrors Python's `_quote_value`).
 // ---------------------------------------------------------------------------
 
+/// Public wrapper around the internal [`quote_value`] helper for other
+/// crate modules that need the same SurrealQL literal rendering.
+pub fn quote_value_public(value: &Value) -> String {
+    quote_value(value)
+}
+
 /// Quote a [`Value`] for inclusion in a SurrealQL expression.
 ///
 /// - `null` becomes `NULL`.
