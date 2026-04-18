@@ -3970,6 +3970,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "futures",
  "pretty_assertions",
  "redis",
  "regex",

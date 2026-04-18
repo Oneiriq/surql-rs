@@ -54,3 +54,6 @@ pub mod schema;
 pub mod types;
 
 pub use error::{Result, SurqlError};
+
+#[cfg(feature = "client")]
+pub use connection::DatabaseClient;
