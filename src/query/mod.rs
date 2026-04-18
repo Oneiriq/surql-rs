@@ -8,14 +8,22 @@
 //!   [`ParallelHint`](hints::ParallelHint), [`TimeoutHint`](hints::TimeoutHint),
 //!   [`FetchHint`](hints::FetchHint), [`ExplainHint`](hints::ExplainHint)).
 //! - [`results`]: typed result wrappers and extraction helpers.
-//!
-//! Subsequent increments add typed/batch/graph CRUD, and the async executor.
+//! - [`executor`] *(feature `client`)*: async execution on top of
+//!   [`DatabaseClient`](crate::DatabaseClient).
+//! - [`crud`] *(feature `client`)*: JSON-in / JSON-out record CRUD helpers.
+//! - [`typed`] *(feature `client`)*: serde-round-trip CRUD helpers.
 
 pub mod builder;
+#[cfg(feature = "client")]
+pub mod crud;
+#[cfg(feature = "client")]
+pub mod executor;
 pub mod expressions;
 pub mod helpers;
 pub mod hints;
 pub mod results;
+#[cfg(feature = "client")]
+pub mod typed;
 
 pub use builder::{Operation, OrderField, Query, WhereCondition};
 pub use expressions::{
