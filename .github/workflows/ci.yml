@@ -16,20 +16,26 @@ env:
 
 jobs:
   lint-test:
-    name: Lint and Test
-    runs-on: ubuntu-latest
+    name: Lint and Test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust"
+          prefix-key: "v1-rust-${{ matrix.os }}-${{ matrix.rust }}"
 
       - name: Check formatting
         run: cargo fmt --all --check
