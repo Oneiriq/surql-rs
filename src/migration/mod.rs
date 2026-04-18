@@ -5,8 +5,9 @@
 //! filesystem-level discovery/loading of migration files (tracked in
 //! [`discovery`]).
 //!
-//! Additional submodules (`executor`, `history`, `hooks`, `rollback`,
-//! `squash`, `versioning`, `watcher`) will land in follow-up PRs.
+//! Additional submodules (`executor`, `history`, `rollback`, `squash`,
+//! `watcher`) will land in follow-up PRs. Git hook integration lives in
+//! [`hooks`]; snapshot versioning in [`versioning`].
 //!
 //! ## Migration file format
 //!
@@ -31,6 +32,7 @@
 pub mod diff;
 pub mod discovery;
 pub mod generator;
+pub mod hooks;
 pub mod models;
 pub mod versioning;
 
@@ -46,6 +48,11 @@ pub use discovery::{
 pub use generator::{
     create_blank_migration, generate_initial_migration, generate_migration,
     generate_migration_from_diffs,
+};
+pub use hooks::{
+    check_schema_drift, check_schema_drift_from_snapshots, default_schema_filter,
+    generate_precommit_config, get_staged_schema_files, registry_to_snapshot,
+    severity_for_operation, versioned_to_snapshot, DriftIssue, DriftReport, DriftSeverity,
 };
 pub use models::{
     DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
