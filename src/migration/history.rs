@@ -108,31 +108,37 @@ pub async fn ensure_migration_table(client: &DatabaseClient) -> Result<()> {
 pub async fn record_migration(client: &DatabaseClient, entry: &MigrationHistory) -> Result<()> {
     ensure_migration_table(client).await?;
 
-    let mut data = serde_json::Map::new();
-    data.insert("version".into(), Value::String(entry.version.clone()));
-    data.insert(
+    // SurrealDB v3 rejects bare ISO-8601 strings for datetime-typed
+    // fields with "Expected `datetime` but found '...'", so we emit
+    // CREATE ... SET applied_at = <datetime> $applied_at and keep the
+    // cast visible in the SurrealQL rather than relying on CONTENT
+    // auto-coercion.
+    let mut vars: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    vars.insert("id".into(), Value::String(record_id_for(&entry.version)));
+    vars.insert("version".into(), Value::String(entry.version.clone()));
+    vars.insert(
         "description".into(),
         Value::String(entry.description.clone()),
     );
-    data.insert(
+    vars.insert(
         "applied_at".into(),
         Value::String(entry.applied_at.to_rfc3339()),
     );
-    data.insert("checksum".into(), Value::String(entry.checksum.clone()));
+    vars.insert("checksum".into(), Value::String(entry.checksum.clone()));
+
+    let mut set = String::from(
+        "version = $version, description = $description, \
+         applied_at = <datetime> $applied_at, checksum = $checksum",
+    );
     if let Some(ms) = entry.execution_time_ms {
-        data.insert("execution_time_ms".into(), json!(ms));
+        vars.insert("execution_time_ms".into(), json!(ms));
+        set.push_str(", execution_time_ms = $execution_time_ms");
     }
 
     let surql = format!(
-        "CREATE type::thing('{table}', $version) CONTENT $data;",
+        "CREATE type::thing('{table}', $id) SET {set};",
         table = MIGRATION_TABLE_NAME,
     );
-    let mut vars: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-    vars.insert(
-        "version".into(),
-        Value::String(record_id_for(&entry.version)),
-    );
-    vars.insert("data".into(), Value::Object(data));
 
     client
         .query_with_vars(&surql, vars)
