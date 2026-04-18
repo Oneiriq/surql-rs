@@ -49,21 +49,24 @@ jobs:
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
-    services:
-      surrealdb:
-        image: surrealdb/surrealdb:latest
-        ports:
-          - 8000:8000
-        options: >-
-          --health-cmd "curl -f http://localhost:8000/health || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-        env:
-          SURREAL_USER: root
-          SURREAL_PASS: root
     steps:
       - uses: actions/checkout@v4
+
+      - name: Start SurrealDB
+        run: |
+          docker run -d \
+            --name surrealdb \
+            -p 8000:8000 \
+            surrealdb/surrealdb:v2.2 \
+            start --user root --pass root memory
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8000/health; then
+              echo "SurrealDB ready"
+              break
+            fi
+            echo "Waiting for SurrealDB... attempt $i"
+            sleep 2
+          done
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -77,3 +80,7 @@ jobs:
           SURREAL_URL: ws://localhost:8000
           SURREAL_USER: root
           SURREAL_PASS: root
+
+      - name: Stop SurrealDB
+        if: always()
+        run: docker stop surrealdb || true
