@@ -35,8 +35,15 @@
 //! - [`parser`]: inverse of the definition-to-SurrealQL path — parses
 //!   `INFO FOR DB` / `INFO FOR TABLE` responses back into [`TableDefinition`]
 //!   / [`EdgeDefinition`] / [`AccessDefinition`] values.
-//!
-//! The visualiser (themes / visualize / utils) lands in a follow-up PR.
+//! - [`themes`]: preset themes ([`modern_theme`], [`dark_theme`],
+//!   [`forest_theme`], [`minimal_theme`]) plus [`Theme`], [`ColorScheme`],
+//!   [`GraphVizTheme`], [`MermaidTheme`], [`ASCIITheme`] and the
+//!   [`get_theme`] / [`list_themes`] helpers.
+//! - [`visualize`]: [`generate_mermaid`], [`generate_graphviz`],
+//!   [`generate_ascii`] diagram generators plus [`visualize_schema`] /
+//!   [`visualize_from_registry`] and the [`OutputFormat`] enum.
+//! - [`utils`]: shared helpers used by the visualiser
+//!   ([`display_width`], [`strip_ansi`]).
 
 pub mod access;
 pub mod edge;
@@ -45,8 +52,11 @@ pub mod parser;
 pub mod registry;
 pub mod sql;
 pub mod table;
+pub mod themes;
+pub mod utils;
 pub mod validator;
 pub mod validator_utils;
+pub mod visualize;
 
 pub use access::{
     access_schema, jwt_access, record_access, AccessDefinition, AccessSchemaBuilder, AccessType,
@@ -72,6 +82,14 @@ pub use table::{
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
     MTreeVectorType, TableDefinition, TableMode,
 };
+pub use themes::{
+    dark_ascii, dark_color_scheme, dark_graphviz, dark_mermaid, dark_theme, forest_ascii,
+    forest_color_scheme, forest_graphviz, forest_mermaid, forest_theme, get_theme, list_themes,
+    minimal_ascii, minimal_color_scheme, minimal_graphviz, minimal_mermaid, minimal_theme,
+    modern_ascii, modern_color_scheme, modern_graphviz, modern_mermaid, modern_theme, ASCIITheme,
+    ColorScheme, GraphVizTheme, MermaidTheme, Theme,
+};
+pub use utils::{char_display_width, display_width, strip_ansi};
 pub use validator::{
     normalize_expression, validate_edge, validate_edges, validate_field, validate_index,
     validate_schema, validate_table, validate_tables, ValidationResult, ValidationSeverity,
@@ -79,4 +97,8 @@ pub use validator::{
 pub use validator_utils::{
     filter_by_severity, filter_errors, filter_warnings, format_validation_report,
     get_validation_summary, group_by_table, has_errors, ValidationSummary,
+};
+pub use visualize::{
+    generate_ascii, generate_graphviz, generate_mermaid, visualize_from_registry, visualize_schema,
+    OutputFormat, ThemeOption,
 };
