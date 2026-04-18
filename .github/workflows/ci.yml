@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+  push:
+    branches:
+      - main
+      - 'release/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check compilation
+        run: cargo check --all-targets --all-features
+
+      - name: Run unit tests
+        run: cargo test --lib --all-features
+
+      - name: Run doc tests
+        run: cargo test --doc --all-features
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SurrealDB
+        run: |
+          docker run -d \
+            --name surrealdb \
+            -p 8000:8000 \
+            surrealdb/surrealdb:v2.2 \
+            start --user root --pass root memory
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8000/health; then
+              echo "SurrealDB ready"
+              break
+            fi
+            echo "Waiting for SurrealDB... attempt $i"
+            sleep 2
+          done
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run integration tests
+        run: |
+          if [ -d tests ] && ls tests/*.rs >/dev/null 2>&1; then
+            cargo test --all-features --tests
+          else
+            echo "No integration tests yet; skipping."
+          fi
+        env:
+          SURREAL_URL: ws://localhost:8000
+          SURREAL_USER: root
+          SURREAL_PASS: root
+
+      - name: Stop SurrealDB
+        if: always()
+        run: docker stop surrealdb || true
