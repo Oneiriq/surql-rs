@@ -268,7 +268,7 @@ pub struct MigrationStatus {
 }
 
 /// Type of schema change operation captured by a [`SchemaDiff`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffOperation {
     /// A new table was added.
