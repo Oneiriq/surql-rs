@@ -22,6 +22,10 @@ name = "surql"
 path = "src/bin/surql.rs"
 required-features = ["cli"]
 
+[[bench]]
+name = "types"
+harness = false
+
 [features]
 default = ["client"]
 client = ["dep:tokio", "dep:surrealdb", "dep:reqwest", "dep:futures"]

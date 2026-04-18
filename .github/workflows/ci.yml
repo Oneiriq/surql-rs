@@ -16,20 +16,26 @@ env:
 
 jobs:
   lint-test:
-    name: Lint and Test
-    runs-on: ubuntu-latest
+    name: Lint and Test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, beta]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust"
+          prefix-key: "v1-rust-${{ matrix.os }}-${{ matrix.rust }}"
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -75,9 +81,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run integration tests
+        # --test-threads=1 because the tests share a single namespace /
+        # database; running them in parallel causes SurrealDB write
+        # conflicts ("Failed to commit transaction due to a read or
+        # write conflict").
         run: |
           if [ -d tests ] && ls tests/*.rs >/dev/null 2>&1; then
-            cargo test --all-features --tests
+            cargo test --all-features --tests -- --test-threads=1
           else
             echo "No integration tests yet; skipping."
           fi

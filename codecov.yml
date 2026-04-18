@@ -1,0 +1,25 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 85%
+        threshold: 1%
+        informational: false
+    patch:
+      default:
+        target: 90%
+        threshold: 1%
+        informational: false
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+github_checks:
+  annotations: true
+
+ignore:
+  - "benches/"
+  - "tests/"
+  - "src/bin/"
