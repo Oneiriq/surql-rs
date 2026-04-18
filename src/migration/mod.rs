@@ -5,9 +5,8 @@
 //! filesystem-level discovery/loading of migration files (tracked in
 //! [`discovery`]).
 //!
-//! Additional submodules (`diff`, `executor`, `generator`, `history`,
-//! `hooks`, `rollback`, `squash`, `versioning`, `watcher`) will land in
-//! follow-up PRs.
+//! Additional submodules (`executor`, `history`, `hooks`, `rollback`,
+//! `squash`, `versioning`, `watcher`) will land in follow-up PRs.
 //!
 //! ## Migration file format
 //!
@@ -31,6 +30,7 @@
 
 pub mod diff;
 pub mod discovery;
+pub mod generator;
 pub mod models;
 
 pub use diff::{
@@ -41,6 +41,10 @@ pub use diff::{
 pub use discovery::{
     discover_migrations, get_description_from_filename, get_version_from_filename, load_migration,
     validate_migration_name,
+};
+pub use generator::{
+    create_blank_migration, generate_initial_migration, generate_migration,
+    generate_migration_from_diffs,
 };
 pub use models::{
     DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
