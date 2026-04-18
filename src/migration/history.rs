@@ -202,8 +202,12 @@ pub async fn get_applied_migrations(client: &DatabaseClient) -> Result<Vec<Migra
 /// Returns [`SurqlError::MigrationHistory`] on query failure.
 pub async fn is_migration_applied(client: &DatabaseClient, version: &str) -> Result<bool> {
     ensure_migration_table(client).await?;
+    // SELECT * here (rather than just `version`) so the row round-trips
+    // through `parse_history_rows` -- that helper requires `applied_at`
+    // to decode successfully, and would skip rows whose payload is
+    // missing it.
     let surql = format!(
-        "SELECT version FROM {table} WHERE version = $version LIMIT 1;",
+        "SELECT * FROM {table} WHERE version = $version LIMIT 1;",
         table = MIGRATION_TABLE_NAME,
     );
     let mut vars: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
