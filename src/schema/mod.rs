@@ -32,13 +32,16 @@
 //!   against database-observed schemas; returns a `Vec<ValidationResult>`.
 //! - [`validator_utils`]: filtering, grouping, summary, and human-readable
 //!   report helpers for working with validation results.
+//! - [`parser`]: inverse of the definition-to-SurrealQL path — parses
+//!   `INFO FOR DB` / `INFO FOR TABLE` responses back into [`TableDefinition`]
+//!   / [`EdgeDefinition`] / [`AccessDefinition`] values.
 //!
-//! The schema parser and the visualiser (themes / visualize / utils) land in
-//! follow-up PRs.
+//! The visualiser (themes / visualize / utils) lands in a follow-up PR.
 
 pub mod access;
 pub mod edge;
 pub mod fields;
+pub mod parser;
 pub mod registry;
 pub mod sql;
 pub mod table;
@@ -54,6 +57,10 @@ pub use fields::{
     array_field, bool_field, computed_field, datetime_field, field, float_field, int_field,
     object_field, record_field, string_field, validate_field_name, FieldBuilder, FieldDefinition,
     FieldType,
+};
+pub use parser::{
+    parse_access, parse_db_info, parse_event, parse_field, parse_fields, parse_index,
+    parse_indexes, parse_table_info, parse_table_mode, DatabaseInfo,
 };
 pub use registry::{
     clear_registry, get_registered_edges, get_registered_tables, get_registry, register_edge,
