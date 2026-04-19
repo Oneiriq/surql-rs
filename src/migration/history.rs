@@ -135,8 +135,13 @@ pub async fn record_migration(client: &DatabaseClient, entry: &MigrationHistory)
         set.push_str(", execution_time_ms = $execution_time_ms");
     }
 
+    // `type::thing` was renamed to `type::record` in SurrealDB v3; v2
+    // emitted "Invalid function/constant path, did you maybe mean
+    // `type::record`" when the old name was used on v3, so the rename
+    // must land alongside the crate bump for CI (now on v3.0.5) to go
+    // green.
     let surql = format!(
-        "CREATE type::thing('{table}', $id) SET {set};",
+        "CREATE type::record('{table}', $id) SET {set};",
         table = MIGRATION_TABLE_NAME,
     );
 
