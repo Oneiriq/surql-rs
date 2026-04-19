@@ -72,3 +72,7 @@ pub use error::{Result, SurqlError};
 
 #[cfg(feature = "client")]
 pub use connection::DatabaseClient;
+
+// Convenience re-exports for the query-UX surface (sub-feature 1: first-class
+// `type::record` / `type::thing` helpers).
+pub use types::operators::{type_record, type_thing};

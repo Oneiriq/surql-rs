@@ -102,6 +102,23 @@ pub async fn update_record<T>(
     data: Value,
 ) -> Result<Value> {
     let target = record_id.to_string();
+    update_record_target(client, &target, data).await
+}
+
+/// Update (replace) an existing record identified by a raw SurrealQL target
+/// string (e.g. `"user:alice"` or the rendering of a
+/// [`type_record`](crate::types::operators::type_record) expression).
+///
+/// Additive companion to [`update_record`] introduced for the query-UX
+/// release: accepts any target that can be rendered to SurrealQL without
+/// requiring a statically-typed [`RecordID`]. Pair with
+/// [`crate::types::operators::type_record`] to update targets produced by
+/// `type::record(...)` helpers.
+pub async fn update_record_target(
+    client: &DatabaseClient,
+    target: &str,
+    data: Value,
+) -> Result<Value> {
     let mut vars = BTreeMap::new();
     vars.insert("data".to_owned(), data);
     let surql = format!("UPDATE {target} CONTENT $data");
@@ -130,6 +147,16 @@ pub async fn upsert_record<T>(
     data: Value,
 ) -> Result<Value> {
     let target = record_id.to_string();
+    upsert_record_target(client, &target, data).await
+}
+
+/// Upsert using a raw SurrealQL target string (additive companion to
+/// [`upsert_record`]).
+pub async fn upsert_record_target(
+    client: &DatabaseClient,
+    target: &str,
+    data: Value,
+) -> Result<Value> {
     let mut vars = BTreeMap::new();
     vars.insert("data".to_owned(), data);
     let surql = format!("UPSERT {target} CONTENT $data");
