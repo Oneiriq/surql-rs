@@ -37,9 +37,11 @@ pub mod typed;
 pub use batch::{build_relate_query, build_upsert_query, RelateItem};
 pub use builder::{Operation, OrderField, Query, WhereCondition};
 pub use expressions::{
-    abs_, array_contains, array_length, as_, avg, cast, ceil, concat, count, field, floor, func,
-    lower, math_max, math_mean, math_min, math_sum, max_, min_, raw, round_, sum_, time_format,
-    time_now, type_is, upper, value, ExprArg, Expression, ExpressionKind,
+    abs_, array_contains, array_length, as_, avg, cast, ceil, concat, count, count_all, count_if,
+    field, floor, func, lower, math_abs, math_ceil, math_floor, math_max, math_mean, math_min,
+    math_round, math_sum, max_, min_, raw, round_, string_concat, string_len, string_lower,
+    string_upper, sum_, time_format, time_now, type_is, upper, value, ExprArg, Expression,
+    ExpressionKind,
 };
 pub use graph_query::GraphQuery;
 pub use helpers::{
