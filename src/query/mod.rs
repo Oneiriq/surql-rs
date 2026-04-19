@@ -2,16 +2,16 @@
 //!
 //! Port of `surql/query/` from `oneiriq-surql` (Python). Currently exposes:
 //!
-//! - [`builder`]: immutable [`Query`](builder::Query) builder.
-//! - [`helpers`]: free functions that return preconfigured [`Query`](builder::Query)s.
-//! - [`hints`]: query optimization hints ([`IndexHint`](hints::IndexHint),
-//!   [`ParallelHint`](hints::ParallelHint), [`TimeoutHint`](hints::TimeoutHint),
-//!   [`FetchHint`](hints::FetchHint), [`ExplainHint`](hints::ExplainHint)).
+//! - [`builder`]: immutable [`Query`] builder.
+//! - [`helpers`]: free functions that return preconfigured [`Query`]s.
+//! - [`hints`]: query optimization hints ([`IndexHint`],
+//!   [`ParallelHint`], [`TimeoutHint`],
+//!   [`FetchHint`], [`ExplainHint`]).
 //! - [`results`]: typed result wrappers and extraction helpers.
-//! - [`batch`]: pure [`build_upsert_query`](batch::build_upsert_query) /
-//!   [`build_relate_query`](batch::build_relate_query) renderers plus async
+//! - [`batch`]: pure [`build_upsert_query`] /
+//!   [`build_relate_query`] renderers plus async
 //!   `*_many` helpers *(feature `client`)*.
-//! - [`graph_query`]: fluent [`GraphQuery`](graph_query::GraphQuery) builder.
+//! - [`graph_query`]: fluent [`GraphQuery`] builder.
 //! - [`executor`] *(feature `client`)*: async execution on top of
 //!   [`DatabaseClient`](crate::DatabaseClient).
 //! - [`crud`] *(feature `client`)*: JSON-in / JSON-out record CRUD helpers.

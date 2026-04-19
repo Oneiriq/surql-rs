@@ -7,6 +7,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-18
+
+### Documentation
+
+- `docs/features.md` -- full feature-flag reference.
+- `docs/query-ux.md` -- before / after walkthroughs for the 0.2
+  crate-root helpers (`type_record`, `type_thing`, `extract_many`,
+  `has_result`, `select_expr`, `execute`, `aggregate_records`).
+- `docs/v3-patterns.md` -- SurrealDB v3-specific SurrealQL shapes
+  (subprotocol handshake, `type::record` rename, datetime coercion,
+  unrolled graph depth, rejected `UPSERT INTO [...]`, buffered
+  transactions, `SurrealValue` avoidance).
+- `docs/cli.md` -- full subcommand reference (replaces the pre-0.1
+  "planned" placeholder).
+- `docs/migration.md` -- 0.1.x -> 0.2.x upgrade notes.
+- Updated README top-level example with `type_record`,
+  `Query::select_expr`, `Query::execute`, `aggregate_records`.
+- Updated `mkdocs.yml` nav with the new pages and `docs.rs/oneiriq-surql`
+  reference link.
+- Fixed pre-existing rustdoc intra-doc link warnings so
+  `cargo doc --no-deps --all-features` succeeds under
+  `RUSTDOCFLAGS="-D warnings"`.
+
+No API changes.
+
+## [0.1.0 - 0.2.0] see releases
+
 ### Added
 
 - `migration::versioning` -- `VersionedSnapshot`, `VersionGraph`, and
