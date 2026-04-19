@@ -18,7 +18,7 @@ jobs:
   sanity-ubuntu:
     name: Sanity ubuntu-latest / ${{ matrix.rust }}
     # Runs on every scheduled invocation (daily + weekly) and on manual dispatch.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
