@@ -29,7 +29,7 @@ Define schemas, generate migrations, build queries, and perform typed CRUD
 ## Quick Start
 
 ```shell
-cargo add surql
+cargo add oneiriq-surql
 ```
 
 ```rust

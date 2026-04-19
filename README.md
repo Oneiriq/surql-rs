@@ -19,13 +19,13 @@ A code-first database toolkit for [SurrealDB](https://surrealdb.com/). Define sc
 ## Quick Start
 
 ```shell
-cargo add surql
+cargo add oneiriq-surql
 ```
 
 With the CLI:
 
 ```shell
-cargo install surql --features cli
+cargo install oneiriq-surql --features cli
 ```
 
 ```rust
