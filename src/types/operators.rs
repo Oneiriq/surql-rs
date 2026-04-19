@@ -298,7 +298,7 @@ impl OperatorExpr for Not {
 // Functional helpers (match the Python API: `eq`, `ne`, `and_`, ...).
 // ---------------------------------------------------------------------------
 
-/// Build an [`Eq`] operator.
+/// Build an [`struct@Eq`] operator.
 pub fn eq(field: impl Into<String>, value: impl Into<Value>) -> Operator {
     Operator::Eq(Eq::new(field, value))
 }
@@ -395,7 +395,7 @@ pub fn not_(operand: Operator) -> Operator {
 // Value quoting (mirrors Python's `_quote_value`).
 // ---------------------------------------------------------------------------
 
-/// Public wrapper around the internal [`quote_value`] helper for other
+/// Public wrapper around the internal `quote_value` helper for other
 /// crate modules that need the same SurrealQL literal rendering.
 pub fn quote_value_public(value: &Value) -> String {
     quote_value(value)
