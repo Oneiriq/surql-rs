@@ -71,15 +71,19 @@ nav:
   - Getting Started:
       - Installation: installation.md
       - Quick Start: quickstart.md
+      - Feature Flags: features.md
   - Guides:
       - Schema Definition: schema.md
       - Migrations: migrations.md
       - Query Builder: queries.md
+      - Query UX Helpers: query-ux.md
       - Query Hints: query_hints.md
+      - SurrealDB v3 Patterns: v3-patterns.md
       - Visualization: visualization.md
   - Reference:
       - CLI: cli.md
-      - API (docs.rs): https://docs.rs/surql
+      - Upgrading 0.1 -> 0.2: migration.md
+      - API (docs.rs): https://docs.rs/oneiriq-surql
   - Changelog: changelog.md
 
 extra:
@@ -87,4 +91,4 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/Oneiriq/surql-rs
     - icon: fontawesome/brands/rust
-      link: https://crates.io/crates/surql
+      link: https://crates.io/crates/oneiriq-surql
