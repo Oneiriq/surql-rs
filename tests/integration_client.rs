@@ -3,7 +3,7 @@
 //! Gated on the `SURREAL_URL` env var matching the CI docker job:
 //!
 //! ```text
-//! docker run -d -p 8000:8000 surrealdb/surrealdb:v2.2 start --user root --pass root memory
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --all-features --test integration_client
 //! ```
@@ -74,11 +74,10 @@ struct Person {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct Watched {
-    value: i64,
-}
+// The live-query test uses `serde_json::Value` rather than a typed
+// struct because the 3.x SDK stream requires the payload to
+// implement `surrealdb::types::SurrealValue`, and the blanket impl
+// for `serde_json::Value` keeps the test free of a derive dance.
 
 #[tokio::test]
 async fn connect_signin_root_uses_namespace_and_database() {
@@ -159,6 +158,14 @@ async fn transaction_commit_persists() {
         return;
     };
 
+    // SurrealDB v3 rejects SELECT against a table that has never
+    // existed. Pre-define the table so the post-commit SELECT sees a
+    // real (but empty) table.
+    client
+        .query("DEFINE TABLE person SCHEMALESS;")
+        .await
+        .expect("define person table");
+
     let mut txn = Transaction::begin(&client).await.expect("begin");
     txn.execute("CREATE person:txn_commit SET name = 'txn'")
         .await
@@ -181,6 +188,13 @@ async fn transaction_rollback_discards_writes() {
         println!("skipped: SURREAL_URL not set");
         return;
     };
+
+    // Pre-define the table so the post-rollback SELECT can run on v3
+    // (which rejects SELECT against a missing table).
+    client
+        .query("DEFINE TABLE person SCHEMALESS;")
+        .await
+        .expect("define person table");
 
     let mut txn = Transaction::begin(&client).await.expect("begin");
     txn.execute("CREATE person:txn_abort SET name = 'abort'")
@@ -210,7 +224,8 @@ async fn live_query_receives_change() {
         .await
         .expect("define table");
 
-    let mut live: LiveQuery<Watched> = LiveQuery::start(&client, "watched").await.expect("live");
+    let mut live: LiveQuery<serde_json::Value> =
+        LiveQuery::start(&client, "watched").await.expect("live");
 
     let writer = client.clone();
     let producer = tokio::spawn(async move {

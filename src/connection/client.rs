@@ -5,6 +5,15 @@
 //! underlying engine (WebSocket, HTTP, in-memory, file, `SurrealKV`) from
 //! the URL at runtime. Retry logic, connection timeout, and
 //! auth-level dispatch mirror the Python client one-for-one.
+//!
+//! Targets the `surrealdb` crate 3.x line, which removed the
+//! top-level `api::` module in favour of `engine::`, replaced the
+//! opaque `Jwt` return on signin with a structured `Token`, and made
+//! the `SurrealValue` trait the typed-call envelope. For the typed
+//! CRUD helpers exposed by [`DatabaseClient`] we intentionally round
+//! through raw SurrealQL + `serde_json::Value` so callers only need
+//! `serde::Serialize + serde::de::DeserializeOwned` bounds on their
+//! types (not `SurrealValue`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,7 +23,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::{
-    Database as SdkDatabase, Jwt, Namespace as SdkNamespace, Record as SdkRecord, Root as SdkRoot,
+    Database as SdkDatabase, Namespace as SdkNamespace, Record as SdkRecord, Root as SdkRoot, Token,
 };
 use surrealdb::Surreal;
 use tokio::sync::RwLock;
@@ -122,15 +131,12 @@ impl DatabaseClient {
     pub async fn signin<C: Credentials + ?Sized>(&self, creds: &C) -> Result<TokenAuth> {
         self.require_connected()?;
         let payload = creds.to_signin_payload();
-        let jwt = match creds.auth_type() {
+        let token = match creds.auth_type() {
             AuthType::Root => {
                 let username = payload_str(&payload, "username")?;
                 let password = payload_str(&payload, "password")?;
                 self.inner
-                    .signin(SdkRoot {
-                        username: &username,
-                        password: &password,
-                    })
+                    .signin(SdkRoot { username, password })
                     .await
                     .map_err(|e| connection_err(&e))?
             }
@@ -140,9 +146,9 @@ impl DatabaseClient {
                 let password = payload_str(&payload, "password")?;
                 self.inner
                     .signin(SdkNamespace {
-                        namespace: &namespace,
-                        username: &username,
-                        password: &password,
+                        namespace,
+                        username,
+                        password,
                     })
                     .await
                     .map_err(|e| connection_err(&e))?
@@ -154,10 +160,10 @@ impl DatabaseClient {
                 let password = payload_str(&payload, "password")?;
                 self.inner
                     .signin(SdkDatabase {
-                        namespace: &namespace,
-                        database: &database,
-                        username: &username,
-                        password: &password,
+                        namespace,
+                        database,
+                        username,
+                        password,
                     })
                     .await
                     .map_err(|e| connection_err(&e))?
@@ -166,7 +172,10 @@ impl DatabaseClient {
                 let namespace = payload_str(&payload, "namespace")?;
                 let database = payload_str(&payload, "database")?;
                 let access = payload_str(&payload, "access")?;
-                // Everything else is scope-defined vars.
+                // Everything else is scope-defined vars. In v3 the
+                // `Record` credential is generic over `P: SurrealValue`;
+                // `serde_json::Value` implements it, so we bundle the
+                // remaining credential fields into a JSON object.
                 let mut params = serde_json::Map::new();
                 for (k, v) in &payload {
                     if !matches!(k.as_str(), "namespace" | "database" | "access") {
@@ -175,16 +184,16 @@ impl DatabaseClient {
                 }
                 self.inner
                     .signin(SdkRecord {
-                        namespace: &namespace,
-                        database: &database,
-                        access: &access,
-                        params,
+                        namespace,
+                        database,
+                        access,
+                        params: Value::Object(params),
                     })
                     .await
                     .map_err(|e| connection_err(&e))?
             }
         };
-        Ok(TokenAuth::new(jwt.into_insecure_token()))
+        Ok(TokenAuth::new(token.access.into_insecure_token()))
     }
 
     /// Sign up a scope user (record access).
@@ -194,24 +203,24 @@ impl DatabaseClient {
         for (k, v) in &creds.variables {
             params.insert(k.clone(), v.clone());
         }
-        let jwt = self
+        let token = self
             .inner
             .signup(SdkRecord {
-                namespace: &creds.namespace,
-                database: &creds.database,
-                access: &creds.access,
-                params,
+                namespace: creds.namespace.clone(),
+                database: creds.database.clone(),
+                access: creds.access.clone(),
+                params: Value::Object(params),
             })
             .await
             .map_err(|e| connection_err(&e))?;
-        Ok(TokenAuth::new(jwt.into_insecure_token()))
+        Ok(TokenAuth::new(token.access.into_insecure_token()))
     }
 
     /// Authenticate using a previously-issued JWT.
     pub async fn authenticate(&self, token: &str) -> Result<()> {
         self.require_connected()?;
         self.inner
-            .authenticate(Jwt::from(token))
+            .authenticate(Token::from(token))
             .await
             .map_err(|e| connection_err(&e))?;
         Ok(())
@@ -242,41 +251,40 @@ impl DatabaseClient {
         self.require_connected()?;
         let mut builder = self.inner.query(surql.to_owned());
         for (k, v) in vars {
+            // In 3.x the `bind` input must implement `SurrealValue`;
+            // `(String, serde_json::Value)` qualifies because both
+            // components do (and tuples are encoded as 2-element
+            // arrays which `into_variables` unpacks as key/value
+            // chunks).
             builder = builder.bind((k, v));
         }
         let mut response = builder.await.map_err(|e| query_err(&e))?;
         let count = response.num_statements();
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
-            // Take the raw SurrealDB `Value` (which preserves Record IDs,
-            // Durations, etc.) and convert to `serde_json::Value` via
-            // the SDK's built-in JSON mapping. Trying to deserialize
-            // directly into `serde_json::Value` fails because SurrealDB
-            // uses tagged enums on the wire.
-            let raw: surrealdb::Value = response.take(i).map_err(|e| query_err(&e))?;
-            out.push(surreal_value_to_json(raw));
+            // `IndexedResults::take(usize)` in 3.x only accepts
+            // `surrealdb::types::Value` / `Vec<T>` / `Option<T>` for
+            // index-based retrieval. Take the core `Value` (which
+            // preserves record IDs, durations, decimals, etc.) and
+            // downgrade to `serde_json::Value` via
+            // `into_json_value`.
+            let raw: surrealdb::types::Value = response.take(i).map_err(|e| query_err(&e))?;
+            out.push(raw.into_json_value());
         }
         Ok(Value::Array(out))
     }
 
     /// Typed `SELECT` against a table or record ID (`"user"` / `"user:alice"`).
+    ///
+    /// Internally routes through raw SurrealQL + `serde_json::Value`
+    /// so callers only need `serde::de::DeserializeOwned`; the 3.x
+    /// SDK's typed `select` would force a `SurrealValue` bound on
+    /// `T`, which would be a breaking change for existing users.
     pub async fn select<T: DeserializeOwned>(&self, target: &str) -> Result<Vec<T>> {
         self.require_connected()?;
-        let (table, id) = split_target(target);
-        let out: Vec<T> = if let Some(id) = id {
-            let single: Option<T> = self
-                .inner
-                .select((table.to_owned(), id.to_owned()))
-                .await
-                .map_err(|e| query_err(&e))?;
-            single.into_iter().collect()
-        } else {
-            self.inner
-                .select(table.to_owned())
-                .await
-                .map_err(|e| query_err(&e))?
-        };
-        Ok(out)
+        let surql = format!("SELECT * FROM {target};");
+        let raw = self.query(&surql).await?;
+        flatten_rows_typed(&raw)
     }
 
     /// Typed `CREATE`. Returns the created record.
@@ -285,22 +293,14 @@ impl DatabaseClient {
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
         self.require_connected()?;
-        let (table, id) = split_target(target);
-        let result: Option<T> = if let Some(id) = id {
-            self.inner
-                .create((table.to_owned(), id.to_owned()))
-                .content(data)
-                .await
-                .map_err(|e| query_err(&e))?
-        } else {
-            // Table-level create on a target without an id returns `Option<T>`.
-            self.inner
-                .create(table.to_owned())
-                .content(data)
-                .await
-                .map_err(|e| query_err(&e))?
-        };
-        result.ok_or_else(|| SurqlError::Query {
+        let content = serde_json::to_value(&data).map_err(|e| SurqlError::Serialization {
+            reason: e.to_string(),
+        })?;
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        vars.insert("data".into(), content);
+        let surql = format!("CREATE {target} CONTENT $data;");
+        let raw = self.query_with_vars(&surql, vars).await?;
+        first_row_typed(&raw)?.ok_or_else(|| SurqlError::Query {
             reason: format!("CREATE on {target} returned no record"),
         })
     }
@@ -311,27 +311,14 @@ impl DatabaseClient {
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
         self.require_connected()?;
-        let (table, id) = split_target(target);
-        let result: Option<T> = if let Some(id) = id {
-            self.inner
-                .update((table.to_owned(), id.to_owned()))
-                .content(data)
-                .await
-                .map_err(|e| query_err(&e))?
-        } else {
-            let mut list: Vec<T> = self
-                .inner
-                .update(table.to_owned())
-                .content(data)
-                .await
-                .map_err(|e| query_err(&e))?;
-            if list.is_empty() {
-                None
-            } else {
-                Some(list.remove(0))
-            }
-        };
-        result.ok_or_else(|| SurqlError::Query {
+        let content = serde_json::to_value(&data).map_err(|e| SurqlError::Serialization {
+            reason: e.to_string(),
+        })?;
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        vars.insert("data".into(), content);
+        let surql = format!("UPDATE {target} CONTENT $data;");
+        let raw = self.query_with_vars(&surql, vars).await?;
+        first_row_typed(&raw)?.ok_or_else(|| SurqlError::Query {
             reason: format!("UPDATE on {target} returned no record"),
         })
     }
@@ -347,27 +334,14 @@ impl DatabaseClient {
         T: DeserializeOwned + Send + Sync + 'static,
     {
         self.require_connected()?;
-        let (table, id) = split_target(target);
-        let result: Option<T> = if let Some(id) = id {
-            self.inner
-                .update((table.to_owned(), id.to_owned()))
-                .merge(data)
-                .await
-                .map_err(|e| query_err(&e))?
-        } else {
-            let mut list: Vec<T> = self
-                .inner
-                .update(table.to_owned())
-                .merge(data)
-                .await
-                .map_err(|e| query_err(&e))?;
-            if list.is_empty() {
-                None
-            } else {
-                Some(list.remove(0))
-            }
-        };
-        result.ok_or_else(|| SurqlError::Query {
+        let patch = serde_json::to_value(&data).map_err(|e| SurqlError::Serialization {
+            reason: e.to_string(),
+        })?;
+        let mut vars: BTreeMap<String, Value> = BTreeMap::new();
+        vars.insert("patch".into(), patch);
+        let surql = format!("UPDATE {target} MERGE $patch;");
+        let raw = self.query_with_vars(&surql, vars).await?;
+        first_row_typed(&raw)?.ok_or_else(|| SurqlError::Query {
             reason: format!("MERGE on {target} returned no record"),
         })
     }
@@ -375,21 +349,9 @@ impl DatabaseClient {
     /// Typed `DELETE`. Returns the deleted records.
     pub async fn delete<T: DeserializeOwned>(&self, target: &str) -> Result<Vec<T>> {
         self.require_connected()?;
-        let (table, id) = split_target(target);
-        let out: Vec<T> = if let Some(id) = id {
-            let deleted: Option<T> = self
-                .inner
-                .delete((table.to_owned(), id.to_owned()))
-                .await
-                .map_err(|e| query_err(&e))?;
-            deleted.into_iter().collect()
-        } else {
-            self.inner
-                .delete(table.to_owned())
-                .await
-                .map_err(|e| query_err(&e))?
-        };
-        Ok(out)
+        let surql = format!("DELETE {target} RETURN BEFORE;");
+        let raw = self.query(&surql).await?;
+        flatten_rows_typed(&raw)
     }
 
     /// Server-side health check (wraps `Surreal::health`).
@@ -416,8 +378,8 @@ impl DatabaseClient {
         if let (Some(user), Some(pass)) = (self.config.username(), self.config.password()) {
             self.inner
                 .signin(SdkRoot {
-                    username: user,
-                    password: pass,
+                    username: user.to_owned(),
+                    password: pass.to_owned(),
                 })
                 .await
                 .map_err(|e| connection_err(&e))?;
@@ -454,32 +416,38 @@ impl DatabaseClient {
 
 impl From<surrealdb::Error> for SurqlError {
     fn from(err: surrealdb::Error) -> Self {
-        // Prefer the underlying string; SurrealDB's Display already
-        // covers both `Api` and `Db` variants.
+        // 3.x unifies `Error` into a single struct with a `kind_str()`
+        // discriminator and a human-readable message. Map the relevant
+        // kinds onto the richer `SurqlError` taxonomy; fall back to a
+        // substring match on the message for anything not yet modelled
+        // in the typed details.
         classify_surrealdb_error(&err, err.to_string())
     }
 }
 
 fn classify_surrealdb_error(err: &surrealdb::Error, msg: String) -> SurqlError {
-    match err {
-        surrealdb::Error::Api(api) => {
-            let api_msg = api.to_string();
-            let lowered = api_msg.to_lowercase();
-            if lowered.contains("connection")
-                || lowered.contains("not connected")
-                || lowered.contains("connect")
-                || lowered.contains("websocket")
-                || lowered.contains("timed out")
-            {
-                SurqlError::Connection { reason: msg }
-            } else if lowered.contains("transaction") {
-                SurqlError::Transaction { reason: msg }
-            } else {
-                SurqlError::Query { reason: msg }
-            }
-        }
-        surrealdb::Error::Db(_) => SurqlError::Database { reason: msg },
+    if err.is_connection() {
+        return SurqlError::Connection { reason: msg };
     }
+    if err.is_query() || err.is_not_found() || err.is_not_allowed() || err.is_thrown() {
+        return SurqlError::Query { reason: msg };
+    }
+    if err.is_serialization() {
+        return SurqlError::Serialization { reason: msg };
+    }
+    let lowered = msg.to_lowercase();
+    if lowered.contains("transaction") {
+        return SurqlError::Transaction { reason: msg };
+    }
+    if lowered.contains("connect")
+        || lowered.contains("not connected")
+        || lowered.contains("websocket")
+        || lowered.contains("timed out")
+        || lowered.contains("subprotocol")
+    {
+        return SurqlError::Connection { reason: msg };
+    }
+    SurqlError::Database { reason: msg }
 }
 
 pub(crate) fn connection_err(err: &surrealdb::Error) -> SurqlError {
@@ -489,20 +457,55 @@ pub(crate) fn connection_err(err: &surrealdb::Error) -> SurqlError {
 }
 
 pub(crate) fn query_err(err: &surrealdb::Error) -> SurqlError {
-    match err {
-        surrealdb::Error::Api(_) => SurqlError::Query {
-            reason: err.to_string(),
-        },
-        surrealdb::Error::Db(_) => SurqlError::Database {
-            reason: err.to_string(),
-        },
+    classify_surrealdb_error(err, err.to_string())
+}
+
+/// Flatten every row in the raw `query()` response into a typed vector.
+fn flatten_rows_typed<T: DeserializeOwned>(raw: &Value) -> Result<Vec<T>> {
+    let mut out: Vec<T> = Vec::new();
+    collect_rows(raw, &mut out)?;
+    Ok(out)
+}
+
+fn collect_rows<T: DeserializeOwned>(value: &Value, out: &mut Vec<T>) -> Result<()> {
+    match value {
+        Value::Null => Ok(()),
+        Value::Array(items) => {
+            for item in items {
+                collect_rows(item, out)?;
+            }
+            Ok(())
+        }
+        Value::Object(obj) => {
+            if let Some(inner) = obj.get("result") {
+                return collect_rows(inner, out);
+            }
+            let row: T = serde_json::from_value(Value::Object(obj.clone())).map_err(|e| {
+                SurqlError::Serialization {
+                    reason: e.to_string(),
+                }
+            })?;
+            out.push(row);
+            Ok(())
+        }
+        other => {
+            let row: T =
+                serde_json::from_value(other.clone()).map_err(|e| SurqlError::Serialization {
+                    reason: e.to_string(),
+                })?;
+            out.push(row);
+            Ok(())
+        }
     }
 }
 
-fn surreal_value_to_json(value: surrealdb::Value) -> Value {
-    // `surrealdb::Value` is a thin wrapper over the core `Value`, which
-    // implements `From<CoreValue> for serde_json::Value`.
-    Value::from(value.into_inner())
+fn first_row_typed<T: DeserializeOwned>(raw: &Value) -> Result<Option<T>> {
+    let mut rows: Vec<T> = flatten_rows_typed(raw)?;
+    Ok(if rows.is_empty() {
+        None
+    } else {
+        Some(rows.remove(0))
+    })
 }
 
 fn payload_str(map: &serde_json::Map<String, Value>, key: &str) -> Result<String> {
@@ -514,13 +517,6 @@ fn payload_str(map: &serde_json::Map<String, Value>, key: &str) -> Result<String
         None => Err(SurqlError::Validation {
             reason: format!("credential field {key:?} is missing"),
         }),
-    }
-}
-
-fn split_target(target: &str) -> (&str, Option<&str>) {
-    match target.split_once(':') {
-        Some((table, id)) if !table.is_empty() && !id.is_empty() => (table, Some(id)),
-        _ => (target, None),
     }
 }
 
@@ -546,11 +542,34 @@ mod tests {
     }
 
     #[test]
-    fn split_target_detects_record_id() {
-        assert_eq!(split_target("user"), ("user", None));
-        assert_eq!(split_target("user:alice"), ("user", Some("alice")));
-        assert_eq!(split_target(":alice"), (":alice", None));
-        assert_eq!(split_target("user:"), ("user:", None));
+    fn flatten_rows_typed_handles_wrapped_and_flat_shapes() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct Row {
+            name: String,
+        }
+        let wrapped = serde_json::json!([
+            { "result": [{ "name": "alice" }, { "name": "bob" }] }
+        ]);
+        let rows: Vec<Row> = flatten_rows_typed(&wrapped).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "alice");
+
+        let flat = serde_json::json!([[{ "name": "carol" }]]);
+        let rows: Vec<Row> = flatten_rows_typed(&flat).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "carol");
+    }
+
+    #[test]
+    fn first_row_typed_returns_none_for_empty_array() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Row {
+            #[allow(dead_code)]
+            name: String,
+        }
+        let raw = serde_json::json!([[]]);
+        let row: Option<Row> = first_row_typed(&raw).unwrap();
+        assert!(row.is_none());
     }
 
     #[test]
@@ -593,10 +612,17 @@ mod tests {
 
     #[test]
     fn surrealdb_error_maps_to_surql_error() {
-        // We can't easily construct a real surrealdb::Error here, but we
-        // can assert the mapper accepts a constructed Db variant.
-        let core = surrealdb::error::Db::Thrown("boom".into());
-        let err: SurqlError = surrealdb::Error::from(core).into();
-        assert!(matches!(err, SurqlError::Database { .. }));
+        // In 3.x `surrealdb::Error` is a single struct with typed
+        // variants exposed via predicate methods. Use the public
+        // constructor helpers to synthesise representative cases and
+        // assert they map onto the expected `SurqlError` variants.
+        let thrown: SurqlError = surrealdb::Error::thrown("boom".into()).into();
+        assert!(matches!(thrown, SurqlError::Query { .. }));
+
+        let connection: SurqlError = surrealdb::Error::connection("down".into(), None).into();
+        assert!(matches!(connection, SurqlError::Connection { .. }));
+
+        let internal: SurqlError = surrealdb::Error::internal("boom".into()).into();
+        assert!(matches!(internal, SurqlError::Database { .. }));
     }
 }

@@ -1,7 +1,7 @@
 //! Live-query streaming.
 //!
 //! Port of `surql/connection/streaming.py` (MVP). Wraps the
-//! `surrealdb` SDK's `select(...).live()` stream so callers get a plain
+//! `surrealdb` SDK's `LIVE SELECT` stream so callers get a plain
 //! [`futures::Stream`] of deserialized notifications.
 //!
 //! Live queries require a WebSocket (`ws://` / `wss://`) or embedded
@@ -10,14 +10,20 @@
 //!
 //! The underlying SDK stream sends `KILL` on drop, so dropping the
 //! [`LiveQuery`] automatically releases the server-side subscription.
+//!
+//! The 3.x SDK requires the notification payload type to implement
+//! `surrealdb::types::SurrealValue`. The blanket impl for
+//! `serde_json::Value` covers the common "untyped" case; users
+//! wanting typed payloads must derive `SurrealValue` on their data
+//! struct.
 
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::Stream;
-use serde::de::DeserializeOwned;
 use surrealdb::method::QueryStream;
+use surrealdb::types::SurrealValue;
 use surrealdb::Notification;
 
 use crate::connection::client::DatabaseClient;
@@ -29,16 +35,17 @@ use crate::error::{Result, SurqlError};
 ///
 /// ```no_run
 /// use futures::StreamExt;
-/// use serde::Deserialize;
+/// use serde_json::Value;
 /// use surql::connection::{ConnectionConfig, DatabaseClient, LiveQuery};
-///
-/// #[derive(Debug, Deserialize)]
-/// struct User { name: String }
 ///
 /// # async fn run() -> surql::Result<()> {
 /// let client = DatabaseClient::new(ConnectionConfig::default())?;
 /// client.connect().await?;
-/// let mut live: LiveQuery<User> = LiveQuery::start(&client, "user").await?;
+/// // `serde_json::Value` implements `SurrealValue` out of the box,
+/// // so it works as the payload type without any derive. For typed
+/// // payloads, derive `surrealdb::types::SurrealValue` on your
+/// // struct.
+/// let mut live: LiveQuery<Value> = LiveQuery::start(&client, "user").await?;
 /// while let Some(notification) = live.next().await {
 ///     let n = notification?;
 ///     println!("change: {:?}", n);
@@ -58,7 +65,7 @@ impl<T> std::fmt::Debug for LiveQuery<T> {
 
 impl<T> LiveQuery<T>
 where
-    T: DeserializeOwned + Unpin + 'static,
+    T: SurrealValue + Unpin + 'static,
 {
     /// Start a `LIVE SELECT * FROM <target>` subscription.
     ///
@@ -89,7 +96,7 @@ where
 
 impl<T> Stream for LiveQuery<T>
 where
-    T: DeserializeOwned + Unpin + 'static,
+    T: SurrealValue + Unpin + 'static,
 {
     type Item = Result<Notification<T>>;
 

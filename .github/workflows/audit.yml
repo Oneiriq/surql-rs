@@ -31,3 +31,11 @@ jobs:
         uses: rustsec/audit-check@v1.4.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2023-0071: `rsa` 0.9.x has a timing sidechannel
+          # ("Marvin Attack"). No patched version is available
+          # upstream -- the crate is awaiting a constant-time
+          # reimplementation. Reaches us transitively via
+          # `surrealdb` 3.x. Not actionable from this repo; revisit
+          # when upstream ships a fix or `surrealdb` swaps RSA JWT
+          # verification for a constant-time implementation.
+          ignore: RUSTSEC-2023-0071
