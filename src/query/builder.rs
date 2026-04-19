@@ -240,6 +240,42 @@ impl Query {
         }
     }
 
+    /// Start a `SELECT` query whose projection is a list of typed
+    /// [`Expression`](crate::query::expressions::Expression) fragments.
+    ///
+    /// Each expression is rendered via `expression.to_surql()` and joined
+    /// with `, ` so callers can mix aggregate factories (`count()`,
+    /// `math_mean(...)`) with plain field references without stringifying
+    /// them by hand.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::query::builder::Query;
+    /// use surql::query::expressions::{as_, count_all, math_mean};
+    ///
+    /// let q = Query::new()
+    ///     .select_expr(vec![
+    ///         as_(&count_all(), "total"),
+    ///         as_(&math_mean("strength"), "mean_strength"),
+    ///     ])
+    ///     .from_table("memory_entry").unwrap()
+    ///     .group_all();
+    ///
+    /// assert_eq!(
+    ///     q.to_surql().unwrap(),
+    ///     "SELECT count() AS total, math::mean(strength) AS mean_strength \
+    ///      FROM memory_entry GROUP ALL",
+    /// );
+    /// ```
+    pub fn select_expr(
+        self,
+        fields: impl IntoIterator<Item = crate::query::expressions::Expression>,
+    ) -> Self {
+        let rendered: Vec<String> = fields.into_iter().map(|e| e.to_surql()).collect();
+        self.select(Some(rendered))
+    }
+
     /// Set the target table.
     ///
     /// Accepts either a bare table (`"user"`) or a record id
@@ -792,6 +828,33 @@ impl Query {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Client-feature execution shim (sub-feature 4: builder.execute)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "client")]
+impl Query {
+    /// Render this query to SurrealQL and execute it against `client`.
+    ///
+    /// Thin async wrapper over
+    /// [`execute_query`](crate::query::executor::execute_query) so callers
+    /// can write `.execute(&client).await` directly on the builder. Returns
+    /// the raw `serde_json::Value` produced by the driver - pass through
+    /// [`crate::query::results::extract_many`] /
+    /// [`crate::query::results::extract_one`] /
+    /// [`crate::query::results::extract_scalar`] to pull values out.
+    ///
+    /// For typed deserialisation use
+    /// [`crate::query::executor::fetch_all`] /
+    /// [`crate::query::executor::fetch_one`] instead.
+    pub async fn execute(
+        &self,
+        client: &crate::connection::DatabaseClient,
+    ) -> Result<serde_json::Value> {
+        crate::query::executor::execute_query(client, self).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,5 +1384,41 @@ mod tests {
             .to_surql()
             .unwrap()
             .contains("JOIN post ON user.id = post.author"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-feature 4: select_expr accepts typed Expressions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn select_expr_renders_projection() {
+        use crate::query::expressions::{as_, count_all, math_mean};
+
+        let q = Query::new()
+            .select_expr(vec![
+                as_(&count_all(), "total"),
+                as_(&math_mean("strength"), "mean"),
+            ])
+            .from_table("memory_entry")
+            .unwrap()
+            .group_all();
+
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT count() AS total, math::mean(strength) AS mean FROM memory_entry GROUP ALL",
+        );
+    }
+
+    #[test]
+    fn select_expr_empty_falls_back_to_empty_list() {
+        // Empty iterator yields no fields, so the default "*" (populated by
+        // the non-expr `select(None)` helper) is NOT applied here; ensure
+        // we still render a valid statement with just FROM.
+        let q = Query::new()
+            .select_expr(Vec::<crate::query::expressions::Expression>::new())
+            .from_table("user")
+            .unwrap();
+        // Empty fields -> "*" by build_select's fallback.
+        assert_eq!(q.to_surql().unwrap(), "SELECT * FROM user");
     }
 }

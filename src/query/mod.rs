@@ -37,9 +37,11 @@ pub mod typed;
 pub use batch::{build_relate_query, build_upsert_query, RelateItem};
 pub use builder::{Operation, OrderField, Query, WhereCondition};
 pub use expressions::{
-    abs_, array_contains, array_length, as_, avg, cast, ceil, concat, count, field, floor, func,
-    lower, math_max, math_mean, math_min, math_sum, max_, min_, raw, round_, sum_, time_format,
-    time_now, type_is, upper, value, ExprArg, Expression, ExpressionKind,
+    abs_, array_contains, array_length, as_, avg, cast, ceil, concat, count, count_all, count_if,
+    field, floor, func, lower, math_abs, math_ceil, math_floor, math_max, math_mean, math_min,
+    math_round, math_sum, max_, min_, raw, round_, string_concat, string_len, string_lower,
+    string_upper, sum_, time_format, time_now, type_is, upper, value, ExprArg, Expression,
+    ExpressionKind,
 };
 pub use graph_query::GraphQuery;
 pub use helpers::{
@@ -51,7 +53,12 @@ pub use hints::{
     HintType, IndexHint, ParallelHint, QueryHint, TimeoutHint,
 };
 pub use results::{
-    aggregate, count_result, extract_one, extract_result, extract_scalar, has_results, paginated,
-    record, records, success, AggregateResult, CountResult, ListResult, PageInfo, PaginatedResult,
-    QueryResult, RecordResult,
+    aggregate, count_result, extract_many, extract_one, extract_result, extract_scalar, has_result,
+    has_results, paginated, record, records, success, AggregateResult, CountResult, ListResult,
+    PageInfo, PaginatedResult, QueryResult, RecordResult,
 };
+
+// Aggregation entrypoint (sub-feature 4). Gated on the `client` feature
+// because it needs a live [`DatabaseClient`] to dispatch the rendered query.
+#[cfg(feature = "client")]
+pub use crud::{aggregate_records, build_aggregate_query, AggregateOpts};
