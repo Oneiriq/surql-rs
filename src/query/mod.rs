@@ -53,7 +53,7 @@ pub use hints::{
     HintType, IndexHint, ParallelHint, QueryHint, TimeoutHint,
 };
 pub use results::{
-    aggregate, count_result, extract_one, extract_result, extract_scalar, has_results, paginated,
-    record, records, success, AggregateResult, CountResult, ListResult, PageInfo, PaginatedResult,
-    QueryResult, RecordResult,
+    aggregate, count_result, extract_many, extract_one, extract_result, extract_scalar, has_result,
+    has_results, paginated, record, records, success, AggregateResult, CountResult, ListResult,
+    PageInfo, PaginatedResult, QueryResult, RecordResult,
 };
