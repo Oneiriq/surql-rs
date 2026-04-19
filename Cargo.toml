@@ -33,6 +33,7 @@ cli = ["client", "dep:clap", "dep:tokio", "dep:tracing-subscriber"]
 cache = ["dep:tokio", "dep:async-trait"]
 cache-redis = ["cache", "dep:redis"]
 settings = ["dep:dotenvy", "dep:toml"]
+orchestration = ["client", "dep:async-trait"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
