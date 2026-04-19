@@ -46,11 +46,15 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "cache")]
+pub mod cache;
 pub mod connection;
 pub mod error;
 pub mod migration;
 pub mod query;
 pub mod schema;
+#[cfg(feature = "settings")]
+pub mod settings;
 pub mod types;
 
 pub use error::{Result, SurqlError};
