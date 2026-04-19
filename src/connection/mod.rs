@@ -7,6 +7,8 @@
 
 pub mod auth;
 #[cfg(feature = "client")]
+pub mod auth_manager;
+#[cfg(feature = "client")]
 pub mod client;
 pub mod config;
 #[cfg(feature = "client")]
@@ -24,6 +26,8 @@ pub use auth::{
 };
 pub use config::{ConnectionConfig, NamedConnectionConfig, Protocol};
 
+#[cfg(feature = "client")]
+pub use auth_manager::{AuthManager, TokenState};
 #[cfg(feature = "client")]
 pub use client::DatabaseClient;
 #[cfg(feature = "client")]
