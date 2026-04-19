@@ -10,6 +10,8 @@ pub mod auth;
 pub mod client;
 pub mod config;
 #[cfg(feature = "client")]
+pub mod context;
+#[cfg(feature = "client")]
 pub mod streaming;
 #[cfg(feature = "client")]
 pub mod transaction;
@@ -22,6 +24,8 @@ pub use config::{ConnectionConfig, NamedConnectionConfig, Protocol};
 
 #[cfg(feature = "client")]
 pub use client::DatabaseClient;
+#[cfg(feature = "client")]
+pub use context::{clear_db, connection_override, connection_scope, get_db, has_db, set_db};
 #[cfg(feature = "client")]
 pub use streaming::LiveQuery;
 #[cfg(feature = "client")]
