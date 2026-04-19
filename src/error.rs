@@ -109,6 +109,11 @@ pub enum SurqlError {
         /// Human-readable explanation.
         reason: String,
     },
+    /// Error raised by the schema file watcher.
+    MigrationWatcher {
+        /// Human-readable explanation.
+        reason: String,
+    },
     /// Multi-environment orchestration failed.
     Orchestration {
         /// Human-readable explanation.
@@ -157,6 +162,7 @@ impl fmt::Display for SurqlError {
             }
             Self::MigrationHistory { reason } => write!(f, "migration history error: {reason}"),
             Self::MigrationSquash { reason } => write!(f, "migration squash error: {reason}"),
+            Self::MigrationWatcher { reason } => write!(f, "migration watcher error: {reason}"),
             Self::Orchestration { reason } => write!(f, "orchestration error: {reason}"),
             Self::Serialization { reason } => write!(f, "serialization error: {reason}"),
             Self::Io { reason } => write!(f, "io error: {reason}"),

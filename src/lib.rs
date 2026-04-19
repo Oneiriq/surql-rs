@@ -31,8 +31,15 @@
 //!   ([`discover_migrations`](migration::discover_migrations),
 //!   [`load_migration`](migration::load_migration)).
 //!
-//! Additional modules (`cache`, `orchestration`, migration execution)
-//! are under active port and will land incrementally.
+//! - [`orchestration`] *(feature-gated: `orchestration`)*: Multi-database
+//!   migration orchestration — [`EnvironmentConfig`](orchestration::EnvironmentConfig),
+//!   [`EnvironmentRegistry`](orchestration::EnvironmentRegistry),
+//!   [`MigrationCoordinator`](orchestration::MigrationCoordinator),
+//!   [`HealthCheck`](orchestration::HealthCheck), and deployment
+//!   strategies ([`SequentialStrategy`](orchestration::SequentialStrategy),
+//!   [`ParallelStrategy`](orchestration::ParallelStrategy),
+//!   [`RollingStrategy`](orchestration::RollingStrategy),
+//!   [`CanaryStrategy`](orchestration::CanaryStrategy)).
 
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
@@ -46,11 +53,19 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "cache")]
+pub mod cache;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod connection;
 pub mod error;
 pub mod migration;
+#[cfg(feature = "orchestration")]
+pub mod orchestration;
 pub mod query;
 pub mod schema;
+#[cfg(feature = "settings")]
+pub mod settings;
 pub mod types;
 
 pub use error::{Result, SurqlError};

@@ -6,7 +6,7 @@
 //! SurrealDB server is reachable. Exercise with:
 //!
 //! ```text
-//! docker run -d -p 8000:8000 surrealdb/surrealdb:v2.2 start --user root --pass root memory
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --all-features --test integration_query
 //! ```

@@ -40,13 +40,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
 use crate::migration::diff::{diff_schemas, SchemaSnapshot};
 use crate::migration::models::{DiffOperation, SchemaDiff};
-use crate::migration::versioning::{list_snapshots, VersionedSnapshot};
+use crate::migration::versioning::{
+    create_snapshot, list_snapshots, store_snapshot, VersionedSnapshot,
+};
 use crate::schema::registry::SchemaRegistry;
 
 /// Severity of a single drift issue.
@@ -391,6 +394,145 @@ pub fn generate_precommit_config(schema_path: &str, fail_on_drift: bool) -> Stri
     format!(
         "repos:\n  - repo: local\n    hooks:\n      - id: surql-schema-check\n        name: Check schema migrations\n        entry: surql schema check --schema {schema_path}{fail_flag}\n        language: system\n        pass_filenames: false\n"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Auto-snapshot hooks (parity with `surql/migration/hooks.py`)
+// ---------------------------------------------------------------------------
+
+/// Global toggle for automatic post-migration snapshots.
+///
+/// Mirrors the Python `AUTO_SNAPSHOT_ENABLED` module-level boolean. The
+/// toggle lives in the always-on [`hooks`](self) module so it can be
+/// read from both client-gated (history/executor) and pure (watcher,
+/// squash) call sites.
+static AUTO_SNAPSHOT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable automatic schema snapshots after successful migrations.
+///
+/// Subsequent calls to [`create_snapshot_on_migration`] will take a
+/// snapshot; callers that honour the flag (e.g. the client-gated
+/// migration executor) will start taking snapshots on apply.
+pub fn enable_auto_snapshots() {
+    AUTO_SNAPSHOT_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Disable automatic schema snapshots.
+pub fn disable_auto_snapshots() {
+    AUTO_SNAPSHOT_ENABLED.store(false, Ordering::Relaxed);
+}
+
+/// `true` when automatic snapshots are enabled.
+#[must_use]
+pub fn is_auto_snapshot_enabled() -> bool {
+    AUTO_SNAPSHOT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Callback run immediately before the snapshot is taken; receives the
+/// migration version that triggered the snapshot.
+pub type PreSnapshotHook<'a> = Box<dyn FnOnce(&str) + 'a>;
+/// Callback run after the snapshot has been stored; receives a reference
+/// to the stored [`VersionedSnapshot`].
+pub type PostSnapshotHook<'a> = Box<dyn FnOnce(&VersionedSnapshot) + 'a>;
+
+/// Hook invoked around [`create_snapshot_on_migration`].
+///
+/// The `pre` hook runs before the snapshot is created; the `post` hook
+/// runs after a successful store with the resulting [`VersionedSnapshot`].
+/// Either hook may be [`None`]. Hooks are `FnOnce` so they can capture
+/// state by move.
+pub struct SnapshotHooks<'a> {
+    /// Callback run immediately before creating the snapshot. Receives
+    /// the migration version that triggered the snapshot.
+    pub pre: Option<PreSnapshotHook<'a>>,
+    /// Callback run after the snapshot has been stored. Receives a
+    /// reference to the stored [`VersionedSnapshot`].
+    pub post: Option<PostSnapshotHook<'a>>,
+}
+
+impl<'a> SnapshotHooks<'a> {
+    /// Construct a hook pair with no pre- or post-callback.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            pre: None,
+            post: None,
+        }
+    }
+
+    /// Attach a pre-snapshot callback.
+    #[must_use]
+    pub fn pre<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&str) + 'a,
+    {
+        self.pre = Some(Box::new(f));
+        self
+    }
+
+    /// Attach a post-snapshot callback.
+    #[must_use]
+    pub fn post<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&VersionedSnapshot) + 'a,
+    {
+        self.post = Some(Box::new(f));
+        self
+    }
+}
+
+impl Default for SnapshotHooks<'_> {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+/// Create and persist a schema snapshot on behalf of a just-applied
+/// migration.
+///
+/// Honours [`is_auto_snapshot_enabled`]: when the flag is `false` the
+/// function is a no-op and returns `Ok(None)`. When enabled it captures
+/// the current [`SchemaRegistry`] state via
+/// [`create_snapshot`] and persists it to `snapshots_dir` via
+/// [`store_snapshot`].
+///
+/// `migration_count` is stored on the snapshot for later inspection and
+/// matches the Python signature.
+///
+/// `hooks.pre` runs before the snapshot is created; `hooks.post` runs
+/// after a successful store. Hooks are best-effort: they must not
+/// panic, and their execution is not reported through the returned
+/// `Result` (errors are swallowed by the hook closure itself).
+///
+/// # Errors
+///
+/// Returns [`SurqlError::Validation`] if `version` is empty (surfaced
+/// from [`create_snapshot`]), or [`SurqlError::Io`] /
+/// [`SurqlError::Serialization`] if the snapshot cannot be written.
+pub fn create_snapshot_on_migration(
+    registry: &SchemaRegistry,
+    snapshots_dir: &Path,
+    version: &str,
+    migration_count: u64,
+    hooks: SnapshotHooks<'_>,
+) -> Result<Option<VersionedSnapshot>> {
+    if !is_auto_snapshot_enabled() {
+        return Ok(None);
+    }
+
+    if let Some(pre) = hooks.pre {
+        pre(version);
+    }
+
+    let mut snapshot = create_snapshot(registry, version, format!("auto: {version}"))?;
+    snapshot.migration_count = migration_count;
+    store_snapshot(&snapshot, snapshots_dir)?;
+
+    if let Some(post) = hooks.post {
+        post(&snapshot);
+    }
+
+    Ok(Some(snapshot))
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,5 +1153,121 @@ mod tests {
         let yaml = generate_precommit_config("schemas/", true);
         assert!(!yaml.is_empty());
         assert!(yaml.len() > 100);
+    }
+
+    // --- auto-snapshot hooks -----------------------------------------------
+
+    // NOTE: these tests mutate the global AUTO_SNAPSHOT_ENABLED toggle.
+    // They are serialised via AUTO_SNAPSHOT_TEST_LOCK because cargo test
+    // runs tests in parallel by default and a shared atomic toggle
+    // cannot be partitioned per-thread.
+
+    static AUTO_SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_flag_lock<R>(f: impl FnOnce() -> R) -> R {
+        let guard = AUTO_SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let out = f();
+        drop(guard);
+        out
+    }
+
+    #[test]
+    fn enable_disable_is_enabled_roundtrip() {
+        with_flag_lock(|| {
+            disable_auto_snapshots();
+            assert!(!is_auto_snapshot_enabled());
+            enable_auto_snapshots();
+            assert!(is_auto_snapshot_enabled());
+            disable_auto_snapshots();
+            assert!(!is_auto_snapshot_enabled());
+        });
+    }
+
+    #[test]
+    fn create_snapshot_on_migration_no_op_when_disabled() {
+        with_flag_lock(|| {
+            disable_auto_snapshots();
+            let registry = SchemaRegistry::new();
+            registry.register_table(table_schema("user"));
+            let dir = unique_temp_dir("auto-off");
+            let hooks = SnapshotHooks::none();
+            let out = create_snapshot_on_migration(&registry, &dir, "20260101_000000", 0, hooks)
+                .expect("hook runs");
+            assert!(out.is_none());
+            let list = std::fs::read_dir(&dir).unwrap();
+            assert_eq!(list.count(), 0);
+        });
+    }
+
+    #[test]
+    fn create_snapshot_on_migration_writes_file_when_enabled() {
+        with_flag_lock(|| {
+            enable_auto_snapshots();
+            let registry = SchemaRegistry::new();
+            registry.register_table(table_schema("user"));
+            let dir = unique_temp_dir("auto-on");
+            let snap = create_snapshot_on_migration(
+                &registry,
+                &dir,
+                "20260101_000000",
+                7,
+                SnapshotHooks::none(),
+            )
+            .expect("hook runs")
+            .expect("snapshot present");
+            disable_auto_snapshots();
+            assert_eq!(snap.migration_count, 7);
+            let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+            assert_eq!(files.len(), 1);
+        });
+    }
+
+    #[test]
+    fn create_snapshot_on_migration_runs_pre_and_post_hooks() {
+        with_flag_lock(|| {
+            enable_auto_snapshots();
+            let registry = SchemaRegistry::new();
+            registry.register_table(table_schema("user"));
+            let dir = unique_temp_dir("auto-hooks");
+
+            let pre_cell = std::sync::Arc::new(std::sync::Mutex::new(Option::<String>::None));
+            let post_cell = std::sync::Arc::new(std::sync::Mutex::new(Option::<String>::None));
+
+            let pre_cell_cb = std::sync::Arc::clone(&pre_cell);
+            let post_cell_cb = std::sync::Arc::clone(&post_cell);
+            let hooks = SnapshotHooks::none()
+                .pre(move |v: &str| {
+                    *pre_cell_cb.lock().unwrap() = Some(v.to_string());
+                })
+                .post(move |s: &VersionedSnapshot| {
+                    *post_cell_cb.lock().unwrap() = Some(s.version.clone());
+                });
+
+            let snap = create_snapshot_on_migration(&registry, &dir, "20260109_120000", 3, hooks)
+                .expect("hook runs")
+                .expect("snapshot present");
+            disable_auto_snapshots();
+
+            assert_eq!(pre_cell.lock().unwrap().as_deref(), Some("20260109_120000"));
+            assert_eq!(
+                post_cell.lock().unwrap().as_deref(),
+                Some(snap.version.as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn create_snapshot_on_migration_surfaces_validation_error_on_empty_version() {
+        with_flag_lock(|| {
+            enable_auto_snapshots();
+            let registry = SchemaRegistry::new();
+            let dir = unique_temp_dir("auto-empty");
+            let err = create_snapshot_on_migration(&registry, &dir, "", 0, SnapshotHooks::none())
+                .expect_err("must reject empty version");
+            disable_auto_snapshots();
+            assert!(matches!(err, SurqlError::Validation { .. }));
+        });
     }
 }
