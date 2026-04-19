@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::query::builder::Query;
-use surql::query::{crud, executor, typed};
-use surql::types::operators::{eq, gt};
+use surql::query::expressions::{as_, count_all, math_mean, math_sum};
+use surql::query::results::{extract_many, extract_one, extract_scalar, has_result};
+use surql::query::{crud, executor, typed, AggregateOpts};
+use surql::types::operators::{eq, gt, type_record, type_thing};
 use surql::types::record_id::RecordID;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +245,212 @@ async fn crud_bulk_and_count_and_query() {
         .await
         .expect("delete_records");
     assert_eq!(deleted, 1);
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn aggregate_records_group_all_returns_aggregates() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+
+    // Seed three memory_entry rows across two networks.
+    client
+        .query("CREATE memory_entry:a SET network = 'default', strength = 1.0;")
+        .await
+        .expect("seed a");
+    client
+        .query("CREATE memory_entry:b SET network = 'default', strength = 3.0;")
+        .await
+        .expect("seed b");
+    client
+        .query("CREATE memory_entry:c SET network = 'other', strength = 5.0;")
+        .await
+        .expect("seed c");
+
+    let opts = AggregateOpts {
+        select: vec![
+            ("total".to_string(), count_all()),
+            ("strength_sum".to_string(), math_sum("strength")),
+            ("strength_mean".to_string(), math_mean("strength")),
+        ],
+        group_all: true,
+        ..Default::default()
+    };
+
+    let rows = crud::aggregate_records(&client, "memory_entry", opts)
+        .await
+        .expect("aggregate_records group_all");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["total"].as_i64(), Some(3));
+    assert_eq!(row["strength_sum"].as_f64(), Some(9.0));
+    assert_eq!(row["strength_mean"].as_f64(), Some(3.0));
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn aggregate_records_group_by_splits_rows() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+
+    client
+        .query("CREATE memory_entry:a SET network = 'default', strength = 1.0;")
+        .await
+        .expect("seed a");
+    client
+        .query("CREATE memory_entry:b SET network = 'default', strength = 3.0;")
+        .await
+        .expect("seed b");
+    client
+        .query("CREATE memory_entry:c SET network = 'other', strength = 5.0;")
+        .await
+        .expect("seed c");
+
+    let opts = AggregateOpts {
+        select: vec![
+            ("network".to_string(), surql::query::raw("network")),
+            ("count".to_string(), count_all()),
+            ("sum".to_string(), math_sum("strength")),
+        ],
+        group_by: vec!["network".into()],
+        order_by: vec![("network".into(), "ASC".into())],
+        ..Default::default()
+    };
+
+    let rows = crud::aggregate_records(&client, "memory_entry", opts)
+        .await
+        .expect("aggregate_records group_by");
+    assert_eq!(rows.len(), 2);
+    // Ordered ASC by network -> "default", "other".
+    assert_eq!(rows[0]["network"].as_str(), Some("default"));
+    assert_eq!(rows[0]["count"].as_i64(), Some(2));
+    assert_eq!(rows[1]["network"].as_str(), Some("other"));
+    assert_eq!(rows[1]["sum"].as_f64(), Some(5.0));
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn type_record_target_round_trip_with_update() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+
+    // Create using the SurrealQL `type::record` literal so we can verify
+    // that targets rendered by our `type_record()` helper address the same
+    // record at update time.
+    client
+        .query("CREATE type::record('task', 'abc') SET name = 'draft', status = 'pending';")
+        .await
+        .expect("seed task");
+
+    // Render a target via type_record() and UPDATE through it.
+    let target = type_record("task", "abc");
+    let target_sql = target.to_surql();
+    assert_eq!(target_sql, "type::record('task', 'abc')");
+
+    let updated = crud::update_record_target(
+        &client,
+        &target_sql,
+        json!({"name": "draft", "status": "done"}),
+    )
+    .await
+    .expect("update via type::record target");
+    assert_eq!(updated["status"], "done");
+
+    // And UPSERT through a `type_record()` target rendering.
+    let upsert_target = type_record("task", "abc").to_surql();
+    let upserted = crud::upsert_record_target(
+        &client,
+        &upsert_target,
+        json!({"name": "final", "status": "archived"}),
+    )
+    .await
+    .expect("upsert via type::record target");
+    assert_eq!(upserted["status"], "archived");
+
+    // type_thing renders the SurrealQL `type::thing(...)` form deterministically;
+    // v3.0.5 only honours it in some positions so we assert the shape
+    // rather than executing it here.
+    assert_eq!(
+        type_thing("task", "abc").to_surql(),
+        "type::thing('task', 'abc')",
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn extract_helpers_round_trip_against_raw_response() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+
+    client
+        .query("CREATE user:alice SET name = 'alice', age = 30;")
+        .await
+        .expect("seed alice");
+    client
+        .query("CREATE user:bob SET name = 'bob', age = 40;")
+        .await
+        .expect("seed bob");
+
+    let raw = executor::execute_raw(&client, "SELECT * FROM user", None)
+        .await
+        .expect("execute_raw");
+
+    assert!(has_result(&raw));
+    assert_eq!(extract_many(&raw).len(), 2);
+    let first = extract_one(&raw).expect("first row");
+    assert!(first.get("name").is_some());
+
+    let count_raw =
+        executor::execute_raw(&client, "SELECT count() AS count FROM user GROUP ALL", None)
+            .await
+            .expect("count raw");
+    let total = extract_scalar(&count_raw, "count", json!(0));
+    assert_eq!(total.as_i64(), Some(2));
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_builder_execute_convenience() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    client
+        .query("CREATE user:alice SET name = 'alice', age = 30;")
+        .await
+        .expect("seed alice");
+
+    let q = Query::new().select(None).from_table("user").unwrap();
+    let raw = q.execute(&client).await.expect("builder execute");
+    assert!(has_result(&raw));
+
+    // And the builder's select_expr / group_all path.
+    let agg = Query::new()
+        .select_expr(vec![as_(&count_all(), "count")])
+        .from_table("user")
+        .unwrap()
+        .group_all()
+        .execute(&client)
+        .await
+        .expect("agg execute");
+    let row = extract_one(&agg).expect("one aggregate row");
+    assert_eq!(
+        row.get("count").and_then(serde_json::Value::as_i64),
+        Some(1)
+    );
 
     client.disconnect().await.unwrap();
 }

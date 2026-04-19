@@ -72,3 +72,12 @@ pub use error::{Result, SurqlError};
 
 #[cfg(feature = "client")]
 pub use connection::DatabaseClient;
+
+// Convenience re-exports for the query-UX surface (sub-feature 1: first-class
+// `type::record` / `type::thing` helpers).
+pub use types::operators::{type_record, type_thing};
+
+// Result-extraction helpers hoisted into the crate root for ergonomic
+// `use surql::{extract_one, extract_scalar, extract_many, has_result};` usage
+// (sub-feature 3).
+pub use query::results::{extract_many, extract_one, extract_scalar, has_result};

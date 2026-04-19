@@ -6,8 +6,11 @@
 
 use serde_json::Value;
 
-use super::record_ref::RecordRef;
+use super::record_id::RecordIdValue;
+use super::record_ref::{record_ref, RecordRef};
 use super::surreal_fn::SurrealFn;
+
+use crate::query::expressions::Expression;
 
 /// Trait implemented by every operator so they can all produce SurrealQL.
 pub trait OperatorExpr {
@@ -443,6 +446,63 @@ fn quote_key(key: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// type::record / type::thing first-class helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `type::record('<table>', <id>)` expression.
+///
+/// Mirrors the ergonomics of the Python `type_record()` helper: callers pass
+/// a table name and any [`RecordIdValue`]-convertible id, and receive an
+/// [`Expression`] (tagged [`crate::query::expressions::ExpressionKind::Function`])
+/// that can be embedded anywhere a target, value, or SurrealQL fragment is
+/// accepted. The returned expression renders identically to
+/// [`RecordRef::to_surql`].
+///
+/// ## Examples
+///
+/// ```
+/// use surql::types::operators::type_record;
+///
+/// let target = type_record("task", "abc-123");
+/// assert_eq!(target.to_surql(), "type::record('task', 'abc-123')");
+///
+/// let numeric = type_record("post", 42_i64);
+/// assert_eq!(numeric.to_surql(), "type::record('post', 42)");
+/// ```
+pub fn type_record(table: impl Into<String>, record_id: impl Into<RecordIdValue>) -> Expression {
+    Expression::function(record_ref(table, record_id).to_surql())
+}
+
+/// Build a `type::thing('<table>', <id>)` expression.
+///
+/// `type::thing` is the SurrealDB alias for `type::record`. This helper is
+/// provided for parity with the SurrealQL function set; the rendered SurrealQL
+/// uses `type::thing(...)` verbatim so query plans that expect the literal
+/// `thing` function call continue to match.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::types::operators::type_thing;
+///
+/// let target = type_thing("user", "alice");
+/// assert_eq!(target.to_surql(), "type::thing('user', 'alice')");
+///
+/// let numeric = type_thing("post", 123_i64);
+/// assert_eq!(numeric.to_surql(), "type::thing('post', 123)");
+/// ```
+pub fn type_thing(table: impl Into<String>, record_id: impl Into<RecordIdValue>) -> Expression {
+    let rendered = match record_id.into() {
+        RecordIdValue::Int(n) => format!("type::thing('{}', {n})", table.into()),
+        RecordIdValue::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+            format!("type::thing('{}', '{escaped}')", table.into())
+        }
+    };
+    Expression::function(rendered)
+}
+
 fn try_wrapped_raw(obj: &serde_json::Map<String, Value>) -> Option<String> {
     if let Ok(fnv) = serde_json::from_value::<SurrealFn>(Value::Object(obj.clone())) {
         return Some(fnv.to_surql());
@@ -589,6 +649,72 @@ mod tests {
         assert_eq!(
             eq("author", rr).to_surql(),
             "author = type::record('user', 'alice')"
+        );
+    }
+
+    #[test]
+    fn type_record_string_id_renders() {
+        assert_eq!(
+            type_record("task", "abc-123").to_surql(),
+            "type::record('task', 'abc-123')"
+        );
+    }
+
+    #[test]
+    fn type_record_int_id_renders() {
+        assert_eq!(
+            type_record("post", 42_i64).to_surql(),
+            "type::record('post', 42)"
+        );
+    }
+
+    #[test]
+    fn type_record_escapes_single_quote() {
+        assert_eq!(
+            type_record("user", "o'brien").to_surql(),
+            "type::record('user', 'o\\'brien')"
+        );
+    }
+
+    #[test]
+    fn type_record_is_function_expression() {
+        let expr = type_record("task", "abc");
+        assert_eq!(
+            expr.kind,
+            crate::query::expressions::ExpressionKind::Function
+        );
+    }
+
+    #[test]
+    fn type_thing_string_id_renders() {
+        assert_eq!(
+            type_thing("user", "alice").to_surql(),
+            "type::thing('user', 'alice')"
+        );
+    }
+
+    #[test]
+    fn type_thing_int_id_renders() {
+        assert_eq!(
+            type_thing("post", 123_i64).to_surql(),
+            "type::thing('post', 123)"
+        );
+    }
+
+    #[test]
+    fn type_thing_escapes_backslash() {
+        assert_eq!(
+            type_thing("path", "a\\b").to_surql(),
+            "type::thing('path', 'a\\\\b')"
+        );
+    }
+
+    #[test]
+    fn type_thing_is_function_expression() {
+        let expr = type_thing("user", "alice");
+        assert_eq!(
+            expr.kind,
+            crate::query::expressions::ExpressionKind::Function
         );
     }
 }
