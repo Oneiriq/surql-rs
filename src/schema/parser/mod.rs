@@ -15,6 +15,16 @@
 //! Input is always [`serde_json::Value`]; there is no tight coupling to the
 //! `surrealdb` crate.
 //!
+//! The implementation is split into cohesive submodules so no file exceeds
+//! the repository's 1000-LOC budget:
+//!
+//! - [`field`] — `DEFINE FIELD` parsing.
+//! - [`index`] — `DEFINE INDEX` parsing (UNIQUE / SEARCH / MTREE / HNSW).
+//! - [`event`] — `DEFINE EVENT` parsing.
+//! - [`access`] — `DEFINE ACCESS` parsing (JWT + RECORD).
+//! - [`table`] — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
+//! - [`db`] — `INFO FOR DB` parsing + edge partitioning.
+//!
 //! ## Example
 //!
 //! ```
@@ -42,144 +52,41 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Result, SurqlError};
+use crate::schema::access::AccessDefinition;
+use crate::schema::edge::EdgeDefinition;
+use crate::schema::table::TableDefinition;
 
-use super::access::{AccessDefinition, AccessType, JwtConfig, RecordAccessConfig};
-use super::edge::{EdgeDefinition, EdgeMode};
-use super::fields::{FieldDefinition, FieldType};
-use super::table::{
-    EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
-    MTreeVectorType, TableDefinition, TableMode,
-};
+mod access;
+mod db;
+mod event;
+mod field;
+mod index;
+mod table;
 
-// --- Regex accessors ---------------------------------------------------------
+pub use access::parse_access;
+pub use db::parse_db_info;
+pub use event::{parse_event, parse_events};
+pub use field::{parse_field, parse_fields};
+pub use index::{parse_index, parse_indexes};
+pub use table::{parse_table_info, parse_table_mode};
 
-fn regex_case_insensitive(pattern: &str) -> Regex {
+// --- Shared regex helper -----------------------------------------------------
+
+/// Build a case-insensitive [`Regex`] from a body pattern. Shared across
+/// the parser submodules.
+pub(super) fn regex_case_insensitive(pattern: &str) -> Regex {
     Regex::new(&format!("(?i){pattern}")).expect("valid regex pattern")
 }
 
-fn type_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+(\w+)"))
-}
+// --- Shared JSON helpers -----------------------------------------------------
 
-fn readonly_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bREADONLY\b"))
-}
-
-fn flexible_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bFLEXIBLE\b"))
-}
-
-fn columns_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex_case_insensitive(r"COLUMNS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|\s*;|\s*$)")
-    })
-}
-
-fn fields_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex_case_insensitive(r"FIELDS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|\s*;|\s*$)")
-    })
-}
-
-fn dimension_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"DIMENSION\s+(\d+)"))
-}
-
-fn distance_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"(?:DIST|DISTANCE)\s+(\w+)"))
-}
-
-fn efc_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"EFC\s+(\d+)"))
-}
-
-fn m_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bM\s+(\d+)"))
-}
-
-fn when_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"(?s)WHEN\s+(.+?)\s+THEN"))
-}
-
-fn then_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"(?s)THEN\s+(?:\{(.+?)\}|(.+?))(?:\s*;|\s*$)"))
-}
-
-fn relation_from_to_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+RELATION\s+FROM\s+(\w+)\s+TO\s+(\w+)"))
-}
-
-fn algorithm_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"ALGORITHM\s+(\w+)"))
-}
-
-fn key_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"(?s)KEY\s+'([^']*)'"))
-}
-
-fn url_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"(?s)URL\s+'([^']*)'"))
-}
-
-fn issuer_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"(?s)WITH\s+ISSUER\s+'([^']*)'"))
-}
-
-fn signup_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex_case_insensitive(r"(?s)SIGNUP\s+\((.+?)\)(?:\s+SIGNIN|\s+DURATION|\s*;|\s*$)")
-    })
-}
-
-fn signin_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex_case_insensitive(r"(?s)SIGNIN\s+\((.+?)\)(?:\s+SIGNUP|\s+DURATION|\s*;|\s*$)")
-    })
-}
-
-fn session_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"FOR\s+SESSION\s+(\w+)"))
-}
-
-fn token_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"FOR\s+TOKEN\s+(\w+)"))
-}
-
-fn access_type_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+(JWT|RECORD)"))
-}
-
-// --- Helpers -----------------------------------------------------------------
-
-fn expect_object<'a>(
+pub(super) fn expect_object<'a>(
     value: &'a Value,
     context: &str,
 ) -> Result<&'a serde_json::Map<String, Value>> {
@@ -206,7 +113,7 @@ fn type_name_of(value: &Value) -> &'static str {
 ///
 /// Non-string values are skipped so callers can tolerate server responses that
 /// stash additional metadata under the same key.
-fn value_to_string_map(value: &Value) -> BTreeMap<String, String> {
+pub(super) fn value_to_string_map(value: &Value) -> BTreeMap<String, String> {
     value
         .as_object()
         .map(|m| {
@@ -218,7 +125,10 @@ fn value_to_string_map(value: &Value) -> BTreeMap<String, String> {
 }
 
 /// Pick the first populated child object from `info` under any of `keys`.
-fn pick_map<'a>(info: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+pub(super) fn pick_map<'a>(
+    info: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
     for k in keys {
         if let Some(v) = info.get(*k) {
             if v.as_object().is_some_and(|m| !m.is_empty()) {
@@ -245,599 +155,19 @@ pub struct DatabaseInfo {
     pub accesses: BTreeMap<String, AccessDefinition>,
 }
 
-// --- Primary entry points ----------------------------------------------------
-
-/// Parse a SurrealDB `INFO FOR TABLE` response into a [`TableDefinition`].
-///
-/// Accepts either the short-key shape (`fd`, `ix`, `ev`) or the long-key shape
-/// (`fields`, `indexes`, `events`). Unknown enum values surface as the default
-/// variant (for example `FieldType::Any` for unknown types), matching the
-/// Python behaviour.
-///
-/// Returns [`SurqlError::SchemaParse`] when the top-level value is not a JSON
-/// object.
-pub fn parse_table_info(table_name: &str, info: &Value) -> Result<TableDefinition> {
-    let obj = expect_object(info, &format!("INFO FOR TABLE {table_name}"))?;
-
-    let tb_definition = obj.get("tb").and_then(Value::as_str).unwrap_or("");
-    let mode = parse_table_mode(tb_definition);
-
-    let fields_value = pick_map(obj, &["fields", "fd"]);
-    let fields = fields_value
-        .map(|v| parse_fields(&value_to_string_map(v)))
-        .unwrap_or_default();
-
-    let indexes_value = pick_map(obj, &["indexes", "ix"]);
-    let indexes = indexes_value
-        .map(|v| parse_indexes(&value_to_string_map(v)))
-        .unwrap_or_default();
-
-    let events_value = pick_map(obj, &["events", "ev"]);
-    let events = events_value
-        .map(|v| parse_events(&value_to_string_map(v)))
-        .unwrap_or_default();
-
-    Ok(TableDefinition {
-        name: table_name.to_string(),
-        mode,
-        fields,
-        indexes,
-        events,
-        permissions: None,
-        drop: false,
-    })
-}
-
-/// Parse a SurrealDB `INFO FOR DB` response.
-///
-/// The response is inspected for tables (under `tb` / `tables`) and access
-/// definitions (under `ac` / `accesses`). Tables declared with
-/// `TYPE RELATION FROM ... TO ...` are routed into
-/// [`DatabaseInfo::edges`] as [`EdgeDefinition`] values; every other table
-/// becomes a [`TableDefinition`] in [`DatabaseInfo::tables`].
-///
-/// Returns [`SurqlError::SchemaParse`] when the top-level value is not a JSON
-/// object.
-pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
-    let obj = expect_object(info, "INFO FOR DB")?;
-
-    let mut out = DatabaseInfo::default();
-
-    if let Some(tb_value) = pick_map(obj, &["tb", "tables"]) {
-        for (name, def_value) in tb_value.as_object().expect("checked by pick_map") {
-            let Some(def) = def_value.as_str() else {
-                continue;
-            };
-            if let Some((from, to)) = extract_relation_endpoints(def) {
-                out.edges.insert(
-                    name.clone(),
-                    EdgeDefinition {
-                        name: name.clone(),
-                        mode: EdgeMode::Relation,
-                        from_table: Some(from),
-                        to_table: Some(to),
-                        fields: Vec::new(),
-                        indexes: Vec::new(),
-                        events: Vec::new(),
-                        permissions: None,
-                    },
-                );
-            } else {
-                let mode = parse_table_mode(def);
-                out.tables.insert(
-                    name.clone(),
-                    TableDefinition {
-                        name: name.clone(),
-                        mode,
-                        fields: Vec::new(),
-                        indexes: Vec::new(),
-                        events: Vec::new(),
-                        permissions: None,
-                        drop: false,
-                    },
-                );
-            }
-        }
-    }
-
-    if let Some(ac_value) = pick_map(obj, &["ac", "accesses"]) {
-        for (name, def_value) in ac_value.as_object().expect("checked by pick_map") {
-            let Some(def) = def_value.as_str() else {
-                continue;
-            };
-            if let Some(access) = parse_access(name, def) {
-                out.accesses.insert(name.clone(), access);
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-// --- Building-block parsers --------------------------------------------------
-
-/// Parse the `DEFINE TABLE` statement into a [`TableMode`].
-///
-/// An empty input defaults to [`TableMode::Schemaless`], mirroring the Python
-/// module's fallback.
-pub fn parse_table_mode(definition: &str) -> TableMode {
-    if definition.is_empty() {
-        return TableMode::Schemaless;
-    }
-    let upper = definition.to_uppercase();
-    if upper.contains("SCHEMAFULL") {
-        TableMode::Schemafull
-    } else if upper.contains("SCHEMALESS") {
-        TableMode::Schemaless
-    } else if upper.contains("DROP") {
-        TableMode::Drop
-    } else {
-        TableMode::Schemaless
-    }
-}
-
-/// Parse every entry of a `fd` / `fields` map.
-///
-/// Entries that fail to parse are skipped; success entries land in the
-/// returned vector in the iteration order of the underlying map.
-pub fn parse_fields(fd: &BTreeMap<String, String>) -> Vec<FieldDefinition> {
-    fd.iter()
-        .filter_map(|(name, def)| parse_field(name, def))
-        .collect()
-}
-
-/// Parse one `DEFINE FIELD` statement.
-///
-/// Returns `None` when the definition string is empty.
-pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
-    if definition.is_empty() {
-        return None;
-    }
-    Some(FieldDefinition {
-        name: name.to_string(),
-        field_type: extract_field_type(definition),
-        assertion: extract_assertion(definition),
-        default: extract_default(definition),
-        value: extract_value(definition),
-        permissions: None,
-        readonly: extract_readonly(definition),
-        flexible: extract_flexible(definition),
-    })
-}
-
-/// Parse every entry of an `ix` / `indexes` map.
-pub fn parse_indexes(ix: &BTreeMap<String, String>) -> Vec<IndexDefinition> {
-    ix.iter()
-        .filter_map(|(name, def)| parse_index(name, def))
-        .collect()
-}
-
-/// Parse one `DEFINE INDEX` statement.
-///
-/// Returns `None` when the definition string is empty.
-pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
-    if definition.is_empty() {
-        return None;
-    }
-
-    let mut columns = extract_index_columns(definition);
-    if columns.is_empty() {
-        columns = extract_index_fields(definition);
-    }
-
-    let index_type = extract_index_type(definition);
-
-    let mut dimension = None;
-    let mut distance = None;
-    let mut vector_type = None;
-    let mut hnsw_distance = None;
-    let mut efc = None;
-    let mut m = None;
-
-    match index_type {
-        IndexType::Mtree => {
-            dimension = extract_dimension(definition);
-            distance = extract_mtree_distance(definition);
-            vector_type = extract_vector_type(definition);
-        }
-        IndexType::Hnsw => {
-            dimension = extract_dimension(definition);
-            vector_type = extract_vector_type(definition);
-            hnsw_distance = extract_hnsw_distance(definition);
-            efc = extract_hnsw_efc(definition);
-            m = extract_hnsw_m(definition);
-        }
-        _ => {}
-    }
-
-    Some(IndexDefinition {
-        name: name.to_string(),
-        columns,
-        index_type,
-        dimension,
-        distance,
-        vector_type,
-        hnsw_distance,
-        efc,
-        m,
-    })
-}
-
-/// Parse every entry of an `ev` / `events` map.
-pub fn parse_events(ev: &BTreeMap<String, String>) -> Vec<EventDefinition> {
-    ev.iter()
-        .filter_map(|(name, def)| parse_event(name, def))
-        .collect()
-}
-
-/// Parse one `DEFINE EVENT` statement.
-///
-/// Returns `None` when the condition or action cannot be located.
-pub fn parse_event(name: &str, definition: &str) -> Option<EventDefinition> {
-    if definition.is_empty() {
-        return None;
-    }
-    let condition = extract_event_condition(definition)?;
-    let action = extract_event_action(definition)?;
-    Some(EventDefinition {
-        name: name.to_string(),
-        condition,
-        action,
-    })
-}
-
-/// Parse one `DEFINE ACCESS` statement.
-///
-/// Returns `None` when the access type cannot be determined.
-pub fn parse_access(name: &str, definition: &str) -> Option<AccessDefinition> {
-    if definition.is_empty() {
-        return None;
-    }
-    let access_type = extract_access_type(definition)?;
-
-    let mut acc = AccessDefinition {
-        name: name.to_string(),
-        access_type,
-        jwt: None,
-        record: None,
-        duration_session: None,
-        duration_token: None,
-    };
-
-    match access_type {
-        AccessType::Jwt => {
-            let algorithm = extract_algorithm(definition).unwrap_or_else(|| "HS256".into());
-            acc.jwt = Some(JwtConfig {
-                algorithm,
-                key: extract_single_quoted(key_regex(), definition),
-                url: extract_single_quoted(url_regex(), definition),
-                issuer: extract_single_quoted(issuer_regex(), definition),
-            });
-        }
-        AccessType::Record => {
-            let signup = signup_regex()
-                .captures(definition)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().trim().to_string());
-            let signin = signin_regex()
-                .captures(definition)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().trim().to_string());
-            acc.record = Some(RecordAccessConfig { signup, signin });
-        }
-    }
-
-    acc.duration_session = session_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string());
-    acc.duration_token = token_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string());
-
-    Some(acc)
-}
-
-// --- Field extractors --------------------------------------------------------
-
-fn extract_field_type(definition: &str) -> FieldType {
-    let Some(caps) = type_regex().captures(definition) else {
-        return FieldType::Any;
-    };
-    let Some(m) = caps.get(1) else {
-        return FieldType::Any;
-    };
-    match m.as_str().to_ascii_lowercase().as_str() {
-        "string" => FieldType::String,
-        "int" => FieldType::Int,
-        "float" => FieldType::Float,
-        "bool" => FieldType::Bool,
-        "datetime" => FieldType::Datetime,
-        "duration" => FieldType::Duration,
-        "decimal" => FieldType::Decimal,
-        "number" => FieldType::Number,
-        "object" => FieldType::Object,
-        "array" => FieldType::Array,
-        "record" => FieldType::Record,
-        "geometry" => FieldType::Geometry,
-        _ => FieldType::Any,
-    }
-}
-
-/// Locate the case-insensitive keyword `kw` in `text` only at word boundaries
-/// (ASCII boundaries). Returns the byte offset at which the keyword starts.
-///
-/// When `require_whitespace_left` is true, the keyword must be preceded by
-/// whitespace or sit at byte 0 (a `$`-prefixed identifier like `$value` does
-/// not satisfy this, and therefore will not be mis-identified as a clause
-/// terminator).
-fn find_keyword(text: &str, kw: &str, require_whitespace_left: bool) -> Option<usize> {
-    let text_upper = text.to_ascii_uppercase();
-    let kw_upper = kw.to_ascii_uppercase();
-    let bytes = text_upper.as_bytes();
-    let needle = kw_upper.as_bytes();
-    if needle.is_empty() {
-        return None;
-    }
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if bytes[i..i + needle.len()] == *needle {
-            let left_ok = if require_whitespace_left {
-                i == 0 || bytes[i - 1].is_ascii_whitespace()
-            } else {
-                i == 0 || !is_ident_byte(bytes[i - 1])
-            };
-            let right_ok =
-                i + needle.len() == bytes.len() || !is_ident_byte(bytes[i + needle.len()]);
-            if left_ok && right_ok {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Extract the body of a `KEYWORD <body> [TERMINATOR | ;]` clause.
-///
-/// `terminators` lists other keywords that would end the clause; any such
-/// occurrence after the `keyword` anchor truncates the body. A trailing
-/// semicolon is always stripped.
-fn extract_clause(definition: &str, keyword: &str, terminators: &[&str]) -> Option<String> {
-    let start = find_keyword(definition, keyword, false)?;
-    let after_kw = start + keyword.len();
-    // Require at least one whitespace after the keyword (matches `\s+`).
-    let rest_start = definition[after_kw..]
-        .find(|c: char| !c.is_whitespace())
-        .map(|off| after_kw + off)?;
-    // Ensure we actually consumed whitespace between the keyword and the body.
-    if rest_start == after_kw {
-        return None;
-    }
-    let tail = &definition[rest_start..];
-
-    let mut end = tail.len();
-    for term in terminators {
-        if let Some(pos) = find_keyword(tail, term, true) {
-            if pos < end {
-                end = pos;
-            }
-        }
-    }
-    if let Some(pos) = tail.find(';') {
-        if pos < end {
-            end = pos;
-        }
-    }
-
-    let body = tail[..end].trim();
-    if body.is_empty() {
-        return None;
-    }
-    Some(body.to_string())
-}
-
-fn extract_assertion(definition: &str) -> Option<String> {
-    extract_clause(
-        definition,
-        "ASSERT",
-        &["DEFAULT", "VALUE", "READONLY", "FLEXIBLE", "PERMISSIONS"],
-    )
-}
-
-fn extract_default(definition: &str) -> Option<String> {
-    extract_clause(
-        definition,
-        "DEFAULT",
-        &["VALUE", "READONLY", "FLEXIBLE", "PERMISSIONS", "ASSERT"],
-    )
-}
-
-fn extract_value(definition: &str) -> Option<String> {
-    extract_clause(
-        definition,
-        "VALUE",
-        &["DEFAULT", "READONLY", "FLEXIBLE", "PERMISSIONS", "ASSERT"],
-    )
-}
-
-fn extract_readonly(definition: &str) -> bool {
-    readonly_regex().is_match(definition)
-}
-
-fn extract_flexible(definition: &str) -> bool {
-    flexible_regex().is_match(definition)
-}
-
-// --- Index extractors --------------------------------------------------------
-
-fn split_cols(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn extract_index_columns(definition: &str) -> Vec<String> {
-    columns_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| split_cols(m.as_str()))
-        .unwrap_or_default()
-}
-
-fn extract_index_fields(definition: &str) -> Vec<String> {
-    fields_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| split_cols(m.as_str()))
-        .unwrap_or_default()
-}
-
-fn extract_index_type(definition: &str) -> IndexType {
-    let upper = definition.to_uppercase();
-    if upper.contains("UNIQUE") {
-        IndexType::Unique
-    } else if upper.contains("SEARCH") {
-        IndexType::Search
-    } else if upper.contains("HNSW") {
-        IndexType::Hnsw
-    } else if upper.contains("MTREE") {
-        IndexType::Mtree
-    } else {
-        IndexType::Standard
-    }
-}
-
-fn extract_dimension(definition: &str) -> Option<u32> {
-    dimension_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
-
-fn extract_mtree_distance(definition: &str) -> Option<MTreeDistanceType> {
-    let caps = distance_regex().captures(definition)?;
-    let m = caps.get(1)?;
-    match m.as_str().to_uppercase().as_str() {
-        "COSINE" => Some(MTreeDistanceType::Cosine),
-        "EUCLIDEAN" => Some(MTreeDistanceType::Euclidean),
-        "MANHATTAN" => Some(MTreeDistanceType::Manhattan),
-        "MINKOWSKI" => Some(MTreeDistanceType::Minkowski),
-        _ => None,
-    }
-}
-
-fn extract_hnsw_distance(definition: &str) -> Option<HnswDistanceType> {
-    let caps = distance_regex().captures(definition)?;
-    let m = caps.get(1)?;
-    match m.as_str().to_uppercase().as_str() {
-        "CHEBYSHEV" => Some(HnswDistanceType::Chebyshev),
-        "COSINE" => Some(HnswDistanceType::Cosine),
-        "EUCLIDEAN" => Some(HnswDistanceType::Euclidean),
-        "HAMMING" => Some(HnswDistanceType::Hamming),
-        "JACCARD" => Some(HnswDistanceType::Jaccard),
-        "MANHATTAN" => Some(HnswDistanceType::Manhattan),
-        "MINKOWSKI" => Some(HnswDistanceType::Minkowski),
-        "PEARSON" => Some(HnswDistanceType::Pearson),
-        _ => None,
-    }
-}
-
-fn extract_vector_type(definition: &str) -> Option<MTreeVectorType> {
-    // MTREE/HNSW `TYPE` clauses usually appear after `MTREE` / `HNSW`. Scan
-    // every TYPE occurrence in case the first one is swallowed by the field
-    // type clause (SurrealDB uses `TYPE` twice for these indexes).
-    for caps in type_regex().captures_iter(definition) {
-        let Some(m) = caps.get(1) else { continue };
-        match m.as_str().to_uppercase().as_str() {
-            "F64" => return Some(MTreeVectorType::F64),
-            "F32" => return Some(MTreeVectorType::F32),
-            "I64" => return Some(MTreeVectorType::I64),
-            "I32" => return Some(MTreeVectorType::I32),
-            "I16" => return Some(MTreeVectorType::I16),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn extract_hnsw_efc(definition: &str) -> Option<u32> {
-    efc_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
-
-fn extract_hnsw_m(definition: &str) -> Option<u32> {
-    m_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
-
-// --- Event extractors --------------------------------------------------------
-
-fn extract_event_condition(definition: &str) -> Option<String> {
-    when_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().trim().to_string())
-}
-
-fn extract_event_action(definition: &str) -> Option<String> {
-    let caps = then_regex().captures(definition)?;
-    if let Some(m) = caps.get(1) {
-        return Some(m.as_str().trim().to_string());
-    }
-    caps.get(2).map(|m| m.as_str().trim().to_string())
-}
-
-// --- Access extractors -------------------------------------------------------
-
-fn extract_access_type(definition: &str) -> Option<AccessType> {
-    let caps = access_type_regex().captures(definition)?;
-    match caps.get(1)?.as_str().to_uppercase().as_str() {
-        "JWT" => Some(AccessType::Jwt),
-        "RECORD" => Some(AccessType::Record),
-        _ => None,
-    }
-}
-
-fn extract_algorithm(definition: &str) -> Option<String> {
-    algorithm_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
-fn extract_single_quoted(re: &Regex, definition: &str) -> Option<String> {
-    re.captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
-// --- Edge extractor ----------------------------------------------------------
-
-fn extract_relation_endpoints(definition: &str) -> Option<(String, String)> {
-    let caps = relation_from_to_regex().captures(definition)?;
-    let from = caps.get(1)?.as_str().to_string();
-    let to = caps.get(2)?.as_str().to_string();
-    Some((from, to))
-}
-
 #[cfg(test)]
 mod tests {
+    use super::db::extract_relation_endpoints;
     use super::*;
-    use crate::schema::access::{jwt_access, record_access};
-    use crate::schema::edge::typed_edge;
-    use crate::schema::fields::{datetime_field, int_field, string_field};
-    use crate::schema::table::{mtree_index, search_index, table_schema, unique_index};
+    use crate::schema::access::{
+        jwt_access, record_access, AccessType, JwtConfig, RecordAccessConfig,
+    };
+    use crate::schema::edge::{typed_edge, EdgeMode};
+    use crate::schema::fields::{datetime_field, int_field, string_field, FieldType};
+    use crate::schema::table::{
+        mtree_index, search_index, table_schema, unique_index, HnswDistanceType, IndexType,
+        MTreeDistanceType, MTreeVectorType, TableMode,
+    };
     use serde_json::json;
 
     // ---- parse_table_mode ---------------------------------------------------
