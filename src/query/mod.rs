@@ -8,29 +8,40 @@
 //!   [`ParallelHint`](hints::ParallelHint), [`TimeoutHint`](hints::TimeoutHint),
 //!   [`FetchHint`](hints::FetchHint), [`ExplainHint`](hints::ExplainHint)).
 //! - [`results`]: typed result wrappers and extraction helpers.
+//! - [`batch`]: pure [`build_upsert_query`](batch::build_upsert_query) /
+//!   [`build_relate_query`](batch::build_relate_query) renderers plus async
+//!   `*_many` helpers *(feature `client`)*.
+//! - [`graph_query`]: fluent [`GraphQuery`](graph_query::GraphQuery) builder.
 //! - [`executor`] *(feature `client`)*: async execution on top of
 //!   [`DatabaseClient`](crate::DatabaseClient).
 //! - [`crud`] *(feature `client`)*: JSON-in / JSON-out record CRUD helpers.
 //! - [`typed`] *(feature `client`)*: serde-round-trip CRUD helpers.
+//! - [`graph`] *(feature `client`)*: graph traversal + relation helpers.
 
+pub mod batch;
 pub mod builder;
 #[cfg(feature = "client")]
 pub mod crud;
 #[cfg(feature = "client")]
 pub mod executor;
 pub mod expressions;
+#[cfg(feature = "client")]
+pub mod graph;
+pub mod graph_query;
 pub mod helpers;
 pub mod hints;
 pub mod results;
 #[cfg(feature = "client")]
 pub mod typed;
 
+pub use batch::{build_relate_query, build_upsert_query, RelateItem};
 pub use builder::{Operation, OrderField, Query, WhereCondition};
 pub use expressions::{
     abs_, array_contains, array_length, as_, avg, cast, ceil, concat, count, field, floor, func,
     lower, math_max, math_mean, math_min, math_sum, max_, min_, raw, round_, sum_, time_format,
     time_now, type_is, upper, value, ExprArg, Expression, ExpressionKind,
 };
+pub use graph_query::GraphQuery;
 pub use helpers::{
     delete, from_table, insert, limit, offset, order_by, relate, select, similarity_search_query,
     update, upsert, vector_search_query, where_, DataMap, ReturnFormat, VectorDistanceType,
