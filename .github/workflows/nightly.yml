@@ -4,10 +4,6 @@ on:
   schedule:
     # Daily ubuntu sanity across stable + beta.
     - cron: '0 6 * * *'
-    # Weekly (Sunday) macOS sanity across stable + beta. macOS runners
-    # are ~10x the cost of ubuntu; weekly is sufficient for
-    # cross-platform drift detection.
-    - cron: '0 6 * * 0'
   workflow_dispatch:
 
 env:
@@ -38,46 +34,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-nightly-ubuntu-latest-${{ matrix.rust }}"
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Check compilation
-        run: cargo check --all-targets --all-features
-
-      - name: Run unit tests
-        run: cargo test --lib --all-features
-
-      - name: Run doc tests
-        run: cargo test --doc --all-features
-
-  sanity-macos:
-    name: Sanity macos-latest / ${{ matrix.rust }}
-    # Weekly cadence: only runs on the Sunday cron or manual dispatch.
-    if: github.event.schedule == '0 6 * * 0' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable, beta]
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: main
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust-nightly-macos-latest-${{ matrix.rust }}"
 
       - name: Check formatting
         run: cargo fmt --all --check
