@@ -280,9 +280,11 @@ pub fn paginated<T>(items: Vec<T>, page: u64, page_size: u64, total: u64) -> Pag
 
 /// Extract the array of record dictionaries from a raw SurrealDB response.
 ///
-/// Handles both the "nested" format returned by
-/// [`db.query`](https://surrealdb.com/docs) -- `[{"result": [...]}]` --
-/// and the "flat" format returned by `db.select` -- `[{...}, {...}]`.
+/// Handles the three response shapes the surql ecosystem produces:
+///
+/// - **Nested (Python SDK envelope)**: `[{"result": [...]}]`.
+/// - **Flat (Python `db.select`)**: `[{...}, {...}]`.
+/// - **Rust driver (one-array-per-statement)**: `[[{...}, {...}]]`.
 pub fn extract_result(result: &Value) -> Vec<Map<String, Value>> {
     if let Value::Array(items) = result {
         if items.is_empty() {
@@ -300,10 +302,14 @@ pub fn extract_result(result: &Value) -> Vec<Map<String, Value>> {
             }
             return out;
         }
-        return items
-            .iter()
-            .filter_map(|v| v.as_object().cloned())
-            .collect();
+        // Mix of nested arrays (Rust driver per-statement shape) and plain
+        // objects (Python `db.select` shape) - recurse and keep only object
+        // rows.
+        let mut out = Vec::new();
+        for item in items {
+            push_value(&mut out, item);
+        }
+        return out;
     }
     if let Value::Object(obj) = result {
         if let Some(inner) = obj.get("result") {

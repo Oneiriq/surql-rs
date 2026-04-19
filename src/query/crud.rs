@@ -38,6 +38,7 @@ use crate::connection::DatabaseClient;
 use crate::error::Result;
 use crate::query::builder::Query;
 use crate::query::executor::flatten_rows;
+use crate::query::expressions::Expression;
 use crate::query::results::{record, RecordResult};
 use crate::types::operators::{Operator, OperatorExpr};
 use crate::types::record_id::RecordID;
@@ -266,6 +267,113 @@ pub async fn last<T: DeserializeOwned>(
     super::executor::fetch_one(client, &cloned).await
 }
 
+// ---------------------------------------------------------------------------
+// Aggregation (sub-feature 4)
+// ---------------------------------------------------------------------------
+
+/// Options controlling the SurrealQL rendered by [`aggregate_records`].
+///
+/// Mirrors the surql-py `AggregateOpts` shape:
+///
+/// ```text
+/// AggregateOpts {
+///     select: [(alias, Expression), ...],
+///     group_by: [field, ...],
+///     where_: Option<Operator>,
+///     group_all: false,
+///     order_by: [(field, ASC|DESC)],
+///     limit: None,
+/// }
+/// ```
+///
+/// `select` is a list of `(alias, expression)` pairs - each aggregate
+/// projected into the output is always aliased so row shape is stable and
+/// downstream `serde` / `extract_scalar` calls can rely on named columns.
+#[derive(Debug, Clone, Default)]
+pub struct AggregateOpts {
+    /// `(alias, expression)` pairs rendered as `<expr> AS <alias>`.
+    pub select: Vec<(String, Expression)>,
+    /// `GROUP BY` field list.
+    pub group_by: Vec<String>,
+    /// `WHERE` condition (rendered via [`OperatorExpr::to_surql`]).
+    pub where_: Option<Operator>,
+    /// Emit `GROUP ALL` instead of `GROUP BY <fields>`.
+    pub group_all: bool,
+    /// `ORDER BY` entries as `(field, direction)` pairs. Direction is
+    /// validated on [`aggregate_records`] call to be `ASC` / `DESC`.
+    pub order_by: Vec<(String, String)>,
+    /// Optional `LIMIT` value.
+    pub limit: Option<i64>,
+}
+
+/// Build (but do not execute) the SurrealQL query described by `opts`.
+///
+/// Exposed as a standalone step so callers (and unit tests) can inspect
+/// the rendered SurrealQL without requiring a live connection. The
+/// returned [`Query`] is ready to be dispatched via [`Query::execute`] or
+/// [`super::executor::fetch_all`].
+///
+/// Errors when `opts.select` is empty or when any builder-step validation
+/// fails (invalid table name, invalid order direction, negative limit).
+pub fn build_aggregate_query(table: &str, opts: &AggregateOpts) -> Result<Query> {
+    if opts.select.is_empty() {
+        return Err(crate::error::SurqlError::Query {
+            reason: "aggregate_records requires at least one select entry".into(),
+        });
+    }
+
+    let fields: Vec<String> = opts
+        .select
+        .iter()
+        .map(|(alias, expr)| format!("{} AS {alias}", expr.to_surql()))
+        .collect();
+
+    let mut query = Query::new().select(Some(fields)).from_table(table)?;
+
+    if let Some(op) = opts.where_.as_ref() {
+        query = query.where_str(op.to_surql());
+    }
+    if opts.group_all {
+        query = query.group_all();
+    } else if !opts.group_by.is_empty() {
+        query = query.group_by(opts.group_by.iter().cloned());
+    }
+    for (field, direction) in &opts.order_by {
+        query = query.order_by(field.clone(), direction.clone())?;
+    }
+    if let Some(n) = opts.limit {
+        query = query.limit(n)?;
+    }
+
+    Ok(query)
+}
+
+/// Execute a SurrealQL aggregation query against `table`.
+///
+/// Builds:
+///
+/// ```text
+/// SELECT <expr1> AS <alias1>, <expr2> AS <alias2>, ...
+///   FROM <table>
+///   [WHERE <condition>]
+///   [GROUP BY <fields> | GROUP ALL]
+///   [ORDER BY ...]
+///   [LIMIT n]
+/// ```
+///
+/// Each returned [`Value`] row is a JSON object keyed by the aliases in
+/// [`AggregateOpts::select`]. Pair with [`crate::query::results::extract_scalar`]
+/// to pull a single field out of the single-row `GROUP ALL` case.
+pub async fn aggregate_records(
+    client: &DatabaseClient,
+    table: &str,
+    opts: AggregateOpts,
+) -> Result<Vec<Value>> {
+    let query = build_aggregate_query(table, &opts)?;
+    let raw = super::executor::execute_query(client, &query).await?;
+    Ok(flatten_rows(&raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +397,74 @@ mod tests {
         let rendered = serde_json::to_string(&v).unwrap();
         assert!(rendered.contains("\"name\":\"Alice\""));
         assert!(rendered.contains("\"age\":30"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-feature 4: aggregation rendering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_aggregate_query_rejects_empty_select() {
+        let err = build_aggregate_query("memory_entry", &AggregateOpts::default());
+        assert!(matches!(err, Err(crate::error::SurqlError::Query { .. })));
+    }
+
+    #[test]
+    fn build_aggregate_query_renders_select_group_by() {
+        use crate::query::expressions::{count_all, math_sum};
+
+        let opts = AggregateOpts {
+            select: vec![
+                ("count".to_string(), count_all()),
+                ("total".to_string(), math_sum("strength")),
+            ],
+            group_by: vec!["network".into()],
+            ..Default::default()
+        };
+
+        let q = build_aggregate_query("memory_entry", &opts).unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT count() AS count, math::sum(strength) AS total FROM memory_entry \
+             GROUP BY network",
+        );
+    }
+
+    #[test]
+    fn build_aggregate_query_renders_group_all() {
+        use crate::query::expressions::{count_all, math_mean};
+
+        let opts = AggregateOpts {
+            select: vec![
+                ("total".to_string(), count_all()),
+                ("mean".to_string(), math_mean("strength")),
+            ],
+            group_all: true,
+            ..Default::default()
+        };
+        let q = build_aggregate_query("memory_entry", &opts).unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT count() AS total, math::mean(strength) AS mean FROM memory_entry GROUP ALL",
+        );
+    }
+
+    #[test]
+    fn build_aggregate_query_renders_where_order_limit() {
+        use crate::query::expressions::count_all;
+
+        let opts = AggregateOpts {
+            select: vec![("count".to_string(), count_all())],
+            where_: Some(eq("status", "active")),
+            order_by: vec![("count".to_string(), "DESC".into())],
+            limit: Some(5),
+            ..Default::default()
+        };
+        let q = build_aggregate_query("user", &opts).unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT count() AS count FROM user WHERE (status = 'active') \
+             ORDER BY count DESC LIMIT 5",
+        );
     }
 }

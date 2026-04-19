@@ -57,3 +57,8 @@ pub use results::{
     has_results, paginated, record, records, success, AggregateResult, CountResult, ListResult,
     PageInfo, PaginatedResult, QueryResult, RecordResult,
 };
+
+// Aggregation entrypoint (sub-feature 4). Gated on the `client` feature
+// because it needs a live [`DatabaseClient`] to dispatch the rendered query.
+#[cfg(feature = "client")]
+pub use crud::{aggregate_records, build_aggregate_query, AggregateOpts};
