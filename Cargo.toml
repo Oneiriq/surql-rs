@@ -30,7 +30,9 @@ harness = false
 default = ["client"]
 client = ["dep:tokio", "dep:surrealdb", "dep:reqwest", "dep:futures"]
 cli = ["client", "dep:clap", "dep:tokio", "dep:tracing-subscriber"]
-cache-redis = ["dep:redis"]
+cache = ["dep:tokio", "dep:async-trait"]
+cache-redis = ["cache", "dep:redis"]
+settings = ["dep:dotenvy", "dep:toml"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -48,6 +50,10 @@ futures = { version = "0.3", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
+async-trait = { version = "0.1", optional = true }
+dotenvy = { version = "0.15", optional = true }
+toml = { version = "0.8", optional = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
