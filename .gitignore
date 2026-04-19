@@ -8,3 +8,4 @@ Cargo.lock.bak
 .DS_Store
 coverage/
 *.profraw
+/site

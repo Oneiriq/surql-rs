@@ -8,7 +8,7 @@
 //!
 //! ## Modules
 //!
-//! - [`error`]: [`SurqlError`](error::SurqlError) and [`Result`](error::Result).
+//! - [`error`]: [`SurqlError`] and [`Result`].
 //! - [`types`]: Type-safe wrappers ([`RecordID`](types::RecordID),
 //!   [`RecordRef`](types::RecordRef), [`SurrealFn`](types::SurrealFn),
 //!   operators, reserved-word checks, datetime coercion).

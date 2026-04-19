@@ -2,7 +2,7 @@
 //!
 //! Port of `surql/schema/visualize.py`. Generates visual diagrams of database
 //! schemas from [`TableDefinition`] / [`EdgeDefinition`] values (either
-//! supplied directly or pulled from the global [`SchemaRegistry`]) in any of
+//! supplied directly or pulled from the global [`SchemaRegistry`](crate::schema::registry::SchemaRegistry)) in any of
 //! three formats:
 //!
 //! - **Mermaid** — ER-diagram syntax for rendering in Markdown or the Mermaid
@@ -819,7 +819,7 @@ pub fn visualize_schema(
     }
 }
 
-/// Visualise the current global [`SchemaRegistry`] in the requested format.
+/// Visualise the current global [`SchemaRegistry`](crate::schema::registry::SchemaRegistry) in the requested format.
 ///
 /// Convenience wrapper around [`visualize_schema`] that pulls tables and
 /// edges from [`get_registry`].

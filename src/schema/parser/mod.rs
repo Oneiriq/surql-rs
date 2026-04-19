@@ -2,8 +2,8 @@
 //!
 //! Port of `surql/schema/parser.py`. Parses SurrealDB `INFO FOR DB` /
 //! `INFO FOR TABLE` response JSON back into [`TableDefinition`],
-//! [`EdgeDefinition`], [`FieldDefinition`], [`IndexDefinition`],
-//! [`EventDefinition`], and [`AccessDefinition`] values.
+//! [`EdgeDefinition`], `FieldDefinition`, `IndexDefinition`,
+//! `EventDefinition`, and [`AccessDefinition`] values.
 //!
 //! This is the inverse of the schema-definition → SurrealQL path: given the
 //! JSON blob Surreal returns from `INFO FOR ...`, reconstruct the schema
@@ -18,12 +18,12 @@
 //! The implementation is split into cohesive submodules so no file exceeds
 //! the repository's 1000-LOC budget:
 //!
-//! - [`field`] — `DEFINE FIELD` parsing.
-//! - [`index`] — `DEFINE INDEX` parsing (UNIQUE / SEARCH / MTREE / HNSW).
-//! - [`event`] — `DEFINE EVENT` parsing.
-//! - [`access`] — `DEFINE ACCESS` parsing (JWT + RECORD).
-//! - [`table`] — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
-//! - [`db`] — `INFO FOR DB` parsing + edge partitioning.
+//! - `field` — `DEFINE FIELD` parsing.
+//! - `index` — `DEFINE INDEX` parsing (UNIQUE / SEARCH / MTREE / HNSW).
+//! - `event` — `DEFINE EVENT` parsing.
+//! - `access` — `DEFINE ACCESS` parsing (JWT + RECORD).
+//! - `table` — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
+//! - `db` — `INFO FOR DB` parsing + edge partitioning.
 //!
 //! ## Example
 //!

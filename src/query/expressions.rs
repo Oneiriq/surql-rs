@@ -11,9 +11,10 @@ use crate::types::operators::quote_value_public;
 
 /// A typed SurrealQL fragment.
 ///
-/// Expressions store their rendered SurrealQL string. The [`kind`] tag
-/// categorises the fragment (field reference, literal, function call, or
-/// raw) and enables consumers to introspect without parsing the SQL.
+/// Expressions store their rendered SurrealQL string. The
+/// [`kind`](Expression::kind) tag categorises the fragment (field
+/// reference, literal, function call, or raw) and enables consumers to
+/// introspect without parsing the SQL.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Expression {
     /// Rendered SurrealQL.
@@ -120,7 +121,7 @@ where
     Expression::function(format!("{name}({})", parts.join(", ")))
 }
 
-/// Argument wrapper for [`func`] / [`concat`] that accepts both
+/// Argument wrapper for [`func`] / [`concat()`] that accepts both
 /// [`Expression`]s and raw strings.
 #[derive(Debug, Clone)]
 pub enum ExprArg {
@@ -340,7 +341,7 @@ pub fn string_len(field_name: &str) -> Expression {
     Expression::function(format!("string::len({field_name})"))
 }
 
-/// `string::concat(a, b, c, ...)` - snake_case alias of [`concat`].
+/// `string::concat(a, b, c, ...)` - snake_case alias of [`concat()`].
 pub fn string_concat<A>(fields: impl IntoIterator<Item = A>) -> Expression
 where
     A: Into<ExprArg>,
