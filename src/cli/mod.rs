@@ -19,7 +19,7 @@
 //! ## Configuration
 //!
 //! Every subcommand accepts `--config <path>` to override the
-//! automatic [`Settings`](crate::settings::Settings) discovery. Without
+//! automatic [`Settings`] discovery. Without
 //! the flag the standard layered lookup runs (env, `.env`,
 //! `Cargo.toml [package.metadata.surql]`).
 

@@ -11,9 +11,10 @@ use crate::types::operators::quote_value_public;
 
 /// A typed SurrealQL fragment.
 ///
-/// Expressions store their rendered SurrealQL string. The [`kind`] tag
-/// categorises the fragment (field reference, literal, function call, or
-/// raw) and enables consumers to introspect without parsing the SQL.
+/// Expressions store their rendered SurrealQL string. The
+/// [`kind`](Expression::kind) tag categorises the fragment (field
+/// reference, literal, function call, or raw) and enables consumers to
+/// introspect without parsing the SQL.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Expression {
     /// Rendered SurrealQL.
@@ -120,7 +121,7 @@ where
     Expression::function(format!("{name}({})", parts.join(", ")))
 }
 
-/// Argument wrapper for [`func`] / [`concat`] that accepts both
+/// Argument wrapper for [`func`] / [`concat()`] that accepts both
 /// [`Expression`]s and raw strings.
 #[derive(Debug, Clone)]
 pub enum ExprArg {
@@ -308,6 +309,99 @@ pub fn as_(expr: &Expression, alias: &str) -> Expression {
     Expression::raw(format!("{} AS {alias}", expr.to_surql()))
 }
 
+// ---------------------------------------------------------------------------
+// Query-UX function factories (sub-feature 2): snake_case aliases that match
+// the stable ports in surql-py and surql (TS). All return [`Expression`]s
+// composable with `.select()`, `.set()`, `.where_()`, etc.
+// ---------------------------------------------------------------------------
+
+/// `math::abs(field)` - alias of [`abs_`] following the `math_*` naming
+/// convention shared with the Python port.
+pub fn math_abs(field_name: &str) -> Expression {
+    Expression::function(format!("math::abs({field_name})"))
+}
+
+/// `math::ceil(field)` - snake_case alias of [`ceil`].
+pub fn math_ceil(field_name: &str) -> Expression {
+    Expression::function(format!("math::ceil({field_name})"))
+}
+
+/// `math::floor(field)` - snake_case alias of [`floor`].
+pub fn math_floor(field_name: &str) -> Expression {
+    Expression::function(format!("math::floor({field_name})"))
+}
+
+/// `math::round(field, precision)` - snake_case alias of [`round_`].
+pub fn math_round(field_name: &str, precision: i32) -> Expression {
+    Expression::function(format!("math::round({field_name}, {precision})"))
+}
+
+/// `string::len(field)` - reports the character length of a string field.
+pub fn string_len(field_name: &str) -> Expression {
+    Expression::function(format!("string::len({field_name})"))
+}
+
+/// `string::concat(a, b, c, ...)` - snake_case alias of [`concat()`].
+pub fn string_concat<A>(fields: impl IntoIterator<Item = A>) -> Expression
+where
+    A: Into<ExprArg>,
+{
+    concat(fields)
+}
+
+/// `string::lowercase(field)` - snake_case alias of [`lower`].
+pub fn string_lower(field_name: &str) -> Expression {
+    Expression::function(format!("string::lowercase({field_name})"))
+}
+
+/// `string::uppercase(field)` - snake_case alias of [`upper`].
+pub fn string_upper(field_name: &str) -> Expression {
+    Expression::function(format!("string::uppercase({field_name})"))
+}
+
+/// `count()` - zero-argument count aggregate.
+///
+/// Companion to the existing [`count`] helper (which accepts an optional
+/// field name). Matches the `count()` shape used by the surql-py
+/// query-UX API.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::query::expressions::count_all;
+/// assert_eq!(count_all().to_surql(), "count()");
+/// ```
+pub fn count_all() -> Expression {
+    Expression::function("count()".to_string())
+}
+
+/// `count(<condition>)` - count rows matching a boolean condition.
+///
+/// Accepts any [`ExprArg`] - an [`Expression`] (e.g. an [`Operator`](
+/// crate::types::operators::Operator) rendered via `raw(op.to_surql())`)
+/// or a bare SurrealQL fragment. Useful inside `SELECT` projections for
+/// conditional aggregation.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::query::expressions::count_if;
+/// assert_eq!(
+///     count_if("age > 18").to_surql(),
+///     "count(age > 18)",
+/// );
+/// ```
+pub fn count_if<A>(condition: A) -> Expression
+where
+    A: Into<ExprArg>,
+{
+    let rendered = match condition.into() {
+        ExprArg::Expr(e) => e.to_surql(),
+        ExprArg::Str(s) => s,
+    };
+    Expression::function(format!("count({rendered})"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +520,54 @@ mod tests {
     fn display_matches_to_surql() {
         let e = count(None);
         assert_eq!(format!("{e}"), e.to_surql());
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-feature 2: query-UX function factories
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn math_snake_case_aliases() {
+        assert_eq!(math_abs("t").to_surql(), "math::abs(t)");
+        assert_eq!(math_ceil("p").to_surql(), "math::ceil(p)");
+        assert_eq!(math_floor("p").to_surql(), "math::floor(p)");
+        assert_eq!(math_round("p", 2).to_surql(), "math::round(p, 2)");
+    }
+
+    #[test]
+    fn string_snake_case_aliases() {
+        assert_eq!(string_len("name").to_surql(), "string::len(name)");
+        assert_eq!(string_lower("e").to_surql(), "string::lowercase(e)");
+        assert_eq!(string_upper("n").to_surql(), "string::uppercase(n)");
+        let joined = string_concat::<ExprArg>([
+            field("first").into(),
+            value(" ").into(),
+            field("last").into(),
+        ]);
+        assert_eq!(joined.to_surql(), "string::concat(first, ' ', last)");
+    }
+
+    #[test]
+    fn count_all_zero_arg() {
+        assert_eq!(count_all().to_surql(), "count()");
+    }
+
+    #[test]
+    fn count_if_accepts_string_condition() {
+        assert_eq!(count_if("age > 18").to_surql(), "count(age > 18)");
+    }
+
+    #[test]
+    fn count_if_accepts_expression() {
+        let e = raw("status = 'active'");
+        assert_eq!(count_if(e).to_surql(), "count(status = 'active')");
+    }
+
+    #[test]
+    fn new_factories_are_function_kind() {
+        assert_eq!(math_abs("x").kind, ExpressionKind::Function);
+        assert_eq!(string_len("x").kind, ExpressionKind::Function);
+        assert_eq!(count_all().kind, ExpressionKind::Function);
+        assert_eq!(count_if("x = 1").kind, ExpressionKind::Function);
     }
 }

@@ -280,9 +280,11 @@ pub fn paginated<T>(items: Vec<T>, page: u64, page_size: u64, total: u64) -> Pag
 
 /// Extract the array of record dictionaries from a raw SurrealDB response.
 ///
-/// Handles both the "nested" format returned by
-/// [`db.query`](https://surrealdb.com/docs) -- `[{"result": [...]}]` --
-/// and the "flat" format returned by `db.select` -- `[{...}, {...}]`.
+/// Handles the three response shapes the surql ecosystem produces:
+///
+/// - **Nested (Python SDK envelope)**: `[{"result": [...]}]`.
+/// - **Flat (Python `db.select`)**: `[{...}, {...}]`.
+/// - **Rust driver (one-array-per-statement)**: `[[{...}, {...}]]`.
 pub fn extract_result(result: &Value) -> Vec<Map<String, Value>> {
     if let Value::Array(items) = result {
         if items.is_empty() {
@@ -300,10 +302,14 @@ pub fn extract_result(result: &Value) -> Vec<Map<String, Value>> {
             }
             return out;
         }
-        return items
-            .iter()
-            .filter_map(|v| v.as_object().cloned())
-            .collect();
+        // Mix of nested arrays (Rust driver per-statement shape) and plain
+        // objects (Python `db.select` shape) - recurse and keep only object
+        // rows.
+        let mut out = Vec::new();
+        for item in items {
+            push_value(&mut out, item);
+        }
+        return out;
     }
     if let Value::Object(obj) = result {
         if let Some(inner) = obj.get("result") {
@@ -350,6 +356,52 @@ pub fn extract_scalar(result: &Value, key: &str, default: Value) -> Value {
 /// Report whether the response contains at least one record.
 pub fn has_results(result: &Value) -> bool {
     !extract_result(result).is_empty()
+}
+
+/// Extract every record from a raw response as a list of JSON objects.
+///
+/// Unlike [`extract_result`], which returns `serde_json::Map`s, this
+/// accepts the same shapes but returns them as already-boxed
+/// `serde_json::Value` objects so callers can pipe the result through
+/// `serde_json::from_value::<T>` / `.into_iter()` without an extra
+/// wrapping step.
+///
+/// Handles both flat (`[{...}, ...]`) and nested (`[{"result": [...]}]`)
+/// SurrealDB response shapes.
+///
+/// ## Examples
+///
+/// ```
+/// use serde_json::json;
+/// use surql::query::results::extract_many;
+///
+/// let v = json!([{"result": [{"id": "user:1"}, {"id": "user:2"}]}]);
+/// let rows = extract_many(&v);
+/// assert_eq!(rows.len(), 2);
+/// ```
+pub fn extract_many(result: &Value) -> Vec<Value> {
+    extract_result(result)
+        .into_iter()
+        .map(Value::Object)
+        .collect()
+}
+
+/// Report whether the response contains at least one record.
+///
+/// Singular alias for [`has_results`] matching the
+/// `has_result()` ergonomic shape used in the Python / TypeScript ports.
+///
+/// ## Examples
+///
+/// ```
+/// use serde_json::json;
+/// use surql::query::results::has_result;
+///
+/// assert!(has_result(&json!([{"result": [{"id": "u:1"}]}])));
+/// assert!(!has_result(&json!([])));
+/// ```
+pub fn has_result(result: &Value) -> bool {
+    has_results(result)
 }
 
 #[cfg(test)]
@@ -513,5 +565,38 @@ mod tests {
         assert_eq!(c.count, 42);
         let a = aggregate(json!(25.5), Some("AVG".into()), Some("age".into()));
         assert_eq!(a.value, json!(25.5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-feature 3: extract_many / has_result
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_many_flat() {
+        let v = json!([{"id": "u:1"}, {"id": "u:2"}]);
+        let rows = extract_many(&v);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], json!("u:1"));
+    }
+
+    #[test]
+    fn extract_many_nested() {
+        let v = json!([{"result": [{"id": "u:1"}, {"id": "u:2"}]}]);
+        let rows = extract_many(&v);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(serde_json::Value::is_object));
+    }
+
+    #[test]
+    fn extract_many_empty() {
+        assert!(extract_many(&json!([])).is_empty());
+        assert!(extract_many(&json!([{"result": []}])).is_empty());
+    }
+
+    #[test]
+    fn has_result_singular_alias() {
+        assert!(has_result(&json!([{"result": [{"id": "u:1"}]}])));
+        assert!(!has_result(&json!([])));
+        assert!(!has_result(&json!([{"result": []}])));
     }
 }
