@@ -19,36 +19,18 @@
 //!   removal by version a single-statement `DELETE` (no extra `SELECT`).
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
+use crate::migration::hooks::is_auto_snapshot_enabled;
 use crate::migration::models::MigrationHistory;
 use crate::migration::versioning::{create_snapshot, store_snapshot};
 use crate::schema::registry::SchemaRegistry;
 
 /// Name of the SurrealDB table used for migration history.
 pub const MIGRATION_TABLE_NAME: &str = "_migration_history";
-
-/// Auto-snapshot flag (mirrors Python `AUTO_SNAPSHOT_ENABLED`).
-static AUTO_SNAPSHOT_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Enable automatic schema snapshots after successful migrations.
-pub fn enable_auto_snapshots() {
-    AUTO_SNAPSHOT_ENABLED.store(true, Ordering::Relaxed);
-}
-
-/// Disable automatic schema snapshots.
-pub fn disable_auto_snapshots() {
-    AUTO_SNAPSHOT_ENABLED.store(false, Ordering::Relaxed);
-}
-
-/// `true` when automatic snapshots are enabled.
-pub fn is_auto_snapshot_enabled() -> bool {
-    AUTO_SNAPSHOT_ENABLED.load(Ordering::Relaxed)
-}
 
 /// Create the migration history table.
 ///
@@ -388,15 +370,11 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    #[test]
-    fn auto_snapshot_flag_roundtrip() {
-        disable_auto_snapshots();
-        assert!(!is_auto_snapshot_enabled());
-        enable_auto_snapshots();
-        assert!(is_auto_snapshot_enabled());
-        disable_auto_snapshots();
-        assert!(!is_auto_snapshot_enabled());
-    }
+    // `auto_snapshot_flag_roundtrip` moved to `migration::hooks::tests`
+    // alongside the AUTO_SNAPSHOT_TEST_LOCK mutex that serialises access
+    // to the process-global toggle. Keeping the assertion here would
+    // race with those tests when `cargo test --lib` runs threads in
+    // parallel.
 
     #[test]
     fn parse_datetime_handles_rfc3339() {

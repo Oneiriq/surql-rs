@@ -5,9 +5,11 @@
 //! filesystem-level discovery/loading of migration files (tracked in
 //! [`discovery`]).
 //!
-//! Additional submodules (`executor`, `history`, `rollback`, `squash`,
-//! `watcher`) will land in follow-up PRs. Git hook integration lives in
-//! [`hooks`]; snapshot versioning in [`versioning`].
+//! Additional submodules cover [`executor`] (client-gated),
+//! [`history`] (client-gated), [`rollback`] (client-gated),
+//! [`squash`] (pure, always on), and [`watcher`] (feature-gated behind
+//! `watcher`). Git hook integration lives in [`hooks`] (including the
+//! auto-snapshot toggle quartet); snapshot versioning in [`versioning`].
 //!
 //! ## Migration file format
 //!
@@ -40,7 +42,10 @@ pub mod hooks;
 pub mod models;
 #[cfg(feature = "client")]
 pub mod rollback;
+pub mod squash;
 pub mod versioning;
+#[cfg(feature = "watcher")]
+pub mod watcher;
 
 pub use diff::{
     diff_edge_pair, diff_edges, diff_events, diff_fields, diff_indexes, diff_permissions,
@@ -56,18 +61,27 @@ pub use generator::{
     generate_migration_from_diffs,
 };
 pub use hooks::{
-    check_schema_drift, check_schema_drift_from_snapshots, default_schema_filter,
-    generate_precommit_config, get_staged_schema_files, registry_to_snapshot,
-    severity_for_operation, versioned_to_snapshot, DriftIssue, DriftReport, DriftSeverity,
+    check_schema_drift, check_schema_drift_from_snapshots, create_snapshot_on_migration,
+    default_schema_filter, disable_auto_snapshots, enable_auto_snapshots,
+    generate_precommit_config, get_staged_schema_files, is_auto_snapshot_enabled,
+    registry_to_snapshot, severity_for_operation, versioned_to_snapshot, DriftIssue, DriftReport,
+    DriftSeverity, SnapshotHooks,
 };
 pub use models::{
     DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
     MigrationPlan, MigrationState, MigrationStatus, SchemaDiff,
 };
+pub use squash::{
+    filter_migrations_by_version, generate_squashed_migration_content, optimize_statements,
+    squash_migrations, validate_squash_safety, SquashError, SquashOptions, SquashResult,
+    SquashSeverity, SquashWarning,
+};
 pub use versioning::{
     compare_snapshots, create_snapshot, list_snapshots, load_snapshot, store_snapshot,
     SnapshotComparison, VersionGraph, VersionNode, VersionedSnapshot, VersionedSnapshotBuilder,
 };
+#[cfg(feature = "watcher")]
+pub use watcher::{is_schema_file, SchemaWatcher, WatcherConfig};
 
 #[cfg(feature = "client")]
 pub use executor::{
@@ -77,10 +91,9 @@ pub use executor::{
 };
 #[cfg(feature = "client")]
 pub use history::{
-    auto_snapshot_after_apply, create_migration_table, disable_auto_snapshots,
-    enable_auto_snapshots, ensure_migration_table, get_applied_migrations, get_migration_history,
-    is_auto_snapshot_enabled, is_migration_applied, record_migration, remove_migration_record,
-    MIGRATION_TABLE_NAME,
+    auto_snapshot_after_apply, create_migration_table, ensure_migration_table,
+    get_applied_migrations, get_migration_history, is_migration_applied, record_migration,
+    remove_migration_record, MIGRATION_TABLE_NAME,
 };
 #[cfg(feature = "client")]
 pub use rollback::{
