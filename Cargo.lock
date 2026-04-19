@@ -2811,6 +2811,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "oneiriq-surql"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "async-trait",
+ "chrono",
+ "clap",
+ "colored",
+ "comfy-table",
+ "criterion",
+ "dotenvy",
+ "futures",
+ "notify",
+ "predicates",
+ "pretty_assertions",
+ "redis",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "surrealdb",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
 name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4460,38 +4492,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "surql"
-version = "0.1.0"
-dependencies = [
- "assert_cmd",
- "async-trait",
- "chrono",
- "clap",
- "colored",
- "comfy-table",
- "criterion",
- "dotenvy",
- "futures",
- "notify",
- "predicates",
- "pretty_assertions",
- "redis",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "surrealdb",
- "tempfile",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "ulid",
-]
 
 [[package]]
 name = "surrealdb"

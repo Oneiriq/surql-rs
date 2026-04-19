@@ -5,14 +5,14 @@
 Add `surql` as a dependency:
 
 ```shell
-cargo add surql
+cargo add oneiriq-surql
 ```
 
 Or, in `Cargo.toml`:
 
 ```toml
 [dependencies]
-surql = "0.1"
+oneiriq-surql = "0.1"
 ```
 
 ## Feature flags
@@ -25,15 +25,15 @@ surql = "0.1"
 
 ```toml
 [dependencies]
-surql = { version = "0.1", default-features = false }   # library-only, no client
+oneiriq-surql = { version = "0.1", default-features = false }   # library-only, no client
 # or
-surql = { version = "0.1", features = ["cli"] }         # binary + client
+oneiriq-surql = { version = "0.1", features = ["cli"] }         # binary + client
 ```
 
 ## CLI
 
 ```shell
-cargo install surql --features cli
+cargo install oneiriq-surql --features cli
 ```
 
 ## Requirements
