@@ -136,7 +136,7 @@ pub async fn record_migration(client: &DatabaseClient, entry: &MigrationHistory)
     }
 
     let surql = format!(
-        "CREATE type::thing('{table}', $id) SET {set};",
+        "CREATE type::record('{table}', $id) SET {set};",
         table = MIGRATION_TABLE_NAME,
     );
 
