@@ -199,12 +199,21 @@ pub async fn upsert_many(
     }
 
     let mut rows: Vec<Value> = Vec::with_capacity(items.len());
-    for item in items {
-        let target = item
-            .as_object()
-            .and_then(|o| o.get("id"))
-            .and_then(Value::as_str)
-            .map_or_else(|| table.to_string(), ToOwned::to_owned);
+    for mut item in items {
+        // Extract the id to use as the UPSERT target, then strip it from
+        // the payload — SurrealDB v3 rejects `UPSERT person:alice CONTENT
+        // {id: 'person:alice', ...}` because the target is already pinned.
+        let target = if let Some(obj) = item.as_object_mut() {
+            match obj
+                .remove("id")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned))
+            {
+                Some(id) => id,
+                None => table.to_string(),
+            }
+        } else {
+            table.to_string()
+        };
 
         // Validate the target table-part (guards against id values like
         // `drop_table:1` smuggling through).
