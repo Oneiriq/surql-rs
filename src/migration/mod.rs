@@ -6,9 +6,9 @@
 //! [`discovery`]).
 //!
 //! Additional submodules (`executor`, `history`, `rollback`, `watcher`)
-//! will land in follow-up PRs. Git hook integration lives in [`hooks`];
-//! snapshot versioning in [`versioning`]; multi-migration squashing in
-//! [`squash`].
+//! will land in follow-up PRs. Git hook integration lives in [`hooks`]
+//! (including the auto-snapshot toggle quartet); snapshot versioning in
+//! [`versioning`]; multi-migration squashing in [`squash`].
 //!
 //! ## Migration file format
 //!
@@ -58,9 +58,11 @@ pub use generator::{
     generate_migration_from_diffs,
 };
 pub use hooks::{
-    check_schema_drift, check_schema_drift_from_snapshots, default_schema_filter,
-    generate_precommit_config, get_staged_schema_files, registry_to_snapshot,
-    severity_for_operation, versioned_to_snapshot, DriftIssue, DriftReport, DriftSeverity,
+    check_schema_drift, check_schema_drift_from_snapshots, create_snapshot_on_migration,
+    default_schema_filter, disable_auto_snapshots, enable_auto_snapshots,
+    generate_precommit_config, get_staged_schema_files, is_auto_snapshot_enabled,
+    registry_to_snapshot, severity_for_operation, versioned_to_snapshot, DriftIssue, DriftReport,
+    DriftSeverity, SnapshotHooks,
 };
 pub use models::{
     DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
@@ -84,10 +86,9 @@ pub use executor::{
 };
 #[cfg(feature = "client")]
 pub use history::{
-    auto_snapshot_after_apply, create_migration_table, disable_auto_snapshots,
-    enable_auto_snapshots, ensure_migration_table, get_applied_migrations, get_migration_history,
-    is_auto_snapshot_enabled, is_migration_applied, record_migration, remove_migration_record,
-    MIGRATION_TABLE_NAME,
+    auto_snapshot_after_apply, create_migration_table, ensure_migration_table,
+    get_applied_migrations, get_migration_history, is_migration_applied, record_migration,
+    remove_migration_record, MIGRATION_TABLE_NAME,
 };
 #[cfg(feature = "client")]
 pub use rollback::{
