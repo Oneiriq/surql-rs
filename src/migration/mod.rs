@@ -5,9 +5,10 @@
 //! filesystem-level discovery/loading of migration files (tracked in
 //! [`discovery`]).
 //!
-//! Additional submodules (`executor`, `history`, `rollback`, `squash`,
-//! `watcher`) will land in follow-up PRs. Git hook integration lives in
-//! [`hooks`]; snapshot versioning in [`versioning`].
+//! Additional submodules (`executor`, `history`, `rollback`, `watcher`)
+//! will land in follow-up PRs. Git hook integration lives in [`hooks`];
+//! snapshot versioning in [`versioning`]; multi-migration squashing in
+//! [`squash`].
 //!
 //! ## Migration file format
 //!
@@ -40,6 +41,7 @@ pub mod hooks;
 pub mod models;
 #[cfg(feature = "client")]
 pub mod rollback;
+pub mod squash;
 pub mod versioning;
 
 pub use diff::{
@@ -63,6 +65,11 @@ pub use hooks::{
 pub use models::{
     DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
     MigrationPlan, MigrationState, MigrationStatus, SchemaDiff,
+};
+pub use squash::{
+    filter_migrations_by_version, generate_squashed_migration_content, optimize_statements,
+    squash_migrations, validate_squash_safety, SquashError, SquashOptions, SquashResult,
+    SquashSeverity, SquashWarning,
 };
 pub use versioning::{
     compare_snapshots, create_snapshot, list_snapshots, load_snapshot, store_snapshot,
