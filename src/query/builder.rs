@@ -173,7 +173,7 @@ fn identifier_pattern() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid regex"))
 }
 
-fn validate_identifier(name: &str, context: &str) -> Result<()> {
+pub(crate) fn validate_identifier(name: &str, context: &str) -> Result<()> {
     if name.is_empty() {
         let capitalized = capitalize(context);
         return Err(SurqlError::Validation {
@@ -199,7 +199,7 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-fn table_part(target: &str) -> &str {
+pub(crate) fn table_part(target: &str) -> &str {
     target.split_once(':').map_or(target, |(t, _)| t)
 }
 
