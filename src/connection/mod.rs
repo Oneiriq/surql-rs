@@ -3,12 +3,19 @@
 //! Port of `surql/connection/` from `oneiriq-surql` (Python). The
 //! pure data types ([`ConnectionConfig`], credentials, etc.) are always
 //! available. The runtime [`DatabaseClient`], [`Transaction`], and
-//! [`LiveQuery`] live behind the `client` cargo feature.
+//! [`LiveQuery`] live behind the `client` cargo feature, as do the
+//! context / registry / auth-manager / streaming-manager facilities.
 
 pub mod auth;
 #[cfg(feature = "client")]
+pub mod auth_manager;
+#[cfg(feature = "client")]
 pub mod client;
 pub mod config;
+#[cfg(feature = "client")]
+pub mod context;
+#[cfg(feature = "client")]
+pub mod registry;
 #[cfg(feature = "client")]
 pub mod streaming;
 #[cfg(feature = "client")]
@@ -21,8 +28,14 @@ pub use auth::{
 pub use config::{ConnectionConfig, NamedConnectionConfig, Protocol};
 
 #[cfg(feature = "client")]
+pub use auth_manager::{AuthManager, TokenState};
+#[cfg(feature = "client")]
 pub use client::DatabaseClient;
 #[cfg(feature = "client")]
-pub use streaming::LiveQuery;
+pub use context::{clear_db, connection_override, connection_scope, get_db, has_db, set_db};
+#[cfg(feature = "client")]
+pub use registry::{get_registry, set_registry, ConnectionRegistry};
+#[cfg(feature = "client")]
+pub use streaming::{LiveQuery, StreamingManager, SubscriptionId};
 #[cfg(feature = "client")]
 pub use transaction::{Transaction, TransactionState};
