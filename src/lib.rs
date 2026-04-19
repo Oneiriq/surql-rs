@@ -55,6 +55,8 @@
 
 #[cfg(feature = "cache")]
 pub mod cache;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod connection;
 pub mod error;
 pub mod migration;

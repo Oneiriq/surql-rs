@@ -16,8 +16,12 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "watcher")]
+use std::time::Duration;
+
+#[cfg(feature = "watcher")]
 use surql::migration::diff::SchemaSnapshot;
 use surql::migration::{
     create_snapshot_on_migration, disable_auto_snapshots, discover_migrations,
