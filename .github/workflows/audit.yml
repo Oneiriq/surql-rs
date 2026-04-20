@@ -20,6 +20,14 @@ on:
     - cron: '0 4 * * *'
   workflow_dispatch:
 
+# `rustsec/audit-check` creates a check-run with the audit result, which
+# needs `checks: write`. The default `GITHUB_TOKEN` scope for new Oneiriq
+# repos is read-only; grant the narrow writes required and keep
+# everything else read-only.
+permissions:
+  contents: read
+  checks: write
+
 jobs:
   audit:
     name: cargo audit
