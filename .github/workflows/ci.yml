@@ -52,6 +52,38 @@ jobs:
       - name: Run doc tests
         run: cargo test --doc --all-features
 
+  client-rustls-build:
+    name: Build client-rustls (no openssl-sys)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-ubuntu-rustls"
+
+      # The point of the `client-rustls` feature is to unblock builds on
+      # runners / images that do not ship `libssl-dev`. Verify the feature
+      # compiles without touching the default `client` stack, and assert
+      # that `openssl-sys` is absent from the resolved dependency graph.
+      - name: Build with client-rustls
+        run: cargo build --no-default-features --features client-rustls
+
+      - name: Check compilation with client-rustls
+        run: cargo check --no-default-features --features client-rustls --all-targets
+
+      - name: Assert openssl-sys is not in the dep graph
+        run: |
+          if cargo tree --no-default-features --features client-rustls --prefix none \
+              | grep -E '^(openssl|openssl-sys|native-tls) '; then
+            echo "client-rustls pulled an OpenSSL / native-tls crate; the feature is broken." >&2
+            exit 1
+          fi
+
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest

@@ -14,7 +14,7 @@
 //! in bare `UPSERT INTO user ...` / `INSERT INTO user ...` statements
 //! even without a `user:` record-id prefix).
 
-#![cfg(feature = "client")]
+#![cfg(any(feature = "client", feature = "client-rustls"))]
 
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};

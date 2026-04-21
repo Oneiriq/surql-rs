@@ -11,7 +11,7 @@
 //!   cargo test --all-features --test integration_query
 //! ```
 
-#![cfg(feature = "client")]
+#![cfg(any(feature = "client", feature = "client-rustls"))]
 
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};

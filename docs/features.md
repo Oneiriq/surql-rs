@@ -8,15 +8,16 @@ any binary-only dependencies.
 
 ## Summary
 
-| Feature        | Default | Implies                | Pulls in                                                   | What you get                                                                 |
-|----------------|---------|------------------------|------------------------------------------------------------|------------------------------------------------------------------------------|
-| `client`       | yes     | -                      | `tokio`, `surrealdb` 3.x, `reqwest`, `futures`             | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer.   |
-| `cli`          | no      | `client`, `orchestration`, `settings` | `clap`, `tracing-subscriber`, `comfy-table`, `colored` | The `surql` binary (`migrate`, `schema`, `db`, `orchestrate`).              |
-| `cache`        | no      | -                      | `tokio`, `async-trait`                                     | `MemoryCache` backend, `CacheManager`, global cache registry.                |
-| `cache-redis`  | no      | `cache`                | `redis`                                                    | `RedisCache` backend for the cache manager.                                  |
-| `settings`     | no      | -                      | `dotenvy`, `toml`                                          | Layered `Settings` / `SettingsBuilder` (env, `.env`, `Cargo.toml` metadata). |
-| `orchestration`| no      | `client`               | `async-trait`                                              | Multi-database deployment strategies, environment registry, health checks.   |
-| `watcher`      | no      | -                      | `notify`, `tokio`, `tokio-util`                            | Filesystem watcher for schema / migration hot-reload.                        |
+| Feature         | Default | Implies                | Pulls in                                                   | What you get                                                                 |
+|-----------------|---------|------------------------|------------------------------------------------------------|------------------------------------------------------------------------------|
+| `client`        | yes     | -                      | `tokio`, `surrealdb` 3.x (`native-tls`), `reqwest` (`default-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
+| `client-rustls` | no      | -                      | `tokio`, `surrealdb` 3.x (`rustls`), `reqwest` (`rustls-tls-webpki-roots`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). See [Picking a TLS backend](#picking-a-tls-backend). |
+| `cli`           | no      | `client`, `orchestration`, `settings` | `clap`, `tracing-subscriber`, `comfy-table`, `colored` | The `surql` binary (`migrate`, `schema`, `db`, `orchestrate`).              |
+| `cache`         | no      | -                      | `tokio`, `async-trait`                                     | `MemoryCache` backend, `CacheManager`, global cache registry.                |
+| `cache-redis`   | no      | `cache`                | `redis`                                                    | `RedisCache` backend for the cache manager.                                  |
+| `settings`      | no      | -                      | `dotenvy`, `toml`                                          | Layered `Settings` / `SettingsBuilder` (env, `.env`, `Cargo.toml` metadata). |
+| `orchestration` | no      | `client`               | `async-trait`                                              | Multi-database deployment strategies, environment registry, health checks.   |
+| `watcher`       | no      | -                      | `notify`, `tokio`, `tokio-util`                            | Filesystem watcher for schema / migration hot-reload.                        |
 
 ## Picking a profile
 
@@ -42,7 +43,40 @@ oneiriq-surql = "0.2"
 
 Equivalent to `features = ["client"]`. Brings in `tokio`, `surrealdb`,
 and the full async surface (`DatabaseClient`, `executor::fetch_all`,
-`crud::*`, `graph::*`, `batch::*_many`, `Transaction`).
+`crud::*`, `graph::*`, `batch::*_many`, `Transaction`). Uses the
+system `native-tls` stack (links `openssl-sys` on Linux,
+Security.framework on macOS).
+
+### Async client with rustls (no `openssl-sys`)
+
+```toml
+[dependencies]
+oneiriq-surql = { version = "0.2", default-features = false, features = ["client-rustls"] }
+```
+
+Same API surface as `client`, but TLS is provided by `rustls` +
+`webpki-roots` instead of `native-tls`. This is the right choice for
+CI runners, Alpine / distroless containers, and any environment where
+you do not want to install `libssl-dev` / link against the system
+OpenSSL.
+
+### Picking a TLS backend
+
+Pick exactly one of `client` or `client-rustls`:
+
+|                                | `client`                      | `client-rustls`                                   |
+|--------------------------------|-------------------------------|---------------------------------------------------|
+| TLS stack                      | `native-tls` (+ `openssl-sys` on Linux) | `rustls` + `webpki-roots`               |
+| Needs `libssl-dev` at build    | yes (on Linux)                | no                                                |
+| Uses OS trust store            | yes                           | no -- ships Mozilla webpki roots                  |
+| Cross-compilation friendliness | depends on target OpenSSL     | portable, pure Rust                               |
+| API surface                    | identical                     | identical                                         |
+| Backwards compatible           | yes (default since 0.1)       | new in 0.2.2                                      |
+
+Enabling both at once compiles, but doubles the TLS dependency set.
+If you are consuming this crate from multiple workspace members,
+pick one variant and hold it consistent via a workspace-level
+feature flag.
 
 ### CLI / service binary
 

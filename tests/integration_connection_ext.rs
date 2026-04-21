@@ -13,7 +13,7 @@
 //!   cargo test --test integration_connection_ext --features client -- --test-threads=1
 //! ```
 
-#![cfg(feature = "client")]
+#![cfg(any(feature = "client", feature = "client-rustls"))]
 
 use std::env;
 use std::sync::Arc;

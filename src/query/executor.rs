@@ -5,13 +5,13 @@
 //! [`DatabaseClient::query_with_vars`](crate::DatabaseClient::query_with_vars),
 //! then extracts / deserializes the result.
 //!
-//! All functions are `#[cfg(feature = "client")]` because they depend on the
+//! All functions are `#[cfg(any(feature = "client", feature = "client-rustls"))]` because they depend on the
 //! async SurrealDB SDK handle.
 //!
 //! ## Examples
 //!
 //! ```no_run
-//! # #[cfg(feature = "client")]
+//! # #[cfg(any(feature = "client", feature = "client-rustls"))]
 //! # async fn demo() -> surql::error::Result<()> {
 //! use serde::{Deserialize, Serialize};
 //! use surql::connection::{ConnectionConfig, DatabaseClient};
