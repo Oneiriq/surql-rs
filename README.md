@@ -24,11 +24,26 @@ A code-first database toolkit for [SurrealDB](https://surrealdb.com/). Define sc
 cargo add oneiriq-surql
 ```
 
+Pure-Rust TLS (no `openssl-sys`, recommended for CI runners without
+`libssl-dev`):
+
+```shell
+cargo add oneiriq-surql --no-default-features --features client-rustls
+```
+
 With the CLI:
 
 ```shell
 cargo install oneiriq-surql --features cli
 ```
+
+### TLS backends
+
+- `client` (default) -- async client backed by `native-tls`; links
+  `openssl-sys` on Linux, Security.framework on macOS.
+- `client-rustls` -- same client surface, pure-Rust TLS via `rustls`
+  + `webpki-roots`. No system OpenSSL needed. See
+  [docs/features.md](docs/features.md#picking-a-tls-backend).
 
 ### Define a schema
 

@@ -19,14 +19,14 @@
 
 use crate::error::{Result, SurqlError};
 
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 use serde::de::DeserializeOwned;
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 use serde_json::Value;
 
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 use crate::connection::DatabaseClient;
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 use crate::query::executor::{extract_rows, flatten_rows};
 
 /// Immutable fluent builder for graph traversal queries.
@@ -211,7 +211,7 @@ impl GraphQuery {
     }
 
     /// Execute the rendered query and return raw JSON rows.
-    #[cfg(feature = "client")]
+    #[cfg(any(feature = "client", feature = "client-rustls"))]
     pub async fn execute(&self, client: &DatabaseClient) -> Result<Vec<Value>> {
         let surql = self.to_surql()?;
         let raw = client.query(&surql).await?;
@@ -219,7 +219,7 @@ impl GraphQuery {
     }
 
     /// Execute the rendered query and deserialize each row into `T`.
-    #[cfg(feature = "client")]
+    #[cfg(any(feature = "client", feature = "client-rustls"))]
     pub async fn fetch_typed<T: DeserializeOwned>(
         &self,
         client: &DatabaseClient,
@@ -230,7 +230,7 @@ impl GraphQuery {
     }
 
     /// Count matching rows via `SELECT count() ... GROUP ALL`.
-    #[cfg(feature = "client")]
+    #[cfg(any(feature = "client", feature = "client-rustls"))]
     pub async fn count(&self, client: &DatabaseClient) -> Result<i64> {
         let surql = self.to_count_surql()?;
         let raw = client.query(&surql).await?;
@@ -242,7 +242,7 @@ impl GraphQuery {
     }
 
     /// `true` when at least one row matches the query.
-    #[cfg(feature = "client")]
+    #[cfg(any(feature = "client", feature = "client-rustls"))]
     pub async fn exists(&self, client: &DatabaseClient) -> Result<bool> {
         Ok(self.count(client).await? > 0)
     }

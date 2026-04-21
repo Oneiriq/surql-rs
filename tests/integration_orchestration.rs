@@ -13,7 +13,10 @@
 //!   cargo test --all-features --test integration_orchestration -- --test-threads=1
 //! ```
 
-#![cfg(all(feature = "orchestration", feature = "client"))]
+#![cfg(all(
+    feature = "orchestration",
+    any(feature = "client", feature = "client-rustls")
+))]
 
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};

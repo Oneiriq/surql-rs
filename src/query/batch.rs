@@ -5,14 +5,14 @@
 //! `build_upsert_query` / `build_relate_query` helpers that render
 //! SurrealQL without executing it.
 //!
-//! All async functions are `#[cfg(feature = "client")]` (same as
+//! All async functions are `#[cfg(any(feature = "client", feature = "client-rustls"))]` (same as
 //! [`super::crud`]). The `build_*_query` helpers are available in every
 //! build because they only render strings.
 //!
 //! ## Examples
 //!
 //! ```no_run
-//! # #[cfg(feature = "client")]
+//! # #[cfg(any(feature = "client", feature = "client-rustls"))]
 //! # async fn demo() -> surql::error::Result<()> {
 //! use serde_json::json;
 //! use surql::connection::{ConnectionConfig, DatabaseClient};
@@ -41,9 +41,9 @@ use crate::types::operators::quote_value_public;
 
 use super::builder::{table_part, validate_identifier};
 
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 use crate::connection::DatabaseClient;
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 use crate::query::executor::flatten_rows;
 
 // ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ pub fn build_relate_query(
 ///
 /// Returns the upserted rows. An empty `items` slice short-circuits to
 /// `Ok(vec![])` without contacting the database.
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 pub async fn upsert_many(
     client: &DatabaseClient,
     table: &str,
@@ -231,7 +231,7 @@ pub async fn upsert_many(
 /// Batch insert multiple records via `INSERT INTO <table> [...]`.
 ///
 /// Fails if any record already exists (SurrealDB `INSERT` semantics).
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 pub async fn insert_many(
     client: &DatabaseClient,
     table: &str,
@@ -285,7 +285,7 @@ impl RelateItem {
 ///
 /// All statements are sent in a single query and the aggregated rows are
 /// returned.
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 pub async fn relate_many(
     client: &DatabaseClient,
     from_table: &str,
@@ -320,7 +320,7 @@ pub async fn relate_many(
 ///
 /// IDs may be bare (`"alice"`) or fully qualified (`"user:alice"`); bare
 /// IDs are prefixed with `<table>:` automatically.
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "client-rustls"))]
 pub async fn delete_many(
     client: &DatabaseClient,
     table: &str,

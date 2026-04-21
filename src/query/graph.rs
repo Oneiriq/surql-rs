@@ -15,7 +15,7 @@
 //! ## Examples
 //!
 //! ```no_run
-//! # #[cfg(feature = "client")]
+//! # #[cfg(any(feature = "client", feature = "client-rustls"))]
 //! # async fn demo() -> surql::error::Result<()> {
 //! use surql::connection::{ConnectionConfig, DatabaseClient};
 //! use surql::query::graph;
@@ -35,7 +35,7 @@
 //! # let _ = posts; Ok(()) }
 //! ```
 
-#![cfg(feature = "client")]
+#![cfg(any(feature = "client", feature = "client-rustls"))]
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

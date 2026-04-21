@@ -7,6 +7,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-04-21
+
+### Added
+
+- `client-rustls` feature (Oneiriq/surql-rs#97). Same surface as the
+  default `client` feature, but with a pure-Rust TLS stack
+  (`rustls` + `webpki-roots`) instead of `native-tls`. Enables
+  building on runners that do not have `libssl-dev` / the system
+  OpenSSL headers installed. See
+  [docs/features.md](docs/features.md#picking-a-tls-backend) for the
+  trade-offs and [docs/migration.md](docs/migration.md#6-switching-to-client-rustls-022)
+  for a switching guide.
+
+### Changed
+
+- The `client` feature now explicitly selects `surrealdb/native-tls`
+  and `reqwest/default-tls`. Behaviour is unchanged for existing
+  consumers (the implicit TLS stack was already `native-tls`), but
+  the TLS backend is no longer inherited from upstream defaults --
+  it is pinned by the feature flag. No API changes.
+- Optional `surrealdb` and `reqwest` dependencies are declared with
+  `default-features = false` so the TLS backend is selected
+  exclusively by `client` / `client-rustls`.
+
 ## [0.2.1] - 2026-04-18
 
 ### Documentation

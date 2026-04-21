@@ -5,7 +5,7 @@
 //! composes the lower-level JSON helpers in [`super::crud`] /
 //! [`super::executor`].
 //!
-//! All functions are `#[cfg(feature = "client")]`.
+//! All functions are `#[cfg(any(feature = "client", feature = "client-rustls"))]`.
 
 use std::collections::BTreeMap;
 

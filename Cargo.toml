@@ -1,6 +1,6 @@
 [package]
 name = "oneiriq-surql"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.90"
 authors = ["Shon Thomas <shon@oneiriq.com>"]
@@ -28,7 +28,35 @@ harness = false
 
 [features]
 default = ["client"]
-client = ["dep:tokio", "dep:surrealdb", "dep:reqwest", "dep:futures"]
+# The async-client surface is gated in source with
+# `cfg(any(feature = "client", feature = "client-rustls"))`, so both
+# variants expose the same `DatabaseClient` / `executor` / `crud` / `graph`
+# API. Pick exactly one of `client` (the historical `native-tls` default)
+# or `client-rustls` (pure-Rust TLS, no `openssl-sys`).
+client = [
+    "dep:tokio",
+    "dep:surrealdb",
+    "dep:reqwest",
+    "dep:futures",
+    "surrealdb/native-tls",
+    "reqwest/default-tls",
+]
+# Pure-Rust TLS variant. Enables the same `client` code paths but swaps the
+# TLS backend to `rustls` + webpki roots so nothing in the resolved
+# dependency graph depends on `openssl-sys`. Use this variant on CI
+# runners / images that do not install `libssl-dev`.
+#
+# Note that enabling this alongside `client` is additive and compiles, but
+# the resulting binary will link both TLS stacks. Downstream workspaces
+# should pick one variant and wire it through a workspace feature flag.
+client-rustls = [
+    "dep:tokio",
+    "dep:surrealdb",
+    "dep:reqwest",
+    "dep:futures",
+    "surrealdb/rustls",
+    "reqwest/rustls-tls-webpki-roots",
+]
 cli = [
     "client",
     "orchestration",
@@ -55,8 +83,12 @@ ulid = { version = "1.1", features = ["serde"] }
 
 # Optional (feature-gated)
 tokio = { version = "1.48", features = ["full"], optional = true }
-surrealdb = { version = "3.0", optional = true }
-reqwest = { version = "0.12", features = ["json"], optional = true }
+# `surrealdb` and `reqwest` opt out of default features so the TLS backend is
+# selected explicitly by the `client` / `client-rustls` feature flags. The
+# default-feature set of `surrealdb` includes `rustls`; we prefer to be
+# explicit so downstream consumers know which TLS stack they are pulling.
+surrealdb = { version = "3.0", default-features = false, features = ["protocol-ws"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "http2", "system-proxy"], optional = true }
 futures = { version = "0.3", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

@@ -11,7 +11,7 @@
 //! Tests bail with `"skipped: SURREAL_URL not set"` when the variable is
 //! absent so `cargo test` stays green in environments without a server.
 
-#![cfg(feature = "client")]
+#![cfg(any(feature = "client", feature = "client-rustls"))]
 
 use std::env;
 use std::time::Duration;

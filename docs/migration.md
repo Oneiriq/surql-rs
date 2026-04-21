@@ -79,17 +79,36 @@ See [CLI reference](cli.md) for the full tree.
 
 0.2.x formalises the feature matrix:
 
-| Feature        | 0.1.x                   | 0.2.x                                        |
-|----------------|-------------------------|----------------------------------------------|
-| `client`       | default                 | default                                      |
-| `cli`          | partial (migrate only)  | full tree; implies `client` + `orchestration` + `settings` |
-| `cache`        | new                     | `MemoryCache` backend + `CacheManager`       |
-| `cache-redis`  | new                     | `RedisCache` backend (implies `cache`)       |
-| `settings`     | new                     | layered `Settings` / `SettingsBuilder`       |
-| `orchestration`| new                     | deployment strategies, environment registry  |
-| `watcher`      | new                     | filesystem watcher                           |
+| Feature         | 0.1.x                   | 0.2.x                                        |
+|-----------------|-------------------------|----------------------------------------------|
+| `client`        | default                 | default; `native-tls` TLS stack              |
+| `client-rustls` | -                       | new in 0.2.2; pure-Rust TLS (no `openssl-sys`) |
+| `cli`           | partial (migrate only)  | full tree; implies `client` + `orchestration` + `settings` |
+| `cache`         | new                     | `MemoryCache` backend + `CacheManager`       |
+| `cache-redis`   | new                     | `RedisCache` backend (implies `cache`)       |
+| `settings`      | new                     | layered `Settings` / `SettingsBuilder`       |
+| `orchestration` | new                     | deployment strategies, environment registry  |
+| `watcher`       | new                     | filesystem watcher                           |
 
 See [Feature flags](features.md) for the detailed matrix.
+
+### 6. Switching to `client-rustls` (0.2.2+)
+
+If your CI runner or container does not have `libssl-dev` installed,
+swap the default `client` feature for `client-rustls`:
+
+```toml
+[dependencies]
+oneiriq-surql = { version = "0.2", default-features = false, features = ["client-rustls"] }
+```
+
+The public API is unchanged -- `DatabaseClient`, `executor::*`,
+`crud::*`, and every other `client`-gated item resolves identically.
+The only difference is that `reqwest` is configured with
+`rustls-tls-webpki-roots` and `surrealdb` with its `rustls` feature,
+so no `openssl-sys` (or `native-tls`) enters the dependency graph.
+Mixing `client` and `client-rustls` compiles but pulls both TLS
+stacks -- pick one per workspace.
 
 ## Deprecations
 

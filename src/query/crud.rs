@@ -6,12 +6,12 @@
 //! `query_records`). Typed (serde-round-trip) variants live in
 //! [`super::typed`].
 //!
-//! All functions are `#[cfg(feature = "client")]`.
+//! All functions are `#[cfg(any(feature = "client", feature = "client-rustls"))]`.
 //!
 //! ## Examples
 //!
 //! ```no_run
-//! # #[cfg(feature = "client")]
+//! # #[cfg(any(feature = "client", feature = "client-rustls"))]
 //! # async fn demo() -> surql::error::Result<()> {
 //! use serde_json::json;
 //! use surql::connection::{ConnectionConfig, DatabaseClient};

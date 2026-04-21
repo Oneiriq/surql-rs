@@ -12,7 +12,7 @@
 //!   cargo test --all-features --test integration_migration
 //! ```
 
-#![cfg(feature = "client")]
+#![cfg(any(feature = "client", feature = "client-rustls"))]
 
 use std::env;
 use std::path::Path;

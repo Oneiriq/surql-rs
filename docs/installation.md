@@ -22,7 +22,8 @@ Short overview; the full matrix and recipes live on the
 
 | Feature         | Default | What it adds                                              |
 |-----------------|---------|-----------------------------------------------------------|
-| `client`        | yes     | Async SurrealDB client (`tokio`, `surrealdb` 3.x).        |
+| `client`        | yes     | Async SurrealDB client (`tokio`, `surrealdb` 3.x) with `native-tls`. |
+| `client-rustls` | no      | Same client surface but with pure-Rust TLS (no `openssl-sys`). |
 | `cli`           | no      | `surql` binary (implies `client`, `orchestration`, `settings`). |
 | `cache`         | no      | In-process `MemoryCache` backend + `CacheManager`.        |
 | `cache-redis`   | no      | Redis backend for the cache manager (implies `cache`).    |
@@ -37,6 +38,9 @@ oneiriq-surql = { version = "0.2", default-features = false }
 
 # binary + client
 oneiriq-surql = { version = "0.2", features = ["cli"] }
+
+# async client, pure-Rust TLS (no libssl-dev on the build host)
+oneiriq-surql = { version = "0.2", default-features = false, features = ["client-rustls"] }
 ```
 
 ## CLI
@@ -50,7 +54,10 @@ Subcommand reference: [CLI](cli.md).
 ## Requirements
 
 - Rust 1.90 or newer.
-- For the `client` feature: SurrealDB 3.0 or newer.
+- For the `client` feature: SurrealDB 3.0 or newer, plus a system
+  TLS stack (`libssl-dev` on Linux, `Security.framework` on macOS).
+- For the `client-rustls` feature: SurrealDB 3.0 or newer. No system
+  TLS stack required.
 
 ## What's next
 
