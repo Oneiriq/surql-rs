@@ -18,6 +18,9 @@ cargo fmt --all --check
 echo "[pre-push] cargo clippy --all-targets --all-features -- -D warnings"
 cargo clippy --all-targets --all-features -- -D warnings
 
+echo "[pre-push] cargo check --all-targets --all-features"
+cargo check --all-targets --all-features
+
 echo "[pre-push] cargo test --lib --all-features"
 cargo test --lib --all-features
 
