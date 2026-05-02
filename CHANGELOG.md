@@ -7,6 +7,35 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-05-02
+
+### Changed
+
+- The default feature set is now `["client-rustls"]` (pure-Rust TLS).
+  Previously the default was `["client"]`, which pulled
+  `surrealdb/native-tls` and `reqwest/default-tls` and therefore
+  `openssl-sys` into the dependency graph. The historical native-tls
+  backend is still available via the `client` feature (now also exposed
+  under the `client-tls` alias) for consumers that need the system
+  OpenSSL stack.
+- The `cli` and `orchestration` features now depend on `client-rustls`
+  instead of `client` so that `cargo install oneiriq-surql --features cli`
+  and other typical builds no longer compile against `openssl-sys`.
+
+### Security
+
+- Drops the `openssl-sys` transitive dependency from the default
+  dependency graph, clearing the following Dependabot advisories on
+  this crate's published default build:
+  - rust-openssl: incorrect bounds assertion in AES key wrap (HIGH)
+  - rust-openssl: unchecked callback length in PSK / cookie trampolines
+    leaks adjacent memory to peer (HIGH)
+  - rust-openssl: `MdCtxRef::digest_final()` writes past caller buffer
+    with no length check (HIGH)
+- Consumers who explicitly opt into `--features client` (or the
+  `client-tls` alias) still link the system OpenSSL stack and remain
+  subject to upstream `rust-openssl` advisories.
+
 ## [0.2.2] - 2026-04-21
 
 ### Added
