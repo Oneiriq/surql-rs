@@ -20,11 +20,11 @@ env:
 jobs:
   lint-test:
     name: Lint and Test (${{ matrix.os }} / ${{ matrix.rust }})
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, aur0]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         rust: [stable, beta]
     steps:
       - uses: actions/checkout@v6
@@ -57,7 +57,7 @@ jobs:
 
   client-rustls-build:
     name: Build client-rustls (no openssl-sys)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, aur0]
     steps:
       - uses: actions/checkout@v6
 
@@ -89,7 +89,7 @@ jobs:
 
   integration:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, aur0]
     steps:
       - uses: actions/checkout@v6
 
