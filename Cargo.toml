@@ -1,6 +1,6 @@
 [package]
 name = "oneiriq-surql"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.90"
 authors = ["Shon Thomas <shon@oneiriq.com>"]
@@ -27,7 +27,11 @@ name = "types"
 harness = false
 
 [features]
-default = ["client"]
+# Default to the pure-Rust TLS stack so `cargo add oneiriq-surql` does not
+# pull `openssl-sys` into the dependency graph. The historical
+# `native-tls`-backed variant is still available as the opt-in `client-tls`
+# feature for consumers that need the system OpenSSL stack.
+default = ["client-rustls"]
 # The async-client surface is gated in source with
 # `cfg(any(feature = "client", feature = "client-rustls"))`, so both
 # variants expose the same `DatabaseClient` / `executor` / `crud` / `graph`
@@ -41,6 +45,10 @@ client = [
     "surrealdb/native-tls",
     "reqwest/default-tls",
 ]
+# Alias for `client` -- the historical `native-tls` (openssl) backend.
+# Kept as a named flag so downstream consumers can opt into the system
+# OpenSSL stack with a stable feature name.
+client-tls = ["client"]
 # Pure-Rust TLS variant. Enables the same `client` code paths but swaps the
 # TLS backend to `rustls` + webpki roots so nothing in the resolved
 # dependency graph depends on `openssl-sys`. Use this variant on CI
@@ -58,7 +66,7 @@ client-rustls = [
     "reqwest/rustls-tls-webpki-roots",
 ]
 cli = [
-    "client",
+    "client-rustls",
     "orchestration",
     "settings",
     "dep:clap",
@@ -70,7 +78,7 @@ cli = [
 cache = ["dep:tokio", "dep:async-trait"]
 cache-redis = ["cache", "dep:redis"]
 settings = ["dep:dotenvy", "dep:toml"]
-orchestration = ["client", "dep:async-trait"]
+orchestration = ["client-rustls", "dep:async-trait"]
 watcher = ["dep:notify", "dep:tokio", "dep:tokio-util"]
 
 [dependencies]
