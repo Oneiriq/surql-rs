@@ -4,7 +4,8 @@
 
 #![allow(missing_docs)]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use surql::types::{eq, gt, RecordID};
 
 fn bench_record_id_new(c: &mut Criterion) {
