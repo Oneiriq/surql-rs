@@ -423,7 +423,10 @@ fn load_cargo_metadata(start: &Path) -> Result<CargoMetadataSection> {
     let Ok(raw) = std::fs::read_to_string(&cargo_path) else {
         return Ok(CargoMetadataSection::default());
     };
-    let parsed: toml::Value = match raw.parse() {
+    // `toml::Value`'s `FromStr` impl in toml >= 1.0 parses a single TOML
+    // *value*, not a document. Use `toml::from_str` so the entire
+    // `Cargo.toml` is interpreted as a document.
+    let parsed: toml::Value = match toml::from_str(&raw) {
         Ok(v) => v,
         Err(_) => return Ok(CargoMetadataSection::default()),
     };
