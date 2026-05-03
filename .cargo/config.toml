@@ -1,0 +1,30 @@
+# wasm32-unknown-unknown target configuration.
+#
+# `getrandom 0.3` requires both:
+#   * the `wasm_js` Cargo feature (set via the wasm-target dependency
+#     block in Cargo.toml), AND
+#   * the `getrandom_backend="wasm_js"` rustc cfg flag (set here).
+#
+# Without the rustc flag, `getrandom` emits a `compile_error!` even when
+# the feature flag alone is enabled. See
+# https://docs.rs/getrandom/0.3/#webassembly-support
+#
+# Note: `surrealdb-core` pulls `ring` (with its `wasm32_unknown_unknown_js`
+# feature on `cfg(target_family = "wasm")`), and `ring 0.17`'s build script
+# still invokes the system C compiler with `--target=wasm32-unknown-unknown`
+# to compile the curve25519 / aes / etc. C glue. Apple's bundled
+# `/usr/bin/clang` does not include a wasm32 backend; on macOS callers must
+# point cc-rs at a wasm-capable LLVM, e.g.
+#
+#   brew install llvm
+#   export CC_wasm32_unknown_unknown=$(brew --prefix llvm)/bin/clang
+#   export AR_wasm32_unknown_unknown=$(brew --prefix llvm)/bin/llvm-ar
+#   cargo build --target wasm32-unknown-unknown \
+#       -p oneiriq-surql --no-default-features --features client-wasm
+#
+# Linux distributions where `clang` ships with the wasm backend (most
+# modern LLVM packages, Ubuntu 22.04+ `clang-15`, Fedora `clang`, etc.)
+# need no env-var override. See `scripts/check-wasm.sh` for the canonical
+# invocation and the README's "WebAssembly support" section.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

@@ -832,7 +832,7 @@ impl Query {
 // Client-feature execution shim (sub-feature 4: builder.execute)
 // ---------------------------------------------------------------------------
 
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 impl Query {
     /// Render this query to SurrealQL and execute it against `client`.
     ///

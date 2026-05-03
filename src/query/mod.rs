@@ -20,18 +20,18 @@
 
 pub mod batch;
 pub mod builder;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod crud;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod executor;
 pub mod expressions;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod graph;
 pub mod graph_query;
 pub mod helpers;
 pub mod hints;
 pub mod results;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod typed;
 
 pub use batch::{build_relate_query, build_upsert_query, RelateItem};
@@ -60,5 +60,5 @@ pub use results::{
 
 // Aggregation entrypoint (sub-feature 4). Gated on the `client` feature
 // because it needs a live [`DatabaseClient`] to dispatch the rendered query.
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use crud::{aggregate_records, build_aggregate_query, AggregateOpts};

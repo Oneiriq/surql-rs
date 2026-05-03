@@ -7,18 +7,18 @@
 //! context / registry / auth-manager / streaming-manager facilities.
 
 pub mod auth;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod auth_manager;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod client;
 pub mod config;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod context;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod registry;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod streaming;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod transaction;
 
 pub use auth::{
@@ -27,15 +27,15 @@ pub use auth::{
 };
 pub use config::{ConnectionConfig, NamedConnectionConfig, Protocol};
 
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use auth_manager::{AuthManager, TokenState};
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use client::DatabaseClient;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use context::{clear_db, connection_override, connection_scope, get_db, has_db, set_db};
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use registry::{get_registry, set_registry, ConnectionRegistry};
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use streaming::{LiveQuery, StreamingManager, SubscriptionId};
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use transaction::{Transaction, TransactionState};

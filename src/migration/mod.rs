@@ -33,14 +33,14 @@
 
 pub mod diff;
 pub mod discovery;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod executor;
 pub mod generator;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod history;
 pub mod hooks;
 pub mod models;
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod rollback;
 pub mod squash;
 pub mod versioning;
@@ -83,19 +83,19 @@ pub use versioning::{
 #[cfg(feature = "watcher")]
 pub use watcher::{is_schema_file, SchemaWatcher, WatcherConfig};
 
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use executor::{
     create_migration_plan, execute_migration, execute_migration_plan,
     get_applied_migrations_ordered, get_migration_status, get_pending_migrations, migrate_down,
     migrate_up, validate_migrations, version_is_applied, MigrateUpOptions, MigrationStatusReport,
 };
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use history::{
     auto_snapshot_after_apply, create_migration_table, ensure_migration_table,
     get_applied_migrations, get_migration_history, is_migration_applied, record_migration,
     remove_migration_record, MIGRATION_TABLE_NAME,
 };
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use rollback::{
     analyze_rollback_safety, create_rollback_plan, execute_rollback, plan_rollback_to_version,
     RollbackIssue, RollbackPlan, RollbackResult, RollbackSafety,

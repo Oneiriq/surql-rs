@@ -326,6 +326,13 @@ where
         schema_dir
     };
 
+    // Strip inherited git env vars so `current_dir(cwd)` actually picks
+    // up the repo rooted at `cwd`. Without this, callers invoked from
+    // inside a git hook (where `git` exports `GIT_DIR` /
+    // `GIT_WORK_TREE` / `GIT_INDEX_FILE` for child processes) would
+    // accidentally read the outer repo's index. This also makes our
+    // own `migration::hooks` tests deterministic when run under
+    // `git push -> pre-push -> cargo test`.
     let output = Command::new("git")
         .args([
             "diff",
@@ -335,6 +342,11 @@ where
             "--relative",
         ])
         .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
         .output()
         .map_err(|e| SurqlError::Io {
             reason: format!("failed to invoke git: {e}"),
@@ -568,34 +580,47 @@ mod tests {
     /// Spin up an ephemeral git repository in `dir`. Returns `true` on
     /// success. If `git` is not available, returns `false` so individual
     /// tests can skip gracefully.
+    ///
+    /// Strips inherited git env vars so the temp repo is isolated from
+    /// any outer git invocation that spawned the test (e.g. running
+    /// `cargo test` from inside a `git push -> pre-push` hook, where
+    /// `GIT_DIR` etc. are exported for child processes).
     fn init_git_repo(dir: &Path) -> bool {
-        let Ok(status) = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .status()
-        else {
+        let Ok(status) = clean_git(dir).args(["init", "-q"]).status() else {
             return false;
         };
         if !status.success() {
             return false;
         }
-        let _ = Command::new("git")
+        let _ = clean_git(dir)
             .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
             .status();
-        let _ = Command::new("git")
+        let _ = clean_git(dir)
             .args(["config", "user.name", "surql-test"])
-            .current_dir(dir)
             .status();
         true
     }
 
     fn git_add(dir: &Path, relpath: &str) -> bool {
-        Command::new("git")
+        clean_git(dir)
             .args(["add", "--", relpath])
-            .current_dir(dir)
             .status()
             .is_ok_and(|s| s.success())
+    }
+
+    /// `Command::new("git")` rooted at `dir` with all inherited git env
+    /// vars stripped. Mirrors the production `get_staged_schema_files`
+    /// behaviour and stops the outer repo's index leaking into temp-dir
+    /// fixtures.
+    fn clean_git(dir: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_COMMON_DIR");
+        cmd
     }
 
     fn make_diff(op: DiffOperation, table: &str, field: Option<&str>, desc: &str) -> SchemaDiff {

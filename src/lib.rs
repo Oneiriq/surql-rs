@@ -70,7 +70,7 @@ pub mod types;
 
 pub use error::{Result, SurqlError};
 
-#[cfg(any(feature = "client", feature = "client-rustls"))]
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use connection::DatabaseClient;
 
 // Convenience re-exports for the query-UX surface (sub-feature 1: first-class
