@@ -22,6 +22,13 @@ test-doc:
 build:
     cargo build --all-features --release
 
+# Build the `client-wasm` surface for `wasm32-unknown-unknown`. See
+# `scripts/check-wasm.sh` for the macOS Homebrew-LLVM auto-detection
+# notes (Apple's `/usr/bin/clang` lacks the wasm32 backend that
+# `ring 0.17`'s build script needs).
+check-wasm:
+    ./scripts/check-wasm.sh
+
 check:
     just fmt-check
     just lint
