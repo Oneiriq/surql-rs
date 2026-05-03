@@ -12,6 +12,7 @@ any binary-only dependencies.
 |-----------------|---------|------------------------|------------------------------------------------------------|------------------------------------------------------------------------------|
 | `client`        | yes     | -                      | `tokio`, `surrealdb` 3.x (`native-tls`), `reqwest` (`default-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
 | `client-rustls` | no      | -                      | `tokio`, `surrealdb` 3.x (`rustls`), `reqwest` (`rustls-tls-webpki-roots`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). See [Picking a TLS backend](#picking-a-tls-backend). |
+| `client-wasm`   | no      | -                      | `tokio` (wasm subset), `surrealdb` 3.x (`protocol-ws`, `kv-mem`), `futures` | Wasm-friendly variant. Same `DatabaseClient` API, no TLS / `reqwest` / `rt-multi-thread`. See [WebAssembly support](#webassembly-support). |
 | `cli`           | no      | `client`, `orchestration`, `settings` | `clap`, `tracing-subscriber`, `comfy-table`, `colored` | The `surql` binary (`migrate`, `schema`, `db`, `orchestrate`).              |
 | `cache`         | no      | -                      | `tokio`, `async-trait`                                     | `MemoryCache` backend, `CacheManager`, global cache registry.                |
 | `cache-redis`   | no      | `cache`                | `redis`                                                    | `RedisCache` backend for the cache manager.                                  |
@@ -131,6 +132,64 @@ oneiriq-surql = { version = "0.2", features = ["watcher"] }
 
 Filesystem watcher for schema / migration files - useful for
 `cargo watch`-style development loops.
+
+### WebAssembly support
+
+```toml
+[dependencies]
+oneiriq-surql = { version = "0.2", default-features = false, features = ["client-wasm"] }
+```
+
+Tracks Oneiriq/surql-rs#115. Enables the same
+`DatabaseClient` / `executor::*` / `crud::*` / `graph::*` /
+`batch::*_many` API as `client-rustls`, but compiles cleanly to
+`wasm32-unknown-unknown`:
+
+- `surrealdb` is pulled with `protocol-ws` + `kv-mem` only. Browsers
+  terminate TLS at the WebSocket layer, so neither `rustls` (which
+  pulls `ring`'s C glue) nor `native-tls` is enabled. `kv-mem` lets
+  wasm callers run an embedded engine for local state and tests with
+  no server roundtrip.
+- `reqwest` is **not** pulled. It is unused in `surql`'s source path
+  and `reqwest`'s default TLS stacks do not link on wasm.
+- `tokio` is reduced to `["sync", "macros", "rt", "time"]`.
+  `tokio::spawn` is not available; if you need to fan out, use
+  `wasm-bindgen-futures::spawn_local` from the caller crate.
+
+#### Build prerequisites
+
+`surrealdb-core 3.x` pulls `ring 0.17` with its
+`wasm32_unknown_unknown_js` feature, but `ring`'s build script still
+invokes the system C compiler with `--target=wasm32-unknown-unknown`.
+On macOS, Apple's `/usr/bin/clang` does not include a wasm32 backend;
+install Homebrew LLVM and point `cc-rs` at it:
+
+```sh
+brew install llvm
+export CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang"
+export AR_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/llvm-ar"
+```
+
+Modern Linux distributions (Ubuntu 22.04+ `clang-15`, Fedora `clang`)
+ship with the wasm32 backend built in -- no override needed.
+
+The crate ships `.cargo/config.toml` with the
+`--cfg=getrandom_backend="wasm_js"` rustflag (required by `getrandom
+0.3` on wasm; the feature flag alone is insufficient -- see
+https://docs.rs/getrandom/0.3/#webassembly-support) and a
+`scripts/check-wasm.sh` wrapper that auto-detects Homebrew LLVM and
+runs the canonical:
+
+```sh
+cargo build \
+    --target wasm32-unknown-unknown \
+    --no-default-features \
+    --features client-wasm \
+    -p oneiriq-surql
+```
+
+This is the gate downstream consumers (`pixel-stroke-persistence`,
+etc.) should mirror in their own CI.
 
 ## Build-time guarantees
 

@@ -35,7 +35,7 @@
 //! # let _ = posts; Ok(()) }
 //! ```
 
-#![cfg(any(feature = "client", feature = "client-rustls"))]
+#![cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

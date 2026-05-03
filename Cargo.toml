@@ -1,6 +1,6 @@
 [package]
 name = "oneiriq-surql"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.90"
 authors = ["Shon Thomas <shon@oneiriq.com>"]
@@ -65,6 +65,33 @@ client-rustls = [
     "surrealdb/rustls",
     "reqwest/rustls-tls-webpki-roots",
 ]
+# Wasm-friendly client surface (Oneiriq/surql-rs#115). Enables the same
+# `DatabaseClient` / `executor` / `crud` / `graph` query API as
+# `client-rustls`, but with a dependency set that compiles cleanly to
+# `wasm32-unknown-unknown`:
+#
+#   * `surrealdb` is pulled with `protocol-ws` + `kv-mem` only. The browser
+#     terminates TLS for `wss://`, so neither `rustls` (pulls `ring`,
+#     which has no wasm32-unknown-unknown C build) nor `native-tls` is
+#     enabled. `kv-mem` lets wasm callers run an embedded engine for
+#     local state / tests with no server roundtrip.
+#   * `reqwest` is **not** pulled. It is unused in `surql`'s source today
+#     and `reqwest`'s default TLS stacks do not link on wasm.
+#   * `tokio` features are reduced to the wasm-buildable subset
+#     (`sync`, `macros`, `rt`) via the
+#     `[target.'cfg(target_arch = "wasm32")'.dependencies]` block below;
+#     `tokio::spawn` / `JoinHandle`-using code (`StreamingManager`) is
+#     conditionally compiled out for wasm targets.
+#
+# This feature is additive: native callers can keep using
+# `client-rustls`. Wasm callers should depend on
+# `oneiriq-surql = { default-features = false, features = ["client-wasm"] }`.
+client-wasm = [
+    "dep:tokio",
+    "dep:surrealdb",
+    "dep:futures",
+    "surrealdb/kv-mem",
+]
 cli = [
     "client-rustls",
     "orchestration",
@@ -89,8 +116,10 @@ regex = "1.10"
 tracing = "0.1"
 ulid = { version = "1.1", features = ["serde"] }
 
-# Optional (feature-gated)
-tokio = { version = "1.48", features = ["full"], optional = true }
+# Optional (feature-gated). Note that `tokio` is declared per-target below
+# so that wasm32 builds get a wasm-buildable feature subset (no
+# `rt-multi-thread` / `net` / `process` / etc.).
+#
 # `surrealdb` and `reqwest` opt out of default features so the TLS backend is
 # selected explicitly by the `client` / `client-rustls` feature flags. The
 # default-feature set of `surrealdb` includes `rustls`; we prefer to be
@@ -109,6 +138,24 @@ tokio-util = { version = "0.7", optional = true }
 comfy-table = { version = "7.1", optional = true }
 colored = { version = "3.1", optional = true }
 sha2 = "0.11"
+
+# Native targets get the full tokio runtime (multi-threaded scheduler,
+# network IO, filesystem helpers, signals, etc.). The historical default.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.48", features = ["full"], optional = true }
+
+# Wasm targets get the wasm-buildable subset of tokio (no
+# `rt-multi-thread`, no `net`, no `process`, no `signal`, no `fs`).
+# `tokio::sync` / `tokio::time` / `tokio::task_local!` all build on
+# `wasm32-unknown-unknown`; `tokio::spawn` is gated out at the source
+# level where it appears (see `connection::streaming::StreamingManager`).
+#
+# `getrandom` is a transitive dependency (via `ulid` -> `rand_core`).
+# On wasm it requires the `wasm_js` feature **and** the
+# `--cfg=getrandom_backend="wasm_js"` rustc flag (see `.cargo/config.toml`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.48", default-features = false, features = ["sync", "macros", "rt", "time"], optional = true }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

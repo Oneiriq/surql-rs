@@ -7,6 +7,46 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-05-02
+
+### Added
+
+- `client-wasm` feature (Oneiriq/surql-rs#115). Wasm-friendly client
+  surface that compiles cleanly to `wasm32-unknown-unknown`. Pulls
+  `surrealdb` with `protocol-ws` + `kv-mem` only -- no `rustls` /
+  `native-tls` / `reqwest`, since browsers terminate TLS at the
+  WebSocket layer and `kv-mem` lets wasm callers run an embedded engine
+  for local state and tests. Exposes the same
+  `DatabaseClient` / `executor` / `crud` / `graph` / `batch` API as
+  `client-rustls`.
+- `[target.'cfg(target_arch = "wasm32")'.dependencies]` block in
+  `Cargo.toml` that overrides `tokio` to the wasm-buildable subset
+  (`sync`, `macros`, `rt`, `time`) and pulls
+  `getrandom 0.3` with the `wasm_js` feature so `ulid` /
+  `rand_core` link on wasm.
+- `.cargo/config.toml` with the
+  `--cfg=getrandom_backend="wasm_js"` rustflag required by
+  `getrandom 0.3` on `wasm32-unknown-unknown` (the feature flag alone is
+  insufficient -- see https://docs.rs/getrandom/0.3/#webassembly-support).
+- `scripts/check-wasm.sh` -- canonical local + CI gate for the wasm
+  build. On macOS auto-detects Homebrew LLVM so `cc-rs` can hand
+  `ring 0.17`'s build script a wasm-capable clang (Apple's
+  `/usr/bin/clang` has no wasm32 backend).
+
+### Changed
+
+- The optional `tokio` dependency moved from a top-level
+  `[dependencies]` declaration with `features = ["full"]` to two
+  target-specific declarations: native targets keep the historical
+  `["full"]` feature set, while `wasm32-*` targets get
+  `["sync", "macros", "rt", "time"]`. No source-level API changes.
+
+### Fixed
+
+- `cargo build --target wasm32-unknown-unknown -p oneiriq-surql --no-default-features --features client-wasm`
+  now succeeds on a system with a wasm-capable clang in scope. Unblocks
+  Oneiriq/pixel-stroke#236 (web-build of `pixel-stroke-persistence`).
+
 ## [0.2.3] - 2026-05-02
 
 ### Changed
