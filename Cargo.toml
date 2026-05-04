@@ -142,7 +142,7 @@ sha2 = "0.11"
 # Native targets get the full tokio runtime (multi-threaded scheduler,
 # network IO, filesystem helpers, signals, etc.). The historical default.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1.48", features = ["full"], optional = true }
+tokio = { version = "1.52", features = ["full"], optional = true }
 
 # Wasm targets get the wasm-buildable subset of tokio (no
 # `rt-multi-thread`, no `net`, no `process`, no `signal`, no `fs`).
@@ -154,7 +154,7 @@ tokio = { version = "1.48", features = ["full"], optional = true }
 # On wasm it requires the `wasm_js` feature **and** the
 # `--cfg=getrandom_backend="wasm_js"` rustc flag (see `.cargo/config.toml`).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1.48", default-features = false, features = ["sync", "macros", "rt", "time"], optional = true }
+tokio = { version = "1.52", default-features = false, features = ["sync", "macros", "rt", "time"], optional = true }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
