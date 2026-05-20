@@ -114,52 +114,48 @@ jobs:
 
   integration:
     name: Integration Tests
-    runs-on: [self-hosted, aur0]
-    # Per-repo SurrealDB endpoint so this job does not collide with the
-    # sibling surql-py / surql / surql-go integration runs that share
-    # the aur0 host. Port 8000 is the default SurrealDB binding and was
-    # observed in the wild colliding ("Bind for 0.0.0.0:8000 failed:
-    # port is already allocated") with another container holding the
-    # same port on a parallel sibling-repo run. Using a unique port +
-    # container name guarantees no overlap.
-    env:
-      SURREAL_PORT: 8765
-      SURREAL_CONTAINER: surrealdb-surql-rs
+    # Run integration tests on the cloud `ubuntu-latest` runner rather
+    # than the self-hosted aur0 host. Two reasons:
+    #
+    # 1. The aur0 host already runs a `kushtakas-surrealdb` container
+    #    bound to port 8000, so the integration job's `docker run -p
+    #    8000:8000` collides ("Bind for 0.0.0.0:8000 failed: port is
+    #    already allocated"). Re-mapping to another host port works
+    #    around the bind but the test's `ws://localhost:<port>` connect
+    #    then fails ("Cannot assign requested address") because the
+    #    aur0 runner is itself containerised and cannot reach a sibling
+    #    container via the host's loopback. ubuntu-latest is a bare VM
+    #    that gets a fresh dockerd, so neither problem exists there.
+    # 2. Cloud runners avoid exposing aur0 to fork-PR code execution.
+    #
+    # The sibling surql-py port made the same move for the same
+    # reasons.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      # See the `lint-test` job above for the rationale — the integration
-      # tests build with `--all-features` and therefore also pull the
-      # `client` (native-tls) feature.
-      - name: Install libssl-dev (required for the `client` feature)
-        run: |
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
-          fi
-
       - name: Start SurrealDB
         run: |
-          # Self-clean any leftover container from a previous cancelled /
-          # failed run on the same self-hosted runner — the post-job
-          # cleanup step does not always run if the runner is restarted
-          # mid-job. Without this `docker run` errors with "container
-          # name already in use" and the whole job aborts before any
-          # tests fire. Same fix the surql-py port landed in 1.5.8.
-          docker rm -f "$SURREAL_CONTAINER" >/dev/null 2>&1 || true
+          # Idempotent self-clean — no stopped sibling on a fresh VM, but
+          # harmless if it ever runs there.
+          docker rm -f surrealdb >/dev/null 2>&1 || true
           docker run -d \
-            --name "$SURREAL_CONTAINER" \
-            -p "$SURREAL_PORT:8000" \
+            --name surrealdb \
+            -p 8000:8000 \
             surrealdb/surrealdb:v3.0.5 \
             start --user root --pass root memory
-          for i in $(seq 1 20); do
-            if curl -sf "http://localhost:$SURREAL_PORT/health"; then
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then
               echo "SurrealDB ready"
               break
             fi
             echo "Waiting for SurrealDB... attempt $i"
             sleep 2
           done
+          # Fail the job if the server never came up so downstream
+          # connect failures surface here rather than as cryptic
+          # WebSocket errors mid-test.
+          curl -sf http://localhost:8000/health
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -179,19 +175,12 @@ jobs:
             echo "No integration tests yet; skipping."
           fi
         env:
-          # SURREAL_PORT is set in the job-level `env:` block above
-          # (port 8765). Hardcoded here because `${{ env.* }}`
-          # interpolation inside a step-level `env:` block requires the
-          # whole value to be a single expression, and we want the
-          # `ws://` prefix concatenation.
-          SURREAL_URL: ws://localhost:8765
+          SURREAL_URL: ws://localhost:8000
           SURREAL_USER: root
           SURREAL_PASS: root
 
       - name: Stop and remove SurrealDB
         if: always()
-        # `docker stop` alone leaves a stopped container behind that
-        # blocks the next run's `docker run --name <SURREAL_CONTAINER>`.
-        # Use `rm -f` so the cleanup is idempotent and self-recovers
-        # from a previous job that died before this step ran.
-        run: docker rm -f "$SURREAL_CONTAINER" >/dev/null 2>&1 || true
+        # The cloud `ubuntu-latest` runner is ephemeral so cleanup is
+        # cosmetic — included for symmetry with the start step.
+        run: docker rm -f surrealdb >/dev/null 2>&1 || true
