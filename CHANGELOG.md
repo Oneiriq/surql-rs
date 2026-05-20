@@ -227,8 +227,8 @@ queue.
   (`rustls` + `webpki-roots`) instead of `native-tls`. Enables
   building on runners that do not have `libssl-dev` / the system
   OpenSSL headers installed. See
-  [docs/features.md](docs/features.md#picking-a-tls-backend) for the
-  trade-offs and [docs/migration.md](docs/migration.md#6-switching-to-client-rustls-022)
+  [docs/features.md](features.md#picking-a-tls-backend) for the
+  trade-offs and [docs/migration.md](migration.md#6-switching-to-client-rustls-022)
   for a switching guide.
 
 ### Changed
