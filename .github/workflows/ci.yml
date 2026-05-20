@@ -5,13 +5,23 @@ on:
     branches:
       - main
       - 'release/**'
+  # Keep push-on-main so coverage / merge-commit verification still
+  # runs after a merge, but DROP push-on-release/** — those branches
+  # only ever receive PRs that already fired this workflow via
+  # pull_request, so push-on-release/** is pure duplicated work.
   push:
     branches:
       - main
-      - 'release/**'
 
 permissions:
   contents: read
+
+# Per-ref concurrency: a new push to a branch (or new push to the
+# PR head) cancels the in-progress run for the same ref. Cuts queue
+# pressure on the aur0 self-hosted runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

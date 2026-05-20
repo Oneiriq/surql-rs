@@ -28,6 +28,13 @@ permissions:
   contents: read
   checks: write
 
+# Per-ref concurrency: cancel in-progress audits for the same ref when
+# a new push lands. The schedule trigger is unaffected because its ref
+# differs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   audit:
     name: cargo audit

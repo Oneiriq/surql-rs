@@ -69,8 +69,9 @@ pub use fields::{
     FieldType,
 };
 pub use parser::{
-    parse_access, parse_db_info, parse_event, parse_field, parse_fields, parse_index,
-    parse_indexes, parse_table_info, parse_table_mode, DatabaseInfo,
+    parse_access, parse_db_info, parse_edge_info, parse_event, parse_field, parse_fields,
+    parse_index, parse_indexes, parse_table_info, parse_table_mode, parse_table_permissions,
+    DatabaseInfo,
 };
 pub use registry::{
     clear_registry, get_registered_edges, get_registered_tables, get_registry, register_edge,

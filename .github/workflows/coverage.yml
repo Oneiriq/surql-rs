@@ -5,13 +5,21 @@ on:
     branches:
       - main
       - 'release/**'
+  # Push-on-main only — release/** branches only ever receive PRs that
+  # already fired this workflow, so push-on-release/** is duplicated
+  # work.
   push:
     branches:
       - main
-      - 'release/**'
 
 permissions:
   contents: read
+
+# Per-ref concurrency: cancel any in-progress coverage run for the same
+# ref when a new push lands. Saves ~5 min per redundant rev.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

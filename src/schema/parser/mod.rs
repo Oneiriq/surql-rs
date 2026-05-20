@@ -36,7 +36,7 @@
 //!     "tb": "DEFINE TABLE user SCHEMAFULL",
 //!     "fields": { "name": "DEFINE FIELD name ON TABLE user TYPE string" }
 //! });
-//! let table = parse_table_info("user", &info).expect("valid table info");
+//! let table = parse_table_info("user", &info, None).expect("valid table info");
 //! assert_eq!(table.name, "user");
 //! assert_eq!(table.fields.len(), 1);
 //!
@@ -64,16 +64,20 @@ use crate::schema::table::TableDefinition;
 
 mod access;
 mod db;
+mod edge;
 mod event;
 mod field;
 mod index;
+mod permissions;
 mod table;
 
 pub use access::parse_access;
 pub use db::parse_db_info;
+pub use edge::parse_edge_info;
 pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
 pub use index::{parse_index, parse_indexes};
+pub use permissions::parse_table_permissions;
 pub use table::{parse_table_info, parse_table_mode};
 
 // --- Shared regex helper -----------------------------------------------------
@@ -157,7 +161,7 @@ pub struct DatabaseInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::db::extract_relation_endpoints;
+    use super::edge::parse_edge_endpoints;
     use super::*;
     use crate::schema::access::{
         jwt_access, record_access, AccessType, JwtConfig, RecordAccessConfig,
@@ -414,7 +418,7 @@ mod tests {
 
     #[test]
     fn parse_table_info_requires_object() {
-        let err = parse_table_info("user", &json!("not an object")).unwrap_err();
+        let err = parse_table_info("user", &json!("not an object"), None).unwrap_err();
         assert!(matches!(err, SurqlError::SchemaParse { .. }));
     }
 
@@ -428,7 +432,7 @@ mod tests {
                 "on_change": "DEFINE EVENT on_change ON TABLE user WHEN true THEN CREATE log;"
             }
         });
-        let t = parse_table_info("user", &info).unwrap();
+        let t = parse_table_info("user", &info, None).unwrap();
         assert_eq!(t.mode, TableMode::Schemafull);
         assert_eq!(t.fields.len(), 1);
         assert_eq!(t.indexes.len(), 1);
@@ -443,7 +447,7 @@ mod tests {
             "indexes": {},
             "events": {}
         });
-        let t = parse_table_info("post", &info).unwrap();
+        let t = parse_table_info("post", &info, None).unwrap();
         assert_eq!(t.mode, TableMode::Schemaless);
         assert_eq!(t.fields.len(), 1);
     }
@@ -451,7 +455,7 @@ mod tests {
     #[test]
     fn parse_table_info_missing_tb_defaults_schemaless() {
         let info = json!({});
-        let t = parse_table_info("post", &info).unwrap();
+        let t = parse_table_info("post", &info, None).unwrap();
         assert_eq!(t.mode, TableMode::Schemaless);
         assert!(t.fields.is_empty());
     }
@@ -541,7 +545,7 @@ mod tests {
             },
             "ix": { "email_idx": email_ix }
         });
-        let parsed = parse_table_info("user", &info).unwrap();
+        let parsed = parse_table_info("user", &info, None).unwrap();
         assert_eq!(parsed.mode, TableMode::Schemafull);
         assert_eq!(parsed.fields.len(), 3);
         assert_eq!(parsed.indexes.len(), 1);
@@ -572,7 +576,7 @@ mod tests {
             "tb": stmts[0].trim_end_matches(';'),
             "ix": { "emb_idx": stmts[1].trim_end_matches(';') }
         });
-        let parsed = parse_table_info("doc", &info).unwrap();
+        let parsed = parse_table_info("doc", &info, None).unwrap();
         let ix = &parsed.indexes[0];
         assert_eq!(ix.index_type, IndexType::Mtree);
         assert_eq!(ix.dimension, Some(1536));
@@ -590,7 +594,7 @@ mod tests {
             "tb": stmts[0].trim_end_matches(';'),
             "ix": { "content_search": stmts[1].trim_end_matches(';') }
         });
-        let parsed = parse_table_info("post", &info).unwrap();
+        let parsed = parse_table_info("post", &info, None).unwrap();
         let ix = &parsed.indexes[0];
         assert_eq!(ix.index_type, IndexType::Search);
         assert_eq!(ix.columns.len(), 2);
@@ -674,7 +678,7 @@ mod tests {
 
     #[test]
     fn parse_table_info_rejects_null_input() {
-        let err = parse_table_info("t", &Value::Null).unwrap_err();
+        let err = parse_table_info("t", &Value::Null, None).unwrap_err();
         assert!(matches!(err, SurqlError::SchemaParse { .. }));
     }
 
@@ -705,7 +709,7 @@ mod tests {
             "fields": { "a": "DEFINE FIELD a ON TABLE user TYPE string" },
             "fd": { "b": "DEFINE FIELD b ON TABLE user TYPE int" }
         });
-        let t = parse_table_info("user", &info).unwrap();
+        let t = parse_table_info("user", &info, None).unwrap();
         assert_eq!(t.fields.len(), 1);
         assert_eq!(t.fields[0].name, "a");
     }
@@ -730,16 +734,16 @@ mod tests {
     }
 
     #[test]
-    fn extract_relation_endpoints_parses_correctly() {
-        let (from, to) =
-            extract_relation_endpoints("DEFINE TABLE likes TYPE RELATION FROM user TO post")
-                .unwrap();
-        assert_eq!(from, "user");
-        assert_eq!(to, "post");
+    fn parse_edge_endpoints_parses_correctly() {
+        let (from, to) = parse_edge_endpoints("DEFINE TABLE likes TYPE RELATION FROM user TO post");
+        assert_eq!(from.as_deref(), Some("user"));
+        assert_eq!(to.as_deref(), Some("post"));
     }
 
     #[test]
-    fn extract_relation_endpoints_missing_returns_none() {
-        assert!(extract_relation_endpoints("DEFINE TABLE likes SCHEMAFULL").is_none());
+    fn parse_edge_endpoints_missing_returns_none() {
+        let (from, to) = parse_edge_endpoints("DEFINE TABLE likes SCHEMAFULL");
+        assert_eq!(from, None);
+        assert_eq!(to, None);
     }
 }

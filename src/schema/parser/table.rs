@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::event::parse_events;
 use super::field::parse_fields;
 use super::index::parse_indexes;
+use super::permissions::parse_table_permissions;
 use super::{expect_object, pick_map, value_to_string_map};
 use crate::error::Result;
 use crate::schema::table::{TableDefinition, TableMode};
@@ -43,13 +44,28 @@ pub fn parse_table_mode(definition: &str) -> TableMode {
 /// variant (for example `FieldType::Any` for unknown types), matching the
 /// Python behaviour.
 ///
+/// SurrealDB v3's `INFO FOR TABLE` does **not** include the table-level
+/// `DEFINE TABLE` statement, so table mode and `PERMISSIONS` cannot be
+/// recovered from it alone. Pass `define_table` — the
+/// `DEFINE TABLE <name> ...` string from `INFO FOR DB`'s `tables.<name>`
+/// entry — to recover them; without it, the parser falls back to the
+/// legacy `tb` key inside the response (v1/v2 shape), and the table
+/// mode defaults to [`TableMode::Schemaless`] / permissions to `None`
+/// on v3.
+///
 /// Returns [`crate::error::SurqlError::SchemaParse`] when the top-level value
 /// is not a JSON object.
-pub fn parse_table_info(table_name: &str, info: &Value) -> Result<TableDefinition> {
+pub fn parse_table_info(
+    table_name: &str,
+    info: &Value,
+    define_table: Option<&str>,
+) -> Result<TableDefinition> {
     let obj = expect_object(info, &format!("INFO FOR TABLE {table_name}"))?;
 
-    let tb_definition = obj.get("tb").and_then(Value::as_str).unwrap_or("");
+    let tb_definition =
+        define_table.unwrap_or_else(|| obj.get("tb").and_then(Value::as_str).unwrap_or(""));
     let mode = parse_table_mode(tb_definition);
+    let permissions = parse_table_permissions(tb_definition);
 
     let fields_value = pick_map(obj, &["fields", "fd"]);
     let fields = fields_value
@@ -72,7 +88,7 @@ pub fn parse_table_info(table_name: &str, info: &Value) -> Result<TableDefinitio
         fields,
         indexes,
         events,
-        permissions: None,
+        permissions,
         drop: false,
     })
 }

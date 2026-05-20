@@ -7,23 +7,30 @@
 //! `parser.rs` so each submodule stays under the 1000-LOC budget; see
 //! parent [`super`] for the public entry points.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::Value;
 
 use super::access::parse_access;
+use super::edge::{parse_edge_endpoints, parse_edge_mode};
+use super::permissions::parse_table_permissions;
 use super::table::parse_table_mode;
-use super::{expect_object, pick_map, regex_case_insensitive, DatabaseInfo};
+use super::{expect_object, pick_map, DatabaseInfo};
 use crate::error::Result;
-use crate::schema::edge::{EdgeDefinition, EdgeMode};
+use crate::schema::edge::EdgeDefinition;
 use crate::schema::table::TableDefinition;
 
-// --- Regex accessors ---------------------------------------------------------
+// --- Edge classification -----------------------------------------------------
 
-fn relation_from_to_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+RELATION\s+FROM\s+(\w+)\s+TO\s+(\w+)"))
+/// `true` when the `DEFINE TABLE` string declares a relation-mode edge.
+/// Word-boundary anchored — `TYPE RELATIONAL_SOMETHING` will not match.
+fn is_edge_definition(definition: &str) -> bool {
+    // `parse_edge_mode` is the single source of truth for what counts as
+    // a `TYPE RELATION` edge; using it here keeps the two call sites in
+    // lockstep so `parse_db_info` cannot disagree with `parse_edge_info`
+    // about whether a given DEFINE TABLE is an edge.
+    matches!(
+        parse_edge_mode(definition),
+        crate::schema::edge::EdgeMode::Relation,
+    )
 }
 
 // --- Public parser -----------------------------------------------------------
@@ -48,18 +55,19 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
             let Some(def) = def_value.as_str() else {
                 continue;
             };
-            if let Some((from, to)) = extract_relation_endpoints(def) {
+            if is_edge_definition(def) {
+                let (from_table, to_table) = parse_edge_endpoints(def);
                 out.edges.insert(
                     name.clone(),
                     EdgeDefinition {
                         name: name.clone(),
-                        mode: EdgeMode::Relation,
-                        from_table: Some(from),
-                        to_table: Some(to),
+                        mode: parse_edge_mode(def),
+                        from_table,
+                        to_table,
                         fields: Vec::new(),
                         indexes: Vec::new(),
                         events: Vec::new(),
-                        permissions: None,
+                        permissions: parse_table_permissions(def),
                     },
                 );
             } else {
@@ -72,7 +80,7 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
                         fields: Vec::new(),
                         indexes: Vec::new(),
                         events: Vec::new(),
-                        permissions: None,
+                        permissions: parse_table_permissions(def),
                         drop: false,
                     },
                 );
@@ -94,14 +102,6 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
     Ok(out)
 }
 
-// --- Edge extractor ----------------------------------------------------------
-
-/// Pull the `FROM <tb> TO <tb>` pair out of a relation-mode
-/// `DEFINE TABLE` statement. Exposed to the parser module for unit-test
-/// coverage in [`super`]'s test module.
-pub(super) fn extract_relation_endpoints(definition: &str) -> Option<(String, String)> {
-    let caps = relation_from_to_regex().captures(definition)?;
-    let from = caps.get(1)?.as_str().to_string();
-    let to = caps.get(2)?.as_str().to_string();
-    Some((from, to))
-}
+// (Edge endpoint extraction lives in [`super::edge::parse_edge_endpoints`];
+//  this file used to host its own RELATION-only helper before the 0.2.5
+//  parser upgrade unified the two paths.)
