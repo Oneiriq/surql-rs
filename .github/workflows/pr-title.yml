@@ -11,6 +11,12 @@ on:
 permissions:
   pull-requests: read
 
+# Per-ref concurrency: a rapid sequence of PR-title edits cancels the
+# in-progress lint and only the latest title is checked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Conventional Commit

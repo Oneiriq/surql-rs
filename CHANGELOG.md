@@ -7,6 +7,148 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-05-19
+
+Brings the parser, RecordID, and batch surfaces to feature parity with
+the surql-py 1.6.4 / 1.7.0 release window (and the sibling surql v1.5.0
+TypeScript port). Also hardens the CI workflow set so PRs do not double-
+run and the docs build no longer serialises every ref behind a single
+queue.
+
+### Added
+
+- **`parse_edge_info(edge_name, info, define_table)`** in
+  `surql::schema::parser` — counterpart to [`parse_table_info`] for
+  graph-edge tables defined via `edge_schema` / [`EdgeDefinition`]. Edge
+  mode is detected from the `DEFINE TABLE` statement: `TYPE RELATION`
+  resolves to `EdgeMode::Relation`, `SCHEMAFULL` to `EdgeMode::Schemafull`,
+  anything else to `EdgeMode::Schemaless`. `FROM <table>` and
+  `TO <table>` are extracted independently so a malformed live
+  definition that lost one clause surfaces as missing-endpoint drift
+  instead of a parse failure. On `Relation`-mode edges the auto-emitted
+  `in` and `out` field declarations SurrealDB stores are stripped on
+  parse — they are implicit when `TYPE RELATION` is set, so the
+  code-side `EdgeDefinition` does not declare them and round-trip diffs
+  were flagging them as orphan additions. Per-action `PERMISSIONS`
+  round-trip via the new `parse_table_permissions` helper.
+
+- **`parse_table_permissions(definition)`** in
+  `surql::schema::parser` — extracts the per-action `PERMISSIONS` rules
+  from a `DEFINE TABLE` statement string. Returns `None` for the trivial
+  `NONE` / `FULL` postures (the code-side helpers have no representation
+  for those) and for definitions without a `PERMISSIONS` clause.
+  Recognises the expanded form
+  (`FOR select WHERE r1 FOR create WHERE r2 …`), the comma-joined form
+  v3 emits when several actions share a rule
+  (`FOR select, create, update, delete WHERE r`), and arbitrary mixes of
+  both. The Rust `regex` crate does not support lookahead, so the body
+  is split on `FOR` boundaries before applying the per-clause matcher —
+  same per-action map shape the surql-py port produces, no lookahead.
+
+- **`parse_table_info(name, info, define_table)`** — the optional third
+  argument is the `DEFINE TABLE <name> ...` statement string, fetched
+  from `INFO FOR DB`'s `tables.<name>` entry. SurrealDB v3's
+  `INFO FOR TABLE` does *not* include the table-level `DEFINE TABLE`
+  statement, so table mode and `PERMISSIONS` cannot be recovered from
+  it alone. Without `define_table` the parser falls back to the legacy
+  `tb` key inside the response (the v1 / v2 shape) and table mode
+  defaults to `Schemaless` on v3.
+
+- **`strip_brackets(value)`** in `surql::types`, re-exported from the
+  crate root. SurrealDB v3 wraps record-id keys that contain anything
+  other than `[A-Za-z_][A-Za-z0-9_]*` or pure digits in unicode angle
+  brackets `⟨ … ⟩` (U+27E8 / U+27E9). Downstream consumers that wanted
+  the bare `table:id` shape were calling
+  `value.replace('⟨', "").replace('⟩', "")` themselves at every API
+  boundary; `strip_brackets` centralises that strip and also accepts
+  the legacy ASCII `< … >` form. `None` is passed through untouched so
+  the helper is safe to apply unconditionally.
+
+- **`upsert_many_in_tx(txn, table, items, conflict_fields)`** — atomic
+  counterpart to [`upsert_many`]. Queues one
+  `UPSERT <target> CONTENT { … }` statement per item on the supplied
+  [`Transaction`] buffer; the per-record statements inherit the
+  surrounding `BEGIN TRANSACTION` / `COMMIT TRANSACTION` framing so a
+  single bad record rolls back the entire batch on commit instead of
+  leaving the database half-seeded. `Transaction::execute` queues raw
+  SQL without param bindings, so the CONTENT payload is rendered as a
+  SurrealQL object literal (rather than `$data`-bound as it is in
+  autocommit mode). Both `upsert_many` and `upsert_many_in_tx` accept
+  an optional `conflict_fields` slice that emits an inline-value
+  `WHERE … AND …` clause appended to each UPSERT.
+
+### Fixed
+
+- **`build_upsert_query` emitted `UPSERT INTO <table> [ {…}, {…} ]`**,
+  which SurrealDB v3 rejects with a parse error — v3 wants a single
+  record-id or table target after `UPSERT`, not an array literal. The
+  renderer now emits one `UPSERT <target> CONTENT { … }` statement per
+  item, joined by `;`, matching the surql-py 1.7.0 / surql 1.5.0
+  shape that is portable across the sibling ports. The
+  pre-0.2.5 source comment acknowledged the bug ("not valid SurrealDB
+  v3 SurrealQL") but kept the broken shape for byte-for-byte parity
+  with the older surql-py renderer; that parity bridge is no longer
+  needed.
+
+- **`build_upsert_query` `conflict_fields` emitted `WHERE field =
+  $item.field`**, which has no `$item` binding in scope at the call
+  site (and the rendered string is also fed verbatim to
+  `Transaction::execute`, which queues raw SQL without binding params).
+  The renderer now inlines the conflict values
+  (`WHERE email = 'a@b.com' AND tenant = 'BFS'`), matching the surql
+  1.5.0 fix.
+
+- **`RecordID::Display` emitted ASCII `<id>` brackets** for ids that
+  could not be rendered bare. SurrealDB v3 rejects ASCII `<` / `>` in
+  record-id positions with
+  `Unexpected token '<', expected a record-id key`; the output now uses
+  the v3-correct unicode escape syntax `⟨id⟩` (U+27E8 / U+27E9).
+  `RecordID::parse` accepts both forms on input so legacy wire payloads
+  still round-trip cleanly. **Breaking** for callers that asserted on
+  the exact `Display` output; the SQL shape is identical otherwise.
+
+- **`RecordID::needs_angle_brackets` accepted leading-digit ids bare**
+  (`chunk:1abc`). The pre-0.2.5 `simple_id_pattern` was
+  `[A-Za-z0-9_]+`, which let `1abc` slip through and produced a literal
+  v3 rejects with `Unexpected token`. The new `identifier_id_pattern`
+  is `[A-Za-z_][A-Za-z0-9_]*`, with a separate allow-list for pure-
+  digit strings (which v3 parses as integer-key ids and round-trips
+  bare). Matches surql-py 1.7.0.
+
+### Changed
+
+- **`upsert_many` no longer routes through
+  `UPSERT <table> CONTENT $data` for items that lack an `id` field**.
+  The autocommit path always pins the target — `data.id` when present,
+  `<table>` otherwise — and strips `id` from the bound payload so v3
+  does not reject the duplicate field.
+
+- **CI workflow set hardened against runaway runs**:
+  - `docs.yml` switched from the global `group: pages` concurrency
+    queue (which serialised every build + deploy across all refs and
+    caused multi-day stalls when a long-running deploy held the queue)
+    to a per-ref group with `cancel-in-progress: true`.
+  - `ci.yml` and `coverage.yml` gained per-ref concurrency groups so
+    rapid pushes to a PR cancel the in-progress run. The redundant
+    `push: branches: ['release/**']` triggers were dropped — release
+    branches only ever receive PRs that already fired the workflow via
+    `pull_request`, so the push trigger was pure duplicated work.
+  - `audit.yml`, `dep-review.yml`, and `pr-title.yml` gained per-ref
+    concurrency groups so a sequence of PR edits cancels the in-progress
+    lint and only the latest revision is checked.
+
+### Verified
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --lib --all-features --tests -- -D warnings` — clean.
+- `cargo test --lib --no-default-features` — **927 passed, 0 failed**.
+- `cargo test --lib --all-features` — **1088 passed, 0 failed**
+  (baseline was 1066 on 0.2.4; +22 regression tests covering
+  `parse_edge_info`, `parse_table_permissions`, `strip_brackets`,
+  unicode-bracket `RecordID::Display`, and the per-record
+  `build_upsert_query` shape).
+- All integration tests compile.
+
 ## [0.2.4] - 2026-05-02
 
 ### Added

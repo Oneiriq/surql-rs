@@ -16,7 +16,7 @@ pub use operators::{
     ContainsAll, ContainsAny, ContainsNot, Eq, Gt, Gte, Inside, IsNotNull, IsNull, Lt, Lte, Ne,
     Not, NotInside, Operator, OperatorExpr, Or,
 };
-pub use record_id::{RecordID, RecordIdValue};
+pub use record_id::{strip_brackets, RecordID, RecordIdValue};
 pub use record_ref::{record_ref, RecordRef};
 pub use reserved::{check_reserved_word, EDGE_ALLOWED_RESERVED, SURREAL_RESERVED_WORDS};
 pub use surreal_fn::{surql_fn, SurrealFn};

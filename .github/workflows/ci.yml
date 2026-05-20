@@ -5,13 +5,23 @@ on:
     branches:
       - main
       - 'release/**'
+  # Keep push-on-main so coverage / merge-commit verification still
+  # runs after a merge, but DROP push-on-release/** — those branches
+  # only ever receive PRs that already fired this workflow via
+  # pull_request, so push-on-release/** is pure duplicated work.
   push:
     branches:
       - main
-      - 'release/**'
 
 permissions:
   contents: read
+
+# Per-ref concurrency: a new push to a branch (or new push to the
+# PR head) cancels the in-progress run for the same ref. Cuts queue
+# pressure on the aur0 self-hosted runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,6 +38,21 @@ jobs:
         rust: [stable, beta]
     steps:
       - uses: actions/checkout@v6
+
+      # `cargo test --all-features` enables the legacy `client` feature
+      # alongside `client-rustls`; the `client` path pulls `openssl-sys`,
+      # which needs the system OpenSSL development headers to compile.
+      # The aur0 self-hosted runner image does not ship them, so without
+      # this step `--all-features` fails with `Could not find directory
+      # of OpenSSL installation` and the whole job aborts. The
+      # `client-rustls`-only build path is separately verified by the
+      # `client-rustls-build` job below and does not need libssl-dev.
+      - name: Install libssl-dev (required for the `client` feature)
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -89,18 +114,37 @@ jobs:
 
   integration:
     name: Integration Tests
-    runs-on: [self-hosted, aur0]
+    # Run integration tests on the cloud `ubuntu-latest` runner rather
+    # than the self-hosted aur0 host. Two reasons:
+    #
+    # 1. The aur0 host already runs a `kushtakas-surrealdb` container
+    #    bound to port 8000, so the integration job's `docker run -p
+    #    8000:8000` collides ("Bind for 0.0.0.0:8000 failed: port is
+    #    already allocated"). Re-mapping to another host port works
+    #    around the bind but the test's `ws://localhost:<port>` connect
+    #    then fails ("Cannot assign requested address") because the
+    #    aur0 runner is itself containerised and cannot reach a sibling
+    #    container via the host's loopback. ubuntu-latest is a bare VM
+    #    that gets a fresh dockerd, so neither problem exists there.
+    # 2. Cloud runners avoid exposing aur0 to fork-PR code execution.
+    #
+    # The sibling surql-py port made the same move for the same
+    # reasons.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Start SurrealDB
         run: |
+          # Idempotent self-clean — no stopped sibling on a fresh VM, but
+          # harmless if it ever runs there.
+          docker rm -f surrealdb >/dev/null 2>&1 || true
           docker run -d \
             --name surrealdb \
             -p 8000:8000 \
             surrealdb/surrealdb:v3.0.5 \
             start --user root --pass root memory
-          for i in $(seq 1 20); do
+          for i in $(seq 1 30); do
             if curl -sf http://localhost:8000/health; then
               echo "SurrealDB ready"
               break
@@ -108,6 +152,10 @@ jobs:
             echo "Waiting for SurrealDB... attempt $i"
             sleep 2
           done
+          # Fail the job if the server never came up so downstream
+          # connect failures surface here rather than as cryptic
+          # WebSocket errors mid-test.
+          curl -sf http://localhost:8000/health
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -131,6 +179,8 @@ jobs:
           SURREAL_USER: root
           SURREAL_PASS: root
 
-      - name: Stop SurrealDB
+      - name: Stop and remove SurrealDB
         if: always()
-        run: docker stop surrealdb || true
+        # The cloud `ubuntu-latest` runner is ephemeral so cleanup is
+        # cosmetic — included for symmetry with the start step.
+        run: docker rm -f surrealdb >/dev/null 2>&1 || true
