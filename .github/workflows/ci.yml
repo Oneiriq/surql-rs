@@ -130,6 +130,13 @@ jobs:
 
       - name: Start SurrealDB
         run: |
+          # Self-clean any leftover `surrealdb` container from a previous
+          # cancelled / failed run on the same self-hosted runner — the
+          # post-job `docker stop` step does not remove the container, so
+          # without this `docker run` errors with "container name already
+          # in use" and the whole job aborts before any tests fire. Same
+          # fix the surql-py port landed in 1.5.8.
+          docker rm -f surrealdb >/dev/null 2>&1 || true
           docker run -d \
             --name surrealdb \
             -p 8000:8000 \
@@ -166,6 +173,10 @@ jobs:
           SURREAL_USER: root
           SURREAL_PASS: root
 
-      - name: Stop SurrealDB
+      - name: Stop and remove SurrealDB
         if: always()
-        run: docker stop surrealdb || true
+        # `docker stop` alone leaves a stopped container behind that
+        # blocks the next run's `docker run --name surrealdb`. Use
+        # `rm -f` so the cleanup is idempotent and self-recovers from
+        # a previous job that died before this step ran.
+        run: docker rm -f surrealdb >/dev/null 2>&1 || true
