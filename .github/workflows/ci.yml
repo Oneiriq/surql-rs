@@ -5,13 +5,25 @@ on:
     branches:
       - main
       - 'release/**'
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.editorconfig'
+      - '.gitignore'
   # Keep push-on-main so coverage / merge-commit verification still
-  # runs after a merge, but DROP push-on-release/** — those branches
-  # only ever receive PRs that already fired this workflow via
+  # runs after a merge, but DROP push-on-release/** because those
+  # branches only ever receive PRs that already fired this workflow via
   # pull_request, so push-on-release/** is pure duplicated work.
   push:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.editorconfig'
+      - '.gitignore'
 
 permissions:
   contents: read
@@ -28,6 +40,10 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # PR / push runs only fire the `stable` toolchain to keep queue
+  # pressure low on the aur0 self-hosted runner; `nightly.yml` covers
+  # `beta` (and the rest of cross-toolchain coverage) on a daily cron so
+  # regressions still surface within 24 hours.
   lint-test:
     name: Lint and Test (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: [self-hosted, aur0]
@@ -35,7 +51,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        rust: [stable, beta]
+        rust: [stable]
     steps:
       - uses: actions/checkout@v6
 

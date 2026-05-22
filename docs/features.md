@@ -10,8 +10,8 @@ any binary-only dependencies.
 
 | Feature         | Default | Implies                | Pulls in                                                   | What you get                                                                 |
 |-----------------|---------|------------------------|------------------------------------------------------------|------------------------------------------------------------------------------|
-| `client`        | yes     | -                      | `tokio`, `surrealdb` 3.x (`native-tls`), `reqwest` (`default-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
-| `client-rustls` | no      | -                      | `tokio`, `surrealdb` 3.x (`rustls`), `reqwest` (`rustls-tls-webpki-roots`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). See [Picking a TLS backend](#picking-a-tls-backend). |
+| `client-rustls` | yes     | -                      | `tokio`, `surrealdb` 3.x (`rustls`), `reqwest` (`rustls-tls-webpki-roots`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). The default backend since 0.2.3. See [Picking a TLS backend](#picking-a-tls-backend). |
+| `client`        | no      | -                      | `tokio`, `surrealdb` 3.x (`native-tls`), `reqwest` (`default-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
 | `client-wasm`   | no      | -                      | `tokio` (wasm subset), `surrealdb` 3.x (`protocol-ws`, `kv-mem`), `futures` | Wasm-friendly variant. Same `DatabaseClient` API, no TLS / `reqwest` / `rt-multi-thread`. See [WebAssembly support](#webassembly-support). |
 | `cli`           | no      | `client`, `orchestration`, `settings` | `clap`, `tracing-subscriber`, `comfy-table`, `colored` | The `surql` binary (`migrate`, `schema`, `db`, `orchestrate`).              |
 | `cache`         | no      | -                      | `tokio`, `async-trait`                                     | `MemoryCache` backend, `CacheManager`, global cache registry.                |
@@ -35,31 +35,33 @@ result helpers. Everything under `types::`, `schema::`, `query::*`
 diff / generator / versioning / discovery`, and the parser remains
 available.
 
-### Default async client
+### Default async client (rustls TLS)
 
 ```toml
 [dependencies]
 oneiriq-surql = "0.2"
 ```
 
-Equivalent to `features = ["client"]`. Brings in `tokio`, `surrealdb`,
-and the full async surface (`DatabaseClient`, `executor::fetch_all`,
-`crud::*`, `graph::*`, `batch::*_many`, `Transaction`). Uses the
-system `native-tls` stack (links `openssl-sys` on Linux,
-Security.framework on macOS).
+Equivalent to `features = ["client-rustls"]`. Brings in `tokio`,
+`surrealdb`, and the full async surface (`DatabaseClient`,
+`executor::fetch_all`, `crud::*`, `graph::*`, `batch::*_many`,
+`Transaction`). TLS is handled by `rustls` + `webpki-roots`, so no
+`openssl-sys` is linked, no `libssl-dev` is needed at build time, and
+the dependency graph is portable across glibc / musl / cross-compile
+targets.
 
-### Async client with rustls (no `openssl-sys`)
+### Async client with native-tls
 
 ```toml
 [dependencies]
-oneiriq-surql = { version = "0.2", default-features = false, features = ["client-rustls"] }
+oneiriq-surql = { version = "0.2", default-features = false, features = ["client"] }
 ```
 
-Same API surface as `client`, but TLS is provided by `rustls` +
-`webpki-roots` instead of `native-tls`. This is the right choice for
-CI runners, Alpine / distroless containers, and any environment where
-you do not want to install `libssl-dev` / link against the system
-OpenSSL.
+Same API surface as `client-rustls`, but TLS is delegated to the
+system `native-tls` stack (links `openssl-sys` on Linux,
+Security.framework on macOS). Use this when you must validate
+against the OS trust store or interop with a TLS extension that is
+only implemented by OpenSSL.
 
 ### Picking a TLS backend
 
@@ -72,7 +74,7 @@ Pick exactly one of `client` or `client-rustls`:
 | Uses OS trust store            | yes                           | no -- ships Mozilla webpki roots                  |
 | Cross-compilation friendliness | depends on target OpenSSL     | portable, pure Rust                               |
 | API surface                    | identical                     | identical                                         |
-| Backwards compatible           | yes (default since 0.1)       | new in 0.2.2                                      |
+| Backwards compatible           | yes (default 0.1.x, 0.2.0 to 0.2.2) | new in 0.2.2, default since 0.2.3           |
 
 Enabling both at once compiles, but doubles the TLS dependency set.
 If you are consuming this crate from multiple workspace members,

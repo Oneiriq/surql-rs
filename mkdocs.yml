@@ -79,6 +79,9 @@ nav:
       - Query UX Helpers: query-ux.md
       - Query Hints: query_hints.md
       - SurrealDB v3 Patterns: v3-patterns.md
+      - Connection Management: connection-management.md
+      - Caching: caching.md
+      - Orchestration: orchestration.md
       - Visualization: visualization.md
   - Reference:
       - CLI: cli.md

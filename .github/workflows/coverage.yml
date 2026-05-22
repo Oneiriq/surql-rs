@@ -5,12 +5,24 @@ on:
     branches:
       - main
       - 'release/**'
-  # Push-on-main only — release/** branches only ever receive PRs that
-  # already fired this workflow, so push-on-release/** is duplicated
-  # work.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.editorconfig'
+      - '.gitignore'
+  # Push-on-main only because release/** branches only ever receive PRs
+  # that already fired this workflow, so push-on-release/** is
+  # duplicated work.
   push:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.editorconfig'
+      - '.gitignore'
 
 permissions:
   contents: read
