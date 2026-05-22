@@ -1,8 +1,31 @@
-# Upgrading 0.1.x -> 0.2.x
+# Upgrading
 
-This page focuses on API deltas between the 0.1.0 feature-complete
-release and the 0.2.0 "query-UX" wave. For the `.surql` migration
-**file format** (which has not changed), see [Migrations](migrations.md).
+This page tracks user-facing deltas between consecutive releases.
+For the `.surql` migration **file format** (which has not changed),
+see [Migrations](migrations.md).
+
+## Upgrading 0.2.5 -> 0.2.6
+
+`0.2.6` is a maintenance release. No public-API breaking changes.
+
+- TLS dependency `openssl` bumped to `0.10.80` to close
+  [CVE-2026-45784](https://nvd.nist.gov/vuln/detail/CVE-2026-45784)
+  (medium severity, AES-KW-PAD out-of-bounds write). The crate's
+  default backend is `client-rustls`, which does not link `openssl`;
+  the bump only affects consumers that opt into the `client` /
+  `client-tls` features.
+- Security Audit workflow rewired to a direct `cargo audit` invocation
+  so the daily scheduled scan no longer relies on a Node.js 20 action
+  that the runner is being upgraded off.
+- CI matrix on push / pull-request now runs the `stable` toolchain
+  only; `beta` coverage moved to the daily Nightly workflow.
+- New documentation pages: [Connection Management](connection-management.md),
+  [Caching](caching.md), and [Orchestration](orchestration.md).
+
+## Upgrading 0.1.x -> 0.2.x
+
+API deltas between the 0.1.0 feature-complete release and the 0.2.0
+query-UX surface.
 
 ## TL;DR
 
@@ -81,8 +104,8 @@ See [CLI reference](cli.md) for the full tree.
 
 | Feature         | 0.1.x                   | 0.2.x                                        |
 |-----------------|-------------------------|----------------------------------------------|
-| `client`        | default                 | default; `native-tls` TLS stack              |
-| `client-rustls` | -                       | new in 0.2.2; pure-Rust TLS (no `openssl-sys`) |
+| `client`        | default                 | `native-tls` TLS stack; opt-in since 0.2.3   |
+| `client-rustls` | -                       | new in 0.2.2; default since 0.2.3 (pure-Rust TLS, no `openssl-sys`) |
 | `cli`           | partial (migrate only)  | full tree; implies `client` + `orchestration` + `settings` |
 | `cache`         | new                     | `MemoryCache` backend + `CacheManager`       |
 | `cache-redis`   | new                     | `RedisCache` backend (implies `cache`)       |
