@@ -7,6 +7,67 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-05-22
+
+Maintenance release focused on closing open security, dependency, and
+CI-hygiene work. No public-API breaking changes.
+
+### Security
+
+- Bumped `openssl` from `0.10.79` to `0.10.80` via `cargo update`,
+  closing [CVE-2026-45784](https://nvd.nist.gov/vuln/detail/CVE-2026-45784)
+  (medium severity, potential out-of-bounds write in
+  `CipherCtxRef::cipher_update_inplace` for AES-KW-PAD ciphers). The
+  crate's default `client-rustls` backend never links `openssl`; the
+  bump only affects consumers that opt into the `client` /
+  `client-tls` feature.
+
+### Fixed
+
+- Daily Security Audit workflow no longer fails on every scheduled
+  run. Replaced the deprecated Node.js 20
+  `rustsec/audit-check@v2.0.0` action with a direct
+  `taiki-e/install-action` + `cargo audit` invocation. The new step
+  exits non-zero only on actual vulnerabilities; informational
+  unmaintained warnings (atomic-polyfill, bincode 2.x) are surfaced as
+  logs because they reach the dep graph transitively through
+  `surrealdb` and are not actionable from this repo.
+
+### Changed
+
+- CI workflow (`ci.yml`) now runs the `stable` Rust toolchain only on
+  push and pull-request triggers. `beta` toolchain coverage moved to
+  the daily Nightly workflow so regressions still surface within 24
+  hours without paying for two parallel jobs on every PR rev.
+- Added `paths-ignore` filters to `ci.yml` and `coverage.yml` so pure
+  documentation, LICENSE, or `.editorconfig` / `.gitignore` changes no
+  longer trigger a full compile + clippy + test run. `docs.yml`
+  already handles documentation rebuilds.
+- Dependabot auto-merge workflow now uses
+  `dependabot/fetch-metadata@v3` and
+  `lewagon/wait-on-check-action@v1.7.0`, the latest stable majors of
+  both actions.
+- `docs/features.md` and `docs/migration.md` corrected: the default
+  feature has been `client-rustls` since `0.2.3`, not `client`.
+
+### Added
+
+- `docs/connection-management.md` documents the task-scoped current
+  client, `ConnectionRegistry`, `AuthManager`, `StreamingManager` /
+  `LiveQuery`, and `Transaction`.
+- `docs/caching.md` documents `CacheManager`, the `MemoryCache` and
+  `RedisCache` backends, the `cached` / `cached_with` /
+  `cache_key_for` helpers, and the invalidation surface.
+- `docs/orchestration.md` documents `EnvironmentConfig` /
+  `EnvironmentRegistry`, `DeploymentPlan`, `DeploymentCoordinator`,
+  the four built-in `DeploymentStrategy` implementations (Sequential,
+  Parallel, Rolling, Canary), `DeploymentResult`, and
+  `check_environment_health` / `verify_connectivity`.
+- `docs/migration.md` now carries an `Upgrading 0.2.5 -> 0.2.6`
+  section.
+- `mkdocs.yml` navigation surfaces the three new module pages under
+  Guides.
+
 ## [0.2.5] - 2026-05-19
 
 Brings the parser, RecordID, and batch surfaces to feature parity with
