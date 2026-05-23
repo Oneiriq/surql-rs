@@ -1,36 +1,37 @@
 name: CI
 
+# Single, gated pipeline for push and pull-request events. Every
+# stage downstream of `lint` only runs once its prerequisites pass, so
+# a fmt / clippy / test failure short-circuits the entire run instead
+# of fanning out to coverage / integration / audit / docs in parallel.
+#
+# Job DAG:
+#
+#   lint -> test ---> integration -+
+#        |       \--> coverage ----+
+#        |--> build-rustls --------+
+#        |--> audit ---------------+--> docs-build --> docs-approval --> docs-deploy
+#
+# `docs-approval` and `docs-deploy` only fire on push to main; the
+# approval environment is required-reviewer-gated, so a human signs
+# off before Pages publishes.
+
 on:
   pull_request:
     branches:
       - main
       - 'release/**'
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.editorconfig'
-      - '.gitignore'
-  # Keep push-on-main so coverage / merge-commit verification still
-  # runs after a merge, but DROP push-on-release/** because those
-  # branches only ever receive PRs that already fired this workflow via
-  # pull_request, so push-on-release/** is pure duplicated work.
   push:
     branches:
       - main
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.editorconfig'
-      - '.gitignore'
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
-# Per-ref concurrency: a new push to a branch (or new push to the
-# PR head) cancels the in-progress run for the same ref. Cuts queue
-# pressure on the aur0 self-hosted runner.
+# Per-ref concurrency so a new push to the same branch cancels the
+# in-flight pipeline. Saves runner time on rapid pushes / force-pushes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -40,30 +41,16 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # PR / push runs only fire the `stable` toolchain to keep queue
-  # pressure low on the aur0 self-hosted runner; `nightly.yml` covers
-  # `beta` (and the rest of cross-toolchain coverage) on a daily cron so
-  # regressions still surface within 24 hours.
-  lint-test:
-    name: Lint and Test (${{ matrix.os }} / ${{ matrix.rust }})
+  lint:
+    name: Lint (fmt + clippy)
     runs-on: [self-hosted, aur0]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        rust: [stable]
     steps:
       - uses: actions/checkout@v6
 
-      # `cargo test --all-features` enables the legacy `client` feature
-      # alongside `client-rustls`; the `client` path pulls `openssl-sys`,
-      # which needs the system OpenSSL development headers to compile.
-      # The aur0 self-hosted runner image does not ship them, so without
-      # this step `--all-features` fails with `Could not find directory
-      # of OpenSSL installation` and the whole job aborts. The
-      # `client-rustls`-only build path is separately verified by the
-      # `client-rustls-build` job below and does not need libssl-dev.
-      - name: Install libssl-dev (required for the `client` feature)
+      # `cargo clippy --all-features` enables the legacy `client`
+      # feature which links `openssl-sys`; needs system OpenSSL
+      # headers on the runner image.
+      - name: Install libssl-dev
         run: |
           if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update -qq
@@ -71,33 +58,55 @@ jobs:
           fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-${{ matrix.os }}-${{ matrix.rust }}"
+          prefix-key: "v1-rust-ubuntu-latest-stable"
 
-      - name: Check formatting
+      - name: cargo fmt --check
         run: cargo fmt --all --check
 
-      - name: Run clippy
+      - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Check compilation
+      - name: cargo check
         run: cargo check --all-targets --all-features
 
-      - name: Run unit tests
+  test:
+    name: Unit + Doc Tests
+    needs: lint
+    runs-on: [self-hosted, aur0]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install libssl-dev
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-ubuntu-latest-stable"
+
+      - name: cargo test --lib
         run: cargo test --lib --all-features
 
-      - name: Run doc tests
+      - name: cargo test --doc
         run: cargo test --doc --all-features
 
-  client-rustls-build:
+  build-rustls:
     name: Build client-rustls (no openssl-sys)
+    needs: lint
     runs-on: [self-hosted, aur0]
     steps:
       - uses: actions/checkout@v6
@@ -110,17 +119,13 @@ jobs:
         with:
           prefix-key: "v1-rust-ubuntu-rustls"
 
-      # The point of the `client-rustls` feature is to unblock builds on
-      # runners / images that do not ship `libssl-dev`. Verify the feature
-      # compiles without touching the default `client` stack, and assert
-      # that `openssl-sys` is absent from the resolved dependency graph.
-      - name: Build with client-rustls
+      - name: cargo build (client-rustls only)
         run: cargo build --no-default-features --features client-rustls
 
-      - name: Check compilation with client-rustls
+      - name: cargo check (client-rustls only)
         run: cargo check --no-default-features --features client-rustls --all-targets
 
-      - name: Assert openssl-sys is not in the dep graph
+      - name: Assert openssl-sys / native-tls absent from dep graph
         run: |
           if cargo tree --no-default-features --features client-rustls --prefix none \
               | grep -E '^(openssl|openssl-sys|native-tls) '; then
@@ -128,32 +133,39 @@ jobs:
             exit 1
           fi
 
+  audit:
+    name: cargo audit
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # RUSTSEC-2023-0071 (`rsa` 0.9.x Marvin Attack timing sidechannel)
+      # reaches us transitively via `surrealdb` 3.x with no upstream
+      # patched version; revisit when upstream ships a fix or
+      # `surrealdb` swaps RSA JWT verification for a constant-time
+      # implementation. Informational unmaintained warnings stay
+      # non-blocking because `--deny warnings` is not passed.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
   integration:
     name: Integration Tests
-    # Run integration tests on the cloud `ubuntu-latest` runner rather
-    # than the self-hosted aur0 host. Two reasons:
-    #
-    # 1. The aur0 host already runs a `kushtakas-surrealdb` container
-    #    bound to port 8000, so the integration job's `docker run -p
-    #    8000:8000` collides ("Bind for 0.0.0.0:8000 failed: port is
-    #    already allocated"). Re-mapping to another host port works
-    #    around the bind but the test's `ws://localhost:<port>` connect
-    #    then fails ("Cannot assign requested address") because the
-    #    aur0 runner is itself containerised and cannot reach a sibling
-    #    container via the host's loopback. ubuntu-latest is a bare VM
-    #    that gets a fresh dockerd, so neither problem exists there.
-    # 2. Cloud runners avoid exposing aur0 to fork-PR code execution.
-    #
-    # The sibling surql-py port made the same move for the same
-    # reasons.
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Start SurrealDB
         run: |
-          # Idempotent self-clean — no stopped sibling on a fresh VM, but
-          # harmless if it ever runs there.
           docker rm -f surrealdb >/dev/null 2>&1 || true
           docker run -d \
             --name surrealdb \
@@ -168,9 +180,6 @@ jobs:
             echo "Waiting for SurrealDB... attempt $i"
             sleep 2
           done
-          # Fail the job if the server never came up so downstream
-          # connect failures surface here rather than as cryptic
-          # WebSocket errors mid-test.
           curl -sf http://localhost:8000/health
 
       - name: Install Rust toolchain
@@ -179,11 +188,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      # `--test-threads=1` because the tests share a single namespace
+      # / database; running them in parallel causes SurrealDB write
+      # conflicts.
       - name: Run integration tests
-        # --test-threads=1 because the tests share a single namespace /
-        # database; running them in parallel causes SurrealDB write
-        # conflicts ("Failed to commit transaction due to a read or
-        # write conflict").
         run: |
           if [ -d tests ] && ls tests/*.rs >/dev/null 2>&1; then
             cargo test --all-features --tests -- --test-threads=1
@@ -195,8 +203,90 @@ jobs:
           SURREAL_USER: root
           SURREAL_PASS: root
 
-      - name: Stop and remove SurrealDB
+      - name: Stop SurrealDB
         if: always()
-        # The cloud `ubuntu-latest` runner is ephemeral so cleanup is
-        # cosmetic — included for symmetry with the start step.
         run: docker rm -f surrealdb >/dev/null 2>&1 || true
+
+  coverage:
+    name: Coverage
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-coverage"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Collect coverage
+        run: cargo llvm-cov --all-features --lib --lcov --output-path lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+  docs-build:
+    name: Build docs site
+    needs: [test, integration, coverage, audit, build-rustls]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install mkdocs-material mkdocs-minify-plugin
+
+      - name: mkdocs build --strict
+        run: mkdocs build --strict
+
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  docs-approval:
+    name: Approve docs deploy
+    needs: docs-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # `docs-deploy-approval` is a GitHub Environment with required
+    # reviewers configured in repo settings. The job just waits on
+    # human sign-off before docs-deploy fires.
+    environment:
+      name: docs-deploy-approval
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - run: echo "Awaiting approval for docs deploy to GitHub Pages..."
+
+  docs-deploy:
+    name: Deploy docs to GitHub Pages
+    needs: docs-approval
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
