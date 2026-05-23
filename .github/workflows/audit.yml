@@ -1,21 +1,12 @@
-name: Security Audit
+name: Security Audit (scheduled)
+
+# Daily safety net for `cargo audit`. The push / pull-request audit
+# path now lives inside the consolidated `ci.yml` pipeline so it can
+# gate `docs-deploy` directly; this workflow only fires on the cron
+# schedule to catch new RUSTSEC advisories that appear when no
+# commit lands.
 
 on:
-  pull_request:
-    branches:
-      - main
-      - 'release/**'
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/audit.yml'
-  push:
-    branches:
-      - main
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/audit.yml'
   schedule:
     - cron: '0 4 * * *'
   workflow_dispatch:
@@ -23,9 +14,6 @@ on:
 permissions:
   contents: read
 
-# Per-ref concurrency: cancel in-progress audits for the same ref when
-# a new push lands. The schedule trigger is unaffected because its ref
-# differs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -45,17 +33,7 @@ jobs:
         with:
           tool: cargo-audit
 
-      # `cargo audit` exits non-zero on vulnerabilities by default; the
-      # informational `unmaintained` / `unsound` / `notice` advisories
-      # stay non-blocking unless `--deny warnings` is passed. We surface
-      # the latter as logs only because the unmaintained chain
-      # (atomic-polyfill, bincode 2.x) reaches us transitively through
-      # surrealdb and is not actionable from this repo.
-      #
-      # RUSTSEC-2023-0071 (`rsa` 0.9.x Marvin Attack timing sidechannel)
-      # is a real vulnerability advisory but reaches us transitively via
-      # `surrealdb` 3.x; no patched version is available upstream.
-      # Revisit when upstream ships a fix or `surrealdb` swaps RSA JWT
-      # verification for a constant-time implementation.
-      - name: Run cargo audit
+      # See `ci.yml` for the rationale on `--ignore RUSTSEC-2023-0071`
+      # (transitive `rsa` 0.9.x Marvin Attack, no upstream patch).
+      - name: cargo audit
         run: cargo audit --ignore RUSTSEC-2023-0071

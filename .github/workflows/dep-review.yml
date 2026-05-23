@@ -19,6 +19,12 @@ concurrency:
 jobs:
   dep-review:
     name: Dependency Review
+    # Refuse to run on PRs opened from a fork. Defence in depth: the
+    # action itself does not check out fork code, but skipping the
+    # job entirely avoids spending runner time on PRs we will not
+    # accept directly anyway (fork PRs must be reviewed and
+    # re-opened from a branch in this repo).
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
