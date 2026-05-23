@@ -43,6 +43,13 @@ env:
 jobs:
   lint:
     name: Lint (fmt + clippy)
+    # Refuse to run on PRs opened from a fork. The downstream jobs
+    # all `needs: lint` so this single guard cascades and skips the
+    # entire pipeline for fork PRs. Push events only ever fire from
+    # within this repo (GitHub does not run push workflows on
+    # forks against the upstream repo's workflow files), so the
+    # `push` branch of the condition is always true.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, aur0]
     steps:
       - uses: actions/checkout@v6
