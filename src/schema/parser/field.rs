@@ -29,6 +29,11 @@ fn flexible_regex() -> &'static Regex {
     RE.get_or_init(|| regex_case_insensitive(r"\bFLEXIBLE\b"))
 }
 
+fn record_target_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"record\s*<\s*(\w+)\s*>"))
+}
+
 // --- Public parsers ----------------------------------------------------------
 
 /// Parse every entry of a `fd` / `fields` map.
@@ -57,6 +62,7 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
         permissions: None,
         readonly: extract_readonly(definition),
         flexible: extract_flexible(definition),
+        target_table: extract_target_table(definition),
     })
 }
 
@@ -84,6 +90,13 @@ fn extract_field_type(definition: &str) -> FieldType {
         "geometry" => FieldType::Geometry,
         _ => FieldType::Any,
     }
+}
+
+/// Extract the target table from a `record<table>` TYPE clause, if present.
+fn extract_target_table(definition: &str) -> Option<String> {
+    record_target_regex()
+        .captures(definition)
+        .map(|caps| caps[1].to_string())
 }
 
 /// Locate the case-insensitive keyword `kw` in `text` only at word boundaries

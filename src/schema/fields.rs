@@ -22,6 +22,26 @@ fn field_name_part_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").expect("valid regex"))
 }
 
+/// Regex matching the canonical `type::record("<table>", $value)` coercion.
+fn type_record_coercion_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"^type::record\s*\(\s*["']([a-zA-Z_][a-zA-Z0-9_]*)["']\s*,\s*\$value\s*\)\s*\z"#,
+        )
+        .expect("valid regex")
+    })
+}
+
+/// If `value` is the canonical record coercion expression, return the target
+/// table. `type::record("plan", $value)` yields `Some("plan")`. Returns `None`
+/// for anything else, including more complex VALUE expressions.
+fn detect_target_table_from_value(value: &str) -> Option<String> {
+    type_record_coercion_regex()
+        .captures(value.trim())
+        .map(|caps| caps[1].to_string())
+}
+
 /// SurrealDB field types supported by `DEFINE FIELD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +139,10 @@ pub struct FieldDefinition {
     /// Whether the field allows flexible schema.
     #[serde(default)]
     pub flexible: bool,
+    /// For RECORD fields, the target table this field links to. When set,
+    /// renders `TYPE record<{target_table}>` instead of bare `record`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub target_table: Option<String>,
 }
 
 impl FieldDefinition {
@@ -136,6 +160,7 @@ impl FieldDefinition {
             permissions: None,
             readonly: false,
             flexible: false,
+            target_table: None,
         }
     }
 
@@ -185,6 +210,12 @@ impl FieldDefinition {
         self
     }
 
+    /// Set the record target table, rendering `TYPE record<table>`.
+    pub fn with_target_table(mut self, table: impl Into<String>) -> Self {
+        self.target_table = Some(table.into());
+        self
+    }
+
     /// Validate the field definition against SurrealDB identifier rules.
     ///
     /// Returns [`SurqlError::Validation`] for an empty name, empty segments,
@@ -214,12 +245,13 @@ impl FieldDefinition {
     /// Render with optional `IF NOT EXISTS` clause.
     pub fn to_surql_with_options(&self, table: &str, if_not_exists: bool) -> String {
         let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        let (type_clause, drop_value) = self.resolve_type_clause();
         let mut sql = format!(
             "DEFINE FIELD{ine} {name} ON TABLE {table} TYPE {ty}",
             ine = ine,
             name = self.name,
             table = table,
-            ty = self.field_type.as_str(),
+            ty = type_clause,
         );
         if let Some(assertion) = &self.assertion {
             write!(sql, " ASSERT {}", assertion).expect("writing to String cannot fail");
@@ -228,7 +260,9 @@ impl FieldDefinition {
             write!(sql, " DEFAULT {}", default).expect("writing to String cannot fail");
         }
         if let Some(value) = &self.value {
-            write!(sql, " VALUE {}", value).expect("writing to String cannot fail");
+            if !drop_value {
+                write!(sql, " VALUE {}", value).expect("writing to String cannot fail");
+            }
         }
         if self.readonly {
             sql.push_str(" READONLY");
@@ -238,6 +272,24 @@ impl FieldDefinition {
         }
         sql.push(';');
         sql
+    }
+
+    /// Resolve the `TYPE` clause, honoring a RECORD `target_table` by emitting
+    /// `record<target>`. The returned boolean indicates whether a redundant
+    /// `type::record("target", $value)` VALUE coercion should be dropped.
+    fn resolve_type_clause(&self) -> (String, bool) {
+        if self.field_type == FieldType::Record {
+            if let Some(target) = &self.target_table {
+                let drop_value = self
+                    .value
+                    .as_deref()
+                    .and_then(detect_target_table_from_value)
+                    .as_deref()
+                    == Some(target.as_str());
+                return (format!("record<{target}>"), drop_value);
+            }
+        }
+        (self.field_type.as_str().to_string(), false)
     }
 }
 
@@ -360,18 +412,53 @@ impl FieldBuilder {
         self
     }
 
+    /// Set the record target table, rendering `TYPE record<table>`.
+    pub fn target_table(mut self, table: impl Into<String>) -> Self {
+        self.inner.target_table = Some(table.into());
+        self
+    }
+
     /// Finalise the builder, returning the field and an optional reserved-word
     /// warning message for the caller to log.
-    pub fn build(self) -> Result<(FieldDefinition, Option<String>)> {
+    pub fn build(mut self) -> Result<(FieldDefinition, Option<String>)> {
+        self.finalize_record_target();
         self.inner.validate()?;
         let warning = check_reserved_word(&self.inner.name, false);
         Ok((self.inner, warning))
     }
 
     /// Finalise the builder and discard any reserved-word warning.
-    pub fn build_unchecked(self) -> Result<FieldDefinition> {
+    pub fn build_unchecked(mut self) -> Result<FieldDefinition> {
+        self.finalize_record_target();
         self.inner.validate()?;
         Ok(self.inner)
+    }
+
+    /// Mirror `surql.schema.fields.field`: lift a canonical
+    /// `type::record("X", $value)` coercion on a RECORD field into
+    /// `target_table`, then drop the now-redundant VALUE coercion.
+    fn finalize_record_target(&mut self) {
+        if self.inner.field_type != FieldType::Record {
+            return;
+        }
+        if self.inner.target_table.is_none() {
+            if let Some(detected) = self
+                .inner
+                .value
+                .as_deref()
+                .and_then(detect_target_table_from_value)
+            {
+                self.inner.target_table = Some(detected);
+            }
+        }
+        let redundant = matches!(
+            (self.inner.target_table.as_deref(), self.inner.value.as_deref()),
+            (Some(target), Some(value))
+                if detect_target_table_from_value(value).as_deref() == Some(target)
+        );
+        if redundant {
+            self.inner.value = None;
+        }
     }
 }
 
@@ -414,13 +501,12 @@ pub fn object_field(name: impl Into<String>) -> FieldBuilder {
 
 /// Convenience constructor for a `record` field.
 ///
-/// When `table` is `Some`, an assertion is attached that constrains the
-/// referenced record table. An explicit `assertion` chained afterwards is
-/// composed using `AND` (mirroring the Python behaviour).
+/// When `table` is `Some`, the target table is recorded so the field renders
+/// `TYPE record<table>` (the typed form SurrealDB introspection expects).
 pub fn record_field(name: impl Into<String>, table: Option<&str>) -> FieldBuilder {
     let mut builder = field(name, FieldType::Record);
     if let Some(target) = table {
-        builder.inner.assertion = Some(format!("$value.table = \"{target}\""));
+        builder.inner.target_table = Some(target.to_string());
     }
     builder
 }
@@ -607,13 +693,59 @@ mod tests {
     fn builder_record_field_with_table() {
         let (f, _) = record_field("author", Some("user")).build().unwrap();
         assert_eq!(f.field_type, FieldType::Record);
-        assert_eq!(f.assertion.as_deref(), Some(r#"$value.table = "user""#),);
+        assert_eq!(f.target_table.as_deref(), Some("user"));
+        assert_eq!(
+            f.to_surql("post"),
+            "DEFINE FIELD author ON TABLE post TYPE record<user>;"
+        );
     }
 
     #[test]
     fn builder_record_field_no_table() {
         let (f, _) = record_field("link", None).build().unwrap();
         assert!(f.assertion.is_none());
+        assert!(f.target_table.is_none());
+    }
+
+    #[test]
+    fn detect_target_table_matches_canonical_coercion() {
+        assert_eq!(
+            detect_target_table_from_value("type::record(\"plan\", $value)").as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            detect_target_table_from_value("type::record('user', $value)").as_deref(),
+            Some("user")
+        );
+        assert!(detect_target_table_from_value("$value.id").is_none());
+        assert!(detect_target_table_from_value("type::record(\"a\", $other)").is_none());
+    }
+
+    #[test]
+    fn explicit_target_table_renders_typed_record() {
+        let (f, _) = field("author", FieldType::Record)
+            .target_table("user")
+            .build()
+            .unwrap();
+        assert_eq!(f.target_table.as_deref(), Some("user"));
+        assert_eq!(
+            f.to_surql("post"),
+            "DEFINE FIELD author ON TABLE post TYPE record<user>;"
+        );
+    }
+
+    #[test]
+    fn value_coercion_lifts_target_table_and_drops_value() {
+        let (f, _) = field("workspace_id", FieldType::Record)
+            .value("type::record(\"workspace\", $value)")
+            .build()
+            .unwrap();
+        assert_eq!(f.target_table.as_deref(), Some("workspace"));
+        assert!(f.value.is_none());
+        assert_eq!(
+            f.to_surql("task"),
+            "DEFINE FIELD workspace_id ON TABLE task TYPE record<workspace>;"
+        );
     }
 
     #[test]
