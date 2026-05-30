@@ -7,6 +7,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Typed `record<table>` field emission. `FieldDefinition` gains a
+  `target_table` field, and `record_field(name, Some("user"))`, the new
+  `target_table(...)` builder setter, and `with_target_table(...)` all render
+  `TYPE record<user>`. A canonical `type::record("X", $value)` coercion on a
+  RECORD field is auto-lifted into `target_table` at build time, dropping the
+  now redundant VALUE clause. The `DEFINE FIELD` parser reads `record<table>`
+  back into `target_table` so typed records round-trip.
+
 ## [0.2.6] - 2026-05-22
 
 Maintenance release focused on closing open security, dependency, and
