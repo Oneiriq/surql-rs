@@ -124,7 +124,7 @@ ulid = { version = "1.1", features = ["serde"] }
 # selected explicitly by the `client` / `client-rustls` feature flags. The
 # default-feature set of `surrealdb` includes `rustls`; we prefer to be
 # explicit so downstream consumers know which TLS stack they are pulling.
-surrealdb = { version = "3.0", default-features = false, features = ["protocol-ws"], optional = true }
+surrealdb = { version = "3.1", default-features = false, features = ["protocol-ws"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "http2", "system-proxy"], optional = true }
 futures = { version = "0.3", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
