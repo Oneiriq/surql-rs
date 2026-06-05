@@ -195,6 +195,18 @@ impl EdgeDefinition {
     /// Render the `DEFINE TABLE` statement with optional `IF NOT EXISTS`.
     pub fn to_surql_with_options(&self, if_not_exists: bool) -> Result<String> {
         let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        // Table-level PERMISSIONS render inline on the DEFINE TABLE statement
+        // (the only valid placement), matching `TableDefinition`.
+        let perms = match &self.permissions {
+            Some(p) if !p.is_empty() => {
+                let clauses: Vec<String> = p
+                    .iter()
+                    .map(|(action, rule)| format!("FOR {action} WHERE {rule}"))
+                    .collect();
+                format!(" PERMISSIONS {}", clauses.join(" "))
+            }
+            _ => String::new(),
+        };
         match self.mode {
             EdgeMode::Relation => {
                 let from = self
@@ -216,22 +228,25 @@ impl EdgeDefinition {
                         ),
                     })?;
                 Ok(format!(
-                    "DEFINE TABLE{ine} {name} TYPE RELATION FROM {from} TO {to};",
+                    "DEFINE TABLE{ine} {name} TYPE RELATION FROM {from} TO {to}{perms};",
                     ine = ine,
                     name = self.name,
                     from = from,
                     to = to,
+                    perms = perms,
                 ))
             }
             EdgeMode::Schemafull => Ok(format!(
-                "DEFINE TABLE{ine} {name} SCHEMAFULL;",
+                "DEFINE TABLE{ine} {name} SCHEMAFULL{perms};",
                 ine = ine,
                 name = self.name,
+                perms = perms,
             )),
             EdgeMode::Schemaless => Ok(format!(
-                "DEFINE TABLE{ine} {name} SCHEMALESS;",
+                "DEFINE TABLE{ine} {name} SCHEMALESS{perms};",
                 ine = ine,
                 name = self.name,
+                perms = perms,
             )),
         }
     }
@@ -429,6 +444,21 @@ mod tests {
         let e =
             typed_edge("follows", "user", "user").with_permissions([("create", "$auth.id = in")]);
         assert!(e.permissions.as_ref().unwrap().contains_key("create"));
+    }
+
+    #[test]
+    fn edge_permissions_render_inline_on_define_table() {
+        let e = typed_edge("follows", "user", "user")
+            .with_permissions([("select", "tenant_id = $auth.tenant")]);
+        let sql = e.to_surql_with_options(false).unwrap();
+        assert!(sql.starts_with("DEFINE TABLE follows TYPE RELATION FROM user TO user"));
+        assert!(sql.contains("PERMISSIONS FOR select WHERE tenant_id = $auth.tenant"));
+        assert!(sql.ends_with(";"));
+        // No permissions -> no clause (unchanged behavior).
+        let plain = typed_edge("likes", "user", "post")
+            .to_surql_with_options(false)
+            .unwrap();
+        assert!(!plain.contains("PERMISSIONS"));
     }
 
     #[test]
