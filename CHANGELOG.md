@@ -7,6 +7,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-06-04
+
+### Fixed
+
+- **Table-level `PERMISSIONS` now render correctly.** `TableDefinition` emitted
+  a malformed `DEFINE FIELD PERMISSIONS FOR {action} ON TABLE ...` per action,
+  which SurrealDB rejects (`Unexpected token FOR`). Table permissions now render
+  inline on the `DEFINE TABLE` statement (`... PERMISSIONS FOR select WHERE ...
+  FOR create WHERE ...`), the only valid placement. Affects
+  `to_surql_with_options` / `to_surql_all_with_options` and `generate_table_sql`.
+- **Edge table `PERMISSIONS` were silently dropped.** `EdgeDefinition` ignored
+  its `permissions` entirely; they now render inline on the
+  `DEFINE TABLE ... TYPE RELATION` statement.
+- **Migration diff renders a permissions change as valid SurrealQL.** A
+  `ModifyPermissions` diff emitted the same malformed `DEFINE FIELD PERMISSIONS`
+  form; it now emits a single `DEFINE TABLE <t> PERMISSIONS ...` statement. (A
+  `SCHEMAFULL` table re-defined this way falls back to `SCHEMALESS`; full-mode
+  fidelity is a follow-up once the diff carries the table mode.)
+
+### Added
+
+- `AccessDefinition::to_surql_with_options(if_not_exists)` and
+  `generate_access_sql_with_options(access, if_not_exists)` to emit
+  `DEFINE ACCESS IF NOT EXISTS ...` for idempotent re-application (e.g. a
+  persistent store applying its schema on every connect).
+
 ## [0.2.7] - 2026-05-30
 
 ### Added
