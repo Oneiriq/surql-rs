@@ -229,9 +229,18 @@ impl AccessDefinition {
     ///
     /// Validates the definition first; returns an error if validation fails.
     pub fn to_surql(&self) -> Result<String> {
+        self.to_surql_with_options(false)
+    }
+
+    /// Render the `DEFINE ACCESS` statement, optionally with `IF NOT EXISTS` so
+    /// it can be re-applied idempotently (e.g. on every connect to a persistent
+    /// store). Validates the definition first.
+    pub fn to_surql_with_options(&self, if_not_exists: bool) -> Result<String> {
         self.validate()?;
+        let ine = if if_not_exists { "IF NOT EXISTS " } else { "" };
         let mut sql = format!(
-            "DEFINE ACCESS {name} ON DATABASE TYPE {ty}",
+            "DEFINE ACCESS {ine}{name} ON DATABASE TYPE {ty}",
+            ine = ine,
             name = self.name,
             ty = self.access_type.as_str(),
         );
@@ -417,6 +426,15 @@ mod tests {
         let sql = a.to_surql().unwrap();
         assert!(sql.contains("URL 'https://auth.example.com/jwks'"));
         assert!(sql.contains("WITH ISSUER 'https://auth.example.com'"));
+    }
+
+    #[test]
+    fn access_to_surql_if_not_exists() {
+        let a = jwt_access("api", JwtConfig::hs256("secret"));
+        let sql = a.to_surql_with_options(true).unwrap();
+        assert!(sql.starts_with("DEFINE ACCESS IF NOT EXISTS api ON DATABASE"));
+        // Default stays without the guard.
+        assert!(a.to_surql().unwrap().starts_with("DEFINE ACCESS api ON DATABASE"));
     }
 
     #[test]

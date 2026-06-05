@@ -82,6 +82,15 @@ pub fn generate_access_sql(access: &AccessDefinition) -> Result<Vec<String>> {
     Ok(vec![access.to_surql()?])
 }
 
+/// Render the `DEFINE ACCESS` statement(s) for `access`, optionally with
+/// `IF NOT EXISTS` for idempotent re-application.
+pub fn generate_access_sql_with_options(
+    access: &AccessDefinition,
+    if_not_exists: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![access.to_surql_with_options(if_not_exists)?])
+}
+
 /// Render a complete SurrealQL schema script.
 ///
 /// Tables render first, followed by edges. Each definition block is
