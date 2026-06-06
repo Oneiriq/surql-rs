@@ -453,7 +453,7 @@ mod tests {
         let sql = e.to_surql_with_options(false).unwrap();
         assert!(sql.starts_with("DEFINE TABLE follows TYPE RELATION FROM user TO user"));
         assert!(sql.contains("PERMISSIONS FOR select WHERE tenant_id = $auth.tenant"));
-        assert!(sql.ends_with(";"));
+        assert!(sql.ends_with(';'));
         // No permissions -> no clause (unchanged behavior).
         let plain = typed_edge("likes", "user", "post")
             .to_surql_with_options(false)

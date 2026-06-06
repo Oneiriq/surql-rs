@@ -794,7 +794,7 @@ mod tests {
         assert!(define.contains("PERMISSIONS FOR"));
         assert!(define.contains("FOR select WHERE $auth.id = id"));
         assert!(define.contains("FOR create WHERE $auth.id = id"));
-        assert!(define.ends_with(";"));
+        assert!(define.ends_with(';'));
         // And there is no separate malformed statement.
         let stmts = t.to_surql_all();
         assert!(!stmts.iter().any(|s| s.contains("DEFINE FIELD PERMISSIONS")));
