@@ -49,6 +49,10 @@ pub enum Operator {
     IsNull(IsNull),
     /// `field IS NOT NULL`
     IsNotNull(IsNotNull),
+    /// `field IS NONE`
+    IsNone(IsNone),
+    /// `field IS NOT NONE`
+    IsNotNone(IsNotNone),
     /// `(left) AND (right)`
     And(And),
     /// `(left) OR (right)`
@@ -74,6 +78,8 @@ impl OperatorExpr for Operator {
             Self::NotInside(x) => x.to_surql(),
             Self::IsNull(x) => x.to_surql(),
             Self::IsNotNull(x) => x.to_surql(),
+            Self::IsNone(x) => x.to_surql(),
+            Self::IsNotNone(x) => x.to_surql(),
             Self::And(x) => x.to_surql(),
             Self::Or(x) => x.to_surql(),
             Self::Not(x) => x.to_surql(),
@@ -251,6 +257,54 @@ impl OperatorExpr for IsNotNull {
     }
 }
 
+/// `field IS NONE` — matches an absent field. SurrealDB distinguishes NONE
+/// (the field is not set) from NULL (set to the null value); a field skipped
+/// during serialization reads as NONE, so this is the correct guard for an
+/// optional field that is simply unset.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IsNone {
+    /// Field name.
+    pub field: String,
+}
+
+impl IsNone {
+    /// Construct `IS NONE` for the given field.
+    pub fn new(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+        }
+    }
+}
+
+impl OperatorExpr for IsNone {
+    fn to_surql(&self) -> String {
+        format!("{} IS NONE", self.field)
+    }
+}
+
+/// `field IS NOT NONE` — matches a field that is set (to any value, including
+/// null). The complement of [`IsNone`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IsNotNone {
+    /// Field name.
+    pub field: String,
+}
+
+impl IsNotNone {
+    /// Construct `IS NOT NONE` for the given field.
+    pub fn new(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+        }
+    }
+}
+
+impl OperatorExpr for IsNotNone {
+    fn to_surql(&self) -> String {
+        format!("{} IS NOT NONE", self.field)
+    }
+}
+
 /// Logical AND of two operators.
 #[derive(Debug, Clone, PartialEq)]
 pub struct And {
@@ -366,6 +420,16 @@ pub fn is_null(field: impl Into<String>) -> Operator {
 /// Build an [`IsNotNull`] operator.
 pub fn is_not_null(field: impl Into<String>) -> Operator {
     Operator::IsNotNull(IsNotNull::new(field))
+}
+
+/// Build an [`IsNone`] operator (`field IS NONE` — the field is unset).
+pub fn is_none(field: impl Into<String>) -> Operator {
+    Operator::IsNone(IsNone::new(field))
+}
+
+/// Build an [`IsNotNone`] operator (`field IS NOT NONE` — the field is set).
+pub fn is_not_none(field: impl Into<String>) -> Operator {
+    Operator::IsNotNone(IsNotNone::new(field))
 }
 
 /// Combine two operators with logical AND.
@@ -590,6 +654,17 @@ mod tests {
         assert_eq!(
             is_not_null("created_at").to_surql(),
             "created_at IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn is_none_and_not_none() {
+        // An absent (unset) field is NONE, not NULL -- the correct guard for an
+        // optional field that was never written.
+        assert_eq!(is_none("deleted_at").to_surql(), "deleted_at IS NONE");
+        assert_eq!(
+            is_not_none("consolidated_expert").to_surql(),
+            "consolidated_expert IS NOT NONE"
         );
     }
 

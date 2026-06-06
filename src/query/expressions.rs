@@ -76,6 +76,62 @@ impl Expression {
     pub fn to_surql(&self) -> String {
         self.sql.clone()
     }
+
+    fn binary(self, op: &str, rhs: impl Into<Expression>) -> Self {
+        Expression::raw(format!("({} {} {})", self.sql, op, rhs.into().sql))
+    }
+}
+
+// Arithmetic via the standard operator traits, so expressions compose with
+// `+ - * /`. The result is parenthesised so precedence is explicit:
+// `field("n") + 1` renders `(n + 1)`.
+// Because the right-hand side may be another field reference, an
+// `UPDATE ... SET` assignment can compute the new value from the row's current
+// value — collapsing a read-modify-write into one atomic statement.
+impl<R: Into<Expression>> std::ops::Add<R> for Expression {
+    type Output = Expression;
+    fn add(self, rhs: R) -> Expression {
+        self.binary("+", rhs)
+    }
+}
+
+impl<R: Into<Expression>> std::ops::Sub<R> for Expression {
+    type Output = Expression;
+    fn sub(self, rhs: R) -> Expression {
+        self.binary("-", rhs)
+    }
+}
+
+impl<R: Into<Expression>> std::ops::Mul<R> for Expression {
+    type Output = Expression;
+    fn mul(self, rhs: R) -> Expression {
+        self.binary("*", rhs)
+    }
+}
+
+impl<R: Into<Expression>> std::ops::Div<R> for Expression {
+    type Output = Expression;
+    fn div(self, rhs: R) -> Expression {
+        self.binary("/", rhs)
+    }
+}
+
+impl From<i64> for Expression {
+    fn from(n: i64) -> Self {
+        Expression::value(n)
+    }
+}
+
+impl From<i32> for Expression {
+    fn from(n: i32) -> Self {
+        Expression::value(n)
+    }
+}
+
+impl From<f64> for Expression {
+    fn from(n: f64) -> Self {
+        Expression::value(n)
+    }
 }
 
 impl std::fmt::Display for Expression {
@@ -419,6 +475,20 @@ mod tests {
     fn count_renders() {
         assert_eq!(count(None).to_surql(), "COUNT(*)");
         assert_eq!(count(Some("id")).to_surql(), "COUNT(id)");
+    }
+
+    #[test]
+    fn arithmetic_combinators_reference_current_fields() {
+        // A counter increment that reads the row's own value.
+        assert_eq!((field("n") + 1).to_surql(), "(n + 1)");
+        // The reinforcement confidence bump: confidence + (1 - confidence) * 0.25.
+        let bump = field("confidence") + (value(1) - field("confidence")) * 0.25;
+        assert_eq!(bump.to_surql(), "(confidence + ((1 - confidence) * 0.25))");
+        // The right-hand side accepts a numeric literal or another expression.
+        assert_eq!(
+            (field("total") / field("count")).to_surql(),
+            "(total / count)"
+        );
     }
 
     #[test]

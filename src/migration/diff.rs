@@ -1313,7 +1313,9 @@ mod tests {
         let diffs = diff_permissions("t", Some(&new_perms), None);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].operation, DiffOperation::ModifyPermissions);
-        assert!(diffs[0].forward_sql.starts_with("DEFINE TABLE t PERMISSIONS"));
+        assert!(diffs[0]
+            .forward_sql
+            .starts_with("DEFINE TABLE t PERMISSIONS"));
         assert!(diffs[0].forward_sql.contains("FOR select WHERE true"));
         assert!(!diffs[0].forward_sql.contains("DEFINE FIELD PERMISSIONS"));
         assert_eq!(diffs[0].backward_sql, "");

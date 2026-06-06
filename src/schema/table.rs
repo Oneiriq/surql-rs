@@ -785,10 +785,8 @@ mod tests {
 
     #[test]
     fn table_permissions_render_on_define_table() {
-        let t = table_schema("user").with_permissions([
-            ("select", "$auth.id = id"),
-            ("create", "$auth.id = id"),
-        ]);
+        let t = table_schema("user")
+            .with_permissions([("select", "$auth.id = id"), ("create", "$auth.id = id")]);
         let define = t.to_surql_with_options(false);
         // Permissions live inside the DEFINE TABLE statement, not a bogus
         // `DEFINE FIELD PERMISSIONS ...` line.

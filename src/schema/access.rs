@@ -434,7 +434,10 @@ mod tests {
         let sql = a.to_surql_with_options(true).unwrap();
         assert!(sql.starts_with("DEFINE ACCESS IF NOT EXISTS api ON DATABASE"));
         // Default stays without the guard.
-        assert!(a.to_surql().unwrap().starts_with("DEFINE ACCESS api ON DATABASE"));
+        assert!(a
+            .to_surql()
+            .unwrap()
+            .starts_with("DEFINE ACCESS api ON DATABASE"));
     }
 
     #[test]

@@ -27,9 +27,12 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use serde_json::Value;
+
 use crate::error::{Result, SurqlError};
 use crate::types::operators::{quote_value_public, Operator, OperatorExpr};
 
+use super::expressions::Expression;
 use super::helpers::{DataMap, ReturnFormat, VectorDistanceType};
 use super::hints::{render_hints, QueryHint};
 
@@ -142,6 +145,10 @@ pub struct Query {
     pub insert_data: Option<DataMap>,
     /// Data for `UPDATE SET` / `UPSERT CONTENT`.
     pub update_data: Option<DataMap>,
+    /// Expression-valued `UPDATE ... SET` assignments (e.g. `n = n + 1`), whose
+    /// right-hand side may reference the row's current fields. Rendered after
+    /// `update_data` in the same `SET` clause.
+    pub update_set_exprs: Vec<(String, Expression)>,
     /// Source record id for `RELATE`.
     pub relate_from: Option<String>,
     /// Target record id for `RELATE`.
@@ -418,6 +425,41 @@ impl Query {
             update_data: Some(data),
             ..self
         })
+    }
+
+    /// Begin an `UPDATE <target> SET ...` whose assignments are supplied via
+    /// [`set`](Self::set) (literal) and [`set_expr`](Self::set_expr)
+    /// (expression-valued, may reference current fields), instead of a literal
+    /// data map. Combine with [`where_`](Self::where_) for a guarded, atomic
+    /// read-modify-write — `UPDATE t SET n = n + 1 WHERE ...` in one statement.
+    pub fn update_set(self, target: impl Into<String>) -> Result<Self> {
+        let target = target.into();
+        validate_identifier(table_part(&target), "table name")?;
+        Ok(Self {
+            operation: Some(Operation::Update),
+            table_name: Some(target),
+            ..self
+        })
+    }
+
+    /// Add a literal-valued assignment to an `UPDATE ... SET`
+    /// (`set("updated_at", now)` ⇒ `updated_at = '<now>'`).
+    pub fn set(mut self, field: impl Into<String>, value: impl Into<Value>) -> Result<Self> {
+        let field = field.into();
+        validate_identifier(&field, "field name")?;
+        self.update_set_exprs
+            .push((field, Expression::value(value)));
+        Ok(self)
+    }
+
+    /// Add an expression-valued assignment to an `UPDATE ... SET`, where the new
+    /// value may reference the row's current fields
+    /// (`set_expr("n", field("n") + 1)` ⇒ `n = n + 1`).
+    pub fn set_expr(mut self, field: impl Into<String>, expr: Expression) -> Result<Self> {
+        let field = field.into();
+        validate_identifier(&field, "field name")?;
+        self.update_set_exprs.push((field, expr));
+        Ok(self)
     }
 
     /// Build an `UPSERT` query.
@@ -738,15 +780,25 @@ impl Query {
 
     fn build_update(&self) -> Result<String> {
         let table = self.require_table(Operation::Update)?;
-        let data = self.update_data.as_ref().ok_or_else(|| SurqlError::Query {
-            reason: "Update data required for UPDATE query".into(),
-        })?;
 
-        let set_str = data
-            .iter()
-            .map(|(k, v)| format!("{k} = {}", quote_value_public(v)))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut assignments: Vec<String> = Vec::new();
+        if let Some(data) = self.update_data.as_ref() {
+            assignments.extend(
+                data.iter()
+                    .map(|(k, v)| format!("{k} = {}", quote_value_public(v))),
+            );
+        }
+        assignments.extend(
+            self.update_set_exprs
+                .iter()
+                .map(|(k, expr)| format!("{k} = {}", expr.to_surql())),
+        );
+        if assignments.is_empty() {
+            return Err(SurqlError::Query {
+                reason: "Update data required for UPDATE query".into(),
+            });
+        }
+        let set_str = assignments.join(", ");
 
         let mut parts = vec![format!("UPDATE {table} SET {set_str}")];
         if !self.conditions.is_empty() {
@@ -917,6 +969,31 @@ mod tests {
         assert_eq!(
             q.to_surql().unwrap(),
             "UPDATE user:alice SET status = 'active'"
+        );
+    }
+
+    #[test]
+    fn update_set_expr_renders_atomic_guarded_update() {
+        use crate::query::expressions::field;
+        use crate::types::operators::{and_, eq, is_none};
+
+        // An atomic, tombstone-guarded read-modify-write in one statement: the
+        // increment references the row's own value, and the guard skips a row
+        // that was forgotten (deleted_at set) between read and write.
+        let q = Query::new()
+            .update_set("memory:abc")
+            .unwrap()
+            .set_expr("reinforcement", field("reinforcement") + 1)
+            .unwrap()
+            .set("updated_at", "2026-06-06T00:00:00+00:00")
+            .unwrap()
+            .where_(and_(eq("tenant_id", "t"), is_none("deleted_at")))
+            .return_after();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "UPDATE memory:abc SET reinforcement = (reinforcement + 1), \
+             updated_at = '2026-06-06T00:00:00+00:00' \
+             WHERE ((tenant_id = 't') AND (deleted_at IS NONE)) RETURN AFTER"
         );
     }
 
