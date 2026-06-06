@@ -7,7 +7,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.28.0] - 2026-06-04
+## [0.28.0] - 2026-06-06
 
 ### Fixed
 
@@ -28,6 +28,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Expression-valued `UPDATE ... SET` for atomic read-modify-writes.**
+  `Query::update_set` begins an `UPDATE <target> SET ...` whose assignments are
+  supplied via `set` (literal) or `set_expr` (expression-valued), combinable
+  with `where_` and `RETURN`. `Expression` now implements the standard
+  arithmetic operators (`+ - * /` over anything `Into<Expression>`, with
+  `From<i64|i32|f64>` for numeric literals), so a `SET` value can reference the
+  row's current fields — e.g. `UPDATE t SET n = n + 1 WHERE ...` collapses a
+  read-modify-write into one statement.
+- **`is_none` / `is_not_none` operators** (`field IS NONE`) — the correct guard
+  for an absent optional field, which SurrealDB reports as `NONE`, not `NULL`.
 - `AccessDefinition::to_surql_with_options(if_not_exists)` and
   `generate_access_sql_with_options(access, if_not_exists)` to emit
   `DEFINE ACCESS IF NOT EXISTS ...` for idempotent re-application (e.g. a
