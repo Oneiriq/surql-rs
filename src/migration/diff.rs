@@ -786,14 +786,20 @@ fn render_permission_statements(table: &str, perms: Option<&BTreeMap<String, Str
     if perms.is_empty() {
         return String::new();
     }
-    let mut parts: Vec<String> = Vec::with_capacity(perms.len());
-    for (action, condition) in perms {
-        parts.push(format!(
-            "DEFINE FIELD PERMISSIONS FOR {} ON TABLE {table} WHERE {condition};",
-            action.to_uppercase()
-        ));
-    }
-    parts.join(" ")
+    // Table permissions render inline on a single `DEFINE TABLE` statement (the
+    // only valid placement for table-level PERMISSIONS), matching the schema
+    // renderer. This was previously a malformed `DEFINE FIELD PERMISSIONS FOR
+    // {action} ON TABLE ...` per action, which SurrealDB rejects.
+    //
+    // NOTE: this re-defines only the permissions; a `SCHEMAFULL` table would
+    // fall back to the `SCHEMALESS` default, so a full-fidelity permission
+    // migration should re-emit the table mode (a future improvement once the
+    // diff carries it here).
+    let clauses: Vec<String> = perms
+        .iter()
+        .map(|(action, condition)| format!("FOR {action} WHERE {condition}"))
+        .collect();
+    format!("DEFINE TABLE {table} PERMISSIONS {};", clauses.join(" "))
 }
 
 fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
@@ -1307,7 +1313,11 @@ mod tests {
         let diffs = diff_permissions("t", Some(&new_perms), None);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].operation, DiffOperation::ModifyPermissions);
-        assert!(diffs[0].forward_sql.contains("FOR SELECT"));
+        assert!(diffs[0]
+            .forward_sql
+            .starts_with("DEFINE TABLE t PERMISSIONS"));
+        assert!(diffs[0].forward_sql.contains("FOR select WHERE true"));
+        assert!(!diffs[0].forward_sql.contains("DEFINE FIELD PERMISSIONS"));
         assert_eq!(diffs[0].backward_sql, "");
     }
 
@@ -1557,8 +1567,12 @@ mod tests {
         code.insert("create".into(), "true".into());
         let diffs = diff_permissions("t", Some(&code), None);
         let fwd = &diffs[0].forward_sql;
-        // Two separate DEFINE FIELD PERMISSIONS statements.
-        assert_eq!(fwd.matches("DEFINE FIELD PERMISSIONS").count(), 2);
+        // One DEFINE TABLE statement carrying both actions inline (the valid
+        // placement), not separate malformed DEFINE FIELD statements.
+        assert_eq!(fwd.matches("DEFINE TABLE").count(), 1);
+        assert!(fwd.contains("FOR select WHERE true"));
+        assert!(fwd.contains("FOR create WHERE true"));
+        assert!(!fwd.contains("DEFINE FIELD PERMISSIONS"));
     }
 
     #[test]

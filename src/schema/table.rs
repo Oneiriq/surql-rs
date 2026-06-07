@@ -537,13 +537,28 @@ impl TableDefinition {
     }
 
     /// Render the `DEFINE TABLE` statement with optional `IF NOT EXISTS`.
+    ///
+    /// Table-level `PERMISSIONS` are rendered as part of this statement
+    /// (`... PERMISSIONS FOR select WHERE ... FOR create WHERE ...`), which is
+    /// the only valid placement for table permissions in SurrealQL.
     pub fn to_surql_with_options(&self, if_not_exists: bool) -> String {
         let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        let perms = match &self.permissions {
+            Some(perms) if !perms.is_empty() => {
+                let clauses: Vec<String> = perms
+                    .iter()
+                    .map(|(action, rule)| format!("FOR {action} WHERE {rule}"))
+                    .collect();
+                format!(" PERMISSIONS {}", clauses.join(" "))
+            }
+            _ => String::new(),
+        };
         format!(
-            "DEFINE TABLE{ine} {name} {mode};",
+            "DEFINE TABLE{ine} {name} {mode}{perms};",
             ine = ine,
             name = self.name,
             mode = self.mode.as_str(),
+            perms = perms,
         )
     }
 
@@ -569,16 +584,8 @@ impl TableDefinition {
         for event in &self.events {
             out.push(event.to_surql_with_options(&self.name, if_not_exists));
         }
-        if let Some(perms) = &self.permissions {
-            for (action, rule) in perms {
-                out.push(format!(
-                    "DEFINE FIELD PERMISSIONS FOR {action} ON TABLE {name} WHERE {rule};",
-                    action = action.to_uppercase(),
-                    name = self.name,
-                    rule = rule,
-                ));
-            }
-        }
+        // Table-level PERMISSIONS are rendered inline on the `DEFINE TABLE`
+        // statement (see `to_surql_with_options`), not as separate statements.
         out
     }
 }
@@ -777,12 +784,20 @@ mod tests {
     }
 
     #[test]
-    fn table_permissions_render_upper() {
-        let t = table_schema("user").with_permissions([("select", "$auth.id = id")]);
+    fn table_permissions_render_on_define_table() {
+        let t = table_schema("user")
+            .with_permissions([("select", "$auth.id = id"), ("create", "$auth.id = id")]);
+        let define = t.to_surql_with_options(false);
+        // Permissions live inside the DEFINE TABLE statement, not a bogus
+        // `DEFINE FIELD PERMISSIONS ...` line.
+        assert!(define.starts_with("DEFINE TABLE user"));
+        assert!(define.contains("PERMISSIONS FOR"));
+        assert!(define.contains("FOR select WHERE $auth.id = id"));
+        assert!(define.contains("FOR create WHERE $auth.id = id"));
+        assert!(define.ends_with(';'));
+        // And there is no separate malformed statement.
         let stmts = t.to_surql_all();
-        assert!(stmts
-            .iter()
-            .any(|s| s.contains("FOR SELECT") && s.contains("$auth.id = id")));
+        assert!(!stmts.iter().any(|s| s.contains("DEFINE FIELD PERMISSIONS")));
     }
 
     #[test]

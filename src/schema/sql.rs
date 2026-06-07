@@ -82,6 +82,15 @@ pub fn generate_access_sql(access: &AccessDefinition) -> Result<Vec<String>> {
     Ok(vec![access.to_surql()?])
 }
 
+/// Render the `DEFINE ACCESS` statement(s) for `access`, optionally with
+/// `IF NOT EXISTS` for idempotent re-application.
+pub fn generate_access_sql_with_options(
+    access: &AccessDefinition,
+    if_not_exists: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![access.to_surql_with_options(if_not_exists)?])
+}
+
 /// Render a complete SurrealQL schema script.
 ///
 /// Tables render first, followed by edges. Each definition block is
@@ -249,9 +258,11 @@ mod tests {
     fn generate_table_sql_with_permissions() {
         let t = table_schema("user").with_permissions([("select", "$auth.id = id")]);
         let stmts = generate_table_sql(&t, false);
-        assert!(stmts
-            .iter()
-            .any(|s| s.contains("FOR SELECT") && s.contains("$auth.id = id")));
+        // Permissions render inline on DEFINE TABLE, valid SurrealQL.
+        let define = &stmts[0];
+        assert!(define.starts_with("DEFINE TABLE user"));
+        assert!(define.contains("PERMISSIONS FOR select WHERE $auth.id = id"));
+        assert!(!stmts.iter().any(|s| s.contains("DEFINE FIELD PERMISSIONS")));
     }
 
     #[test]

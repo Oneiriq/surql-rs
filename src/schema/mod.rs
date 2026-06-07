@@ -77,7 +77,10 @@ pub use registry::{
     clear_registry, get_registered_edges, get_registered_tables, get_registry, register_edge,
     register_table, SchemaRegistry,
 };
-pub use sql::{generate_access_sql, generate_edge_sql, generate_schema_sql, generate_table_sql};
+pub use sql::{
+    generate_access_sql, generate_access_sql_with_options, generate_edge_sql, generate_schema_sql,
+    generate_table_sql,
+};
 pub use table::{
     event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
