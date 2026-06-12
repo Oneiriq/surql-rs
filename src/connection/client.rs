@@ -46,6 +46,13 @@ pub struct DatabaseClient {
     config: ConnectionConfig,
     inner: Surreal<Any>,
     connected: Arc<RwLock<bool>>,
+    /// Whether the underlying SDK engine has been connected. The SDK connects
+    /// a handle once and rejects a second `connect` ("Already connected"), so
+    /// a retry after a partially-successful attempt (engine up, signin or
+    /// namespace selection failed) must skip the engine connect and resume at
+    /// the step that actually failed -- otherwise every retry dies on the
+    /// re-connect and its error masks the real one.
+    engine_connected: Arc<RwLock<bool>>,
 }
 
 impl DatabaseClient {
@@ -57,6 +64,7 @@ impl DatabaseClient {
             config,
             inner: Surreal::init(),
             connected: Arc::new(RwLock::new(false)),
+            engine_connected: Arc::new(RwLock::new(false)),
         })
     }
 
@@ -79,7 +87,11 @@ impl DatabaseClient {
     ///
     /// Retries with exponential backoff up to
     /// [`ConnectionConfig::retry_max_attempts`] times; each attempt is
-    /// bounded by [`ConnectionConfig::timeout`].
+    /// bounded by [`ConnectionConfig::timeout`]. The underlying engine
+    /// connects at most once per handle; a retry -- or a reconnect on an
+    /// already-connected client -- resumes at the step that failed
+    /// (credential signin, namespace selection), so the error that surfaces
+    /// is the real failure, never the SDK's "Already connected" rejection.
     pub async fn connect(&self) -> Result<()> {
         // Reconnect is idempotent: disconnect any previous session first.
         if *self.connected.read().await {
@@ -368,12 +380,35 @@ impl DatabaseClient {
     async fn connect_once(&self) -> Result<()> {
         let timeout = Duration::from_secs_f64(self.config.timeout().max(0.1));
 
-        tokio::time::timeout(timeout, self.inner.connect(self.config.url().to_owned()))
-            .await
-            .map_err(|_| SurqlError::Connection {
-                reason: format!("connect timed out after {timeout:?}"),
-            })?
-            .map_err(|e| connection_err(&e))?;
+        // Connect the engine at most once per handle (the write lock also
+        // serialises concurrent connectors). On later attempts -- a retry
+        // after signin or namespace selection failed, or a reconnect -- the
+        // engine is already up, so resume at the step that failed instead of
+        // letting the SDK's "Already connected" rejection mask the real
+        // error. The SDK reporting "already connected" itself just means the
+        // engine is up by another path; treat it as such, not as a failure.
+        {
+            let mut engine_up = self.engine_connected.write().await;
+            if !*engine_up {
+                match tokio::time::timeout(
+                    timeout,
+                    self.inner.connect(self.config.url().to_owned()),
+                )
+                .await
+                {
+                    Err(_) => {
+                        return Err(SurqlError::Connection {
+                            reason: format!("connect timed out after {timeout:?}"),
+                        })
+                    }
+                    Ok(Err(e)) if !sdk_says_already_connected(&e) => {
+                        return Err(connection_err(&e))
+                    }
+                    Ok(_) => {}
+                }
+                *engine_up = true;
+            }
+        }
 
         if let (Some(user), Some(pass)) = (self.config.username(), self.config.password()) {
             self.inner
@@ -454,6 +489,13 @@ pub(crate) fn connection_err(err: &surrealdb::Error) -> SurqlError {
     SurqlError::Connection {
         reason: err.to_string(),
     }
+}
+
+/// The SDK's rejection of a second `connect` on an already-connected handle.
+/// (A message match, like [`classify_surrealdb_error`]'s fallbacks: the 3.x
+/// error type does not discriminate this case.)
+fn sdk_says_already_connected(err: &surrealdb::Error) -> bool {
+    err.to_string().to_lowercase().contains("already connected")
 }
 
 pub(crate) fn query_err(err: &surrealdb::Error) -> SurqlError {
@@ -586,6 +628,54 @@ mod tests {
         let client = DatabaseClient::new(ConnectionConfig::default()).unwrap();
         client.disconnect().await.unwrap();
         assert!(!client.is_connected());
+    }
+
+    /// Regression: a connect attempt that gets the engine up but fails a
+    /// later step (here: root signin against an embedded engine, which has no
+    /// root auth) used to die on the SDK's "Already connected" rejection on
+    /// every retry, masking the real error behind it.
+    #[tokio::test]
+    async fn retries_surface_the_failing_step_not_already_connected() {
+        let cfg = ConnectionConfig::builder()
+            .url("mem://")
+            .namespace("t")
+            .database("t")
+            .username("root")
+            .password("wrong")
+            .retry_max_attempts(3)
+            .retry_min_wait(0.1)
+            .retry_max_wait(1.0)
+            .build()
+            .unwrap();
+        let client = DatabaseClient::new(cfg).unwrap();
+        let err = client.connect().await.unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            !msg.contains("already connected"),
+            "the signin failure must surface, not the engine re-connect: {err}"
+        );
+        assert!(!client.is_connected());
+    }
+
+    /// Regression: reconnecting an already-connected client used to fail the
+    /// same way (the entry disconnect only invalidates; the engine stays up,
+    /// so the fresh `connect` died on "Already connected").
+    #[tokio::test]
+    async fn reconnect_on_the_same_client_succeeds() {
+        let cfg = ConnectionConfig::builder()
+            .url("mem://")
+            .namespace("t")
+            .database("t")
+            .retry_max_attempts(1)
+            .build()
+            .unwrap();
+        let client = DatabaseClient::new(cfg).unwrap();
+        client.connect().await.unwrap();
+        assert!(client.is_connected());
+        client.connect().await.unwrap();
+        assert!(client.is_connected(), "reconnect lands back in service");
+        // And the session still works.
+        client.query("INFO FOR DB").await.unwrap();
     }
 
     #[tokio::test]

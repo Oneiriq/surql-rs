@@ -1,6 +1,6 @@
 [package]
 name = "oneiriq-surql"
-version = "0.28.0"
+version = "0.28.1"
 edition = "2021"
 rust-version = "1.90"
 authors = ["Shon Thomas <shon@oneiriq.com>"]
@@ -160,6 +160,10 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 tokio = { version = "1.48", features = ["full", "test-util"] }
+# Feature-unifies `kv-mem` into the client's `surrealdb` so connection tests
+# can run a real embedded engine (`mem://`) without a server. Test-only; the
+# published feature set stays ws-only.
+surrealdb = { version = "3.0", default-features = false, features = ["kv-mem"] }
 pretty_assertions = "1.4"
 tempfile = "3.13"
 assert_cmd = "2.2"

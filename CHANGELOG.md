@@ -7,6 +7,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-06-12
+
+### Fixed
+
+- **Connect retries no longer mask the real failure behind "Already
+  connected".** The SDK engine connects once per handle and rejects a second
+  `connect`; after a partially-successful attempt (engine up, then credential
+  signin or namespace selection failed), every retry died on that rejection,
+  so the surfaced error was `Already connected` instead of the actual failure
+  (e.g. `There was a problem with authentication`), and retries 2..n never
+  re-attempted the failing step at all. `DatabaseClient` now tracks
+  engine-level connection state: a retry — or a `connect` on an
+  already-connected client (reconnect), which failed the same way — skips the
+  engine connect and resumes at the step that failed.
+
 ## [0.28.0] - 2026-06-06
 
 ### Fixed
