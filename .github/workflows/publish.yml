@@ -1,0 +1,132 @@
+name: Publish to crates.io
+
+# The deploy workflow, mirroring Oneiriq/surql-py and Oneiriq/surql's
+# `publish.yml`: it fires on a published GitHub Release (or a manual dispatch),
+# re-verifies the tagged commit, then publishes to crates.io behind a
+# human-approved environment gate.
+#
+# crates.io has no staging registry, so the siblings' testpypi/pypi (and
+# jsr/npm) split maps to dry-run vs. real publish:
+#   * a prerelease Release, or a `dry-run` dispatch, runs `verify` only
+#     (packages + `cargo publish --dry-run`, uploads nothing);
+#   * a normal Release, or a `crates-io` dispatch, runs verify -> approval
+#     (the `crates-io-approval` environment gate) -> publish.
+#
+# Unlike the siblings, the gates run on ubuntu-latest rather than the aur0
+# self-hosted runner: a token publish needs no self-hosted resources, and the
+# `--all-features` build needs apt's libssl-dev (the legacy `client` feature
+# links system OpenSSL).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target"
+        required: true
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - crates-io
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  verify:
+    name: Verify release readiness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # `--all-features` enables the legacy `client` (native-tls) feature, which
+      # links system OpenSSL; install the headers, as ci.yml does.
+      - name: Install libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'release'
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CRATE_VERSION="$(cargo pkgid | sed -E 's/.*[#@]([^@#]+)$/\1/')"
+          echo "Tag version:   $TAG_VERSION"
+          echo "Crate version: $CRATE_VERSION"
+          if [ "$TAG_VERSION" != "$CRATE_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $CRATE_VERSION"
+            exit 1
+          fi
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test (lib + doc)
+        run: |
+          cargo test --lib --all-features
+          cargo test --doc --all-features
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Re-audit at release: ci.yml already audited the tagged commit on the way
+      # to main, but a new RUSTSEC advisory can land between merge and release.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --all-features
+
+  approval:
+    name: Approve crates.io publish
+    needs: verify
+    # Only the real-publish path: a normal Release, or an explicit `crates-io`
+    # dispatch. A prerelease Release or a `dry-run` dispatch stops after verify.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'crates-io') ||
+      (github.event_name == 'release' && !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    # `crates-io-approval` is a GitHub Environment with required reviewers
+    # configured in repo settings. The job just waits on human sign-off before
+    # publish fires.
+    environment:
+      name: crates-io-approval
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - run: echo "Awaiting approval to publish to crates.io..."
+
+  publish:
+    name: Publish to crates.io
+    needs: approval
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/oneiriq-surql
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
