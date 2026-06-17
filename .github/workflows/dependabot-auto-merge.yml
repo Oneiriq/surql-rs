@@ -23,7 +23,11 @@ jobs:
           running-workflow-name: auto-merge
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 30
-          allowed-conclusions: success,skipped
+          # CodeQL (and some GitHub-managed checks) report a `neutral` conclusion
+          # rather than `success` when there is nothing to act on; that is not a
+          # failure, so accept it here. Real failures (`failure`, `cancelled`,
+          # `timed_out`) remain excluded, so auto-merge still blocks on them.
+          allowed-conclusions: success,skipped,neutral
 
       - name: Approve + auto-merge
         run: |
