@@ -7,6 +7,34 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-06-17
+
+### Added
+
+- **Full-text search (BM25) is now first-class — the sparse leg of hybrid
+  retrieval.** Define a `DEFINE ANALYZER` in code with `analyzer(name)` /
+  `standard_analyzer(name)` (`AnalyzerDefinition` + `Tokenizer` + `TokenFilter`,
+  rendered via `generate_analyzer_sql` / `generate_analyzer_sql_with_options`);
+  build a BM25-scored full-text index with `bm25_index(name, columns, analyzer)`
+  (or `search_index(...).with_analyzer(...).with_bm25().with_highlights()`); and
+  run the lexical query with `Query::fulltext_search(field, reference, query)` +
+  `Query::search_score(reference, alias)`, or the `fulltext_search_query(...)`
+  helper. Pair it with `vector_search` and fuse the two result orders by rank
+  (Reciprocal Rank Fusion). Verified end-to-end against an embedded SurrealDB
+  engine in `tests/integration_fulltext.rs`.
+
+### Fixed
+
+- **Full-text index now emits the SurrealDB 3.x `FULLTEXT` keyword.** The full-
+  text index keyword was renamed from `SEARCH` to `FULLTEXT` in SurrealDB 3.0, so
+  the previous output (`... SEARCH ANALYZER ascii`) was a parse error on v3.
+  `IndexType::Search` / `search_index` / `IndexDefinition::to_surql*` and the
+  migration diff now emit `FULLTEXT`, and the `INFO FOR TABLE` index parser
+  recognises both spellings. See `docs/v3-patterns.md` §9 — including the note
+  that the v3 streaming executor's full-text scan returns rows in BM25 relevance
+  order but `search::score` is not plumbed through it (returns 0), so rank by the
+  scan's natural order.
+
 ## [0.28.1] - 2026-06-12
 
 ### Fixed

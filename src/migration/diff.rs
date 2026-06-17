@@ -590,6 +590,10 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
     let forward_sql = match idx.index_type {
         IndexType::Mtree => mtree_index_to_sql(table, idx),
         IndexType::Hnsw => hnsw_index_to_sql(table, idx),
+        // A full-text index carries an analyzer / BM25 / highlights clause, so
+        // render it through the definition's own (FULLTEXT-aware) serializer
+        // rather than the bare `as_str` path below.
+        IndexType::Search => idx.to_surql_with_options(table, false),
         _ => {
             let columns = idx.columns.join(", ");
             let mut sql = format!(
@@ -623,6 +627,7 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
     let backward_sql = match idx.index_type {
         IndexType::Mtree => mtree_index_to_sql(table, idx),
         IndexType::Hnsw => hnsw_index_to_sql(table, idx),
+        IndexType::Search => idx.to_surql_with_options(table, false),
         _ => {
             let columns = idx.columns.join(", ");
             format!(
@@ -1270,10 +1275,12 @@ mod tests {
     }
 
     #[test]
-    fn diff_indexes_search_index_emits_search_keyword() {
+    fn diff_indexes_search_index_emits_fulltext_keyword() {
         let idx = IndexDefinition::new("s_idx", ["body"]).with_type(IndexType::Search);
         let diffs = diff_indexes("post", &[idx], &[]);
-        assert!(diffs[0].forward_sql.contains("SEARCH"));
+        // SurrealDB 3.x renders the full-text index with the `FULLTEXT` keyword
+        // (renamed from v1/v2 `SEARCH`).
+        assert!(diffs[0].forward_sql.contains("FULLTEXT"));
     }
 
     // ----- diff_events -----

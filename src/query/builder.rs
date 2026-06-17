@@ -171,6 +171,13 @@ pub struct Query {
     pub vector_distance: Option<VectorDistanceType>,
     /// Optional threshold for the MTREE operator.
     pub vector_threshold: Option<f64>,
+    /// Full-text search field (the `@@` / `@n@` matches operator).
+    pub fulltext_field: Option<String>,
+    /// Full-text match reference number, tying the predicate to
+    /// `search::score(n)` (the `@n@` form).
+    pub fulltext_reference: Option<u8>,
+    /// Full-text query text (inlined as a quoted, escaped literal).
+    pub fulltext_query: Option<String>,
     /// Optimization hints appended as a `/* ... */` prefix.
     pub hints: Vec<QueryHint>,
 }
@@ -595,6 +602,75 @@ impl Query {
     }
 
     // -----------------------------------------------------------------------
+    // Full-text search
+    // -----------------------------------------------------------------------
+
+    /// Configure a full-text `SEARCH` predicate rendered as
+    /// `<field> @<reference>@ <query>` in the `WHERE` clause.
+    ///
+    /// The `reference` integer ties the match to a
+    /// [`search_score`](Self::search_score) (or `search::highlight`) call, so a
+    /// row's BM25 relevance can be projected and ordered on. Requires a BM25
+    /// `SEARCH` index on `field` (see [`bm25_index`](crate::schema::bm25_index)).
+    /// The query text is inlined as a quoted, escaped literal.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::query::builder::Query;
+    ///
+    /// let q = Query::new()
+    ///     .select(None)
+    ///     .search_score(1, "score")
+    ///     .from_table("memory").unwrap()
+    ///     .fulltext_search("content", 1, "insider buying").unwrap()
+    ///     .order_by("score", "DESC").unwrap()
+    ///     .limit(10).unwrap();
+    ///
+    /// assert_eq!(
+    ///     q.to_surql().unwrap(),
+    ///     "SELECT *, search::score(1) AS score FROM memory \
+    ///      WHERE content @1@ 'insider buying' ORDER BY score DESC LIMIT 10",
+    /// );
+    /// ```
+    pub fn fulltext_search(
+        self,
+        field: impl Into<String>,
+        reference: u8,
+        query: impl Into<String>,
+    ) -> Result<Self> {
+        let field = field.into();
+        if field.is_empty() {
+            return Err(SurqlError::Validation {
+                reason: "Full-text search field cannot be empty".into(),
+            });
+        }
+        let query = query.into();
+        if query.is_empty() {
+            return Err(SurqlError::Validation {
+                reason: "Full-text search query cannot be empty".into(),
+            });
+        }
+        Ok(Self {
+            fulltext_field: Some(field),
+            fulltext_reference: Some(reference),
+            fulltext_query: Some(query),
+            ..self
+        })
+    }
+
+    /// Append `search::score(<reference>) AS <alias>` to the projected fields —
+    /// the BM25 relevance for the match registered at `reference` by
+    /// [`fulltext_search`](Self::fulltext_search). Order by `alias` to rank.
+    pub fn search_score(self, reference: u8, alias: impl Into<String>) -> Self {
+        let alias = alias.into();
+        let expr = format!("search::score({reference}) AS {alias}");
+        let mut fields = self.fields;
+        fields.push(expr);
+        Self { fields, ..self }
+    }
+
+    // -----------------------------------------------------------------------
     // RETURN convenience
     // -----------------------------------------------------------------------
 
@@ -730,6 +806,14 @@ impl Query {
                 None => format!("<|{k},{}|>", distance.to_surql()),
             };
             where_parts.push(format!("{field} {operator} {vector_str}"));
+        }
+        if let (Some(field), Some(reference), Some(query)) = (
+            &self.fulltext_field,
+            self.fulltext_reference,
+            &self.fulltext_query,
+        ) {
+            let quoted = quote_value_public(&Value::String(query.clone()));
+            where_parts.push(format!("{field} @{reference}@ {quoted}"));
         }
         for cond in &self.conditions {
             where_parts.push(format!("({cond})"));
@@ -1347,6 +1431,100 @@ mod tests {
             );
         let sql = q.to_surql().unwrap();
         assert!(sql.contains("vector::similarity::cosine(embedding, [0.1, 0.2]) AS score"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-text search
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fulltext_search_renders_match_operator() {
+        let q = Query::new()
+            .select(None)
+            .from_table("memory")
+            .unwrap()
+            .fulltext_search("content", 1, "insider buying")
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT * FROM memory WHERE content @1@ 'insider buying'"
+        );
+    }
+
+    #[test]
+    fn fulltext_search_with_score_and_order() {
+        let q = Query::new()
+            .select(None)
+            .search_score(1, "score")
+            .from_table("memory")
+            .unwrap()
+            .fulltext_search("content", 1, "form 4")
+            .unwrap()
+            .order_by("score", "DESC")
+            .unwrap()
+            .limit(5)
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT *, search::score(1) AS score FROM memory \
+             WHERE content @1@ 'form 4' ORDER BY score DESC LIMIT 5"
+        );
+    }
+
+    #[test]
+    fn fulltext_search_escapes_quotes() {
+        let q = Query::new()
+            .select(None)
+            .from_table("memory")
+            .unwrap()
+            .fulltext_search("content", 0, "o'brien")
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT * FROM memory WHERE content @0@ 'o\\'brien'"
+        );
+    }
+
+    #[test]
+    fn fulltext_search_rejects_empty_field() {
+        let err = Query::new()
+            .select(None)
+            .from_table("memory")
+            .unwrap()
+            .fulltext_search("", 1, "x");
+        assert!(matches!(err, Err(SurqlError::Validation { .. })));
+    }
+
+    #[test]
+    fn fulltext_search_rejects_empty_query() {
+        let err = Query::new()
+            .select(None)
+            .from_table("memory")
+            .unwrap()
+            .fulltext_search("content", 1, "");
+        assert!(matches!(err, Err(SurqlError::Validation { .. })));
+    }
+
+    #[test]
+    fn fulltext_and_vector_both_render_in_where() {
+        let q = Query::new()
+            .select(None)
+            .from_table("memory")
+            .unwrap()
+            .vector_search(
+                "embedding",
+                vec![0.1, 0.2],
+                5,
+                VectorDistanceType::Cosine,
+                None,
+            )
+            .unwrap()
+            .fulltext_search("content", 1, "term")
+            .unwrap();
+        let sql = q.to_surql().unwrap();
+        assert!(sql.contains("embedding <|5,COSINE|> [0.1, 0.2]"));
+        assert!(sql.contains("content @1@ 'term'"));
+        assert!(sql.contains(" AND "));
     }
 
     // -----------------------------------------------------------------------
