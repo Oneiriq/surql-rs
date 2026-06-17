@@ -50,7 +50,9 @@ impl std::fmt::Display for TableMode {
 pub enum IndexType {
     /// UNIQUE index.
     Unique,
-    /// Full-text SEARCH index (with ASCII analyzer by default).
+    /// Full-text index. Renders the SurrealDB 3.x `FULLTEXT` keyword (the v1/v2
+    /// `SEARCH` spelling was renamed in 3.0); pair with an analyzer + BM25 via
+    /// [`bm25_index`] for scorable lexical recall.
     Search,
     /// Plain b-tree style index.
     Standard,
@@ -65,7 +67,7 @@ impl IndexType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unique => "UNIQUE",
-            Self::Search => "SEARCH",
+            Self::Search => "FULLTEXT",
             Self::Standard => "INDEX",
             Self::Mtree => "MTREE",
             Self::Hnsw => "HNSW",
@@ -218,6 +220,19 @@ pub struct IndexDefinition {
     /// HNSW maximum bidirectional links per node.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub m: Option<u32>,
+    /// Full-text `SEARCH` analyzer name. `None` renders the historical default
+    /// (`ascii`); set via [`IndexDefinition::with_analyzer`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub analyzer: Option<String>,
+    /// Whether a `SEARCH` index emits the `BM25` relevance-scoring clause —
+    /// required for [`Query::search_score`](crate::query::builder::Query::search_score)
+    /// to return a value. Uses the engine's default `(k1, b)` parameters.
+    #[serde(default)]
+    pub bm25: bool,
+    /// Whether a `SEARCH` index stores positional `HIGHLIGHTS` data (enables
+    /// `search::highlight` / `search::offsets`).
+    #[serde(default)]
+    pub highlights: bool,
 }
 
 impl IndexDefinition {
@@ -241,12 +256,37 @@ impl IndexDefinition {
             hnsw_distance: None,
             efc: None,
             m: None,
+            analyzer: None,
+            bm25: false,
+            highlights: false,
         }
     }
 
     /// Set the index kind.
     pub fn with_type(mut self, index_type: IndexType) -> Self {
         self.index_type = index_type;
+        self
+    }
+
+    /// Set the full-text `SEARCH` analyzer (e.g. one defined via
+    /// [`analyzer`](crate::schema::analyzer)). Only affects `SEARCH` indexes;
+    /// when unset the index renders the historical `ascii` analyzer.
+    pub fn with_analyzer(mut self, analyzer: impl Into<String>) -> Self {
+        self.analyzer = Some(analyzer.into());
+        self
+    }
+
+    /// Emit the `BM25` relevance-scoring clause on a `SEARCH` index (with the
+    /// engine's default parameters). Required for
+    /// [`search::score`](crate::query::builder::Query::search_score).
+    pub fn with_bm25(mut self) -> Self {
+        self.bm25 = true;
+        self
+    }
+
+    /// Store positional `HIGHLIGHTS` data on a `SEARCH` index.
+    pub fn with_highlights(mut self) -> Self {
+        self.highlights = true;
         self
     }
 
@@ -340,7 +380,17 @@ impl IndexDefinition {
                 );
                 match self.index_type {
                     IndexType::Unique => sql.push_str(" UNIQUE"),
-                    IndexType::Search => sql.push_str(" SEARCH ANALYZER ascii"),
+                    IndexType::Search => {
+                        let analyzer = self.analyzer.as_deref().unwrap_or("ascii");
+                        write!(sql, " FULLTEXT ANALYZER {analyzer}")
+                            .expect("writing to String cannot fail");
+                        if self.bm25 {
+                            sql.push_str(" BM25");
+                        }
+                        if self.highlights {
+                            sql.push_str(" HIGHLIGHTS");
+                        }
+                    }
                     _ => {}
                 }
                 sql.push(';');
@@ -613,13 +663,48 @@ where
     IndexDefinition::new(name, columns).with_type(IndexType::Unique)
 }
 
-/// Build a full-text `SEARCH` index.
+/// Build a full-text `SEARCH` index. With no analyzer set it renders the
+/// historical `ascii` default; chain [`IndexDefinition::with_analyzer`] /
+/// [`IndexDefinition::with_bm25`] / [`IndexDefinition::with_highlights`] for a
+/// scorable index, or use [`bm25_index`].
 pub fn search_index<I, S>(name: impl Into<String>, columns: I) -> IndexDefinition
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
     IndexDefinition::new(name, columns).with_type(IndexType::Search)
+}
+
+/// Build a BM25-scored full-text `SEARCH` index over `columns`, analyzed by
+/// `analyzer`. This is the index to pair with
+/// [`Query::fulltext_search`](crate::query::builder::Query::fulltext_search) and
+/// [`Query::search_score`](crate::query::builder::Query::search_score) for
+/// lexical recall — BM25 is what makes `search::score` return a relevance value.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::schema::bm25_index;
+///
+/// let idx = bm25_index("content_bm25", ["content"], "text_en");
+/// assert_eq!(
+///     idx.to_surql("memory"),
+///     "DEFINE INDEX content_bm25 ON TABLE memory COLUMNS content FULLTEXT ANALYZER text_en BM25;"
+/// );
+/// ```
+pub fn bm25_index<I, S>(
+    name: impl Into<String>,
+    columns: I,
+    analyzer: impl Into<String>,
+) -> IndexDefinition
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    IndexDefinition::new(name, columns)
+        .with_type(IndexType::Search)
+        .with_analyzer(analyzer)
+        .with_bm25()
 }
 
 /// Build an MTREE vector index.
@@ -640,6 +725,9 @@ pub fn mtree_index(
         hnsw_distance: None,
         efc: None,
         m: None,
+        analyzer: None,
+        bm25: false,
+        highlights: false,
     }
 }
 
@@ -666,6 +754,9 @@ pub fn hnsw_index(
         hnsw_distance: Some(distance),
         efc,
         m,
+        analyzer: None,
+        bm25: false,
+        highlights: false,
     }
 }
 
@@ -829,7 +920,38 @@ mod tests {
         let idx = search_index("content_search", ["title", "content"]);
         assert_eq!(
             idx.to_surql("post"),
-            "DEFINE INDEX content_search ON TABLE post COLUMNS title, content SEARCH ANALYZER ascii;"
+            "DEFINE INDEX content_search ON TABLE post COLUMNS title, content FULLTEXT ANALYZER ascii;"
+        );
+    }
+
+    #[test]
+    fn bm25_index_renders_analyzer_and_bm25() {
+        let idx = bm25_index("content_bm25", ["content"], "text_en");
+        assert_eq!(
+            idx.to_surql("memory"),
+            "DEFINE INDEX content_bm25 ON TABLE memory COLUMNS content FULLTEXT ANALYZER text_en BM25;"
+        );
+    }
+
+    #[test]
+    fn search_index_with_analyzer_bm25_highlights() {
+        let idx = search_index("s", ["content"])
+            .with_analyzer("text_en")
+            .with_bm25()
+            .with_highlights();
+        assert_eq!(
+            idx.to_surql("doc"),
+            "DEFINE INDEX s ON TABLE doc COLUMNS content FULLTEXT ANALYZER text_en BM25 HIGHLIGHTS;"
+        );
+    }
+
+    #[test]
+    fn bm25_index_if_not_exists() {
+        let idx = bm25_index("content_bm25", ["content"], "text_en");
+        assert_eq!(
+            idx.to_surql_with_options("memory", true),
+            "DEFINE INDEX IF NOT EXISTS content_bm25 ON TABLE memory COLUMNS content \
+             FULLTEXT ANALYZER text_en BM25;"
         );
     }
 

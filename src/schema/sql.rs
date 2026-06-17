@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use crate::error::Result;
 
 use super::access::AccessDefinition;
+use super::analyzer::AnalyzerDefinition;
 use super::edge::EdgeDefinition;
 use super::table::TableDefinition;
 
@@ -91,6 +92,41 @@ pub fn generate_access_sql_with_options(
     Ok(vec![access.to_surql_with_options(if_not_exists)?])
 }
 
+/// Render the `DEFINE ANALYZER` statement(s) for `analyzer`.
+///
+/// Wraps [`AnalyzerDefinition::to_surql`] into a `Vec<String>` so the output
+/// type matches the other generators. Validation runs first; an invalid
+/// definition yields
+/// [`SurqlError::Validation`](crate::error::SurqlError::Validation).
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_analyzer_sql, standard_analyzer};
+///
+/// let a = standard_analyzer("text_en");
+/// let stmts = generate_analyzer_sql(&a).unwrap();
+/// assert_eq!(
+///     stmts[0],
+///     "DEFINE ANALYZER text_en TOKENIZERS class FILTERS lowercase,ascii;"
+/// );
+/// ```
+pub fn generate_analyzer_sql(analyzer: &AnalyzerDefinition) -> Result<Vec<String>> {
+    analyzer.validate()?;
+    Ok(vec![analyzer.to_surql()])
+}
+
+/// Render the `DEFINE ANALYZER` statement(s) for `analyzer`, optionally with
+/// `IF NOT EXISTS` for idempotent re-application (e.g. a persistent store
+/// applying its schema on every connect).
+pub fn generate_analyzer_sql_with_options(
+    analyzer: &AnalyzerDefinition,
+    if_not_exists: bool,
+) -> Result<Vec<String>> {
+    analyzer.validate()?;
+    Ok(vec![analyzer.to_surql_with_options(if_not_exists)])
+}
+
 /// Render a complete SurrealQL schema script.
 ///
 /// Tables render first, followed by edges. Each definition block is
@@ -141,6 +177,7 @@ pub fn generate_schema_sql(
 mod tests {
     use super::*;
     use crate::schema::access::{jwt_access, record_access, JwtConfig, RecordAccessConfig};
+    use crate::schema::analyzer::{analyzer, standard_analyzer};
     use crate::schema::edge::{edge_schema, typed_edge, EdgeMode};
     use crate::schema::fields::{datetime_field, int_field, string_field};
     use crate::schema::table::{
@@ -235,7 +272,7 @@ mod tests {
     fn generate_table_sql_with_search_index() {
         let t = table_schema("post").with_indexes([search_index("content_search", ["content"])]);
         let stmts = generate_table_sql(&t, false);
-        assert!(stmts.iter().any(|s| s.contains("SEARCH ANALYZER ascii")));
+        assert!(stmts.iter().any(|s| s.contains("FULLTEXT ANALYZER ascii")));
     }
 
     #[test]
@@ -383,6 +420,33 @@ mod tests {
         let mut a = jwt_access("api", JwtConfig::hs256("secret"));
         a.jwt = None;
         assert!(generate_access_sql(&a).is_err());
+    }
+
+    // ---- generate_analyzer_sql ----
+
+    #[test]
+    fn generate_analyzer_sql_standard() {
+        let a = standard_analyzer("text_en");
+        let stmts = generate_analyzer_sql(&a).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0],
+            "DEFINE ANALYZER text_en TOKENIZERS class FILTERS lowercase,ascii;"
+        );
+    }
+
+    #[test]
+    fn generate_analyzer_sql_if_not_exists() {
+        let a = analyzer("plain");
+        let stmts = generate_analyzer_sql_with_options(&a, true).unwrap();
+        assert_eq!(stmts[0], "DEFINE ANALYZER IF NOT EXISTS plain;");
+    }
+
+    #[test]
+    fn generate_analyzer_sql_validates() {
+        let mut a = analyzer("x");
+        a.name = String::new();
+        assert!(generate_analyzer_sql(&a).is_err());
     }
 
     // ---- generate_schema_sql ----

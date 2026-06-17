@@ -52,6 +52,11 @@ fn m_regex() -> &'static Regex {
     RE.get_or_init(|| regex_case_insensitive(r"\bM\s+(\d+)"))
 }
 
+fn analyzer_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"ANALYZER\s+(\w+)"))
+}
+
 // --- Public parsers ----------------------------------------------------------
 
 /// Parse every entry of an `ix` / `indexes` map.
@@ -82,6 +87,9 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
     let mut hnsw_distance = None;
     let mut efc = None;
     let mut m = None;
+    let mut analyzer = None;
+    let mut bm25 = false;
+    let mut highlights = false;
 
     match index_type {
         IndexType::Mtree => {
@@ -96,6 +104,12 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
             efc = extract_hnsw_efc(definition);
             m = extract_hnsw_m(definition);
         }
+        IndexType::Search => {
+            analyzer = extract_analyzer(definition);
+            let upper = definition.to_uppercase();
+            bm25 = upper.contains("BM25");
+            highlights = upper.contains("HIGHLIGHTS");
+        }
         _ => {}
     }
 
@@ -109,6 +123,9 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
         hnsw_distance,
         efc,
         m,
+        analyzer,
+        bm25,
+        highlights,
     })
 }
 
@@ -141,7 +158,7 @@ fn extract_index_type(definition: &str) -> IndexType {
     let upper = definition.to_uppercase();
     if upper.contains("UNIQUE") {
         IndexType::Unique
-    } else if upper.contains("SEARCH") {
+    } else if upper.contains("FULLTEXT") || upper.contains("SEARCH") {
         IndexType::Search
     } else if upper.contains("HNSW") {
         IndexType::Hnsw
@@ -217,4 +234,16 @@ fn extract_hnsw_m(definition: &str) -> Option<u32> {
         .captures(definition)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse().ok())
+}
+
+/// Extract the `SEARCH ANALYZER <name>` analyzer. The historical `ascii`
+/// default (what a plain `search_index` renders) normalises back to `None` so a
+/// round-trip of the default form is an identity, leaving an explicit non-`ascii`
+/// analyzer as `Some`.
+fn extract_analyzer(definition: &str) -> Option<String> {
+    analyzer_regex()
+        .captures(definition)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .filter(|a| !a.eq_ignore_ascii_case("ascii"))
 }

@@ -185,6 +185,51 @@ pub async fn fetch_one<T: DeserializeOwned>(
 This keeps caller code identical between v2 and v3 and avoids a
 `SurrealValue` derive on every schema record type.
 
+## 9. Full-text index renamed `SEARCH` -> `FULLTEXT`
+
+v3 renamed the full-text index keyword. The v1/v2 form:
+
+```text
+DEFINE INDEX idx ON TABLE t COLUMNS content SEARCH ANALYZER ascii BM25;  -- parse error on v3
+```
+
+is rejected (`Unexpected token, expected Eof` at `SEARCH`). v3 spells it
+`FULLTEXT`:
+
+```text
+DEFINE INDEX idx ON TABLE t COLUMNS content FULLTEXT ANALYZER ascii BM25 HIGHLIGHTS;
+```
+
+`surql` emits the `FULLTEXT` keyword from `IndexType::Search` /
+[`search_index`](https://docs.rs/oneiriq-surql) / [`bm25_index`]; the analyzer is
+defined separately with [`generate_analyzer_sql`] (`DEFINE ANALYZER ...`), which
+must run **before** the index that references it. `COLUMNS` and `FIELDS` are
+interchangeable in this statement.
+
+Bare `BM25` uses the engine defaults (`k1 = 1.2`, `b = 0.75`); the analyzer
+defaults to `like` if the clause is omitted (so define + name one explicitly for
+lexical recall).
+
+### `search::score` and scan ordering
+
+The v3 streaming executor's full-text scan yields matching rows **already in BM25
+relevance order**, but does not (in 3.0.x) plumb the per-row score through to
+`search::score(<ref>)`, which returns `0` there. So rank by the scan's natural
+order rather than `ORDER BY search::score(...)`. This is sufficient for
+Reciprocal Rank Fusion, which fuses *ranks*, not raw scores:
+
+```rust
+// The sparse leg of hybrid retrieval: rows come back in relevance order.
+let q = surql::query::helpers::fulltext_search_query(
+    "memory", "content", 1, "insider buying", None, "score",
+)?
+.limit(100)?;
+// Fuse the returned order with the dense (vector_search) order via RRF.
+```
+
+v3 also ships a native `search::rrf([$dense, $sparse], k, 60)` function that fuses
+two result lists server-side, if you prefer in-engine fusion.
+
 ## What's next
 
 - [Query UX helpers](query-ux.md) - the 0.2 crate-root additions.

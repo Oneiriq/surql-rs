@@ -265,6 +265,28 @@ pub fn similarity_search_query(
         .vector_search(target_field, vector, k, distance, threshold)
 }
 
+/// Create a full-text (BM25) search query — the lexical leg of hybrid retrieval.
+///
+/// Wraps [`Query::fulltext_search`] + [`Query::search_score`] into
+/// `SELECT ..., search::score(reference) AS <score_alias> FROM <table>
+/// WHERE <field> @reference@ <query>`. Pair with a
+/// [`bm25_index`](crate::schema::bm25_index) on `field`, then `ORDER BY
+/// <score_alias> DESC` to rank by relevance.
+pub fn fulltext_search_query(
+    table: impl Into<String>,
+    field: impl Into<String>,
+    reference: u8,
+    query: impl Into<String>,
+    fields: Option<Vec<String>>,
+    score_alias: impl Into<String>,
+) -> Result<Query> {
+    Query::new()
+        .select(fields)
+        .search_score(reference, score_alias)
+        .from_table(table)?
+        .fulltext_search(field, reference, query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +430,15 @@ mod tests {
         let sql = q.to_surql().unwrap();
         assert!(sql.starts_with("SELECT * FROM documents"));
         assert!(sql.contains("embedding <|10,COSINE,0.7|>"));
+    }
+
+    #[test]
+    fn fulltext_search_query_helper() {
+        let q =
+            fulltext_search_query("memory", "content", 1, "insider buying", None, "score").unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT *, search::score(1) AS score FROM memory WHERE content @1@ 'insider buying'"
+        );
     }
 }

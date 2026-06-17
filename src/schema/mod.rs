@@ -17,13 +17,16 @@
 //! - [`access`]: [`AccessDefinition`] + [`AccessType`], [`JwtConfig`] /
 //!   [`RecordAccessConfig`] credential-config types, and the
 //!   [`access_schema`] / [`jwt_access`] / [`record_access`] helpers.
+//! - [`analyzer`]: [`AnalyzerDefinition`] + [`Tokenizer`] / [`TokenFilter`] and
+//!   the [`analyzer`](analyzer()) / [`standard_analyzer`] helpers for
+//!   `DEFINE ANALYZER` (the lexical side of full-text `SEARCH` indexes).
 //!
 //! Each value object exposes a `to_surql*` method that renders the matching
 //! `DEFINE` statement.
 //!
 //! - [`sql`]: free functions ([`generate_table_sql`], [`generate_edge_sql`],
-//!   [`generate_access_sql`], [`generate_schema_sql`]) composing full
-//!   DEFINE-statement scripts from the definitions above.
+//!   [`generate_access_sql`], [`generate_analyzer_sql`], [`generate_schema_sql`])
+//!   composing full DEFINE-statement scripts from the definitions above.
 //! - [`registry`]: process-wide [`SchemaRegistry`] singleton plus the
 //!   [`get_registry`], [`register_table`], [`register_edge`],
 //!   [`clear_registry`], [`get_registered_tables`], and
@@ -46,6 +49,7 @@
 //!   ([`display_width`], [`strip_ansi`]).
 
 pub mod access;
+pub mod analyzer;
 pub mod edge;
 pub mod fields;
 pub mod parser;
@@ -62,6 +66,7 @@ pub use access::{
     access_schema, jwt_access, record_access, AccessDefinition, AccessSchemaBuilder, AccessType,
     JwtConfig, RecordAccessConfig,
 };
+pub use analyzer::{analyzer, standard_analyzer, AnalyzerDefinition, TokenFilter, Tokenizer};
 pub use edge::{bidirectional_edge, edge_schema, typed_edge, EdgeDefinition, EdgeMode};
 pub use fields::{
     array_field, bool_field, computed_field, datetime_field, field, float_field, int_field,
@@ -78,11 +83,11 @@ pub use registry::{
     register_table, SchemaRegistry,
 };
 pub use sql::{
-    generate_access_sql, generate_access_sql_with_options, generate_edge_sql, generate_schema_sql,
-    generate_table_sql,
+    generate_access_sql, generate_access_sql_with_options, generate_analyzer_sql,
+    generate_analyzer_sql_with_options, generate_edge_sql, generate_schema_sql, generate_table_sql,
 };
 pub use table::{
-    event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,
+    bm25_index, event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
     MTreeVectorType, TableDefinition, TableMode,
 };
