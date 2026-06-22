@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
+use super::bucket::BucketDefinition;
 use super::edge::EdgeDefinition;
 use super::table::TableDefinition;
 
@@ -44,6 +45,7 @@ use super::table::TableDefinition;
 pub struct SchemaRegistry {
     tables: RwLock<HashMap<String, TableDefinition>>,
     edges: RwLock<HashMap<String, EdgeDefinition>>,
+    buckets: RwLock<HashMap<String, BucketDefinition>>,
     schema_files: RwLock<Vec<PathBuf>>,
 }
 
@@ -69,6 +71,15 @@ impl SchemaRegistry {
         let name = edge.name.clone();
         if let Ok(mut guard) = self.edges.write() {
             guard.insert(name, edge);
+        }
+    }
+
+    /// Register a bucket schema (replaces any existing entry with the same
+    /// name).
+    pub fn register_bucket(&self, bucket: BucketDefinition) {
+        let name = bucket.name.clone();
+        if let Ok(mut guard) = self.buckets.write() {
+            guard.insert(name, bucket);
         }
     }
 
@@ -102,6 +113,35 @@ impl SchemaRegistry {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    /// Look up a registered bucket by name.
+    pub fn get_bucket(&self, name: &str) -> Option<BucketDefinition> {
+        self.buckets
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(name).cloned())
+    }
+
+    /// Return a snapshot of all registered buckets keyed by name.
+    pub fn buckets(&self) -> HashMap<String, BucketDefinition> {
+        self.buckets
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return the names of all registered buckets.
+    pub fn bucket_names(&self) -> Vec<String> {
+        self.buckets
+            .read()
+            .map(|guard| guard.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Number of registered buckets.
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.read().map_or(0, |guard| guard.len())
     }
 
     /// Return the names of all registered tables.
@@ -150,12 +190,15 @@ impl SchemaRegistry {
             .unwrap_or_default()
     }
 
-    /// Clear every registered table, edge, and schema file.
+    /// Clear every registered table, edge, bucket, and schema file.
     pub fn clear(&self) {
         if let Ok(mut guard) = self.tables.write() {
             guard.clear();
         }
         if let Ok(mut guard) = self.edges.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.buckets.write() {
             guard.clear();
         }
         if let Ok(mut guard) = self.schema_files.write() {
@@ -190,7 +233,17 @@ pub fn register_edge(edge: EdgeDefinition) -> EdgeDefinition {
     edge
 }
 
-/// Clear every registered table, edge, and schema file in the global registry.
+/// Register a bucket schema with the global registry and return it.
+///
+/// Convenience wrapper around [`SchemaRegistry::register_bucket`] that
+/// returns the bucket for inline usage.
+pub fn register_bucket(bucket: BucketDefinition) -> BucketDefinition {
+    get_registry().register_bucket(bucket.clone());
+    bucket
+}
+
+/// Clear every registered table, edge, bucket, and schema file in the global
+/// registry.
 pub fn clear_registry() {
     get_registry().clear();
 }
@@ -203,6 +256,11 @@ pub fn get_registered_tables() -> HashMap<String, TableDefinition> {
 /// Snapshot of all edges registered in the global registry.
 pub fn get_registered_edges() -> HashMap<String, EdgeDefinition> {
     get_registry().edges()
+}
+
+/// Snapshot of all buckets registered in the global registry.
+pub fn get_registered_buckets() -> HashMap<String, BucketDefinition> {
+    get_registry().buckets()
 }
 
 #[cfg(test)]
@@ -306,11 +364,35 @@ mod tests {
         let r = SchemaRegistry::new();
         r.register_table(table_schema("user"));
         r.register_edge(typed_edge("likes", "user", "post"));
+        r.register_bucket(crate::schema::bucket::memory_bucket("avatars"));
         r.add_schema_file("schema.rs");
         r.clear();
         assert_eq!(r.table_count(), 0);
         assert_eq!(r.edge_count(), 0);
+        assert_eq!(r.bucket_count(), 0);
         assert!(r.schema_files().is_empty());
+    }
+
+    #[test]
+    fn local_register_bucket_round_trip() {
+        use crate::schema::bucket::memory_bucket;
+        let r = SchemaRegistry::new();
+        let b = memory_bucket("avatars");
+        r.register_bucket(b.clone());
+        assert_eq!(r.get_bucket("avatars"), Some(b));
+        assert_eq!(r.bucket_count(), 1);
+        assert_eq!(r.bucket_names(), vec!["avatars".to_string()]);
+        assert!(r.get_bucket("missing").is_none());
+    }
+
+    #[test]
+    fn global_register_bucket_roundtrip() {
+        use crate::schema::bucket::memory_bucket;
+        with_clean_global(|| {
+            let b = register_bucket(memory_bucket("uploads"));
+            assert_eq!(b.name, "uploads");
+            assert!(get_registered_buckets().contains_key("uploads"));
+        });
     }
 
     #[test]

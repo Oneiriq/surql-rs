@@ -20,6 +20,9 @@
 //! - [`analyzer`]: [`AnalyzerDefinition`] + [`Tokenizer`] / [`TokenFilter`] and
 //!   the [`analyzer`](analyzer()) / [`standard_analyzer`] helpers for
 //!   `DEFINE ANALYZER` (the lexical side of full-text `SEARCH` indexes).
+//! - [`bucket`]: [`BucketDefinition`] + the [`bucket_schema`] /
+//!   [`memory_bucket`] / [`file_bucket`] helpers for SurrealDB v3
+//!   object-storage `DEFINE BUCKET` / `ALTER BUCKET` / `REMOVE BUCKET`.
 //!
 //! Each value object exposes a `to_surql*` method that renders the matching
 //! `DEFINE` statement.
@@ -50,6 +53,7 @@
 
 pub mod access;
 pub mod analyzer;
+pub mod bucket;
 pub mod edge;
 pub mod fields;
 pub mod parser;
@@ -67,24 +71,28 @@ pub use access::{
     JwtConfig, RecordAccessConfig,
 };
 pub use analyzer::{analyzer, standard_analyzer, AnalyzerDefinition, TokenFilter, Tokenizer};
+pub use bucket::{
+    bucket_schema, file_bucket, memory_bucket, BucketDefinition, BucketSchemaBuilder,
+};
 pub use edge::{bidirectional_edge, edge_schema, typed_edge, EdgeDefinition, EdgeMode};
 pub use fields::{
-    array_field, bool_field, computed_field, datetime_field, field, float_field, int_field,
-    object_field, record_field, string_field, validate_field_name, FieldBuilder, FieldDefinition,
-    FieldType,
+    array_field, bool_field, bytes_field, computed_field, datetime_field, field, file_field,
+    float_field, int_field, object_field, record_field, string_field, validate_field_name,
+    FieldBuilder, FieldDefinition, FieldType,
 };
 pub use parser::{
-    parse_access, parse_db_info, parse_edge_info, parse_event, parse_field, parse_fields,
-    parse_index, parse_indexes, parse_table_info, parse_table_mode, parse_table_permissions,
-    DatabaseInfo,
+    parse_access, parse_bucket, parse_db_info, parse_edge_info, parse_event, parse_field,
+    parse_fields, parse_index, parse_indexes, parse_table_info, parse_table_mode,
+    parse_table_permissions, DatabaseInfo,
 };
 pub use registry::{
-    clear_registry, get_registered_edges, get_registered_tables, get_registry, register_edge,
-    register_table, SchemaRegistry,
+    clear_registry, get_registered_buckets, get_registered_edges, get_registered_tables,
+    get_registry, register_bucket, register_edge, register_table, SchemaRegistry,
 };
 pub use sql::{
     generate_access_sql, generate_access_sql_with_options, generate_analyzer_sql,
-    generate_analyzer_sql_with_options, generate_edge_sql, generate_schema_sql, generate_table_sql,
+    generate_analyzer_sql_with_options, generate_bucket_sql, generate_bucket_sql_with_options,
+    generate_edge_sql, generate_schema_sql, generate_table_sql,
 };
 pub use table::{
     bm25_index, event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,

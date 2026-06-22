@@ -70,6 +70,11 @@ pub enum FieldType {
     Record,
     /// `geometry`
     Geometry,
+    /// `file` — a SurrealDB v3 file pointer into a bucket
+    /// (see [`crate::schema::bucket`]).
+    File,
+    /// `bytes` — raw binary data.
+    Bytes,
     /// `any`
     Any,
 }
@@ -90,6 +95,8 @@ impl FieldType {
             Self::Array => "array",
             Self::Record => "record",
             Self::Geometry => "geometry",
+            Self::File => "file",
+            Self::Bytes => "bytes",
             Self::Any => "any",
         }
     }
@@ -523,6 +530,22 @@ pub fn computed_field(
     field(name, field_type).value(value).readonly(true)
 }
 
+/// Convenience constructor for a `file` field.
+///
+/// A `file` field stores a SurrealDB v3 file pointer (`f"bucket:/key"`) into
+/// an object-storage bucket defined via [`crate::schema::bucket`]. Pair it
+/// with the runtime file API on
+/// [`DatabaseClient::bucket`](crate::connection::DatabaseClient) to populate
+/// the referenced object.
+pub fn file_field(name: impl Into<String>) -> FieldBuilder {
+    field(name, FieldType::File)
+}
+
+/// Convenience constructor for a `bytes` field (raw binary data).
+pub fn bytes_field(name: impl Into<String>) -> FieldBuilder {
+    field(name, FieldType::Bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +555,46 @@ mod tests {
         assert_eq!(FieldType::String.as_str(), "string");
         assert_eq!(FieldType::Datetime.as_str(), "datetime");
         assert_eq!(FieldType::Any.as_str(), "any");
+    }
+
+    #[test]
+    fn field_type_file_and_bytes_as_str() {
+        assert_eq!(FieldType::File.as_str(), "file");
+        assert_eq!(FieldType::Bytes.as_str(), "bytes");
+    }
+
+    #[test]
+    fn field_type_file_bytes_serde_roundtrip() {
+        for ft in [FieldType::File, FieldType::Bytes] {
+            let json = serde_json::to_string(&ft).unwrap();
+            let back: FieldType = serde_json::from_str(&json).unwrap();
+            assert_eq!(ft, back);
+        }
+        assert_eq!(serde_json::to_string(&FieldType::File).unwrap(), "\"file\"");
+        assert_eq!(
+            serde_json::to_string(&FieldType::Bytes).unwrap(),
+            "\"bytes\""
+        );
+    }
+
+    #[test]
+    fn builder_file_field_emits_type_file() {
+        let (f, _) = file_field("avatar").build().unwrap();
+        assert_eq!(f.field_type, FieldType::File);
+        assert_eq!(
+            f.to_surql("user"),
+            "DEFINE FIELD avatar ON TABLE user TYPE file;"
+        );
+    }
+
+    #[test]
+    fn builder_bytes_field_emits_type_bytes() {
+        let (f, _) = bytes_field("blob").build().unwrap();
+        assert_eq!(f.field_type, FieldType::Bytes);
+        assert_eq!(
+            f.to_surql("doc"),
+            "DEFINE FIELD blob ON TABLE doc TYPE bytes;"
+        );
     }
 
     #[test]

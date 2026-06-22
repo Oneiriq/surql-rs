@@ -17,6 +17,8 @@
 //! - [`crud`] *(feature `client`)*: JSON-in / JSON-out record CRUD helpers.
 //! - [`typed`] *(feature `client`)*: serde-round-trip CRUD helpers.
 //! - [`graph`] *(feature `client`)*: graph traversal + relation helpers.
+//! - [`files`] *(feature `client`)*: object-storage [`Bucket`] handle for
+//!   SurrealDB v3 file put/get/head/delete/copy/rename/list operations.
 
 pub mod batch;
 pub mod builder;
@@ -25,6 +27,8 @@ pub mod crud;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod executor;
 pub mod expressions;
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
+pub mod files;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod graph;
 pub mod graph_query;
@@ -62,3 +66,8 @@ pub use results::{
 // because it needs a live [`DatabaseClient`] to dispatch the rendered query.
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use crud::{aggregate_records, build_aggregate_query, AggregateOpts};
+
+// Object-storage (files / buckets) runtime API. Gated on the `client` feature
+// because it dispatches against a live [`DatabaseClient`].
+#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
+pub use files::{Bucket, FileData};

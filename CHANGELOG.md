@@ -7,6 +7,61 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-29
+
+### Added
+
+- **Files & buckets (SurrealDB v3 object storage), full code-first depth.**
+  - **Field types**: `FieldType::File` / `FieldType::Bytes` (emit `TYPE file` /
+    `TYPE bytes`) plus `file_field(name)` / `bytes_field(name)` builders; the
+    `INFO FOR ...` field parser round-trips both.
+  - **Schema**: new `schema::bucket` module — `BucketDefinition` with
+    `bucket_schema(name, backend)` / `memory_bucket(name)` /
+    `file_bucket(name, path)` builders, rendering `DEFINE BUCKET
+    [IF NOT EXISTS|OVERWRITE] … BACKEND "…" [READONLY] [PERMISSIONS …]
+    [COMMENT "…"]`, `REMOVE BUCKET …`, and `ALTER BUCKET [IF EXISTS] …`
+    (`READONLY`/`DROP READONLY`, `BACKEND`/`DROP BACKEND`, `PERMISSIONS`,
+    `COMMENT`/`DROP COMMENT`). Exposed via `generate_bucket_sql[_with_options]`.
+  - **Migrations**: `DiffOperation::{AddBucket, DropBucket, ModifyBucket}`,
+    a `bucket` field on `SchemaDiff`, `diff_buckets(code, db)`, and bucket
+    support threaded through `SchemaSnapshot`, `VersionedSnapshot`, the
+    `SchemaRegistry` (`register_bucket` / `get_registered_buckets`), the
+    initial-migration generator, drift detection, and `schema generate`.
+  - **Parser**: `parse_bucket` reconstructs `BucketDefinition` from
+    `INFO FOR DB` (`bu` / `buckets`) into `DatabaseInfo::buckets`.
+  - **`FileRef` value type** (`types::file`): `{ bucket, key }` exposing
+    SurrealDB's **canonical** key form — the key is stored *verbatim*
+    (including the server's leading slash, e.g. `/a.txt`), while `Display`
+    always renders a single-slash pointer (`bucket:/a.txt`) for any input.
+    serde round-trips the structured form (`{ bucket, key: "/a.txt" }`) and
+    accepts the `f"bucket:/key"` literal the SDK emits. The Rust SDK decodes
+    `file` values (in `head`/`file::list`/record fields) straight to that
+    literal, so — unlike the Python port — no `file::bucket`/`file::key`
+    projection is needed.
+  - **Runtime API**: `DatabaseClient::bucket(name)` returns a `Bucket` handle
+    with `put` / `put_if_not_exists` / `get` / `get_text` / `exists` / `head` /
+    `delete` / `copy` / `copy_if_not_exists` / `rename` /
+    `rename_if_not_exists` / `list`. Every op uses the parameterised
+    `type::file($bucket, $key)` constructor with **bound** params (never
+    string-interpolated). Binary payloads bind as a native
+    `surrealdb::types::Value::Bytes` via the new
+    `DatabaseClient::query_with_surreal_vars` (no base64) — the JSON bind path
+    cannot carry raw bytes. Data is accepted as a `FileData::Text|Bytes` enum.
+  - **CLI**: new `surql bucket` group — `define` / `list` / `rm` plus file
+    ops `put` / `get` / `delete` / `exists` / `files`.
+  - Buckets require the server's `SURREAL_CAPS_ALLOW_EXPERIMENTAL=files`
+    environment variable (the feature is hidden and not enabled by
+    `--allow-all`; the `--allow-experimental files` flag form is broken). Live
+    round-trip coverage is in `tests/integration_files.rs` (embedded probe +
+    an `#[ignore]`d server test gated on `SURREAL_FILES_URL`), verified against
+    SurrealDB 3.1.3.
+
+- **Sessions documented as unsupported.** The Rust `surrealdb` crate has no
+  multiplexed-session API, so `surql-rs` deliberately ships none (unlike the
+  Python / TypeScript ports). The new `connection::session` module documents
+  this and advises a separate `DatabaseClient` per isolated namespace/auth
+  context.
+
 ## [0.29.0] - 2026-06-17
 
 ### Added

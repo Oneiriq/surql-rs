@@ -88,6 +88,8 @@ fn extract_field_type(definition: &str) -> FieldType {
         "array" => FieldType::Array,
         "record" => FieldType::Record,
         "geometry" => FieldType::Geometry,
+        "file" => FieldType::File,
+        "bytes" => FieldType::Bytes,
         _ => FieldType::Any,
     }
 }

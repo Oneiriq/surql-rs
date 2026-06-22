@@ -5,6 +5,10 @@
 //! available. The runtime [`DatabaseClient`], [`Transaction`], and
 //! [`LiveQuery`] live behind the `client` cargo feature, as do the
 //! context / registry / auth-manager / streaming-manager facilities.
+//!
+//! See [`session`] for why this crate does **not** expose a
+//! multiplexed-session API (the Rust `surrealdb` crate has none) and what to
+//! use instead.
 
 pub mod auth;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
@@ -16,6 +20,7 @@ pub mod config;
 pub mod context;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod registry;
+pub mod session;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod streaming;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]

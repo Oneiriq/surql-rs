@@ -291,6 +291,13 @@ pub enum DiffOperation {
     DropEvent,
     /// Permissions were modified on a table or field.
     ModifyPermissions,
+    /// A new object-storage bucket was added.
+    AddBucket,
+    /// An existing bucket was removed.
+    DropBucket,
+    /// An existing bucket had its backend / readonly / permissions / comment
+    /// changed.
+    ModifyBucket,
 }
 
 impl DiffOperation {
@@ -307,6 +314,9 @@ impl DiffOperation {
             Self::AddEvent => "add_event",
             Self::DropEvent => "drop_event",
             Self::ModifyPermissions => "modify_permissions",
+            Self::AddBucket => "add_bucket",
+            Self::DropBucket => "drop_bucket",
+            Self::ModifyBucket => "modify_bucket",
         }
     }
 }
@@ -330,6 +340,7 @@ impl std::fmt::Display for DiffOperation {
 ///     field: None,
 ///     index: None,
 ///     event: None,
+///     bucket: None,
 ///     description: "Add user table".into(),
 ///     forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
 ///     backward_sql: "REMOVE TABLE user;".into(),
@@ -341,7 +352,8 @@ impl std::fmt::Display for DiffOperation {
 pub struct SchemaDiff {
     /// The kind of schema change.
     pub operation: DiffOperation,
-    /// Table name affected by the change.
+    /// Table name affected by the change. Empty for database-level objects
+    /// (e.g. buckets) that are not scoped to a table.
     pub table: String,
     /// Field name, if the change targets a field.
     pub field: Option<String>,
@@ -349,6 +361,9 @@ pub struct SchemaDiff {
     pub index: Option<String>,
     /// Event name, if the change targets an event.
     pub event: Option<String>,
+    /// Bucket name, if the change targets an object-storage bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
     /// Human-readable description.
     pub description: String,
     /// SurrealQL that applies the change (forward).
@@ -605,6 +620,9 @@ mod tests {
             DiffOperation::ModifyPermissions.as_str(),
             "modify_permissions"
         );
+        assert_eq!(DiffOperation::AddBucket.as_str(), "add_bucket");
+        assert_eq!(DiffOperation::DropBucket.as_str(), "drop_bucket");
+        assert_eq!(DiffOperation::ModifyBucket.as_str(), "modify_bucket");
     }
 
     #[test]
@@ -635,6 +653,9 @@ mod tests {
             DiffOperation::AddEvent,
             DiffOperation::DropEvent,
             DiffOperation::ModifyPermissions,
+            DiffOperation::AddBucket,
+            DiffOperation::DropBucket,
+            DiffOperation::ModifyBucket,
         ];
         for op in ops {
             let j = serde_json::to_string(&op).unwrap();
@@ -651,6 +672,7 @@ mod tests {
             field: None,
             index: None,
             event: None,
+            bucket: None,
             description: "Add user table".into(),
             forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
             backward_sql: "REMOVE TABLE user;".into(),
@@ -669,6 +691,7 @@ mod tests {
             field: Some("email".into()),
             index: None,
             event: None,
+            bucket: None,
             description: "Add email field".into(),
             forward_sql: "DEFINE FIELD email ON TABLE user TYPE string;".into(),
             backward_sql: "REMOVE FIELD email ON TABLE user;".into(),
@@ -688,6 +711,7 @@ mod tests {
             field: Some("age".into()),
             index: None,
             event: None,
+            bucket: None,
             description: "change age".into(),
             forward_sql: "DEFINE FIELD age ON TABLE user TYPE int;".into(),
             backward_sql: "DEFINE FIELD age ON TABLE user TYPE string;".into(),

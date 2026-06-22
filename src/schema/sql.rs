@@ -17,6 +17,7 @@ use crate::error::Result;
 
 use super::access::AccessDefinition;
 use super::analyzer::AnalyzerDefinition;
+use super::bucket::BucketDefinition;
 use super::edge::EdgeDefinition;
 use super::table::TableDefinition;
 
@@ -125,6 +126,36 @@ pub fn generate_analyzer_sql_with_options(
 ) -> Result<Vec<String>> {
     analyzer.validate()?;
     Ok(vec![analyzer.to_surql_with_options(if_not_exists)])
+}
+
+/// Render the `DEFINE BUCKET` statement(s) for `bucket`.
+///
+/// Wraps [`BucketDefinition::to_surql`] into a `Vec<String>` so the output
+/// type matches the other generators. Validation runs first; an invalid
+/// definition yields
+/// [`SurqlError::Validation`](crate::error::SurqlError::Validation).
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_bucket_sql, memory_bucket};
+///
+/// let b = memory_bucket("avatars");
+/// let stmts = generate_bucket_sql(&b).unwrap();
+/// assert_eq!(stmts[0], "DEFINE BUCKET avatars BACKEND \"memory\";");
+/// ```
+pub fn generate_bucket_sql(bucket: &BucketDefinition) -> Result<Vec<String>> {
+    Ok(vec![bucket.to_surql()?])
+}
+
+/// Render the `DEFINE BUCKET` statement(s) for `bucket`, optionally with
+/// `IF NOT EXISTS` / `OVERWRITE` guards for idempotent re-application.
+pub fn generate_bucket_sql_with_options(
+    bucket: &BucketDefinition,
+    if_not_exists: bool,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![bucket.to_surql_with_options(if_not_exists, overwrite)?])
 }
 
 /// Render a complete SurrealQL schema script.
@@ -420,6 +451,33 @@ mod tests {
         let mut a = jwt_access("api", JwtConfig::hs256("secret"));
         a.jwt = None;
         assert!(generate_access_sql(&a).is_err());
+    }
+
+    // ---- generate_bucket_sql ----
+
+    #[test]
+    fn generate_bucket_sql_memory() {
+        use crate::schema::bucket::memory_bucket;
+        let b = memory_bucket("avatars");
+        let stmts = generate_bucket_sql(&b).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DEFINE BUCKET avatars BACKEND \"memory\";");
+    }
+
+    #[test]
+    fn generate_bucket_sql_with_options_overwrite() {
+        use crate::schema::bucket::memory_bucket;
+        let b = memory_bucket("avatars");
+        let stmts = generate_bucket_sql_with_options(&b, false, true).unwrap();
+        assert!(stmts[0].starts_with("DEFINE BUCKET OVERWRITE avatars"));
+    }
+
+    #[test]
+    fn generate_bucket_sql_validates() {
+        use crate::schema::bucket::memory_bucket;
+        let mut b = memory_bucket("avatars");
+        b.backend = String::new();
+        assert!(generate_bucket_sql(&b).is_err());
     }
 
     // ---- generate_analyzer_sql ----

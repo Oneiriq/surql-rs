@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
 use crate::migration::models::{DiffOperation, SchemaDiff};
+use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::{EdgeDefinition, EdgeMode};
 use crate::schema::fields::FieldDefinition;
 use crate::schema::table::{
@@ -63,6 +64,7 @@ use crate::schema::table::{
 /// let snapshot = SchemaSnapshot {
 ///     tables: vec![table_schema("user")],
 ///     edges: vec![],
+///     buckets: vec![],
 /// };
 /// assert_eq!(snapshot.tables.len(), 1);
 /// ```
@@ -74,6 +76,11 @@ pub struct SchemaSnapshot {
     /// All edges known to this snapshot (in discovery order).
     #[serde(default)]
     pub edges: Vec<EdgeDefinition>,
+    /// All object-storage buckets known to this snapshot (in discovery
+    /// order). Defaults to empty so older snapshots without a `buckets` key
+    /// still deserialise.
+    #[serde(default)]
+    pub buckets: Vec<BucketDefinition>,
 }
 
 impl SchemaSnapshot {
@@ -83,7 +90,7 @@ impl SchemaSnapshot {
         Self::default()
     }
 
-    /// Convenience constructor from two iterators.
+    /// Convenience constructor from tables + edges iterators (no buckets).
     pub fn from_parts<T, E>(tables: T, edges: E) -> Self
     where
         T: IntoIterator<Item = TableDefinition>,
@@ -92,6 +99,21 @@ impl SchemaSnapshot {
         Self {
             tables: tables.into_iter().collect(),
             edges: edges.into_iter().collect(),
+            buckets: Vec::new(),
+        }
+    }
+
+    /// Convenience constructor from tables + edges + buckets iterators.
+    pub fn from_all_parts<T, E, B>(tables: T, edges: E, buckets: B) -> Self
+    where
+        T: IntoIterator<Item = TableDefinition>,
+        E: IntoIterator<Item = EdgeDefinition>,
+        B: IntoIterator<Item = BucketDefinition>,
+    {
+        Self {
+            tables: tables.into_iter().collect(),
+            edges: edges.into_iter().collect(),
+            buckets: buckets.into_iter().collect(),
         }
     }
 }
@@ -383,14 +405,65 @@ pub fn diff_edges(code: &[EdgeDefinition], db: &[EdgeDefinition]) -> Vec<SchemaD
     out
 }
 
+/// Compare two bucket slices.
+///
+/// Buckets present in `code` but absent in `db` are added
+/// ([`DiffOperation::AddBucket`], forward `DEFINE BUCKET`, backward
+/// `REMOVE BUCKET`). Buckets present in `db` but absent in `code` are dropped
+/// ([`DiffOperation::DropBucket`], forward `REMOVE`, backward `DEFINE`).
+/// Buckets present in both whose definition differs are modified
+/// ([`DiffOperation::ModifyBucket`], forward `ALTER` `code`←`db`, backward
+/// `ALTER` `db`←`code`).
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff::diff_buckets;
+/// use surql::schema::memory_bucket;
+///
+/// let code = vec![memory_bucket("avatars")];
+/// let db = vec![];
+/// let diffs = diff_buckets(&code, &db);
+/// assert_eq!(diffs.len(), 1);
+/// assert!(diffs[0].forward_sql.starts_with("DEFINE BUCKET avatars"));
+/// assert_eq!(diffs[0].backward_sql, "REMOVE BUCKET avatars;");
+/// ```
+#[must_use]
+pub fn diff_buckets(code: &[BucketDefinition], db: &[BucketDefinition]) -> Vec<SchemaDiff> {
+    let code_map = index_by_name(code, |b| b.name.as_str());
+    let db_map = index_by_name(db, |b| b.name.as_str());
+    let mut out: Vec<SchemaDiff> = Vec::new();
+
+    for name in sorted_keys(&code_map) {
+        if !db_map.contains_key(name) {
+            out.push(generate_add_bucket_diff(code_map[name]));
+        }
+    }
+    for name in sorted_keys(&db_map) {
+        if !code_map.contains_key(name) {
+            out.push(generate_drop_bucket_diff(db_map[name]));
+        }
+    }
+    for name in sorted_keys(&code_map) {
+        if let Some(db_bucket) = db_map.get(name) {
+            let code_bucket = code_map[name];
+            if code_bucket != *db_bucket {
+                out.push(generate_modify_bucket_diff(code_bucket, db_bucket));
+            }
+        }
+    }
+    out
+}
+
 /// Diff two complete snapshots and return every change required to make
 /// `db` look like `code`.
 ///
-/// The returned diffs are ordered: tables first, then edges.
+/// The returned diffs are ordered: tables first, then edges, then buckets.
 #[must_use]
 pub fn diff_schemas(code: &SchemaSnapshot, db: &SchemaSnapshot) -> Vec<SchemaDiff> {
     let mut out = diff_tables(&code.tables, &db.tables);
     out.extend(diff_edges(&code.edges, &db.edges));
+    out.extend(diff_buckets(&code.buckets, &db.buckets));
     out
 }
 
@@ -466,6 +539,7 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         field: None,
         index: None,
         event: None,
+        bucket: None,
         description: format!("Add table {}", table.name),
         forward_sql,
         backward_sql,
@@ -499,6 +573,7 @@ fn generate_drop_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         field: None,
         index: None,
         event: None,
+        bucket: None,
         description: format!("Drop table {}", table.name),
         forward_sql: format!("REMOVE TABLE {};", table.name),
         backward_sql: format!("DEFINE TABLE {} {};", table.name, table.mode.as_str()),
@@ -534,6 +609,7 @@ fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
         field: Some(field.name.clone()),
         index: None,
         event: None,
+        bucket: None,
         description: format!("Add field {} to {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -550,6 +626,7 @@ fn generate_drop_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff 
         field: Some(field.name.clone()),
         index: None,
         event: None,
+        bucket: None,
         description: format!("Drop field {} from {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -579,6 +656,7 @@ fn generate_modify_field_diff(
         field: Some(new_field.name.clone()),
         index: None,
         event: None,
+        bucket: None,
         description: format!("Modify field {} in {}", new_field.name, table),
         forward_sql,
         backward_sql,
@@ -615,6 +693,7 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         field: None,
         index: Some(idx.name.clone()),
         event: None,
+        bucket: None,
         description: format!("Add index {} to {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -642,6 +721,7 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         field: None,
         index: Some(idx.name.clone()),
         event: None,
+        bucket: None,
         description: format!("Drop index {} from {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -668,6 +748,7 @@ fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         field: None,
         index: None,
         event: Some(ev.name.clone()),
+        bucket: None,
         description: format!("Add event {} to {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -691,6 +772,7 @@ fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         field: None,
         index: None,
         event: Some(ev.name.clone()),
+        bucket: None,
         description: format!("Drop event {} from {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -711,6 +793,7 @@ fn generate_modify_permissions_diff(
         field: None,
         index: None,
         event: None,
+        bucket: None,
         description: format!("Modify permissions for {table}"),
         forward_sql,
         backward_sql,
@@ -744,6 +827,7 @@ fn generate_add_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         field: None,
         index: None,
         event: None,
+        bucket: None,
         description: format!("Add edge {}", edge.name),
         forward_sql,
         backward_sql,
@@ -777,11 +861,93 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         field: None,
         index: None,
         event: None,
+        bucket: None,
         description: format!("Drop edge {}", edge.name),
         forward_sql: format!("REMOVE TABLE {};", edge.name),
         backward_sql: String::new(),
         details: BTreeMap::new(),
     }]
+}
+
+fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
+    // `to_surql` only fails validation; an invalid bucket still yields a
+    // best-effort render so callers can surface it via dry-run (matching the
+    // "infallible diff constructor" contract of the other generators).
+    let forward_sql = bucket.to_surql().unwrap_or_else(|_| {
+        format!(
+            "DEFINE BUCKET {} BACKEND \"{}\";",
+            bucket.name, bucket.backend
+        )
+    });
+    let backward_sql = bucket.to_remove_surql();
+    let mut details = BTreeMap::new();
+    details.insert(
+        "backend".to_string(),
+        serde_json::Value::String(bucket.backend.clone()),
+    );
+    SchemaDiff {
+        operation: DiffOperation::AddBucket,
+        table: String::new(),
+        field: None,
+        index: None,
+        event: None,
+        bucket: Some(bucket.name.clone()),
+        description: format!("Add bucket {}", bucket.name),
+        forward_sql,
+        backward_sql,
+        details,
+    }
+}
+
+fn generate_drop_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
+    let forward_sql = bucket.to_remove_surql();
+    let backward_sql = bucket.to_surql().unwrap_or_else(|_| {
+        format!(
+            "DEFINE BUCKET {} BACKEND \"{}\";",
+            bucket.name, bucket.backend
+        )
+    });
+    SchemaDiff {
+        operation: DiffOperation::DropBucket,
+        table: String::new(),
+        field: None,
+        index: None,
+        event: None,
+        bucket: Some(bucket.name.clone()),
+        description: format!("Drop bucket {}", bucket.name),
+        forward_sql,
+        backward_sql,
+        details: BTreeMap::new(),
+    }
+}
+
+fn generate_modify_bucket_diff(code: &BucketDefinition, db: &BucketDefinition) -> SchemaDiff {
+    // Forward turns the db-side bucket into the code-side one; backward
+    // reverses it. Both use ALTER so existing files are preserved (a
+    // DEFINE OVERWRITE would re-create the bucket).
+    let forward_sql = code.to_alter_surql(db, false);
+    let backward_sql = db.to_alter_surql(code, false);
+    let mut details = BTreeMap::new();
+    details.insert(
+        "old_backend".to_string(),
+        serde_json::Value::String(db.backend.clone()),
+    );
+    details.insert(
+        "new_backend".to_string(),
+        serde_json::Value::String(code.backend.clone()),
+    );
+    SchemaDiff {
+        operation: DiffOperation::ModifyBucket,
+        table: String::new(),
+        field: None,
+        index: None,
+        event: None,
+        bucket: Some(code.name.clone()),
+        description: format!("Modify bucket {}", code.name),
+        forward_sql,
+        backward_sql,
+        details,
+    }
 }
 
 fn render_permission_statements(table: &str, perms: Option<&BTreeMap<String, String>>) -> String {
@@ -1459,6 +1625,81 @@ mod tests {
         assert!(diff_edges(std::slice::from_ref(&e), std::slice::from_ref(&e)).is_empty());
     }
 
+    // ----- diff_buckets -----
+
+    #[test]
+    fn diff_buckets_detects_added() {
+        use crate::schema::bucket::memory_bucket;
+        let code = vec![memory_bucket("avatars")];
+        let diffs = diff_buckets(&code, &[]);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::AddBucket);
+        assert_eq!(diffs[0].bucket.as_deref(), Some("avatars"));
+        assert!(diffs[0].forward_sql.starts_with("DEFINE BUCKET avatars"));
+        assert_eq!(diffs[0].backward_sql, "REMOVE BUCKET avatars;");
+        assert!(diffs[0].table.is_empty());
+    }
+
+    #[test]
+    fn diff_buckets_detects_dropped() {
+        use crate::schema::bucket::memory_bucket;
+        let db = vec![memory_bucket("old")];
+        let diffs = diff_buckets(&[], &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::DropBucket);
+        assert_eq!(diffs[0].forward_sql, "REMOVE BUCKET old;");
+        assert!(diffs[0].backward_sql.starts_with("DEFINE BUCKET old"));
+    }
+
+    #[test]
+    fn diff_buckets_detects_modified_readonly() {
+        use crate::schema::bucket::memory_bucket;
+        let code = vec![memory_bucket("b").with_readonly(true)];
+        let db = vec![memory_bucket("b")];
+        let diffs = diff_buckets(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyBucket);
+        assert_eq!(diffs[0].forward_sql, "ALTER BUCKET b READONLY;");
+        assert_eq!(diffs[0].backward_sql, "ALTER BUCKET b DROP READONLY;");
+    }
+
+    #[test]
+    fn diff_buckets_modified_backend_records_details() {
+        use crate::schema::bucket::{memory_bucket, BucketDefinition};
+        let code = vec![BucketDefinition::new("b", "s3://x")];
+        let db = vec![memory_bucket("b")];
+        let diffs = diff_buckets(&code, &db);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyBucket);
+        assert!(diffs[0].forward_sql.contains("BACKEND \"s3://x\""));
+        assert_eq!(
+            diffs[0].details.get("old_backend"),
+            Some(&serde_json::json!("memory"))
+        );
+        assert_eq!(
+            diffs[0].details.get("new_backend"),
+            Some(&serde_json::json!("s3://x"))
+        );
+    }
+
+    #[test]
+    fn diff_buckets_identical_yields_nothing() {
+        use crate::schema::bucket::memory_bucket;
+        let a = vec![memory_bucket("b").with_comment("c")];
+        assert!(diff_buckets(&a, &a).is_empty());
+    }
+
+    #[test]
+    fn diff_schemas_includes_buckets() {
+        use crate::schema::bucket::memory_bucket;
+        let code = SchemaSnapshot::from_all_parts([tbl("user")], [], [memory_bucket("avatars")]);
+        let db = SchemaSnapshot::default();
+        let diffs = diff_schemas(&code, &db);
+        assert!(diffs
+            .iter()
+            .any(|d| d.operation == DiffOperation::AddBucket));
+        assert!(diffs.iter().any(|d| d.operation == DiffOperation::AddTable));
+    }
+
     // ----- diff_schemas aggregator -----
 
     #[test]
@@ -1602,10 +1843,25 @@ mod tests {
 
     #[test]
     fn snapshot_serde_roundtrip() {
-        let snap = SchemaSnapshot::from_parts([tbl("user")], [relation_edge("likes")]);
+        use crate::schema::bucket::memory_bucket;
+        let snap = SchemaSnapshot::from_all_parts(
+            [tbl("user")],
+            [relation_edge("likes")],
+            [memory_bucket("avatars")],
+        );
         let j = serde_json::to_string(&snap).unwrap();
         let back: SchemaSnapshot = serde_json::from_str(&j).unwrap();
         assert_eq!(snap, back);
+        assert_eq!(back.buckets.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_without_buckets_key_deserialises() {
+        // Older snapshots predate the `buckets` field; #[serde(default)]
+        // must let them load with an empty bucket list.
+        let json = r#"{ "tables": [], "edges": [] }"#;
+        let snap: SchemaSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.buckets.is_empty());
     }
 
     #[test]
