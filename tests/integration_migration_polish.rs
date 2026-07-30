@@ -198,7 +198,7 @@ fn create_snapshot_on_migration_roundtrip() {
         create_snapshot_on_migration(&registry, &dir, "20260101_000000", 0, SnapshotHooks::none())
             .expect("disabled call is a no-op");
     assert!(out.is_none());
-    assert!(fs::read_dir(&dir).unwrap().count() == 0);
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
 
     // Enabled -> writes a snapshot and fires both hooks.
     enable_auto_snapshots();

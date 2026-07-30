@@ -837,7 +837,7 @@ mod tests {
     fn blank_migration_filename_has_surql_extension() {
         let dir = unique_temp_dir("blank-ext");
         let m = create_blank_migration("test", "Test", &dir).unwrap();
-        assert!(m.path.extension().and_then(|s| s.to_str()) == Some("surql"));
+        assert_eq!(m.path.extension().and_then(|s| s.to_str()), Some("surql"));
 
         cleanup(&dir);
     }
