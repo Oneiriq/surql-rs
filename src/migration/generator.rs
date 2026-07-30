@@ -48,6 +48,7 @@ use crate::error::{Result, SurqlError};
 use crate::migration::diff::SchemaSnapshot;
 use crate::migration::discovery::load_migration;
 use crate::migration::models::{Migration, SchemaDiff};
+use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
 use crate::schema::sql::generate_schema_sql;
 use crate::schema::table::TableDefinition;
@@ -147,8 +148,9 @@ pub fn generate_initial_migration(
 ) -> Result<Migration> {
     let tables = registry.tables();
     let edges = registry.edges();
+    let buckets = registry.buckets();
 
-    if tables.is_empty() && edges.is_empty() {
+    if tables.is_empty() && edges.is_empty() && buckets.is_empty() {
         return Err(SurqlError::MigrationGeneration {
             reason: "registry is empty: cannot generate initial migration".to_string(),
         });
@@ -157,6 +159,7 @@ pub fn generate_initial_migration(
     let snapshot = SchemaSnapshot {
         tables: tables.values().cloned().collect(),
         edges: edges.values().cloned().collect(),
+        buckets: buckets.values().cloned().collect(),
     };
 
     let (up_statements, down_statements) = build_initial_statements(&snapshot)?;
@@ -243,6 +246,7 @@ pub fn create_blank_migration(
 ///     field: None,
 ///     index: None,
 ///     event: None,
+///     bucket: None,
 ///     description: "Add user table".into(),
 ///     forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
 ///     backward_sql: "REMOVE TABLE user;".into(),
@@ -490,15 +494,35 @@ fn build_initial_statements(snapshot: &SchemaSnapshot) -> Result<(Vec<String>, V
         }
     })?;
 
-    let up_statements: Vec<String> = raw
+    let mut up_statements: Vec<String> = raw
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
 
+    // Buckets are database-level objects independent of tables; append their
+    // `DEFINE BUCKET ... IF NOT EXISTS` statements after the table/edge DDL.
+    let buckets_map: BTreeMap<String, BucketDefinition> = snapshot
+        .buckets
+        .iter()
+        .map(|b| (b.name.clone(), b.clone()))
+        .collect();
+    for bucket in buckets_map.values() {
+        let stmt = bucket.to_surql_with_options(true, false).map_err(|e| {
+            SurqlError::MigrationGeneration {
+                reason: format!("failed to render bucket {}: {e}", bucket.name),
+            }
+        })?;
+        up_statements.push(stmt);
+    }
+
     let mut down_statements: Vec<String> = Vec::new();
-    // Drop edges first (they reference tables), then tables.
+    // Drop buckets first (independent), then edges (reference tables), then
+    // tables.
+    for bucket_name in buckets_map.keys().rev() {
+        down_statements.push(format!("REMOVE BUCKET {bucket_name};"));
+    }
     for edge_name in edges_map.keys().rev() {
         down_statements.push(format!("REMOVE TABLE IF EXISTS {edge_name};"));
     }
@@ -912,6 +936,7 @@ mod tests {
             field: None,
             index: None,
             event: None,
+            bucket: None,
             description: format!("Add {name} table"),
             forward_sql: format!("DEFINE TABLE {name} SCHEMAFULL;"),
             backward_sql: format!("REMOVE TABLE {name};"),
@@ -957,6 +982,7 @@ mod tests {
                 field: None,
                 index: None,
                 event: None,
+                bucket: None,
                 description: "x".into(),
                 forward_sql: String::new(),
                 backward_sql: String::new(),
@@ -981,6 +1007,7 @@ mod tests {
             field: None,
             index: None,
             event: None,
+            bucket: None,
             description: "x".into(),
             forward_sql: "DEFINE TABLE x SCHEMAFULL".into(),
             backward_sql: "REMOVE TABLE x".into(),

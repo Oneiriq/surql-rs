@@ -154,6 +154,7 @@ async fn watcher_delivers_debounced_drift_report_on_touch() {
     let provider = || SchemaSnapshot {
         tables: vec![table_schema("user")],
         edges: vec![],
+        buckets: vec![],
     };
     let recorded = SchemaSnapshot::new();
     let (watcher, mut rx) = SchemaWatcher::start(

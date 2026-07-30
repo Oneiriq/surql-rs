@@ -36,10 +36,27 @@ fn version_subcommand_prints_banner() {
 fn help_lists_all_command_groups() {
     let output = bin().arg("--help").assert().success().to_string();
     let body = output;
-    for keyword in ["db", "migrate", "schema", "orchestrate"] {
+    for keyword in ["db", "migrate", "schema", "bucket", "orchestrate"] {
         assert!(
             body.contains(keyword),
             "expected `{keyword}` in help output"
+        );
+    }
+}
+
+#[test]
+fn bucket_help_lists_file_subcommands() {
+    let output = bin()
+        .args(["bucket", "--help"])
+        .assert()
+        .success()
+        .to_string();
+    for keyword in [
+        "define", "list", "rm", "put", "get", "delete", "exists", "files",
+    ] {
+        assert!(
+            output.contains(keyword),
+            "expected `{keyword}` in `bucket --help` output"
         );
     }
 }

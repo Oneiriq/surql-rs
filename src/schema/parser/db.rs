@@ -10,6 +10,7 @@
 use serde_json::Value;
 
 use super::access::parse_access;
+use super::bucket::parse_bucket;
 use super::edge::{parse_edge_endpoints, parse_edge_mode};
 use super::permissions::parse_table_permissions;
 use super::table::parse_table_mode;
@@ -37,11 +38,13 @@ fn is_edge_definition(definition: &str) -> bool {
 
 /// Parse a SurrealDB `INFO FOR DB` response.
 ///
-/// The response is inspected for tables (under `tb` / `tables`) and access
-/// definitions (under `ac` / `accesses`). Tables declared with
-/// `TYPE RELATION FROM ... TO ...` are routed into
-/// [`DatabaseInfo::edges`] as [`EdgeDefinition`] values; every other table
-/// becomes a [`TableDefinition`] in [`DatabaseInfo::tables`].
+/// The response is inspected for tables (under `tb` / `tables`), access
+/// definitions (under `ac` / `accesses`), and object-storage buckets (under
+/// `bu` / `buckets`). Tables declared with `TYPE RELATION FROM ... TO ...`
+/// are routed into [`DatabaseInfo::edges`] as [`EdgeDefinition`] values;
+/// every other table becomes a [`TableDefinition`] in
+/// [`DatabaseInfo::tables`]. Buckets are parsed into
+/// [`DatabaseInfo::buckets`].
 ///
 /// Returns [`crate::error::SurqlError::SchemaParse`] when the top-level value
 /// is not a JSON object.
@@ -95,6 +98,17 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
             };
             if let Some(access) = parse_access(name, def) {
                 out.accesses.insert(name.clone(), access);
+            }
+        }
+    }
+
+    if let Some(bu_value) = pick_map(obj, &["bu", "buckets"]) {
+        for (name, def_value) in bu_value.as_object().expect("checked by pick_map") {
+            let Some(def) = def_value.as_str() else {
+                continue;
+            };
+            if let Some(bucket) = parse_bucket(name, def) {
+                out.buckets.insert(name.clone(), bucket);
             }
         }
     }

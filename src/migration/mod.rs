@@ -48,9 +48,9 @@ pub mod versioning;
 pub mod watcher;
 
 pub use diff::{
-    diff_edge_pair, diff_edges, diff_events, diff_fields, diff_indexes, diff_permissions,
-    diff_schemas, diff_table_pair, diff_tables, normalize_expression, validate_default_value,
-    validate_event_expression, SchemaSnapshot,
+    diff_buckets, diff_edge_pair, diff_edges, diff_events, diff_fields, diff_indexes,
+    diff_permissions, diff_schemas, diff_table_pair, diff_tables, normalize_expression,
+    validate_default_value, validate_event_expression, SchemaSnapshot,
 };
 pub use discovery::{
     discover_migrations, get_description_from_filename, get_version_from_filename, load_migration,

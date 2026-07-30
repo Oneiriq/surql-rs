@@ -286,6 +286,44 @@ impl DatabaseClient {
         Ok(Value::Array(out))
     }
 
+    /// Execute a raw SurrealQL query, binding native
+    /// [`surrealdb::types::Value`] variables.
+    ///
+    /// This is the binary-safe sibling of [`query_with_vars`]. The JSON path
+    /// cannot carry raw bytes — `serde_json::Value` has no byte-string variant,
+    /// so a `Vec<u8>` would round-trip as a JSON array of numbers and arrive
+    /// server-side as an `array<int>`, not a `bytes` value. Binding a
+    /// [`surrealdb::types::Value::Bytes`](surrealdb::types::Value) directly
+    /// preserves the `bytes` type, which is what the file `put` API needs.
+    ///
+    /// Each statement's result is returned as one entry of a JSON array, the
+    /// same shape as [`query_with_vars`].
+    ///
+    /// [`query_with_vars`]: DatabaseClient::query_with_vars
+    pub async fn query_with_surreal_vars(
+        &self,
+        surql: &str,
+        vars: BTreeMap<String, surrealdb::types::Value>,
+    ) -> Result<Value> {
+        self.require_connected()?;
+        let mut builder = self.inner.query(surql.to_owned());
+        for (k, v) in vars {
+            // `(String, surrealdb::types::Value)` implements `SurrealValue`
+            // (both components do), so it binds as a 2-element key/value chunk
+            // exactly like the JSON path — but the value keeps its native
+            // type, including `Value::Bytes`.
+            builder = builder.bind((k, v));
+        }
+        let mut response = builder.await.map_err(|e| query_err(&e))?;
+        let count = response.num_statements();
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let raw: surrealdb::types::Value = response.take(i).map_err(|e| query_err(&e))?;
+            out.push(raw.into_json_value());
+        }
+        Ok(Value::Array(out))
+    }
+
     /// Typed `SELECT` against a table or record ID (`"user"` / `"user:alice"`).
     ///
     /// Internally routes through raw SurrealQL + `serde_json::Value`

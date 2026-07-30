@@ -59,10 +59,12 @@ use serde_json::Value;
 
 use crate::error::{Result, SurqlError};
 use crate::schema::access::AccessDefinition;
+use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
 use crate::schema::table::TableDefinition;
 
 mod access;
+mod bucket;
 mod db;
 mod edge;
 mod event;
@@ -72,6 +74,7 @@ mod permissions;
 mod table;
 
 pub use access::parse_access;
+pub use bucket::parse_bucket;
 pub use db::parse_db_info;
 pub use edge::parse_edge_info;
 pub use event::{parse_event, parse_events};
@@ -157,6 +160,9 @@ pub struct DatabaseInfo {
     pub edges: BTreeMap<String, EdgeDefinition>,
     /// Database-level access definitions.
     pub accesses: BTreeMap<String, AccessDefinition>,
+    /// Object-storage bucket definitions.
+    #[serde(default)]
+    pub buckets: BTreeMap<String, BucketDefinition>,
 }
 
 #[cfg(test)]
@@ -230,6 +236,14 @@ mod tests {
     fn parse_field_unknown_type_falls_back_to_any() {
         let f = parse_field("x", "DEFINE FIELD x ON TABLE t TYPE unknown_type_value").unwrap();
         assert_eq!(f.field_type, FieldType::Any);
+    }
+
+    #[test]
+    fn parse_field_file_and_bytes_types() {
+        let f = parse_field("avatar", "DEFINE FIELD avatar ON TABLE user TYPE file").unwrap();
+        assert_eq!(f.field_type, FieldType::File);
+        let b = parse_field("blob", "DEFINE FIELD blob ON TABLE doc TYPE bytes").unwrap();
+        assert_eq!(b.field_type, FieldType::Bytes);
     }
 
     #[test]
@@ -507,6 +521,53 @@ mod tests {
         assert!(db.tables.is_empty());
         assert!(db.edges.is_empty());
         assert!(db.accesses.is_empty());
+        assert!(db.buckets.is_empty());
+    }
+
+    #[test]
+    fn parse_db_info_parses_buckets() {
+        let info = json!({
+            "buckets": {
+                "avatars": "DEFINE BUCKET avatars BACKEND \"memory\"",
+                "uploads": "DEFINE BUCKET uploads BACKEND \"s3://x\" READONLY"
+            }
+        });
+        let db = parse_db_info(&info).unwrap();
+        assert_eq!(db.buckets.len(), 2);
+        assert_eq!(db.buckets.get("avatars").unwrap().backend, "memory");
+        assert!(db.buckets.get("uploads").unwrap().readonly);
+    }
+
+    #[test]
+    fn parse_db_info_parses_buckets_short_key() {
+        let info = json!({
+            "bu": { "b": "DEFINE BUCKET b BACKEND \"memory\"" }
+        });
+        let db = parse_db_info(&info).unwrap();
+        assert_eq!(db.buckets.len(), 1);
+    }
+
+    #[test]
+    fn round_trip_bucket_through_parser() {
+        use crate::schema::bucket::{bucket_schema, memory_bucket};
+        let code = bucket_schema("avatars", "memory")
+            .readonly(true)
+            .comment("user avatars")
+            .build()
+            .unwrap();
+        let sql = code.to_surql().unwrap();
+        let info = json!({ "bu": { "avatars": sql } });
+        let db = parse_db_info(&info).unwrap();
+        let parsed = db.buckets.get("avatars").unwrap();
+        assert_eq!(parsed.backend, "memory");
+        assert!(parsed.readonly);
+        assert_eq!(parsed.comment.as_deref(), Some("user avatars"));
+
+        // And a no-frills bucket survives the round-trip with no false diff.
+        let plain = memory_bucket("p");
+        let info2 = json!({ "bu": { "p": plain.to_surql().unwrap() } });
+        let db2 = parse_db_info(&info2).unwrap();
+        assert_eq!(db2.buckets.get("p"), Some(&plain));
     }
 
     // ---- Round-trip: table --------------------------------------------------

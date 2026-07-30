@@ -16,8 +16,8 @@ use crate::migration::{
     list_snapshots, registry_to_snapshot,
 };
 use crate::schema::{
-    generate_schema_sql, get_registered_edges, get_registered_tables, parse_db_info,
-    visualize_from_registry, OutputFormat as VizFormat, ThemeOption,
+    generate_schema_sql, get_registered_buckets, get_registered_edges, get_registered_tables,
+    parse_db_info, visualize_from_registry, OutputFormat as VizFormat, ThemeOption,
 };
 
 /// Visualisation theme variants exposed on the CLI.
@@ -247,9 +247,19 @@ fn generate(output: Option<&Path>) -> Result<()> {
     use std::collections::BTreeMap;
     let tables = get_registered_tables();
     let edges = get_registered_edges();
+    let buckets = get_registered_buckets();
     let tables_btree: BTreeMap<_, _> = tables.into_iter().collect();
     let edges_btree: BTreeMap<_, _> = edges.into_iter().collect();
-    let body = generate_schema_sql(Some(&tables_btree), Some(&edges_btree), false)?;
+    let mut body = generate_schema_sql(Some(&tables_btree), Some(&edges_btree), false)?;
+    // Buckets are database-level objects; append their DEFINE statements after
+    // the table/edge DDL (sorted by name for deterministic output).
+    let buckets_btree: BTreeMap<_, _> = buckets.into_iter().collect();
+    for bucket in buckets_btree.values() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&bucket.to_surql()?);
+    }
     match output {
         Some(path) => {
             std::fs::write(path, &body)?;

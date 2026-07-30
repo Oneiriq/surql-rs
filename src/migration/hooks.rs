@@ -32,6 +32,7 @@
 //! let code = SchemaSnapshot {
 //!     tables: vec![table_schema("user")],
 //!     edges: vec![],
+//!     buckets: vec![],
 //! };
 //! let recorded = SchemaSnapshot::new();
 //! let report = check_schema_drift_from_snapshots(&code, &recorded);
@@ -89,13 +90,16 @@ pub fn severity_for_operation(op: DiffOperation) -> DriftSeverity {
         DiffOperation::AddTable
         | DiffOperation::AddField
         | DiffOperation::AddIndex
-        | DiffOperation::AddEvent => DriftSeverity::Info,
+        | DiffOperation::AddEvent
+        | DiffOperation::AddBucket => DriftSeverity::Info,
         DiffOperation::ModifyField
         | DiffOperation::ModifyPermissions
-        | DiffOperation::DropEvent => DriftSeverity::Warning,
-        DiffOperation::DropTable | DiffOperation::DropField | DiffOperation::DropIndex => {
-            DriftSeverity::Critical
-        }
+        | DiffOperation::DropEvent
+        | DiffOperation::ModifyBucket => DriftSeverity::Warning,
+        DiffOperation::DropTable
+        | DiffOperation::DropField
+        | DiffOperation::DropIndex
+        | DiffOperation::DropBucket => DriftSeverity::Critical,
     }
 }
 
@@ -261,6 +265,7 @@ pub fn registry_to_snapshot(registry: &SchemaRegistry) -> SchemaSnapshot {
     SchemaSnapshot {
         tables: registry.tables().into_values().collect(),
         edges: registry.edges().into_values().collect(),
+        buckets: registry.buckets().into_values().collect(),
     }
 }
 
@@ -270,6 +275,7 @@ pub fn versioned_to_snapshot(snapshot: &VersionedSnapshot) -> SchemaSnapshot {
     SchemaSnapshot {
         tables: snapshot.tables.values().cloned().collect(),
         edges: snapshot.edges.values().cloned().collect(),
+        buckets: snapshot.buckets.values().cloned().collect(),
     }
 }
 
@@ -630,6 +636,7 @@ mod tests {
             field: field.map(ToString::to_string),
             index: None,
             event: None,
+            bucket: None,
             description: desc.to_string(),
             forward_sql: String::new(),
             backward_sql: String::new(),
@@ -784,6 +791,7 @@ mod tests {
         let snap = SchemaSnapshot {
             tables: vec![table_schema("user")],
             edges: vec![],
+            buckets: vec![],
         };
         let report = check_schema_drift_from_snapshots(&snap, &snap);
         assert!(!report.drift_detected);
@@ -795,6 +803,7 @@ mod tests {
         let code = SchemaSnapshot {
             tables: vec![table_schema("user")],
             edges: vec![],
+            buckets: vec![],
         };
         let recorded = SchemaSnapshot::new();
         let report = check_schema_drift_from_snapshots(&code, &recorded);
@@ -812,6 +821,7 @@ mod tests {
         let recorded = SchemaSnapshot {
             tables: vec![table_schema("old")],
             edges: vec![],
+            buckets: vec![],
         };
         let report = check_schema_drift_from_snapshots(&code, &recorded);
         assert!(report.drift_detected);
@@ -881,6 +891,7 @@ mod tests {
             tables,
             edges: BTreeMap::new(),
             accesses: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             checksum: String::new(),
             migration_count: 0,
         };
@@ -909,6 +920,7 @@ mod tests {
             tables: older_tables,
             edges: BTreeMap::new(),
             accesses: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             checksum: String::new(),
             migration_count: 0,
         };
@@ -925,6 +937,7 @@ mod tests {
             tables: newer_tables,
             edges: BTreeMap::new(),
             accesses: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             checksum: String::new(),
             migration_count: 0,
         };
@@ -958,6 +971,7 @@ mod tests {
             tables,
             edges: BTreeMap::new(),
             accesses: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             checksum: String::new(),
             migration_count: 0,
         };

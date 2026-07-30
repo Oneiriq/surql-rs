@@ -2,7 +2,7 @@
 //!
 //! Implements the top-level command tree exposed by the `surql`
 //! binary and dispatches to the per-group sub-modules ([`db`],
-//! [`migrate`], [`schema`], [`orchestrate`]).
+//! [`migrate`], [`schema`], [`bucket`], [`orchestrate`]).
 //!
 //! The CLI is a thin wrapper around the library: it never contains
 //! SurrealQL- or schema-specific logic of its own, and every side-effect
@@ -31,6 +31,7 @@ use clap::{Parser, Subcommand};
 use crate::error::{Result, SurqlError};
 use crate::settings::{Settings, SettingsBuilder};
 
+pub mod bucket;
 pub mod db;
 pub mod fmt;
 pub mod migrate;
@@ -94,6 +95,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Db(cmd) => db::run(cmd, global).await,
         Command::Migrate(cmd) => migrate::run(cmd, global).await,
         Command::Schema(cmd) => schema::run(cmd, global).await,
+        Command::Bucket(cmd) => bucket::run(cmd, global).await,
         Command::Orchestrate(cmd) => orchestrate::run(cmd, global).await,
     }
 }
@@ -173,6 +175,9 @@ pub enum Command {
     /// Schema inspection / management commands.
     #[command(subcommand)]
     Schema(schema::SchemaCommand),
+    /// Object-storage bucket + file commands (SurrealDB v3 files).
+    #[command(subcommand)]
+    Bucket(bucket::BucketCommand),
     /// Multi-database orchestration commands.
     #[command(subcommand)]
     Orchestrate(orchestrate::OrchestrateCommand),
@@ -198,5 +203,60 @@ mod tests {
     fn config_flag_is_accepted_before_subcommand() {
         let cli = Cli::try_parse_from(["surql", "--config", "/tmp/c.toml", "db", "info"]).unwrap();
         assert!(cli.global.config.is_some());
+    }
+
+    #[test]
+    fn parse_bucket_define_command() {
+        let cli = Cli::try_parse_from([
+            "surql",
+            "bucket",
+            "define",
+            "avatars",
+            "--backend",
+            "memory",
+            "--readonly",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Bucket(bucket::BucketCommand::Define {
+                name,
+                backend,
+                readonly,
+                ..
+            }) => {
+                assert_eq!(name, "avatars");
+                assert_eq!(backend, "memory");
+                assert!(readonly);
+            }
+            other => panic!("expected bucket define, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bucket_put_command() {
+        let cli = Cli::try_parse_from([
+            "surql",
+            "bucket",
+            "put",
+            "avatars",
+            "alice.png",
+            "--text",
+            "hi",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Bucket(bucket::BucketCommand::Put { .. })
+        ));
+    }
+
+    #[test]
+    fn bucket_put_text_and_file_conflict() {
+        // clap should reject specifying both --text and --file.
+        let err = Cli::try_parse_from([
+            "surql", "bucket", "put", "b", "k", "--text", "hi", "--file", "x",
+        ])
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
     }
 }

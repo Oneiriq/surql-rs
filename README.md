@@ -14,8 +14,9 @@ A code-first database toolkit for [SurrealDB](https://surrealdb.com/). Define sc
 - **Async-First** - Tokio-based client on `surrealdb` 3.x with connection pooling, retry logic, and buffered transactions.
 - **Vector Search** - HNSW and MTREE index support with 8 distance metrics and EFC/M tuning.
 - **Graph Traversal** - Native SurrealDB graph features with edge relationships (v3-compatible arrow chains).
+- **Files & Buckets** - SurrealDB v3 object storage: code-first `DEFINE BUCKET` schema + migration diffing, a `FileRef` value type, and a runtime `client.bucket(name)` handle for put/get/head/delete/copy/rename/list.
 - **Schema Visualization** - Mermaid, GraphViz, and ASCII diagrams with theming.
-- **CLI Tools** - Full `surql` binary (`migrate`, `schema`, `db`, `orchestrate`) behind the `cli` feature.
+- **CLI Tools** - Full `surql` binary (`migrate`, `schema`, `db`, `bucket`, `orchestrate`) behind the `cli` feature.
 - **Optional subsystems** - `cache` (memory + Redis), `settings`, `orchestration`, `watcher` feature flags.
 
 ## Quick Start
@@ -115,6 +116,55 @@ let rows = aggregate_records(
 )
 .await?;
 ```
+
+### Files & buckets (SurrealDB v3 object storage)
+
+Define a bucket in code, then read/write files through a typed handle. Bucket
+and key are always passed as **bound** parameters (`type::file($bucket, $key)`)
+— never string-interpolated — and binary payloads are bound as a native
+`bytes` value, not base64.
+
+```rust
+use surql::schema::memory_bucket;          // or file_bucket / bucket_schema
+use surql::query::FileData;
+
+// Schema: `DEFINE BUCKET avatars BACKEND "memory";`
+let bucket = memory_bucket("avatars");
+client.query(&bucket.to_surql()?).await?;
+
+// Runtime file ops via the client handle.
+let files = client.bucket("avatars");
+files.put("alice.png", FileData::bytes(image_bytes)).await?; // binary
+files.put("note.txt", "hello").await?;                       // text
+let text = files.get_text("note.txt").await?;
+let bytes = files.get("alice.png").await?;
+let _ = files.list().await?;
+```
+
+Buckets are an experimental, *hidden* v3 feature: it is **not** enabled by
+`--allow-all`, and the `--allow-experimental files` *flag* form is broken (the
+bare `files` argument is swallowed by the datastore positional). Enable it with
+the environment variable instead:
+
+```bash
+SURREAL_CAPS_ALLOW_EXPERIMENTAL=files \
+  surreal start --bind 127.0.0.1:8000 --user root --pass root --allow-all memory
+```
+
+The `bucket` CLI group and the `DatabaseClient::bucket` handle assume this.
+File keys are returned in SurrealDB's **canonical** form — `FileRef::key()`
+preserves the server's leading-slash key (`/a.txt`) verbatim, while
+`FileRef`'s `Display` always renders a single-slash pointer (`bucket:/a.txt`).
+Bucket definitions participate in schema diffing/migrations (`DEFINE` /
+`ALTER` / `REMOVE BUCKET`) just like tables.
+
+### Sessions
+
+The Rust `surrealdb` crate (3.x) has **no multiplexed-session API**, so this
+crate intentionally does not expose a `Session` type (unlike the Python /
+TypeScript ports). For isolated namespace / database / auth contexts, use a
+separate `DatabaseClient` per context — each owns its own connection and is
+fully isolated. See the `surql::connection::session` module docs for details.
 
 ## Documentation
 

@@ -44,6 +44,7 @@ use crate::error::{Result, SurqlError};
 use crate::migration::discovery::sha2_lite;
 use crate::migration::models::Migration;
 use crate::schema::access::AccessDefinition;
+use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
 use crate::schema::registry::SchemaRegistry;
 use crate::schema::table::TableDefinition;
@@ -86,6 +87,11 @@ pub struct VersionedSnapshot {
     /// Access definitions captured at this version, keyed by access name.
     #[serde(default)]
     pub accesses: BTreeMap<String, AccessDefinition>,
+    /// Object-storage bucket definitions captured at this version, keyed by
+    /// bucket name. Defaults to empty so snapshots written before bucket
+    /// support still deserialise.
+    #[serde(default)]
+    pub buckets: BTreeMap<String, BucketDefinition>,
     /// SHA-256 hex digest of the serialised schema payload.
     pub checksum: String,
     /// Total number of migrations that had been applied at snapshot time.
@@ -117,6 +123,7 @@ pub struct VersionedSnapshotBuilder {
     tables: BTreeMap<String, TableDefinition>,
     edges: BTreeMap<String, EdgeDefinition>,
     accesses: BTreeMap<String, AccessDefinition>,
+    buckets: BTreeMap<String, BucketDefinition>,
     migration_count: u64,
 }
 
@@ -130,6 +137,7 @@ impl VersionedSnapshotBuilder {
             tables: BTreeMap::new(),
             edges: BTreeMap::new(),
             accesses: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             migration_count: 0,
         }
     }
@@ -173,6 +181,15 @@ impl VersionedSnapshotBuilder {
         self
     }
 
+    /// Replace the buckets map.
+    pub fn with_buckets<I>(mut self, buckets: I) -> Self
+    where
+        I: IntoIterator<Item = BucketDefinition>,
+    {
+        self.buckets = buckets.into_iter().map(|b| (b.name.clone(), b)).collect();
+        self
+    }
+
     /// Set the number of migrations that had been applied at snapshot time.
     pub fn with_migration_count(mut self, count: u64) -> Self {
         self.migration_count = count;
@@ -182,7 +199,7 @@ impl VersionedSnapshotBuilder {
     /// Finalise the builder and compute a checksum over the schema payload.
     pub fn build(self) -> VersionedSnapshot {
         let timestamp = self.timestamp.unwrap_or_else(Utc::now);
-        let checksum = compute_checksum(&self.tables, &self.edges, &self.accesses);
+        let checksum = compute_checksum(&self.tables, &self.edges, &self.accesses, &self.buckets);
         VersionedSnapshot {
             version: self.version,
             timestamp,
@@ -190,6 +207,7 @@ impl VersionedSnapshotBuilder {
             tables: self.tables,
             edges: self.edges,
             accesses: self.accesses,
+            buckets: self.buckets,
             checksum,
             migration_count: self.migration_count,
         }
@@ -201,12 +219,14 @@ fn compute_checksum(
     tables: &BTreeMap<String, TableDefinition>,
     edges: &BTreeMap<String, EdgeDefinition>,
     accesses: &BTreeMap<String, AccessDefinition>,
+    buckets: &BTreeMap<String, BucketDefinition>,
 ) -> String {
     // BTreeMap iterates in key order, so serialising is deterministic.
     let payload = serde_json::json!({
         "tables": tables,
         "edges": edges,
         "accesses": accesses,
+        "buckets": buckets,
     });
     // `serde_json::to_vec` on a `Value` is infallible for owned data.
     let bytes = serde_json::to_vec(&payload).unwrap_or_default();
@@ -476,11 +496,13 @@ pub fn create_snapshot(
 
     let tables: BTreeMap<String, TableDefinition> = registry.tables().into_iter().collect();
     let edges: BTreeMap<String, EdgeDefinition> = registry.edges().into_iter().collect();
+    let buckets: BTreeMap<String, BucketDefinition> = registry.buckets().into_iter().collect();
 
     let snapshot = VersionedSnapshot::builder(version)
         .with_description(description)
         .with_tables(tables.into_values())
         .with_edges(edges.into_values())
+        .with_buckets(buckets.into_values())
         .build();
     Ok(snapshot)
 }
@@ -834,6 +856,41 @@ mod tests {
         let reg = SchemaRegistry::new();
         let err = create_snapshot(&reg, "   ", "desc").unwrap_err();
         assert!(matches!(err, SurqlError::Validation { .. }));
+    }
+
+    #[test]
+    fn create_snapshot_captures_buckets() {
+        use crate::schema::bucket::memory_bucket;
+        let reg = SchemaRegistry::new();
+        reg.register_table(tbl("user"));
+        reg.register_bucket(memory_bucket("avatars"));
+        let s = create_snapshot(&reg, "v1", "initial").unwrap();
+        assert!(s.buckets.contains_key("avatars"));
+    }
+
+    #[test]
+    fn snapshot_with_buckets_roundtrips_on_disk() {
+        use crate::schema::bucket::memory_bucket;
+        let dir = tempdir().unwrap();
+        let s = VersionedSnapshot::builder("v1")
+            .with_description("r")
+            .with_tables([tbl("user")])
+            .with_buckets([memory_bucket("avatars")])
+            .build();
+        let path = store_snapshot(&s, dir.path()).unwrap();
+        let loaded = load_snapshot(&path).unwrap();
+        assert_eq!(s, loaded);
+        assert!(loaded.buckets.contains_key("avatars"));
+    }
+
+    #[test]
+    fn buckets_affect_checksum() {
+        use crate::schema::bucket::memory_bucket;
+        let without = VersionedSnapshot::builder("v1").build();
+        let with = VersionedSnapshot::builder("v1")
+            .with_buckets([memory_bucket("avatars")])
+            .build();
+        assert_ne!(without.checksum, with.checksum);
     }
 
     // ----- store_snapshot / load_snapshot round-trip -----
