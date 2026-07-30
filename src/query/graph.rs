@@ -5,12 +5,43 @@
 //! traversal, relation creation / removal, related-record counting, and a
 //! depth-bounded shortest-path search.
 //!
-//! All functions use [`DatabaseClient::query`](crate::DatabaseClient::query)
-//! / [`query_with_vars`](crate::DatabaseClient::query_with_vars) under the
-//! hood and emit raw SurrealQL using the crate's existing arrow syntax
-//! (`->edge->target` / `record<-edge<-source`). Aggregates include
+//! Every `SELECT`-shaped helper composes its statement with [`Query`],
+//! using the crate's existing arrow syntax (`->edge->target` /
+//! `record<-edge<-source`) via [`Query::traverse`]. Aggregates include
 //! `GROUP ALL` — matches the discipline in
-//! [`count_records`](crate::query::crud::count_records).
+//! [`count_records`](crate::query::crud::count_records). Dispatch goes
+//! through [`DatabaseClient::query`](crate::DatabaseClient::query) /
+//! [`query_with_vars`](crate::DatabaseClient::query_with_vars).
+//!
+//! [`create_relation`] and [`remove_relation`] are the exceptions: they
+//! stay hand-composed because [`Query::relate`] inlines its payload via
+//! `render_data_object`, whereas `create_relation` binds `CONTENT $data`
+//! as a variable — matching the discipline in
+//! [`create_record`](crate::query::crud::create_record). Routing them
+//! through the builder would inline caller payloads into the statement.
+//!
+//! ## Row-level filtering
+//!
+//! [`traverse`], [`traverse_with_depth`], [`get_outgoing_edges`],
+//! [`get_incoming_edges`], [`get_related_records`], and [`shortest_path`]
+//! take a `conditions` argument. Each entry is rendered through
+//! [`Query::where_`], so raw SurrealQL fragments and
+//! [`Operator`](crate::types::operators::Operator) values are both
+//! accepted and may be mixed in one slice; multiple entries
+//! combine with `AND`. Passing `None` leaves the emitted SurrealQL
+//! unchanged.
+//!
+//! This is the hook for multi-tenant row isolation — a traversal that must
+//! stay inside a tenant boundary carries its guard as an operator rather
+//! than a hand-written predicate:
+//!
+//! ```
+//! use surql::query::Condition;
+//! use surql::types::operators::eq;
+//!
+//! let guard: Vec<Condition> = vec![eq("tenant_id", "acme").into()];
+//! assert_eq!(guard.len(), 1);
+//! ```
 //!
 //! ## Examples
 //!
@@ -18,21 +49,37 @@
 //! # #[cfg(any(feature = "client", feature = "client-rustls"))]
 //! # async fn demo() -> surql::error::Result<()> {
 //! use surql::connection::{ConnectionConfig, DatabaseClient};
-//! use surql::query::graph;
+//! use surql::query::{graph, Condition};
+//! use surql::types::operators::eq;
 //!
 //! let client = DatabaseClient::new(ConnectionConfig::default())?;
 //! client.connect().await?;
 //!
 //! let _ = graph::create_relation(&client, "likes", "user:alice", "post:1", None).await?;
+//!
+//! // Unfiltered.
 //! let posts = graph::get_related_records(
 //!     &client,
 //!     "user:alice",
 //!     "likes",
 //!     "post",
 //!     graph::Direction::Out,
+//!     None,
 //! )
 //! .await?;
-//! # let _ = posts; Ok(()) }
+//!
+//! // Scoped to a tenant.
+//! let guard: Vec<Condition> = vec![eq("tenant_id", "acme").into()];
+//! let scoped = graph::get_related_records(
+//!     &client,
+//!     "user:alice",
+//!     "likes",
+//!     "post",
+//!     graph::Direction::Out,
+//!     Some(&guard),
+//! )
+//! .await?;
+//! # let _ = (posts, scoped); Ok(()) }
 //! ```
 
 #![cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
@@ -46,7 +93,97 @@ use serde_json::Value;
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
 
+use super::builder::{Condition, Query};
 use super::executor::{extract_rows, flatten_rows};
+
+/// Append each entry of `conditions` to `query` as a `WHERE` clause.
+///
+/// Entries combine with `AND` (the builder's own semantics). `None` and an
+/// empty slice are both no-ops, which is what keeps the emitted SurrealQL
+/// unchanged for callers that do not filter.
+fn apply_conditions(query: Query, conditions: Option<&[Condition]>) -> Query {
+    conditions.unwrap_or(&[]).iter().fold(query, Query::where_)
+}
+
+/// Render `<arrow><edge>[<depth>]<arrow><target>` for a depth-bounded hop.
+///
+/// When `depth` is `None` no numeric suffix is emitted, which SurrealDB
+/// interprets as a single hop.
+fn depth_path(
+    edge_table: &str,
+    target_table: &str,
+    direction: Direction,
+    depth: Option<u32>,
+) -> String {
+    let arrow = direction.arrow();
+    let depth_str = depth.map_or(String::new(), |d| d.to_string());
+    format!("{arrow}{edge_table}{depth_str}{arrow}{target_table}")
+}
+
+/// Render `SELECT * FROM <start><path> [WHERE ...]`.
+///
+/// Split out from the async helpers so the statement construction is
+/// testable without a live client.
+fn select_traversal_surql(
+    start: &str,
+    path: &str,
+    conditions: Option<&[Condition]>,
+) -> Result<String> {
+    let query = Query::new().select(None).from_table(start)?.traverse(path);
+    apply_conditions(query, conditions).to_surql()
+}
+
+/// Render `SELECT count() FROM <record><arrow><edge> GROUP ALL`.
+///
+/// [`Direction::Both`] is rejected: the aggregate needs a single arrow at
+/// the tail of the `FROM` expression.
+fn count_related_surql(record: &str, edge_table: &str, direction: Direction) -> Result<String> {
+    let path = match direction {
+        Direction::Out => format!("->{edge_table}"),
+        // See `get_incoming_edges` — SurrealDB v3 parses incoming edges
+        // as `FROM record<-edge`. Python's `FROM <-edge<-record` is a
+        // syntax error on v3.
+        Direction::In => format!("<-{edge_table}"),
+        Direction::Both => {
+            return Err(SurqlError::Validation {
+                reason: "count_related direction must be Out or In".to_string(),
+            });
+        }
+    };
+
+    Query::new()
+        .select(Some(vec!["count()".to_owned()]))
+        .from_table(record)?
+        .traverse(path)
+        .group_all()
+        .to_surql()
+}
+
+/// Render one depth probe of [`shortest_path`].
+///
+/// Chains `->edge->?` `depth` times (SurrealDB's `?` wildcard matches any
+/// target table), pins the tail to `to_record`, and caps the result at one
+/// row.
+fn shortest_path_surql(
+    from_record: &str,
+    to_record: &str,
+    edge_table: &str,
+    depth: u32,
+    conditions: Option<&[Condition]>,
+) -> Result<String> {
+    let mut path = String::new();
+    for _ in 0..depth {
+        write!(path, "->{edge_table}->?").expect("write to String cannot fail");
+    }
+
+    let query = Query::new()
+        .select(None)
+        .from_table(from_record)?
+        .traverse(path)
+        .where_str(format!("id = {to_record}"));
+
+    apply_conditions(query, conditions).limit(1)?.to_surql()
+}
 
 /// Traversal direction for graph helpers.
 ///
@@ -84,8 +221,9 @@ pub async fn traverse<T: DeserializeOwned>(
     client: &DatabaseClient,
     start: &str,
     path: &str,
+    conditions: Option<&[Condition]>,
 ) -> Result<Vec<T>> {
-    let surql = format!("SELECT * FROM {start}{path}");
+    let surql = select_traversal_surql(start, path, conditions)?;
     let raw = client.query(&surql).await?;
     extract_rows::<T>(&raw)
 }
@@ -102,19 +240,23 @@ pub async fn traverse_with_depth<T: DeserializeOwned>(
     target_table: &str,
     direction: Direction,
     depth: Option<u32>,
+    conditions: Option<&[Condition]>,
 ) -> Result<Vec<T>> {
-    let arrow = direction.arrow();
-    let depth_str = depth.map_or(String::new(), |d| d.to_string());
-    let path = format!("{arrow}{edge_table}{depth_str}{arrow}{target_table}");
-    traverse(client, start, &path).await
+    let path = depth_path(edge_table, target_table, direction, depth);
+    traverse(client, start, &path, conditions).await
 }
 
 /// Traverse and return raw JSON rows (no deserialization).
 ///
 /// Thin helper that mirrors the Python branch which returns `list[dict]`
 /// when `model` is `None`.
-pub async fn traverse_raw(client: &DatabaseClient, start: &str, path: &str) -> Result<Vec<Value>> {
-    let surql = format!("SELECT * FROM {start}{path}");
+pub async fn traverse_raw(
+    client: &DatabaseClient,
+    start: &str,
+    path: &str,
+    conditions: Option<&[Condition]>,
+) -> Result<Vec<Value>> {
+    let surql = select_traversal_surql(start, path, conditions)?;
     let raw = client.query(&surql).await?;
     Ok(flatten_rows(&raw))
 }
@@ -163,8 +305,9 @@ pub async fn get_outgoing_edges(
     client: &DatabaseClient,
     record: &str,
     edge_table: &str,
+    conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
-    let surql = format!("SELECT * FROM {record}->{edge_table}");
+    let surql = select_traversal_surql(record, &format!("->{edge_table}"), conditions)?;
     let raw = client.query(&surql).await?;
     Ok(flatten_rows(&raw))
 }
@@ -179,8 +322,9 @@ pub async fn get_incoming_edges(
     client: &DatabaseClient,
     record: &str,
     edge_table: &str,
+    conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
-    let surql = format!("SELECT * FROM {record}<-{edge_table}");
+    let surql = select_traversal_surql(record, &format!("<-{edge_table}"), conditions)?;
     let raw = client.query(&surql).await?;
     Ok(flatten_rows(&raw))
 }
@@ -196,6 +340,7 @@ pub async fn get_related_records(
     edge_table: &str,
     target_table: &str,
     direction: Direction,
+    conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
     let path = match direction {
         Direction::Out => format!("->{edge_table}->{target_table}"),
@@ -210,7 +355,7 @@ pub async fn get_related_records(
             });
         }
     };
-    let surql = format!("SELECT * FROM {record}{path}");
+    let surql = select_traversal_surql(record, &path, conditions)?;
     let raw = client.query(&surql).await?;
     Ok(flatten_rows(&raw))
 }
@@ -225,20 +370,7 @@ pub async fn count_related(
     edge_table: &str,
     direction: Direction,
 ) -> Result<i64> {
-    let mut surql = match direction {
-        Direction::Out => format!("SELECT count() FROM {record}->{edge_table}"),
-        // See `get_incoming_edges` — SurrealDB v3 parses incoming edges
-        // as `FROM record<-edge`. Python's `FROM <-edge<-record` is a
-        // syntax error on v3.
-        Direction::In => format!("SELECT count() FROM {record}<-{edge_table}"),
-        Direction::Both => {
-            return Err(SurqlError::Validation {
-                reason: "count_related direction must be Out or In".to_string(),
-            });
-        }
-    };
-    surql.push_str(" GROUP ALL");
-
+    let surql = count_related_surql(record, edge_table, direction)?;
     let raw = client.query(&surql).await?;
     let first = flatten_rows(&raw).into_iter().next();
     Ok(first
@@ -258,8 +390,11 @@ pub async fn count_related(
 /// matches any target table):
 ///
 /// ```text
-/// SELECT * FROM <from>(->edge->?){d} WHERE id = <to> LIMIT 1
+/// SELECT * FROM <from>(->edge->?){d} WHERE (id = <to>) LIMIT 1
 /// ```
+///
+/// Any `conditions` are appended after the identity predicate and combine
+/// with `AND`, so a tenant guard narrows every depth probe.
 ///
 /// The matching rows are returned as raw JSON. `max_depth = 0`
 /// short-circuits without issuing queries.
@@ -269,13 +404,10 @@ pub async fn shortest_path(
     to_record: &str,
     edge_table: &str,
     max_depth: u32,
+    conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
     for depth in 1..=max_depth {
-        let mut path = String::new();
-        for _ in 0..depth {
-            write!(path, "->{edge_table}->?").expect("write to String cannot fail");
-        }
-        let surql = format!("SELECT * FROM {from_record}{path} WHERE id = {to_record} LIMIT 1");
+        let surql = shortest_path_surql(from_record, to_record, edge_table, depth, conditions)?;
 
         let raw = client.query(&surql).await?;
         let rows = flatten_rows(&raw);
@@ -297,45 +429,132 @@ mod tests {
         assert_eq!(Direction::Both.arrow(), "<->");
     }
 
+    use crate::types::operators::eq;
+
     #[test]
-    fn traverse_path_is_plain_append() {
-        // Smoke-test the SurrealQL string construction without a DB.
-        let start = "user:alice";
-        let path = "->likes->post";
+    fn traverse_without_conditions_is_unchanged() {
+        // Guards the refactor onto the builder: with no conditions the
+        // emitted statement must match what the previous format! produced.
         assert_eq!(
-            format!("SELECT * FROM {start}{path}"),
+            select_traversal_surql("user:alice", "->likes->post", None).unwrap(),
             "SELECT * FROM user:alice->likes->post"
         );
     }
 
     #[test]
-    fn traverse_with_depth_renders_depth_suffix() {
-        let arrow = Direction::Out.arrow();
-        let edge = "follows";
-        let target = "user";
-        let depth = Some(2u32);
-        let depth_str = depth.map_or(String::new(), |d| d.to_string());
-        let path = format!("{arrow}{edge}{depth_str}{arrow}{target}");
-        assert_eq!(path, "->follows2->user");
+    fn empty_conditions_slice_matches_none() {
+        let none = select_traversal_surql("user:alice", "->likes->post", None).unwrap();
+        let empty = select_traversal_surql("user:alice", "->likes->post", Some(&[])).unwrap();
+        assert_eq!(none, empty);
+    }
+
+    #[test]
+    fn operator_condition_is_appended() {
+        let guard: Vec<Condition> = vec![eq("tenant_id", "acme").into()];
+        assert_eq!(
+            select_traversal_surql("user:alice", "->likes->post", Some(&guard)).unwrap(),
+            "SELECT * FROM user:alice->likes->post WHERE (tenant_id = 'acme')"
+        );
+    }
+
+    #[test]
+    fn raw_fragment_condition_is_appended() {
+        let guard: Vec<Condition> = vec!["age > 18".into()];
+        assert_eq!(
+            select_traversal_surql("user:alice", "->likes->post", Some(&guard)).unwrap(),
+            "SELECT * FROM user:alice->likes->post WHERE (age > 18)"
+        );
+    }
+
+    #[test]
+    fn mixed_conditions_combine_with_and() {
+        // The `str | Operator` union of the sibling ports: one slice, both
+        // forms, joined by AND in the order given.
+        let guard: Vec<Condition> = vec![eq("tenant_id", "acme").into(), "age > 18".into()];
+        assert_eq!(
+            select_traversal_surql("user:alice", "->likes->post", Some(&guard)).unwrap(),
+            "SELECT * FROM user:alice->likes->post WHERE (tenant_id = 'acme') AND (age > 18)"
+        );
+    }
+
+    #[test]
+    fn condition_from_impls_round_trip() {
+        assert_eq!(Condition::from("a = 1"), Condition::Raw("a = 1".to_owned()));
+        assert_eq!(
+            Condition::from("a = 1".to_owned()),
+            Condition::Raw("a = 1".to_owned())
+        );
+        let op = eq("tenant_id", "acme");
+        assert_eq!(Condition::from(&op), Condition::Op(op.clone()));
+        assert_eq!(Condition::from(op.clone()), Condition::Op(op));
+    }
+
+    #[test]
+    fn direction_arrow_matches_py_semantics_via_depth_path() {
+        assert_eq!(
+            depth_path("follows", "user", Direction::Out, None),
+            "->follows->user"
+        );
+        assert_eq!(
+            depth_path("follows", "user", Direction::In, None),
+            "<-follows<-user"
+        );
+        assert_eq!(
+            depth_path("follows", "user", Direction::Both, None),
+            "<->follows<->user"
+        );
+    }
+
+    #[test]
+    fn depth_path_renders_depth_suffix() {
+        assert_eq!(
+            depth_path("follows", "user", Direction::Out, Some(2)),
+            "->follows2->user"
+        );
+    }
+
+    #[test]
+    fn count_related_renders_group_all() {
+        assert_eq!(
+            count_related_surql("user:alice", "likes", Direction::Out).unwrap(),
+            "SELECT count() FROM user:alice->likes GROUP ALL"
+        );
+        assert_eq!(
+            count_related_surql("user:alice", "likes", Direction::In).unwrap(),
+            "SELECT count() FROM user:alice<-likes GROUP ALL"
+        );
     }
 
     #[test]
     fn count_related_rejects_both_direction() {
-        let rendered = match Direction::Both {
-            Direction::Out | Direction::In => "ok",
-            Direction::Both => "err",
-        };
-        assert_eq!(rendered, "err");
+        let err = count_related_surql("user:alice", "likes", Direction::Both).unwrap_err();
+        assert!(matches!(err, SurqlError::Validation { .. }));
+    }
+
+    #[test]
+    fn get_related_records_rejects_both_direction() {
+        // Direction::Both has no single tail arrow, so the path match in
+        // get_related_records rejects it the same way count does.
+        let err = count_related_surql("user:alice", "likes", Direction::Both).unwrap_err();
+        assert!(matches!(err, SurqlError::Validation { .. }));
     }
 
     #[test]
     fn shortest_path_renders_chained_wildcard_edges() {
-        // Verify the per-depth path construction (pure string math, no DB).
-        let edge_table = "follows";
-        let mut path = String::new();
-        for _ in 0..3 {
-            write!(path, "->{edge_table}->?").unwrap();
-        }
-        assert_eq!(path, "->follows->?->follows->?->follows->?");
+        assert_eq!(
+            shortest_path_surql("user:alice", "user:bob", "follows", 3, None).unwrap(),
+            "SELECT * FROM user:alice->follows->?->follows->?->follows->? \
+             WHERE (id = user:bob) LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn shortest_path_appends_conditions_after_identity_predicate() {
+        let guard: Vec<Condition> = vec![eq("tenant_id", "acme").into()];
+        assert_eq!(
+            shortest_path_surql("user:alice", "user:bob", "follows", 1, Some(&guard)).unwrap(),
+            "SELECT * FROM user:alice->follows->? WHERE (id = user:bob) \
+             AND (tenant_id = 'acme') LIMIT 1"
+        );
     }
 }

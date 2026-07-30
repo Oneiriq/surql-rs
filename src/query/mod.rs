@@ -39,7 +39,7 @@ pub mod results;
 pub mod typed;
 
 pub use batch::{build_relate_query, build_upsert_query, RelateItem};
-pub use builder::{Operation, OrderField, Query, WhereCondition};
+pub use builder::{Condition, Operation, OrderField, Query, WhereCondition};
 pub use expressions::{
     abs_, array_contains, array_length, as_, avg, cast, ceil, concat, count, count_all, count_if,
     field, floor, func, lower, math_abs, math_ceil, math_floor, math_max, math_mean, math_min,

@@ -7,6 +7,61 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-07-30
+
+### Added
+
+- **Row-level filtering on the graph helpers (`conditions`).** `query::graph`
+  gained a `conditions` argument on `traverse`, `traverse_raw`,
+  `traverse_with_depth`, `get_outgoing_edges`, `get_incoming_edges`,
+  `get_related_records`, and `shortest_path`. Each entry renders through
+  `Query::where_` and multiple entries combine with `AND`, so a traversal can
+  carry a tenant guard or any other row-level predicate. Restores parity with
+  the sibling ports, which have accepted `conditions` on their graph helpers
+  since surql-py 1.6.0.
+
+  Previously these helpers emitted a bare `SELECT * FROM record->edge` with no
+  filtering hook at all. A caller needing row-level isolation — a mandatory
+  `WHERE tenant_id = …` alongside engine-enforced `PERMISSIONS`, for instance —
+  could not express it, and had to abandon the helpers for a hand-rolled
+  equality-filtered edge table.
+
+- **`query::Condition`.** An owned `Raw(String) | Op(Operator)` carrier with
+  `From` impls for `&str`, `String`, `&String`, `Operator`, and `&Operator`,
+  plus `WhereCondition` for both `Condition` and `&Condition`. `WhereCondition`
+  takes `self` by value and so cannot be used behind a trait object; `Condition`
+  is what lets one slice mix raw fragments and operators, matching the
+  `str | Operator` union the sibling ports accept.
+
+### Changed
+
+- **BREAKING — graph helper signatures.** The seven helpers above take a new
+  trailing `conditions: Option<&[Condition]>` parameter. Rust has no default
+  arguments, so this follows the existing convention in this module of
+  rendering a Python default argument as a required `Option<T>` parameter (as
+  `create_relation`'s `data: Option<Value>` already does). Existing call sites
+  migrate by passing `None`, which leaves the emitted SurrealQL unchanged.
+  `count_related` is deliberately **not** included — surql-py does not filter it
+  either, and diverging would break the 1:1 contract.
+
+- **Graph helpers compose through `Query` instead of `format!`.** Every
+  `SELECT`-shaped helper now builds its statement with
+  `Query::new().select(…).from_table(…).traverse(…)` rather than interpolating
+  identifiers into a string. Statement construction moved into pure sync
+  functions (`select_traversal_surql`, `count_related_surql`,
+  `shortest_path_surql`, `depth_path`) that are unit-testable without a live
+  client.
+
+  `create_relation` and `remove_relation` are intentionally left hand-composed:
+  `Query::relate` inlines its payload via `render_data_object`, whereas
+  `create_relation` binds `CONTENT $data` as a variable, and routing it through
+  the builder would inline caller payloads into the statement.
+
+- **`shortest_path` emits parenthesised predicates.** Now that the identity
+  check goes through the builder, the rendered clause is
+  `WHERE (id = <to>) [AND (…)]` rather than `WHERE id = <to>`. Semantically
+  identical; noted because it changes the exact statement text.
+
 ## [0.30.0] - 2026-07-29
 
 ### Added
