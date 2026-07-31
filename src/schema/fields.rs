@@ -150,6 +150,16 @@ pub struct FieldDefinition {
     /// renders `TYPE record<{target_table}>` instead of bare `record`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub target_table: Option<String>,
+    /// Whether the field accepts `NONE`, rendering `TYPE option<{inner}>`.
+    ///
+    /// SurrealDB v3 SCHEMAFULL tables reject `NONE` for a plain-typed
+    /// column; wrapping the type in `option<...>` is how a column opts into
+    /// being unset. Mirrors `nullable=True` in the Python port (1.5.8+) and
+    /// the TS port's option-wrapped emission. Defaults to `false`, which
+    /// keeps rendering byte-identical for existing definitions and lets
+    /// snapshots written before this field existed deserialize cleanly.
+    #[serde(default)]
+    pub nullable: bool,
 }
 
 impl FieldDefinition {
@@ -168,6 +178,7 @@ impl FieldDefinition {
             readonly: false,
             flexible: false,
             target_table: None,
+            nullable: false,
         }
     }
 
@@ -223,6 +234,12 @@ impl FieldDefinition {
         self
     }
 
+    /// Mark the field as accepting `NONE`, rendering `TYPE option<{inner}>`.
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = nullable;
+        self
+    }
+
     /// Validate the field definition against SurrealDB identifier rules.
     ///
     /// Returns [`SurqlError::Validation`] for an empty name, empty segments,
@@ -253,6 +270,11 @@ impl FieldDefinition {
     pub fn to_surql_with_options(&self, table: &str, if_not_exists: bool) -> String {
         let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
         let (type_clause, drop_value) = self.resolve_type_clause();
+        let type_clause = if self.nullable {
+            format!("option<{type_clause}>")
+        } else {
+            type_clause
+        };
         let mut sql = format!(
             "DEFINE FIELD{ine} {name} ON TABLE {table} TYPE {ty}",
             ine = ine,
@@ -425,6 +447,33 @@ impl FieldBuilder {
         self
     }
 
+    /// Mark the field as accepting `NONE`, rendering `TYPE option<{inner}>`.
+    ///
+    /// Composes with every other builder option, including record targets:
+    ///
+    /// ```
+    /// use surql::schema::fields::{datetime_field, record_field};
+    ///
+    /// let (f, _) = datetime_field("deleted_at").nullable(true).build().unwrap();
+    /// assert_eq!(
+    ///     f.to_surql("file"),
+    ///     "DEFINE FIELD deleted_at ON TABLE file TYPE option<datetime>;",
+    /// );
+    ///
+    /// let (link, _) = record_field("prior", Some("file_version"))
+    ///     .nullable(true)
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     link.to_surql("file_version"),
+    ///     "DEFINE FIELD prior ON TABLE file_version TYPE option<record<file_version>>;",
+    /// );
+    /// ```
+    pub fn nullable(mut self, nullable: bool) -> Self {
+        self.inner.nullable = nullable;
+        self
+    }
+
     /// Finalise the builder, returning the field and an optional reserved-word
     /// warning message for the caller to log.
     pub fn build(mut self) -> Result<(FieldDefinition, Option<String>)> {
@@ -549,6 +598,52 @@ pub fn bytes_field(name: impl Into<String>) -> FieldBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nullable_wraps_type_in_option() {
+        let (f, _) = datetime_field("deleted_at").nullable(true).build().unwrap();
+        assert_eq!(
+            f.to_surql("file"),
+            "DEFINE FIELD deleted_at ON TABLE file TYPE option<datetime>;",
+        );
+    }
+
+    #[test]
+    fn nullable_wraps_record_target() {
+        let (f, _) = record_field("prior", Some("file_version"))
+            .nullable(true)
+            .build()
+            .unwrap();
+        assert_eq!(
+            f.to_surql("file_version"),
+            "DEFINE FIELD prior ON TABLE file_version TYPE option<record<file_version>>;",
+        );
+    }
+
+    #[test]
+    fn nullable_composes_with_other_clauses() {
+        let (f, _) = string_field("lock_mode")
+            .nullable(true)
+            .assertion("$value INSIDE ['governance', 'compliance']")
+            .build()
+            .unwrap();
+        assert_eq!(
+            f.to_surql("blob"),
+            "DEFINE FIELD lock_mode ON TABLE blob TYPE option<string> \
+             ASSERT $value INSIDE ['governance', 'compliance'];",
+        );
+    }
+
+    #[test]
+    fn non_nullable_rendering_is_unchanged() {
+        // Guards the default path: byte-identical to pre-nullable output.
+        let f = FieldDefinition::new("email", FieldType::String);
+        assert_eq!(
+            f.to_surql("user"),
+            "DEFINE FIELD email ON TABLE user TYPE string;",
+        );
+        assert!(!f.nullable);
+    }
 
     #[test]
     fn field_type_as_str_matches_lowercase() {

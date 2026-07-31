@@ -34,6 +34,14 @@ fn record_target_regex() -> &'static Regex {
     RE.get_or_init(|| regex_case_insensitive(r"record\s*<\s*(\w+)\s*>"))
 }
 
+/// Matches `TYPE option<inner>` where `inner` is a bare type word or a
+/// single-level generic like `record<blob>` — exactly the shapes the
+/// emitter produces. The inner text is captured for type resolution.
+fn option_type_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+option\s*<\s*(\w+(?:\s*<\s*\w+\s*>)?)\s*>"))
+}
+
 // --- Public parsers ----------------------------------------------------------
 
 /// Parse every entry of a `fd` / `fields` map.
@@ -53,9 +61,10 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
     if definition.is_empty() {
         return None;
     }
+    let (field_type, nullable) = extract_field_type(definition);
     Some(FieldDefinition {
         name: name.to_string(),
-        field_type: extract_field_type(definition),
+        field_type,
         assertion: extract_assertion(definition),
         default: extract_default(definition),
         value: extract_value(definition),
@@ -63,19 +72,38 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
         readonly: extract_readonly(definition),
         flexible: extract_flexible(definition),
         target_table: extract_target_table(definition),
+        nullable,
     })
 }
 
 // --- Field extractors --------------------------------------------------------
 
-fn extract_field_type(definition: &str) -> FieldType {
+/// Resolve the field type and whether it is `option<...>`-wrapped.
+///
+/// `option<inner>` is checked first — the plain `TYPE \w+` regex would
+/// capture the word `option` and fall through to [`FieldType::Any`],
+/// which would break the code/database round-trip and make migration
+/// diffing flap on every nullable field.
+fn extract_field_type(definition: &str) -> (FieldType, bool) {
+    if let Some(caps) = option_type_regex().captures(definition) {
+        let inner = caps[1].to_ascii_lowercase();
+        let word = inner.split('<').next().unwrap_or("").trim().to_string();
+        return (field_type_from_word(&word), true);
+    }
     let Some(caps) = type_regex().captures(definition) else {
-        return FieldType::Any;
+        return (FieldType::Any, false);
     };
     let Some(m) = caps.get(1) else {
-        return FieldType::Any;
+        return (FieldType::Any, false);
     };
-    match m.as_str().to_ascii_lowercase().as_str() {
+    (
+        field_type_from_word(&m.as_str().to_ascii_lowercase()),
+        false,
+    )
+}
+
+fn field_type_from_word(word: &str) -> FieldType {
+    match word {
         "string" => FieldType::String,
         "int" => FieldType::Int,
         "float" => FieldType::Float,

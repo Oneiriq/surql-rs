@@ -233,6 +233,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_field_option_type_sets_nullable() {
+        let f = parse_field(
+            "deleted_at",
+            "DEFINE FIELD deleted_at ON TABLE file TYPE option<datetime>",
+        )
+        .unwrap();
+        assert_eq!(f.field_type, FieldType::Datetime);
+        assert!(f.nullable);
+    }
+
+    #[test]
+    fn parse_field_option_record_round_trips() {
+        // The full code -> DDL -> parse -> eq cycle that keeps migration
+        // diffing stable for nullable record links.
+        let f = parse_field(
+            "prior",
+            "DEFINE FIELD prior ON TABLE file_version TYPE option<record<file_version>>",
+        )
+        .unwrap();
+        assert_eq!(f.field_type, FieldType::Record);
+        assert_eq!(f.target_table.as_deref(), Some("file_version"));
+        assert!(f.nullable);
+        assert_eq!(
+            f.to_surql("file_version"),
+            "DEFINE FIELD prior ON TABLE file_version TYPE option<record<file_version>>;",
+        );
+    }
+
+    #[test]
+    fn parse_field_plain_type_is_not_nullable() {
+        let f = parse_field("email", "DEFINE FIELD email ON TABLE user TYPE string").unwrap();
+        assert!(!f.nullable);
+    }
+
+    #[test]
     fn parse_field_unknown_type_falls_back_to_any() {
         let f = parse_field("x", "DEFINE FIELD x ON TABLE t TYPE unknown_type_value").unwrap();
         assert_eq!(f.field_type, FieldType::Any);

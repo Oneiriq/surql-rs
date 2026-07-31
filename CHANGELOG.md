@@ -7,6 +7,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **Nullable fields (`TYPE option<...>`).** `FieldBuilder::nullable(bool)` /
+  `FieldDefinition::with_nullable(bool)` wrap the rendered type in
+  `option<...>` (including record targets: `option<record<blob>>`) so a
+  SCHEMAFULL column can accept `NONE`. The `INFO FOR TABLE` parser
+  round-trips the wrapper, keeping migration diffing stable for nullable
+  columns. Restores parity with surql-py (`nullable=True`, 1.5.8+) and the
+  TS port; rendering for non-nullable fields is byte-identical to before.
+
 ## [0.31.0] - 2026-07-30
 
 ### Added
