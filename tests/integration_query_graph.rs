@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
 use surql::connection::{ConnectionConfig, DatabaseClient};
-use surql::query::{batch, graph, GraphQuery};
+use surql::query::{batch, graph, Condition, GraphQuery};
+use surql::types::operators::eq;
 
 fn env_url() -> Option<String> {
     env::var("SURREAL_URL").ok()
@@ -114,7 +115,7 @@ async fn graph_traverse_and_related() {
         .expect("seed graph");
 
     // Single-hop traversal.
-    let followees = graph::traverse_raw(&client, "person:alice", "->follows->person")
+    let followees = graph::traverse_raw(&client, "person:alice", "->follows->person", None)
         .await
         .expect("traverse_raw");
     assert!(
@@ -133,6 +134,7 @@ async fn graph_traverse_and_related() {
         "follows",
         "person",
         graph::Direction::Out,
+        None,
     )
     .await
     .expect("get_related_records");
@@ -150,9 +152,16 @@ async fn graph_traverse_and_related() {
     assert_eq!(count_in, 1);
 
     // Shortest-path with a real connection.
-    let path = graph::shortest_path(&client, "person:alice", "person:charlie", "follows", 4)
-        .await
-        .expect("shortest_path");
+    let path = graph::shortest_path(
+        &client,
+        "person:alice",
+        "person:charlie",
+        "follows",
+        4,
+        None,
+    )
+    .await
+    .expect("shortest_path");
     assert!(!path.is_empty(), "expected non-empty path, got {path:?}");
 
     // Shortest-path with no connection.
@@ -160,13 +169,103 @@ async fn graph_traverse_and_related() {
         .query("CREATE person:isolated SET name = 'isolated';")
         .await
         .expect("seed isolated");
-    let empty = graph::shortest_path(&client, "person:alice", "person:isolated", "follows", 3)
-        .await
-        .expect("shortest_path no-match");
+    let empty = graph::shortest_path(
+        &client,
+        "person:alice",
+        "person:isolated",
+        "follows",
+        3,
+        None,
+    )
+    .await
+    .expect("shortest_path no-match");
     assert!(
         empty.is_empty(),
         "expected empty path to isolated, got {empty:?}"
     );
+
+    client.disconnect().await.unwrap();
+}
+
+/// Row-level isolation: the same traversal, narrowed by a tenant guard.
+///
+/// This is the case the helpers could not express before `conditions` —
+/// without it a multi-tenant caller had to abandon the graph helpers and
+/// hand-roll an equality-filtered edge table.
+#[tokio::test]
+async fn graph_conditions_scope_traversal_to_a_tenant() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+
+    // alice follows one person per tenant.
+    client
+        .query(
+            "CREATE person:alice SET name = 'alice', tenant_id = 'acme';\n\
+             CREATE person:acmebob SET name = 'bob', tenant_id = 'acme';\n\
+             CREATE person:globexdana SET name = 'dana', tenant_id = 'globex';\n\
+             RELATE person:alice->follows->person:acmebob;\n\
+             RELATE person:alice->follows->person:globexdana;",
+        )
+        .await
+        .expect("seed tenants");
+
+    // Unfiltered: both followees come back.
+    let all = graph::get_related_records(
+        &client,
+        "person:alice",
+        "follows",
+        "person",
+        graph::Direction::Out,
+        None,
+    )
+    .await
+    .expect("unfiltered");
+    assert_eq!(all.len(), 2, "expected both followees, got {all:?}");
+
+    // Operator guard: only the in-tenant followee.
+    let guard: Vec<Condition> = vec![eq("tenant_id", "acme").into()];
+    let scoped = graph::get_related_records(
+        &client,
+        "person:alice",
+        "follows",
+        "person",
+        graph::Direction::Out,
+        Some(&guard),
+    )
+    .await
+    .expect("operator guard");
+    assert_eq!(
+        scoped.len(),
+        1,
+        "expected only the acme followee, got {scoped:?}"
+    );
+    assert_eq!(
+        scoped[0].get("tenant_id").and_then(|v| v.as_str()),
+        Some("acme")
+    );
+
+    // A raw fragment narrows the same way.
+    let raw_guard: Vec<Condition> = vec!["tenant_id = 'globex'".into()];
+    let globex = graph::get_related_records(
+        &client,
+        "person:alice",
+        "follows",
+        "person",
+        graph::Direction::Out,
+        Some(&raw_guard),
+    )
+    .await
+    .expect("raw guard");
+    assert_eq!(globex.len(), 1, "expected only dana, got {globex:?}");
+
+    // traverse_raw carries the guard too.
+    let scoped_traverse =
+        graph::traverse_raw(&client, "person:alice", "->follows->person", Some(&guard))
+            .await
+            .expect("scoped traverse_raw");
+    assert_eq!(scoped_traverse.len(), 1);
 
     client.disconnect().await.unwrap();
 }

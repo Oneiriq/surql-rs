@@ -116,6 +116,80 @@ impl WhereCondition for &Operator {
     }
 }
 
+/// A single filter entry: either a raw SurrealQL fragment or an [`Operator`].
+///
+/// [`WhereCondition`] takes `self` by value, so it cannot be used behind a
+/// trait object and a heterogeneous slice of conditions is not expressible
+/// through it alone. `Condition` is the owned carrier that makes one slice
+/// able to mix both forms, matching the `str | Operator` union the graph
+/// helpers accept in the sibling ports.
+///
+/// ```
+/// use surql::query::Condition;
+/// use surql::types::operators::eq;
+///
+/// let filters: Vec<Condition> = vec![
+///     eq("tenant_id", "acme").into(),
+///     "age > 18".into(),
+/// ];
+/// assert_eq!(filters.len(), 2);
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub enum Condition {
+    /// A raw SurrealQL predicate fragment (e.g. `"age > 18"`).
+    Raw(String),
+    /// A builder-constructed operator (e.g. `eq("tenant_id", "acme")`).
+    Op(Operator),
+}
+
+impl From<&str> for Condition {
+    fn from(value: &str) -> Self {
+        Self::Raw(value.to_owned())
+    }
+}
+
+impl From<String> for Condition {
+    fn from(value: String) -> Self {
+        Self::Raw(value)
+    }
+}
+
+impl From<&String> for Condition {
+    fn from(value: &String) -> Self {
+        Self::Raw(value.clone())
+    }
+}
+
+impl From<Operator> for Condition {
+    fn from(value: Operator) -> Self {
+        Self::Op(value)
+    }
+}
+
+impl From<&Operator> for Condition {
+    fn from(value: &Operator) -> Self {
+        Self::Op(value.clone())
+    }
+}
+
+impl WhereCondition for Condition {
+    fn to_condition(self) -> String {
+        match self {
+            Self::Raw(fragment) => fragment,
+            Self::Op(op) => op.to_surql(),
+        }
+    }
+}
+
+impl WhereCondition for &Condition {
+    fn to_condition(self) -> String {
+        match self {
+            Condition::Raw(fragment) => fragment.clone(),
+            Condition::Op(op) => op.to_surql(),
+        }
+    }
+}
+
 /// Immutable query builder.
 ///
 /// Most methods return a new [`Query`] instance; the receiver is taken by
