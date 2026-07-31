@@ -279,6 +279,22 @@ pub(crate) fn validate_identifier(name: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a `SET` assignment target, which may be a dotted path into
+/// a nested object (`metadata.processing`) — SurrealDB assigns nested
+/// fields natively, and the schema layer already accepts dot notation
+/// for field definitions. Each segment validates as an identifier.
+pub(crate) fn validate_set_target(field: &str) -> Result<()> {
+    if field.is_empty() {
+        return Err(SurqlError::Validation {
+            reason: "Field name cannot be empty".to_string(),
+        });
+    }
+    for segment in field.split('.') {
+        validate_identifier(segment, "field name")?;
+    }
+    Ok(())
+}
+
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -527,7 +543,7 @@ impl Query {
     /// (`set("updated_at", now)` ⇒ `updated_at = '<now>'`).
     pub fn set(mut self, field: impl Into<String>, value: impl Into<Value>) -> Result<Self> {
         let field = field.into();
-        validate_identifier(&field, "field name")?;
+        validate_set_target(&field)?;
         self.update_set_exprs
             .push((field, Expression::value(value)));
         Ok(self)
@@ -538,7 +554,7 @@ impl Query {
     /// (`set_expr("n", field("n") + 1)` ⇒ `n = n + 1`).
     pub fn set_expr(mut self, field: impl Into<String>, expr: Expression) -> Result<Self> {
         let field = field.into();
-        validate_identifier(&field, "field name")?;
+        validate_set_target(&field)?;
         self.update_set_exprs.push((field, expr));
         Ok(self)
     }
@@ -1688,6 +1704,40 @@ mod tests {
     // -----------------------------------------------------------------------
     // Traversal / join
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_accepts_dotted_paths_into_nested_objects() {
+        let q = Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set(
+                "metadata.processing",
+                serde_json::json!({"verdict": "clean"}),
+            )
+            .unwrap()
+            .to_surql()
+            .unwrap();
+        assert!(
+            q.contains("SET metadata.processing = "),
+            "nested assignment must render: {q}",
+        );
+        // Hostile segments still refuse.
+        assert!(Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set("metadata.bad segment", 1)
+            .is_err());
+        assert!(Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set("metadata..double", 1)
+            .is_err());
+        assert!(Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set("", 1)
+            .is_err());
+    }
 
     #[test]
     fn traverse_appends_path_to_from() {

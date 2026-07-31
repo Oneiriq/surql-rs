@@ -9,6 +9,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`Query::set` / `set_expr` accept dotted paths.** `SET
+  metadata.processing = {...}` is native SurrealDB nested assignment,
+  and the schema layer already accepts dot notation for field
+  definitions, but the update builder rejected any dotted target as an
+  invalid identifier. Targets now validate per segment.
+
 - **`FLEXIBLE` now renders immediately after the `TYPE` clause.** The
   previous trailing position (`... READONLY FLEXIBLE;`) is a parse error
   on SurrealDB v3 ("FLEXIBLE must be specified after TYPE"), so any
