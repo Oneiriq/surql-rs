@@ -282,6 +282,13 @@ impl FieldDefinition {
             table = table,
             ty = type_clause,
         );
+        // SurrealDB v3 requires FLEXIBLE immediately after the TYPE
+        // clause; rendering it after READONLY (this crate's previous
+        // trailing position) is a parse error: "FLEXIBLE must be
+        // specified after TYPE". Verified against v3.0.5.
+        if self.flexible {
+            sql.push_str(" FLEXIBLE");
+        }
         if let Some(assertion) = &self.assertion {
             write!(sql, " ASSERT {}", assertion).expect("writing to String cannot fail");
         }
@@ -295,9 +302,6 @@ impl FieldDefinition {
         }
         if self.readonly {
             sql.push_str(" READONLY");
-        }
-        if self.flexible {
-            sql.push_str(" FLEXIBLE");
         }
         sql.push(';');
         sql
@@ -749,12 +753,27 @@ mod tests {
 
     #[test]
     fn to_surql_readonly_flexible() {
+        // FLEXIBLE immediately after TYPE is the only ordering the v3
+        // parser accepts alongside READONLY; the previous trailing
+        // position was a parse error on a live server.
         let f = FieldDefinition::new("meta", FieldType::Object)
             .readonly(true)
             .flexible(true);
         assert_eq!(
             f.to_surql("user"),
-            "DEFINE FIELD meta ON TABLE user TYPE object READONLY FLEXIBLE;"
+            "DEFINE FIELD meta ON TABLE user TYPE object FLEXIBLE READONLY;"
+        );
+    }
+
+    #[test]
+    fn to_surql_flexible_composes_with_option_and_default() {
+        let f = FieldDefinition::new("metadata", FieldType::Object)
+            .flexible(true)
+            .with_nullable(true)
+            .with_default("{}");
+        assert_eq!(
+            f.to_surql("file"),
+            "DEFINE FIELD metadata ON TABLE file TYPE option<object> FLEXIBLE DEFAULT {};"
         );
     }
 

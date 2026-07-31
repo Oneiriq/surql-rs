@@ -7,6 +7,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **`FLEXIBLE` now renders immediately after the `TYPE` clause.** The
+  previous trailing position (`... READONLY FLEXIBLE;`) is a parse error
+  on SurrealDB v3 ("FLEXIBLE must be specified after TYPE"), so any
+  schema combining a flexible object field with `READONLY`, `DEFAULT`,
+  `VALUE`, or `ASSERT` failed to apply. Verified against v3.0.5: the
+  after-TYPE position is accepted in every combination, including
+  `option<object> FLEXIBLE`.
+
 ### Added
 
 - **Nullable fields (`TYPE option<...>`).** `FieldBuilder::nullable(bool)` /
