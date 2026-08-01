@@ -64,6 +64,12 @@ use crate::query::builder::{Condition, WhereCondition};
 /// ```
 pub struct LiveQuery<T> {
     stream: QueryStream<Notification<T>>,
+    /// The handle that opened the subscription, held for the stream's
+    /// whole life. The engine ends a live query when the client that
+    /// started it goes away, so a `LiveQuery` that borrowed instead of
+    /// owning would go quiet the moment its caller dropped a `Clone`,
+    /// with no error and no closed stream to explain it.
+    _client: DatabaseClient,
     _marker: PhantomData<T>,
 }
 
@@ -131,6 +137,7 @@ where
             response.stream(0).map_err(|e| streaming_err(&e))?;
         Ok(Self {
             stream,
+            _client: client.clone(),
             _marker: PhantomData,
         })
     }
