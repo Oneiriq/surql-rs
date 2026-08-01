@@ -102,7 +102,22 @@ pub fn parse_access(name: &str, definition: &str) -> Option<AccessDefinition> {
                 .captures(definition)
                 .and_then(|c| c.get(1))
                 .map(|m| m.as_str().trim().to_string());
-            acc.record = Some(RecordAccessConfig { signup, signin });
+            // Record access may carry a JWT verifier for externally
+            // minted tokens; the engine echoes it as `WITH JWT ...`.
+            let jwt = definition
+                .to_uppercase()
+                .contains("WITH JWT")
+                .then(|| JwtConfig {
+                    algorithm: extract_algorithm(definition).unwrap_or_else(|| "HS256".into()),
+                    key: extract_single_quoted(key_regex(), definition),
+                    url: extract_single_quoted(url_regex(), definition),
+                    issuer: None,
+                });
+            acc.record = Some(RecordAccessConfig {
+                signup,
+                signin,
+                jwt,
+            });
         }
     }
 

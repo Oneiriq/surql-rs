@@ -122,6 +122,12 @@ pub struct RecordAccessConfig {
     /// SurrealQL expression that runs on signin.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub signin: Option<String>,
+    /// JWT verifier for externally minted record tokens (`WITH JWT
+    /// ...`). With this set, tokens signed with the declared key and
+    /// carrying an `id` claim authenticate as record sessions
+    /// directly; no signup or signin flow is required.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub jwt: Option<JwtConfig>,
 }
 
 impl RecordAccessConfig {
@@ -139,6 +145,12 @@ impl RecordAccessConfig {
     /// Set the signin expression.
     pub fn with_signin(mut self, signin: impl Into<String>) -> Self {
         self.signin = Some(signin.into());
+        self
+    }
+
+    /// Attach a JWT verifier for externally minted record tokens.
+    pub fn with_jwt(mut self, jwt: JwtConfig) -> Self {
+        self.jwt = Some(jwt);
         self
     }
 }
@@ -265,6 +277,16 @@ impl AccessDefinition {
             if let Some(signin) = &record.signin {
                 write!(sql, " SIGNIN ({})", signin).expect("writing to String cannot fail");
             }
+            if let Some(jwt) = &record.jwt {
+                write!(sql, " WITH JWT ALGORITHM {}", jwt.algorithm)
+                    .expect("writing to String cannot fail");
+                if let Some(key) = &jwt.key {
+                    write!(sql, " KEY '{}'", key).expect("writing to String cannot fail");
+                }
+                if let Some(url) = &jwt.url {
+                    write!(sql, " URL '{}'", url).expect("writing to String cannot fail");
+                }
+            }
         }
 
         if self.duration_session.is_some() || self.duration_token.is_some() {
@@ -355,6 +377,22 @@ pub fn record_access(name: impl Into<String>, config: RecordAccessConfig) -> Acc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_access_renders_jwt_verifier() {
+        let access = AccessDefinition::record(
+            "caller",
+            RecordAccessConfig::new().with_jwt(JwtConfig::hs256("secret")),
+        )
+        .with_session("1h");
+        assert_eq!(
+            access.to_surql().unwrap(),
+            concat!(
+                "DEFINE ACCESS caller ON DATABASE TYPE RECORD ",
+                "WITH JWT ALGORITHM HS256 KEY 'secret' DURATION FOR SESSION 1h;"
+            )
+        );
+    }
 
     #[test]
     fn access_type_strings() {
