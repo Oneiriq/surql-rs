@@ -7,6 +7,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- **`DatabaseClient` clones now share ONE engine session.** The SDK
+  mints a session per `Surreal` clone and announces it with lifecycle
+  events the remote router can lose under concurrency, which surfaced
+  as intermittent `Session not found` failures in any service that
+  clones its client per request (an axum state extraction does
+  exactly that). The inner handle now rides an `Arc`, so clones share
+  the service session and session churn stops entirely. Code that
+  wants an independent session asks for one: `caller_session` for a
+  caller-bound session, `client.inner().clone()` for a raw one. Auth
+  calls (`signin`, `authenticate`, `invalidate`) now act on the
+  shared session, which is what a service almost always means; the
+  previous per-clone isolation was an accident of the SDK's `Clone`.
+
 ### Added
 
 - **`DatabaseClient::caller_session` opens per-caller engine

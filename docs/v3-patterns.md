@@ -307,6 +307,13 @@ that clone, and keeps it. Code that talks to the SDK directly has to hold the
 same handle that ran the statement. Cloning afterwards does not work, because
 the new clone is a different session.
 
+The session churn also loses events: the SDK announces every clone and
+drop to the connection router over a side channel, and under
+multi-threaded request traffic the remote router can process a query
+before the session event that should precede it, which fails the
+query with `Session not found`. `DatabaseClient` therefore shares one
+session across its clones and mints new sessions only on request.
+
 ## 12. Sessions carry authority, so one connection can serve many callers
 
 Section 11's session-per-clone behaviour cuts both ways. The same

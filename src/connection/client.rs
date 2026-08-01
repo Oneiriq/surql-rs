@@ -40,12 +40,19 @@ use crate::error::{Result, SurqlError};
 /// dynamic [`Any`] engine. All methods are `async` and cancellation-safe
 /// at the tokio level.
 ///
-/// The client is `Clone`-able: every clone shares the same underlying
-/// connection (the `surrealdb` SDK holds its own `Arc`).
+/// The client is `Clone`-able, and every clone shares ONE engine
+/// session: the inner SDK handle rides an `Arc`, because the SDK's
+/// own `Clone` mints a session per clone and sends session lifecycle
+/// events the remote router can lose under concurrency, which
+/// surfaces as `Session not found` on requests. A service that
+/// clones its client per request wants one shared session; code that
+/// needs an independent session says so through
+/// [`DatabaseClient::caller_session`] or an explicit
+/// `client.inner().clone()`.
 #[derive(Debug, Clone)]
 pub struct DatabaseClient {
     config: ConnectionConfig,
-    inner: Surreal<Any>,
+    inner: Arc<Surreal<Any>>,
     connected: Arc<RwLock<bool>>,
     /// Whether the underlying SDK engine has been connected. The SDK connects
     /// a handle once and rejects a second `connect` ("Already connected"), so
@@ -63,7 +70,7 @@ impl DatabaseClient {
         config.validate()?;
         Ok(Self {
             config,
-            inner: Surreal::init(),
+            inner: Arc::new(Surreal::init()),
             connected: Arc::new(RwLock::new(false)),
             engine_connected: Arc::new(RwLock::new(false)),
         })
@@ -264,7 +271,9 @@ impl DatabaseClient {
         self.require_connected()?;
         let session = DatabaseClient {
             config: self.config.clone(),
-            inner: self.inner.clone(),
+            // An explicit SDK-level clone: THIS is the one place a
+            // fresh engine session is wanted.
+            inner: Arc::new((*self.inner).clone()),
             // Fresh flags: disconnecting or invalidating the caller
             // session must leave the parent client's state alone.
             connected: Arc::new(RwLock::new(true)),
