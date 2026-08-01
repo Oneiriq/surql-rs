@@ -212,20 +212,34 @@ lexical recall).
 
 ### `search::score` and scan ordering
 
-The v3 streaming executor's full-text scan yields matching rows **already in BM25
-relevance order**, but does not (in 3.0.x) plumb the per-row score through to
-`search::score(<ref>)`, which returns `0` there. So rank by the scan's natural
-order rather than `ORDER BY search::score(...)`. This is sufficient for
-Reciprocal Rank Fusion, which fuses *ranks*, not raw scores:
+The full-text index decides WHICH rows match. It does not rank them.
+
+`search::score(<ref>)` returns `0` for every row, and the scan yields matches in
+**insertion order**, not relevance order. Measured on 3.2.3 across every form the
+engine accepts: a bare scan, the score projected, `ORDER BY` the projected alias,
+the `@@` operator with no reference number, and an index defined `BM25
+HIGHLIGHTS`. None ranks. `ORDER BY search::score(1)` is a parse error (`Missing
+order idiom search in statement selection`).
+
+The way to see it: seed the same two documents in both insertion orders and
+compare the result order. It mirrors the input.
+
+A consumer that needs relevance has to compute it. The practical shape is the one
+production search already uses: let the index select a bounded candidate window,
+then rescore that window locally, matching the analyzer's tokenizer and stemmer
+so local scoring agrees with what the index matched.
 
 ```rust
-// The sparse leg of hybrid retrieval: rows come back in relevance order.
+// The sparse leg of hybrid retrieval: matches, NOT yet ranked.
 let q = surql::query::helpers::fulltext_search_query(
     "memory", "content", 1, "insider buying", None, "score",
 )?
-.limit(100)?;
-// Fuse the returned order with the dense (vector_search) order via RRF.
+.limit(500)?;   // a rescoring window, not the answer
+// Score the window locally, then fuse ranks with the dense leg.
 ```
+
+An earlier revision of this document said the scan returned rows in BM25 order.
+That was wrong.
 
 v3 also ships a native `search::rrf([$dense, $sparse], k, 60)` function that fuses
 two result lists server-side, if you prefer in-engine fusion.
