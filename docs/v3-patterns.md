@@ -230,6 +230,45 @@ let q = surql::query::helpers::fulltext_search_query(
 v3 also ships a native `search::rrf([$dense, $sparse], k, 60)` function that fuses
 two result lists server-side, if you prefer in-engine fusion.
 
+## 10. The KNN operator's second operand picks the plan
+
+`<|k,...|>` takes a second operand that decides how the search runs:
+
+```text
+embedding <|10,64|>     [...]   -- KnnScan: uses the field's vector index
+embedding <|10,COSINE|> [...]   -- KnnTopK over TableScan: compares every row
+```
+
+An INTEGER is the HNSW search effort (`ef`) and selects the index. A metric name
+makes the engine brute-force the table, which is correct and gets slower with
+every row inserted. The bare `<|k|>` form v1/v2 accepted is gone in v3.
+
+[`Query::vector_search`] renders the metric form, so it remains right for a field
+with no vector index. Use [`Query::vector_search_indexed`] whenever the field
+carries an HNSW or DiskANN index and let the index's own metric apply:
+
+```rust
+let q = surql::query::Query::new()
+    .select(None)
+    .from_table("chunk")?
+    .vector_search_indexed("embedding", query_vector, 10, 64)?;
+```
+
+There is no distance threshold on this operator in v3. A float in the second
+position is refused outright (`only integers are allowed here`), and there is no
+third position. For a relevance floor, project the real distance and filter on it
+in the same `WHERE`:
+
+```text
+SELECT * FROM chunk
+WHERE embedding <|100,64|> $q AND vector::distance::knn() <= 0.65
+LIMIT 10
+```
+
+`vector::distance::knn()` reads the distance the KNN operator already computed,
+so the filter costs nothing extra. Cosine distances run 0.0 for identical
+vectors, 0.2929 at 45 degrees, and 1.0 for orthogonal ones.
+
 ## What's next
 
 - [Query UX helpers](query-ux.md) - the 0.2 crate-root additions.
