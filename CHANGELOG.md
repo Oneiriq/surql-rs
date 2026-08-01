@@ -7,6 +7,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **`DatabaseClient::caller_session` opens per-caller engine
+  sessions.** A cloned SDK handle is its own session, so one
+  connection can hold a root session and record-authenticated caller
+  sessions side by side, with the engine applying `PERMISSIONS` to
+  each session's actor. The method authenticates a record access
+  token on a fresh clone, verifies the engine bound a record identity
+  (refusing database-level tokens that `PERMISSIONS` would not
+  filter), and returns a client whose drop ends the session.
+
+- **Connection credentials reach embedded engines at build time.**
+  `username`/`password` now construct embedded datastores with the
+  root user in place, so anonymous sessions stop acting as owner and
+  the engine is lockable from configuration alone. Remote engines
+  keep the existing signin path.
+
 ### Fixed
 
 - **`Query::set` / `set_expr` accept dotted paths.** `SET

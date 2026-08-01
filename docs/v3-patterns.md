@@ -307,6 +307,47 @@ that clone, and keeps it. Code that talks to the SDK directly has to hold the
 same handle that ran the statement. Cloning afterwards does not work, because
 the new clone is a different session.
 
+## 12. Sessions carry authority, so one connection can serve many callers
+
+Section 11's session-per-clone behaviour cuts both ways. The same
+mechanism that silently kills live queries also means one connection
+can hold sessions with different authority at the same time: clone a
+handle, `authenticate` a token on the clone, and the engine evaluates
+that session against the token's actor while the original handle keeps
+its own.
+
+For a service that fronts many callers over one root connection, that
+turns `PERMISSIONS` clauses from dead weight into a second enforcement
+layer. `DatabaseClient::caller_session` packages the pattern:
+
+```rust
+let caller = client.caller_session(&token).await?;
+let rows = caller.query("SELECT * FROM doc;").await?; // engine-filtered
+drop(caller); // the session ends with the client
+```
+
+The facts underneath, all engine-verified:
+
+- Only RECORD sessions are filtered. The token must come from a
+  `DEFINE ACCESS ... TYPE RECORD` method and carry an `id` claim;
+  the engine then binds `$auth` to that record and applies table and
+  field `PERMISSIONS`. A plain `TYPE JWT` access method yields a
+  database-level session that bypasses them, which is why
+  `caller_session` checks `$auth` and refuses tokens that bind no
+  record identity.
+- Externally minted tokens need no `SIGNIN` or `SIGNUP` clause on the
+  access method. Sign the claims with the declared key and the engine
+  verifies them directly.
+- Enforcement follows the actor. Engine credentials decide only what
+  anonymous sessions may do: without them every anonymous session
+  acts as owner, but an authenticated record session is constrained
+  either way. For embedded engines the connection settings' username
+  and password now reach the datastore at build time, so a locked
+  engine is reachable from configuration alone.
+- Engine refusals are silent. A write a table forbids returns empty
+  rows with no error, so the application layer stays the face that
+  explains refusals and the engine acts as a backstop.
+
 ## What's next
 
 - [Query UX helpers](query-ux.md) - the 0.2 crate-root additions.
