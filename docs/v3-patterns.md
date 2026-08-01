@@ -269,6 +269,30 @@ LIMIT 10
 so the filter costs nothing extra. Cosine distances run 0.0 for identical
 vectors, 0.2929 at 45 degrees, and 1.0 for orthogonal ones.
 
+## 11. `Surreal::clone` opens a new session, and dropping it kills that session's live queries
+
+In v3 the SDK gives every `Surreal` clone its own session id, and `Drop` sends
+that session id away:
+
+```rust
+fn clone(&self) -> Self {
+    let session_id = Uuid::new_v4();
+    self.inner.clone_session(self.session_id, session_id);
+    // ...
+}
+```
+
+A live query belongs to the session that ran the `LIVE SELECT`. So a
+subscription opened through a handle that later drops goes quiet: no error, no
+closed stream, just silence. It is easy to hit without noticing, because a
+request handler that clones shared state, starts a subscription, and returns the
+stream has done exactly this.
+
+[`LiveQuery`] handles it: it clones the client, issues the statement through
+that clone, and keeps it. Code that talks to the SDK directly has to hold the
+same handle that ran the statement. Cloning afterwards does not work, because
+the new clone is a different session.
+
 ## What's next
 
 - [Query UX helpers](query-ux.md) - the 0.2 crate-root additions.

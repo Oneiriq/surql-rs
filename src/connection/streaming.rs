@@ -64,11 +64,17 @@ use crate::query::builder::{Condition, WhereCondition};
 /// ```
 pub struct LiveQuery<T> {
     stream: QueryStream<Notification<T>>,
-    /// The handle that opened the subscription, held for the stream's
-    /// whole life. The engine ends a live query when the client that
-    /// started it goes away, so a `LiveQuery` that borrowed instead of
-    /// owning would go quiet the moment its caller dropped a `Clone`,
-    /// with no error and no closed stream to explain it.
+    /// The handle that ISSUED the `LIVE SELECT`, held for the stream's
+    /// whole life.
+    ///
+    /// `Surreal::clone` gives each clone its own session id, and its
+    /// `Drop` ends that session; a live query belongs to the session
+    /// that started it. So a subscription opened through a borrowed
+    /// handle goes quiet the moment the caller's clone drops, silently,
+    /// with no error and no closed stream to explain it. Owning the
+    /// exact handle that ran the statement is what keeps the session,
+    /// and therefore the subscription, alive. A clone made afterwards
+    /// would be a DIFFERENT session and would not help.
     _client: DatabaseClient,
     _marker: PhantomData<T>,
 }
@@ -128,7 +134,11 @@ where
         }
 
         let surql = render_live_select(target, conditions);
-        let mut response = client
+        // Clone BEFORE issuing the statement, and issue it through the
+        // clone this struct keeps: the subscription belongs to whichever
+        // session ran it.
+        let owned = client.clone();
+        let mut response = owned
             .inner()
             .query(surql)
             .await
@@ -137,7 +147,7 @@ where
             response.stream(0).map_err(|e| streaming_err(&e))?;
         Ok(Self {
             stream,
-            _client: client.clone(),
+            _client: owned,
             _marker: PhantomData,
         })
     }
