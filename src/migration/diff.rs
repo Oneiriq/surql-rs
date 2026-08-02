@@ -671,7 +671,10 @@ fn modify_permissions_full(table: &str, forward_sql: String, backward_sql: Strin
 // ---------------------------------------------------------------------------
 
 fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
-    let forward_sql = format!("DEFINE TABLE {} {};", table.name, table.mode.as_str());
+    // The canonical renderer carries mode AND permissions in the one
+    // statement; a separate permissions statement would re-define the
+    // table it just created.
+    let forward_sql = table.to_surql();
     let backward_sql = format!("REMOVE TABLE {};", table.name);
     let mut out = vec![SchemaDiff {
         operation: DiffOperation::AddTable,
@@ -694,15 +697,6 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
     }
     for ev in &table.events {
         out.push(generate_add_event_diff(&table.name, ev));
-    }
-    if let Some(perms) = table.permissions.as_ref() {
-        if !perms.is_empty() {
-            out.push(generate_modify_permissions_diff(
-                &table.name,
-                Some(perms),
-                None,
-            ));
-        }
     }
     out
 }
@@ -1372,12 +1366,14 @@ mod tests {
             .with_events([event("on_upd", "true", "RETURN 1")])
             .with_permissions([("select", "true")]);
         let diffs = diff_tables(&[code_table], &[]);
-        // table + event + perms
-        assert_eq!(diffs.len(), 3);
+        // Table (permissions ride the DEFINE TABLE itself) + event.
+        assert_eq!(diffs.len(), 2);
         assert!(diffs.iter().any(|d| d.operation == DiffOperation::AddEvent));
-        assert!(diffs
-            .iter()
-            .any(|d| d.operation == DiffOperation::ModifyPermissions));
+        assert!(
+            diffs[0].forward_sql.contains("PERMISSIONS"),
+            "{}",
+            diffs[0].forward_sql
+        );
     }
 
     // ----- diff_tables: DROP -----
