@@ -42,6 +42,13 @@ fn option_type_regex() -> &'static Regex {
     RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+option\s*<\s*(\w+(?:\s*<\s*\w+\s*>)?)\s*>"))
 }
 
+/// Matches the engine's echo form for optional fields: `TYPE none | inner`.
+/// The 3.x server reports `option<T>` this way in `INFO FOR TABLE`.
+fn none_union_type_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+none\s*\|\s*(\w+(?:\s*<\s*\w+\s*>)?)"))
+}
+
 // --- Public parsers ----------------------------------------------------------
 
 /// Parse every entry of a `fd` / `fields` map.
@@ -85,6 +92,11 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
 /// which would break the code/database round-trip and make migration
 /// diffing flap on every nullable field.
 fn extract_field_type(definition: &str) -> (FieldType, bool) {
+    if let Some(caps) = none_union_type_regex().captures(definition) {
+        let inner = caps[1].to_ascii_lowercase();
+        let word = inner.split('<').next().unwrap_or("").trim().to_string();
+        return (field_type_from_word(&word), true);
+    }
     if let Some(caps) = option_type_regex().captures(definition) {
         let inner = caps[1].to_ascii_lowercase();
         let word = inner.split('<').next().unwrap_or("").trim().to_string();
@@ -147,10 +159,13 @@ fn find_keyword(text: &str, kw: &str, require_whitespace_left: bool) -> Option<u
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
         if bytes[i..i + needle.len()] == *needle {
+            // `$` blocks a match: `$value` must never read as the
+            // VALUE keyword, or every ASSERT mentioning it grows a
+            // phantom VALUE clause.
             let left_ok = if require_whitespace_left {
                 i == 0 || bytes[i - 1].is_ascii_whitespace()
             } else {
-                i == 0 || !is_ident_byte(bytes[i - 1])
+                i == 0 || (!is_ident_byte(bytes[i - 1]) && bytes[i - 1] != b'$')
             };
             let right_ok =
                 i + needle.len() == bytes.len() || !is_ident_byte(bytes[i + needle.len()]);
@@ -236,4 +251,40 @@ fn extract_readonly(definition: &str) -> bool {
 
 fn extract_flexible(definition: &str) -> bool {
     flexible_regex().is_match(definition)
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use crate::schema::fields::FieldType;
+
+    #[test]
+    fn engine_echo_none_union_parses_as_nullable() {
+        let field = super::parse_field(
+            "expires_at",
+            "DEFINE FIELD expires_at ON access_grant TYPE none | datetime PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::Datetime);
+        assert!(field.nullable);
+
+        let field = super::parse_field(
+            "file",
+            "DEFINE FIELD file ON access_grant TYPE none | record<file> PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::Record);
+        assert!(field.nullable);
+        assert_eq!(field.target_table.as_deref(), Some("file"));
+    }
+
+    #[test]
+    fn dollar_value_never_reads_as_the_value_keyword() {
+        let field = super::parse_field(
+            "op",
+            "DEFINE FIELD op ON access_grant TYPE string DEFAULT 'get' ASSERT $value INSIDE ['x'] PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert!(field.value.is_none(), "{:?}", field.value);
+        assert!(field.assertion.as_deref().unwrap().contains("INSIDE"));
+    }
 }
