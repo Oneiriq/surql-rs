@@ -194,7 +194,17 @@ impl EdgeDefinition {
 
     /// Render the `DEFINE TABLE` statement with optional `IF NOT EXISTS`.
     pub fn to_surql_with_options(&self, if_not_exists: bool) -> Result<String> {
-        let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        self.render_guard(if if_not_exists { " IF NOT EXISTS" } else { "" })
+    }
+
+    /// Render with `OVERWRITE`, replacing an existing definition while
+    /// leaving stored data untouched. What schema evolution applies
+    /// when a stored definition no longer matches the code.
+    pub fn to_surql_overwrite(&self) -> Result<String> {
+        self.render_guard(" OVERWRITE")
+    }
+
+    fn render_guard(&self, ine: &str) -> Result<String> {
         // Table-level PERMISSIONS render inline on the DEFINE TABLE statement
         // (the only valid placement), matching `TableDefinition`.
         let perms = match &self.permissions {

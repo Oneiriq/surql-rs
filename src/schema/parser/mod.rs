@@ -64,6 +64,7 @@ use crate::schema::edge::EdgeDefinition;
 use crate::schema::table::TableDefinition;
 
 mod access;
+mod analyzer;
 mod bucket;
 mod db;
 mod edge;
@@ -74,6 +75,7 @@ mod permissions;
 mod table;
 
 pub use access::parse_access;
+pub use analyzer::parse_analyzer;
 pub use bucket::parse_bucket;
 pub use db::parse_db_info;
 pub use edge::parse_edge_info;
@@ -81,7 +83,7 @@ pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
 pub use index::{parse_index, parse_indexes};
 pub use permissions::parse_table_permissions;
-pub use table::{parse_table_info, parse_table_mode};
+pub use table::{parse_table_full, parse_table_info, parse_table_mode};
 
 // --- Shared regex helper -----------------------------------------------------
 
@@ -156,6 +158,9 @@ pub(super) fn pick_map<'a>(
 pub struct DatabaseInfo {
     /// Regular (non-relation) tables.
     pub tables: BTreeMap<String, TableDefinition>,
+    /// Text analyzers.
+    #[serde(default)]
+    pub analyzers: BTreeMap<String, crate::schema::analyzer::AnalyzerDefinition>,
     /// Relation-mode edge tables.
     pub edges: BTreeMap<String, EdgeDefinition>,
     /// Database-level access definitions.

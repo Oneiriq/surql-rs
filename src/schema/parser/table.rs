@@ -54,6 +54,19 @@ pub fn parse_table_mode(definition: &str) -> TableMode {
 /// on v3.
 ///
 /// Returns [`crate::error::SurqlError::SchemaParse`] when the top-level value
+/// The complete definition for one table from the two `INFO` levels:
+/// the database's `DEFINE TABLE` echo carries mode and permissions,
+/// and the table's own `INFO FOR TABLE` carries fields, indexes, and
+/// events. `INFO FOR DB` alone yields fieldless tables, which is a
+/// trap for anyone diffing against it.
+pub fn parse_table_full(
+    table_name: &str,
+    db_define: &str,
+    table_info: &Value,
+) -> Result<TableDefinition> {
+    parse_table_info(table_name, table_info, Some(db_define))
+}
+
 /// is not a JSON object.
 pub fn parse_table_info(
     table_name: &str,

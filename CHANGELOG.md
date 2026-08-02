@@ -24,6 +24,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **The diff engine serves live-database reconciliation.** Analyzers
+  join `DatabaseInfo`, `SchemaSnapshot`, and `diff_schemas` with
+  their own parser, so the full schema a consumer declares can be
+  compared against what a database actually holds.
+  `parse_table_full` names the two-level composition (`INFO FOR DB`
+  for mode and permissions, `INFO FOR TABLE` for fields, indexes,
+  and events), because the database level alone yields fieldless
+  tables, which is a trap for anyone diffing against it.
+
+### Fixed
+
+- **Diff results are now safe to apply to a live database.**
+  Grouped permission actions (`FOR select, create ...`) compare
+  equal to the engine's split echo instead of reporting a permanent
+  false modification. Modify-class diffs render `OVERWRITE` forms:
+  a modified field re-defines with `OVERWRITE`, and a permissions
+  change carries the owning table's FULL definition, because a
+  permissions-only `DEFINE TABLE` would silently reset the table's
+  mode.
+
 - **`OVERWRITE` rendering across the schema layer.** Tables, fields,
   indexes, events, analyzers, and access methods gain
   `to_surql_overwrite`, and `generate_table_sql_overwrite` renders a

@@ -291,6 +291,12 @@ pub enum DiffOperation {
     DropEvent,
     /// Permissions were modified on a table or field.
     ModifyPermissions,
+    /// A new analyzer was added.
+    AddAnalyzer,
+    /// An existing analyzer's definition changed.
+    ModifyAnalyzer,
+    /// An existing analyzer was removed.
+    DropAnalyzer,
     /// A new object-storage bucket was added.
     AddBucket,
     /// An existing bucket was removed.
@@ -314,6 +320,9 @@ impl DiffOperation {
             Self::AddEvent => "add_event",
             Self::DropEvent => "drop_event",
             Self::ModifyPermissions => "modify_permissions",
+            Self::AddAnalyzer => "add_analyzer",
+            Self::ModifyAnalyzer => "modify_analyzer",
+            Self::DropAnalyzer => "drop_analyzer",
             Self::AddBucket => "add_bucket",
             Self::DropBucket => "drop_bucket",
             Self::ModifyBucket => "modify_bucket",
@@ -341,6 +350,7 @@ impl std::fmt::Display for DiffOperation {
 ///     index: None,
 ///     event: None,
 ///     bucket: None,
+///     analyzer: None,
 ///     description: "Add user table".into(),
 ///     forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
 ///     backward_sql: "REMOVE TABLE user;".into(),
@@ -364,6 +374,9 @@ pub struct SchemaDiff {
     /// Bucket name, if the change targets an object-storage bucket.
     #[serde(default)]
     pub bucket: Option<String>,
+    /// Analyzer name, when the operation concerns an analyzer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzer: Option<String>,
     /// Human-readable description.
     pub description: String,
     /// SurrealQL that applies the change (forward).
@@ -673,6 +686,7 @@ mod tests {
             index: None,
             event: None,
             bucket: None,
+            analyzer: None,
             description: "Add user table".into(),
             forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
             backward_sql: "REMOVE TABLE user;".into(),
@@ -692,6 +706,7 @@ mod tests {
             index: None,
             event: None,
             bucket: None,
+            analyzer: None,
             description: "Add email field".into(),
             forward_sql: "DEFINE FIELD email ON TABLE user TYPE string;".into(),
             backward_sql: "REMOVE FIELD email ON TABLE user;".into(),
@@ -712,6 +727,7 @@ mod tests {
             index: None,
             event: None,
             bucket: None,
+            analyzer: None,
             description: "change age".into(),
             forward_sql: "DEFINE FIELD age ON TABLE user TYPE int;".into(),
             backward_sql: "DEFINE FIELD age ON TABLE user TYPE string;".into(),

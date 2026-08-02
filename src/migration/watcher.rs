@@ -511,6 +511,7 @@ mod tests {
             tables: vec![table_schema("user")],
             edges: vec![],
             buckets: vec![],
+            analyzers: Vec::new(),
         };
         let recorded = SchemaSnapshot::new();
 
@@ -563,6 +564,7 @@ mod tests {
             tables: vec![table_schema("user")],
             edges: vec![],
             buckets: vec![],
+            analyzers: Vec::new(),
         };
         let (w, mut rx) = SchemaWatcher::start(
             std::slice::from_ref(&dir),

@@ -102,6 +102,20 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
         }
     }
 
+    if let Some(az_value) = pick_map(obj, &["az", "analyzers"]) {
+        for (name, def_value) in az_value.as_object().expect("checked by pick_map") {
+            let Some(def) = def_value.as_str() else {
+                continue;
+            };
+            // Lenient like access parsing: an analyzer this crate
+            // cannot model yet is skipped rather than failing the
+            // whole introspection.
+            if let Ok(analyzer) = super::analyzer::parse_analyzer(name, def) {
+                out.analyzers.insert(name.clone(), analyzer);
+            }
+        }
+    }
+
     if let Some(bu_value) = pick_map(obj, &["bu", "buckets"]) {
         for (name, def_value) in bu_value.as_object().expect("checked by pick_map") {
             let Some(def) = def_value.as_str() else {

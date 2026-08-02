@@ -160,6 +160,7 @@ pub fn generate_initial_migration(
         tables: tables.values().cloned().collect(),
         edges: edges.values().cloned().collect(),
         buckets: buckets.values().cloned().collect(),
+        analyzers: Vec::new(),
     };
 
     let (up_statements, down_statements) = build_initial_statements(&snapshot)?;
@@ -247,6 +248,7 @@ pub fn create_blank_migration(
 ///     index: None,
 ///     event: None,
 ///     bucket: None,
+///     analyzer: None,
 ///     description: "Add user table".into(),
 ///     forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
 ///     backward_sql: "REMOVE TABLE user;".into(),
@@ -937,6 +939,7 @@ mod tests {
             index: None,
             event: None,
             bucket: None,
+            analyzer: None,
             description: format!("Add {name} table"),
             forward_sql: format!("DEFINE TABLE {name} SCHEMAFULL;"),
             backward_sql: format!("REMOVE TABLE {name};"),
@@ -983,6 +986,7 @@ mod tests {
                 index: None,
                 event: None,
                 bucket: None,
+                analyzer: None,
                 description: "x".into(),
                 forward_sql: String::new(),
                 backward_sql: String::new(),
@@ -1008,6 +1012,7 @@ mod tests {
             index: None,
             event: None,
             bucket: None,
+            analyzer: None,
             description: "x".into(),
             forward_sql: "DEFINE TABLE x SCHEMAFULL".into(),
             backward_sql: "REMOVE TABLE x".into(),
