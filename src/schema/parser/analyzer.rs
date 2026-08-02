@@ -15,7 +15,7 @@ fn invalid(name: &str, detail: &str) -> SurqlError {
 }
 
 fn parse_tokenizer(name: &str, raw: &str) -> Result<Tokenizer> {
-    match raw {
+    match raw.to_ascii_lowercase().as_str() {
         "blank" => Ok(Tokenizer::Blank),
         "camel" => Ok(Tokenizer::Camel),
         "class" => Ok(Tokenizer::Class),
@@ -25,6 +25,8 @@ fn parse_tokenizer(name: &str, raw: &str) -> Result<Tokenizer> {
 }
 
 fn parse_filter(name: &str, raw: &str) -> Result<TokenFilter> {
+    let raw = raw.to_ascii_lowercase();
+    let raw = raw.as_str();
     if let Some(args) = raw
         .strip_prefix("snowball(")
         .and_then(|r| r.strip_suffix(')'))

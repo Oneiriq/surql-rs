@@ -212,7 +212,46 @@ pub fn normalize_expression(expr: &str) -> String {
             in_space = false;
         }
     }
-    out
+    // The engine normalizes expressions in its echo: one level of
+    // wrapping parentheses, `IS NONE` reported as `= NONE`, and a
+    // space after casts (`<string> id`). Fold those so code and echo
+    // compare equal.
+    let mut out = out.trim().to_owned();
+    if out.starts_with('(') && out.ends_with(')') {
+        let inner = &out[1..out.len() - 1];
+        let mut depth = 0i32;
+        let balanced = inner.chars().all(|c| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth >= 0
+        }) && depth == 0;
+        if balanced {
+            out = inner.trim().to_owned();
+        }
+    }
+    let out = out
+        .replace(" IS NONE", " = NONE")
+        .replace(" is none", " = NONE");
+    let mut folded = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(ch) = chars.next() {
+        folded.push(ch);
+        if ch == '>' && chars.peek() == Some(&' ') {
+            // `<string> id` and `<string>id` are the same cast; keep
+            // comparison spacing (`a > b`) by requiring the `<` side
+            // to look like a cast start.
+            if let Some(open) = folded.rfind('<') {
+                let inside = &folded[open + 1..folded.len() - 1];
+                if !inside.is_empty() && inside.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    chars.next();
+                }
+            }
+        }
+    }
+    folded
 }
 
 fn expr_eq(a: Option<&str>, b: Option<&str>) -> bool {
@@ -305,6 +344,14 @@ pub fn diff_fields(
     }
     for f in db {
         if !code_map.contains_key(f.name.as_str()) {
+            // The engine defines array-child fields (`name.*`) on its
+            // own beside a declared array parent; those are engine
+            // bookkeeping, never removals.
+            if let Some(parent) = f.name.strip_suffix(".*") {
+                if code_map.contains_key(parent) {
+                    continue;
+                }
+            }
             out.push(generate_drop_field_diff(table, f));
         }
     }

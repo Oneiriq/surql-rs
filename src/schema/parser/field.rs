@@ -16,7 +16,7 @@ use crate::schema::fields::{FieldDefinition, FieldType};
 
 pub(super) fn type_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+(\w+)"))
+    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+(\w+)"))
 }
 
 fn readonly_regex() -> &'static Regex {
@@ -39,14 +39,14 @@ fn record_target_regex() -> &'static Regex {
 /// emitter produces. The inner text is captured for type resolution.
 fn option_type_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+option\s*<\s*(\w+(?:\s*<\s*\w+\s*>)?)\s*>"))
+    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+option\s*<\s*(\w+(?:\s*<\s*\w+\s*>)?)\s*>"))
 }
 
 /// Matches the engine's echo form for optional fields: `TYPE none | inner`.
 /// The 3.x server reports `option<T>` this way in `INFO FOR TABLE`.
 fn none_union_type_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+none\s*\|\s*(\w+(?:\s*<\s*\w+\s*>)?)"))
+    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+none\s*\|\s*(\w+(?:\s*<\s*\w+\s*>)?)"))
 }
 
 // --- Public parsers ----------------------------------------------------------
