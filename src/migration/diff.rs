@@ -1131,31 +1131,9 @@ fn render_permission_statements(table: &str, perms: Option<&BTreeMap<String, Str
 }
 
 fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
-    let mut sql = format!(
-        "DEFINE FIELD {name} ON TABLE {table} TYPE {ty}",
-        name = field.name,
-        ty = field.field_type.as_str(),
-    );
-    if let Some(a) = field.assertion.as_deref() {
-        sql.push_str(" ASSERT ");
-        sql.push_str(a);
-    }
-    if let Some(d) = field.default.as_deref() {
-        sql.push_str(" DEFAULT ");
-        sql.push_str(d);
-    }
-    if let Some(v) = field.value.as_deref() {
-        sql.push_str(" VALUE ");
-        sql.push_str(v);
-    }
-    if field.readonly {
-        sql.push_str(" READONLY");
-    }
-    if field.flexible {
-        sql.push_str(" FLEXIBLE");
-    }
-    sql.push(';');
-    sql
+    // The canonical renderer, so clause ordering (FLEXIBLE after
+    // TYPE, VALUE placement) has exactly one implementation.
+    field.to_surql(table)
 }
 
 fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
