@@ -268,7 +268,17 @@ impl FieldDefinition {
 
     /// Render with optional `IF NOT EXISTS` clause.
     pub fn to_surql_with_options(&self, table: &str, if_not_exists: bool) -> String {
-        let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        self.render_guard(table, if if_not_exists { " IF NOT EXISTS" } else { "" })
+    }
+
+    /// Render with `OVERWRITE`, replacing an existing definition while
+    /// leaving stored data untouched. What schema evolution applies
+    /// when a stored definition no longer matches the code.
+    pub fn to_surql_overwrite(&self, table: &str) -> String {
+        self.render_guard(table, " OVERWRITE")
+    }
+
+    fn render_guard(&self, table: &str, ine: &str) -> String {
         let (type_clause, drop_value) = self.resolve_type_clause();
         let type_clause = if self.nullable {
             format!("option<{type_clause}>")

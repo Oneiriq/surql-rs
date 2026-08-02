@@ -24,6 +24,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **`OVERWRITE` rendering across the schema layer.** Tables, fields,
+  indexes, events, analyzers, and access methods gain
+  `to_surql_overwrite`, and `generate_table_sql_overwrite` renders a
+  table's full statement set with it. `IF NOT EXISTS` creates and
+  then never updates, so a consumer whose definitions evolve needs
+  the replacing form to bring an existing database up to the code's
+  schema; data is untouched, only definitions are replaced.
+
 - **`DatabaseClient::caller_session` opens per-caller engine
   sessions.** A cloned SDK handle is its own session, so one
   connection can hold a root session and record-authenticated caller

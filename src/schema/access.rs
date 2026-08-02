@@ -248,8 +248,18 @@ impl AccessDefinition {
     /// it can be re-applied idempotently (e.g. on every connect to a persistent
     /// store). Validates the definition first.
     pub fn to_surql_with_options(&self, if_not_exists: bool) -> Result<String> {
+        self.render_guard(if if_not_exists { "IF NOT EXISTS " } else { "" })
+    }
+
+    /// Render with `OVERWRITE`, replacing an existing definition while
+    /// leaving stored data untouched. What schema evolution applies
+    /// when a stored definition no longer matches the code.
+    pub fn to_surql_overwrite(&self) -> Result<String> {
+        self.render_guard("OVERWRITE ")
+    }
+
+    fn render_guard(&self, ine: &str) -> Result<String> {
         self.validate()?;
-        let ine = if if_not_exists { "IF NOT EXISTS " } else { "" };
         let mut sql = format!(
             "DEFINE ACCESS {ine}{name} ON DATABASE TYPE {ty}",
             ine = ine,
@@ -377,6 +387,18 @@ pub fn record_access(name: impl Into<String>, config: RecordAccessConfig) -> Acc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_renders_overwrite() {
+        let access = AccessDefinition::record(
+            "caller",
+            RecordAccessConfig::new().with_jwt(JwtConfig::hs256("secret")),
+        );
+        assert!(access
+            .to_surql_overwrite()
+            .unwrap()
+            .starts_with("DEFINE ACCESS OVERWRITE caller ON DATABASE TYPE RECORD"));
+    }
 
     #[test]
     fn record_access_renders_jwt_verifier() {

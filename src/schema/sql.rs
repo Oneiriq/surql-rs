@@ -42,6 +42,32 @@ pub fn generate_table_sql(table: &TableDefinition, if_not_exists: bool) -> Vec<S
     table.to_surql_all_with_options(if_not_exists)
 }
 
+/// [`generate_table_sql`] with every statement rendered `OVERWRITE`,
+/// for re-applying definitions that changed since they were stored.
+/// Data is untouched; only the definitions are replaced.
+pub fn generate_table_sql_overwrite(table: &TableDefinition) -> Vec<String> {
+    let mut statements = vec![table.to_surql_overwrite()];
+    statements.extend(
+        table
+            .fields
+            .iter()
+            .map(|f| f.to_surql_overwrite(&table.name)),
+    );
+    statements.extend(
+        table
+            .indexes
+            .iter()
+            .map(|i| i.to_surql_overwrite(&table.name)),
+    );
+    statements.extend(
+        table
+            .events
+            .iter()
+            .map(|e| e.to_surql_overwrite(&table.name)),
+    );
+    statements
+}
+
 /// Render all `DEFINE` statements required to create `edge`.
 ///
 /// Returns [`SurqlError::Validation`](crate::error::SurqlError::Validation)
@@ -216,6 +242,28 @@ mod tests {
     };
 
     // ---- generate_table_sql ----
+
+    #[test]
+    fn overwrite_generator_marks_every_statement() {
+        let table = table_schema("user")
+            .with_mode(TableMode::Schemafull)
+            .with_fields([crate::schema::FieldDefinition::new(
+                "email",
+                crate::schema::FieldType::String,
+            )])
+            .with_indexes([index("idx_email", ["email"])]);
+        let statements = generate_table_sql_overwrite(&table);
+        assert_eq!(statements.len(), 3);
+        for statement in &statements {
+            assert!(
+                statement.contains(" OVERWRITE "),
+                "not an overwrite statement: {statement}"
+            );
+        }
+        assert!(statements[0].starts_with("DEFINE TABLE OVERWRITE user"));
+        assert!(statements[1].starts_with("DEFINE FIELD OVERWRITE email ON TABLE user"));
+        assert!(statements[2].starts_with("DEFINE INDEX OVERWRITE idx_email ON TABLE user"));
+    }
 
     #[test]
     fn generate_table_sql_schemafull_minimal() {
