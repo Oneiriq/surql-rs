@@ -82,7 +82,7 @@ jobs:
           cargo test --doc --all-features
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-audit
 
