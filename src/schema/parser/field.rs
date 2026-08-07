@@ -16,7 +16,7 @@ use crate::schema::fields::{FieldDefinition, FieldType};
 
 pub(super) fn type_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"TYPE\s+(\w+)"))
+    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+(\w+)"))
 }
 
 fn readonly_regex() -> &'static Regex {
@@ -32,6 +32,21 @@ fn flexible_regex() -> &'static Regex {
 fn record_target_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| regex_case_insensitive(r"record\s*<\s*(\w+)\s*>"))
+}
+
+/// Matches `TYPE option<inner>` where `inner` is a bare type word or a
+/// single-level generic like `record<blob>` — exactly the shapes the
+/// emitter produces. The inner text is captured for type resolution.
+fn option_type_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+option\s*<\s*(\w+(?:\s*<\s*\w+\s*>)?)\s*>"))
+}
+
+/// Matches the engine's echo form for optional fields: `TYPE none | inner`.
+/// The 3.x server reports `option<T>` this way in `INFO FOR TABLE`.
+fn none_union_type_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+none\s*\|\s*(\w+(?:\s*<\s*\w+\s*>)?)"))
 }
 
 // --- Public parsers ----------------------------------------------------------
@@ -53,9 +68,10 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
     if definition.is_empty() {
         return None;
     }
+    let (field_type, nullable) = extract_field_type(definition);
     Some(FieldDefinition {
         name: name.to_string(),
-        field_type: extract_field_type(definition),
+        field_type,
         assertion: extract_assertion(definition),
         default: extract_default(definition),
         value: extract_value(definition),
@@ -63,19 +79,43 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
         readonly: extract_readonly(definition),
         flexible: extract_flexible(definition),
         target_table: extract_target_table(definition),
+        nullable,
     })
 }
 
 // --- Field extractors --------------------------------------------------------
 
-fn extract_field_type(definition: &str) -> FieldType {
+/// Resolve the field type and whether it is `option<...>`-wrapped.
+///
+/// `option<inner>` is checked first — the plain `TYPE \w+` regex would
+/// capture the word `option` and fall through to [`FieldType::Any`],
+/// which would break the code/database round-trip and make migration
+/// diffing flap on every nullable field.
+fn extract_field_type(definition: &str) -> (FieldType, bool) {
+    if let Some(caps) = none_union_type_regex().captures(definition) {
+        let inner = caps[1].to_ascii_lowercase();
+        let word = inner.split('<').next().unwrap_or("").trim().to_string();
+        return (field_type_from_word(&word), true);
+    }
+    if let Some(caps) = option_type_regex().captures(definition) {
+        let inner = caps[1].to_ascii_lowercase();
+        let word = inner.split('<').next().unwrap_or("").trim().to_string();
+        return (field_type_from_word(&word), true);
+    }
     let Some(caps) = type_regex().captures(definition) else {
-        return FieldType::Any;
+        return (FieldType::Any, false);
     };
     let Some(m) = caps.get(1) else {
-        return FieldType::Any;
+        return (FieldType::Any, false);
     };
-    match m.as_str().to_ascii_lowercase().as_str() {
+    (
+        field_type_from_word(&m.as_str().to_ascii_lowercase()),
+        false,
+    )
+}
+
+fn field_type_from_word(word: &str) -> FieldType {
+    match word {
         "string" => FieldType::String,
         "int" => FieldType::Int,
         "float" => FieldType::Float,
@@ -119,10 +159,13 @@ fn find_keyword(text: &str, kw: &str, require_whitespace_left: bool) -> Option<u
     let mut i = 0;
     while i + needle.len() <= bytes.len() {
         if bytes[i..i + needle.len()] == *needle {
+            // `$` blocks a match: `$value` must never read as the
+            // VALUE keyword, or every ASSERT mentioning it grows a
+            // phantom VALUE clause.
             let left_ok = if require_whitespace_left {
                 i == 0 || bytes[i - 1].is_ascii_whitespace()
             } else {
-                i == 0 || !is_ident_byte(bytes[i - 1])
+                i == 0 || (!is_ident_byte(bytes[i - 1]) && bytes[i - 1] != b'$')
             };
             let right_ok =
                 i + needle.len() == bytes.len() || !is_ident_byte(bytes[i + needle.len()]);
@@ -208,4 +251,40 @@ fn extract_readonly(definition: &str) -> bool {
 
 fn extract_flexible(definition: &str) -> bool {
     flexible_regex().is_match(definition)
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use crate::schema::fields::FieldType;
+
+    #[test]
+    fn engine_echo_none_union_parses_as_nullable() {
+        let field = super::parse_field(
+            "expires_at",
+            "DEFINE FIELD expires_at ON access_grant TYPE none | datetime PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::Datetime);
+        assert!(field.nullable);
+
+        let field = super::parse_field(
+            "file",
+            "DEFINE FIELD file ON access_grant TYPE none | record<file> PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::Record);
+        assert!(field.nullable);
+        assert_eq!(field.target_table.as_deref(), Some("file"));
+    }
+
+    #[test]
+    fn dollar_value_never_reads_as_the_value_keyword() {
+        let field = super::parse_field(
+            "op",
+            "DEFINE FIELD op ON access_grant TYPE string DEFAULT 'get' ASSERT $value INSIDE ['x'] PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert!(field.value.is_none(), "{:?}", field.value);
+        assert!(field.assertion.as_deref().unwrap().contains("INSIDE"));
+    }
 }

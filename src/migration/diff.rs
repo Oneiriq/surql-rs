@@ -65,6 +65,7 @@ use crate::schema::table::{
 ///     tables: vec![table_schema("user")],
 ///     edges: vec![],
 ///     buckets: vec![],
+///     analyzers: vec![],
 /// };
 /// assert_eq!(snapshot.tables.len(), 1);
 /// ```
@@ -81,6 +82,11 @@ pub struct SchemaSnapshot {
     /// still deserialise.
     #[serde(default)]
     pub buckets: Vec<BucketDefinition>,
+    /// All text analyzers known to this snapshot (in discovery
+    /// order). Defaults to empty so older snapshots still
+    /// deserialise.
+    #[serde(default)]
+    pub analyzers: Vec<crate::schema::analyzer::AnalyzerDefinition>,
 }
 
 impl SchemaSnapshot {
@@ -100,6 +106,7 @@ impl SchemaSnapshot {
             tables: tables.into_iter().collect(),
             edges: edges.into_iter().collect(),
             buckets: Vec::new(),
+            analyzers: Vec::new(),
         }
     }
 
@@ -114,6 +121,7 @@ impl SchemaSnapshot {
             tables: tables.into_iter().collect(),
             edges: edges.into_iter().collect(),
             buckets: buckets.into_iter().collect(),
+            analyzers: Vec::new(),
         }
     }
 }
@@ -204,7 +212,46 @@ pub fn normalize_expression(expr: &str) -> String {
             in_space = false;
         }
     }
-    out
+    // The engine normalizes expressions in its echo: one level of
+    // wrapping parentheses, `IS NONE` reported as `= NONE`, and a
+    // space after casts (`<string> id`). Fold those so code and echo
+    // compare equal.
+    let mut out = out.trim().to_owned();
+    if out.starts_with('(') && out.ends_with(')') {
+        let inner = &out[1..out.len() - 1];
+        let mut depth = 0i32;
+        let balanced = inner.chars().all(|c| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth >= 0
+        }) && depth == 0;
+        if balanced {
+            out = inner.trim().to_owned();
+        }
+    }
+    let out = out
+        .replace(" IS NONE", " = NONE")
+        .replace(" is none", " = NONE");
+    let mut folded = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    while let Some(ch) = chars.next() {
+        folded.push(ch);
+        if ch == '>' && chars.peek() == Some(&' ') {
+            // `<string> id` and `<string>id` are the same cast; keep
+            // comparison spacing (`a > b`) by requiring the `<` side
+            // to look like a cast start.
+            if let Some(open) = folded.rfind('<') {
+                let inside = &folded[open + 1..folded.len() - 1];
+                if !inside.is_empty() && inside.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    chars.next();
+                }
+            }
+        }
+    }
+    folded
 }
 
 fn expr_eq(a: Option<&str>, b: Option<&str>) -> bool {
@@ -297,6 +344,14 @@ pub fn diff_fields(
     }
     for f in db {
         if !code_map.contains_key(f.name.as_str()) {
+            // The engine defines array-child fields (`name.*`) on its
+            // own beside a declared array parent; those are engine
+            // bookkeeping, never removals.
+            if let Some(parent) = f.name.strip_suffix(".*") {
+                if code_map.contains_key(parent) {
+                    continue;
+                }
+            }
             out.push(generate_drop_field_diff(table, f));
         }
     }
@@ -464,6 +519,62 @@ pub fn diff_schemas(code: &SchemaSnapshot, db: &SchemaSnapshot) -> Vec<SchemaDif
     let mut out = diff_tables(&code.tables, &db.tables);
     out.extend(diff_edges(&code.edges, &db.edges));
     out.extend(diff_buckets(&code.buckets, &db.buckets));
+    out.extend(diff_analyzers(&code.analyzers, &db.analyzers));
+    out
+}
+
+/// Compare analyzers by name: added ones render plain, changed ones
+/// render `OVERWRITE`, and removed ones carry the removal for the
+/// caller to decide about.
+pub fn diff_analyzers(
+    code: &[crate::schema::analyzer::AnalyzerDefinition],
+    db: &[crate::schema::analyzer::AnalyzerDefinition],
+) -> Vec<SchemaDiff> {
+    let code_map = index_by_name(code, |a| a.name.as_str());
+    let db_map = index_by_name(db, |a| a.name.as_str());
+    let mut out = Vec::new();
+    let analyzer_diff =
+        |op: DiffOperation, name: &str, forward: String, backward: String| SchemaDiff {
+            operation: op,
+            table: String::new(),
+            field: None,
+            index: None,
+            event: None,
+            bucket: None,
+            analyzer: Some(name.to_owned()),
+            description: format!("{op:?} {name}"),
+            forward_sql: forward,
+            backward_sql: backward,
+            details: BTreeMap::new(),
+        };
+    for name in sorted_keys(&code_map) {
+        let analyzer = code_map[name];
+        match db_map.get(name) {
+            None => out.push(analyzer_diff(
+                DiffOperation::AddAnalyzer,
+                name,
+                analyzer.to_surql(),
+                format!("REMOVE ANALYZER IF EXISTS {name};"),
+            )),
+            Some(db_analyzer) if *db_analyzer != analyzer => out.push(analyzer_diff(
+                DiffOperation::ModifyAnalyzer,
+                name,
+                analyzer.to_surql_overwrite(),
+                db_analyzer.to_surql_overwrite(),
+            )),
+            Some(_) => {}
+        }
+    }
+    for name in sorted_keys(&db_map) {
+        if !code_map.contains_key(name) {
+            out.push(analyzer_diff(
+                DiffOperation::DropAnalyzer,
+                name,
+                format!("REMOVE ANALYZER IF EXISTS {name};"),
+                db_map[name].to_surql(),
+            ));
+        }
+    }
     out
 }
 
@@ -506,11 +617,15 @@ fn diff_table_pair_inner(code: &TableDefinition, db: &TableDefinition) -> Vec<Sc
     let mut out = diff_fields(&code.name, &code.fields, &db.fields);
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
-    out.extend(diff_permissions(
-        &code.name,
-        code.permissions.as_ref(),
-        db.permissions.as_ref(),
-    ));
+    if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
+        // The full definition replaces: a permissions-only DEFINE
+        // TABLE would silently reset the table's mode.
+        out.push(modify_permissions_full(
+            &code.name,
+            code.to_surql_overwrite(),
+            db.to_surql_overwrite(),
+        ));
+    }
     out
 }
 
@@ -518,12 +633,37 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
     let mut out = diff_fields(&code.name, &code.fields, &db.fields);
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
-    out.extend(diff_permissions(
-        &code.name,
-        code.permissions.as_ref(),
-        db.permissions.as_ref(),
-    ));
+    if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
+        match (code.to_surql_overwrite(), db.to_surql_overwrite()) {
+            (Ok(forward), Ok(backward)) => {
+                out.push(modify_permissions_full(&code.name, forward, backward));
+            }
+            _ => out.extend(diff_permissions(
+                &code.name,
+                code.permissions.as_ref(),
+                db.permissions.as_ref(),
+            )),
+        }
+    }
     out
+}
+
+/// A permissions change carried as the owning definition's full
+/// `OVERWRITE` form.
+fn modify_permissions_full(table: &str, forward_sql: String, backward_sql: String) -> SchemaDiff {
+    SchemaDiff {
+        operation: DiffOperation::ModifyPermissions,
+        table: table.to_string(),
+        field: None,
+        index: None,
+        event: None,
+        bucket: None,
+        analyzer: None,
+        description: format!("Modify permissions for {table}"),
+        forward_sql,
+        backward_sql,
+        details: BTreeMap::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +671,10 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
 // ---------------------------------------------------------------------------
 
 fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
-    let forward_sql = format!("DEFINE TABLE {} {};", table.name, table.mode.as_str());
+    // The canonical renderer carries mode AND permissions in the one
+    // statement; a separate permissions statement would re-define the
+    // table it just created.
+    let forward_sql = table.to_surql();
     let backward_sql = format!("REMOVE TABLE {};", table.name);
     let mut out = vec![SchemaDiff {
         operation: DiffOperation::AddTable,
@@ -540,6 +683,7 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Add table {}", table.name),
         forward_sql,
         backward_sql,
@@ -554,15 +698,6 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
     for ev in &table.events {
         out.push(generate_add_event_diff(&table.name, ev));
     }
-    if let Some(perms) = table.permissions.as_ref() {
-        if !perms.is_empty() {
-            out.push(generate_modify_permissions_diff(
-                &table.name,
-                Some(perms),
-                None,
-            ));
-        }
-    }
     out
 }
 
@@ -574,6 +709,7 @@ fn generate_drop_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Drop table {}", table.name),
         forward_sql: format!("REMOVE TABLE {};", table.name),
         backward_sql: format!("DEFINE TABLE {} {};", table.name, table.mode.as_str()),
@@ -610,6 +746,7 @@ fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Add field {} to {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -627,6 +764,7 @@ fn generate_drop_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff 
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Drop field {} from {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -639,8 +777,10 @@ fn generate_modify_field_diff(
     old_field: &FieldDefinition,
     new_field: &FieldDefinition,
 ) -> SchemaDiff {
-    let forward_sql = field_to_sql(table, new_field);
-    let backward_sql = field_to_sql(table, old_field);
+    // Plain DEFINE fails on an existing field; the replace form is
+    // what a modification means.
+    let forward_sql = new_field.to_surql_overwrite(table);
+    let backward_sql = old_field.to_surql_overwrite(table);
     let mut details = BTreeMap::new();
     details.insert(
         "old_type".into(),
@@ -657,6 +797,7 @@ fn generate_modify_field_diff(
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Modify field {} in {}", new_field.name, table),
         forward_sql,
         backward_sql,
@@ -694,6 +835,7 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         index: Some(idx.name.clone()),
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Add index {} to {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -722,6 +864,7 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         index: Some(idx.name.clone()),
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Drop index {} from {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -749,6 +892,7 @@ fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         index: None,
         event: Some(ev.name.clone()),
         bucket: None,
+        analyzer: None,
         description: format!("Add event {} to {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -773,6 +917,7 @@ fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         index: None,
         event: Some(ev.name.clone()),
         bucket: None,
+        analyzer: None,
         description: format!("Drop event {} from {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -794,6 +939,7 @@ fn generate_modify_permissions_diff(
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Modify permissions for {table}"),
         forward_sql,
         backward_sql,
@@ -828,6 +974,7 @@ fn generate_add_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Add edge {}", edge.name),
         forward_sql,
         backward_sql,
@@ -862,6 +1009,7 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         index: None,
         event: None,
         bucket: None,
+        analyzer: None,
         description: format!("Drop edge {}", edge.name),
         forward_sql: format!("REMOVE TABLE {};", edge.name),
         backward_sql: String::new(),
@@ -892,6 +1040,7 @@ fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
         index: None,
         event: None,
         bucket: Some(bucket.name.clone()),
+        analyzer: None,
         description: format!("Add bucket {}", bucket.name),
         forward_sql,
         backward_sql,
@@ -914,6 +1063,7 @@ fn generate_drop_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
         index: None,
         event: None,
         bucket: Some(bucket.name.clone()),
+        analyzer: None,
         description: format!("Drop bucket {}", bucket.name),
         forward_sql,
         backward_sql,
@@ -943,6 +1093,7 @@ fn generate_modify_bucket_diff(code: &BucketDefinition, db: &BucketDefinition) -
         index: None,
         event: None,
         bucket: Some(code.name.clone()),
+        analyzer: None,
         description: format!("Modify bucket {}", code.name),
         forward_sql,
         backward_sql,
@@ -974,31 +1125,9 @@ fn render_permission_statements(table: &str, perms: Option<&BTreeMap<String, Str
 }
 
 fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
-    let mut sql = format!(
-        "DEFINE FIELD {name} ON TABLE {table} TYPE {ty}",
-        name = field.name,
-        ty = field.field_type.as_str(),
-    );
-    if let Some(a) = field.assertion.as_deref() {
-        sql.push_str(" ASSERT ");
-        sql.push_str(a);
-    }
-    if let Some(d) = field.default.as_deref() {
-        sql.push_str(" DEFAULT ");
-        sql.push_str(d);
-    }
-    if let Some(v) = field.value.as_deref() {
-        sql.push_str(" VALUE ");
-        sql.push_str(v);
-    }
-    if field.readonly {
-        sql.push_str(" READONLY");
-    }
-    if field.flexible {
-        sql.push_str(" FLEXIBLE");
-    }
-    sql.push(';');
-    sql
+    // The canonical renderer, so clause ordering (FLEXIBLE after
+    // TYPE, VALUE placement) has exactly one implementation.
+    field.to_surql(table)
 }
 
 fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
@@ -1011,10 +1140,26 @@ fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
         && expr_eq(a.value.as_deref(), b.value.as_deref())
 }
 
+/// Expand comma-grouped action keys (`"select, create"`) into one
+/// entry per action, the shape the engine echoes. Code that groups
+/// actions and a database that splits them must compare equal.
+fn expand_actions(map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (key, value) in map {
+        for action in key.split(',') {
+            out.insert(action.trim().to_owned(), value.clone());
+        }
+    }
+    out
+}
+
 fn permissions_equal(
     a: Option<&BTreeMap<String, String>>,
     b: Option<&BTreeMap<String, String>>,
 ) -> bool {
+    let expanded_a = a.map(expand_actions);
+    let expanded_b = b.map(expand_actions);
+    let (a, b) = (expanded_a.as_ref(), expanded_b.as_ref());
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => {
@@ -1221,12 +1366,14 @@ mod tests {
             .with_events([event("on_upd", "true", "RETURN 1")])
             .with_permissions([("select", "true")]);
         let diffs = diff_tables(&[code_table], &[]);
-        // table + event + perms
-        assert_eq!(diffs.len(), 3);
+        // Table (permissions ride the DEFINE TABLE itself) + event.
+        assert_eq!(diffs.len(), 2);
         assert!(diffs.iter().any(|d| d.operation == DiffOperation::AddEvent));
-        assert!(diffs
-            .iter()
-            .any(|d| d.operation == DiffOperation::ModifyPermissions));
+        assert!(
+            diffs[0].forward_sql.contains("PERMISSIONS"),
+            "{}",
+            diffs[0].forward_sql
+        );
     }
 
     // ----- diff_tables: DROP -----

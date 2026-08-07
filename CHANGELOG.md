@@ -7,9 +7,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.31.0] - 2026-07-30
+
+## [0.31.0] - 2026-08-07
 
 ### Added
+
+- **The diff engine serves live-database reconciliation.** Analyzers
+  join `DatabaseInfo`, `SchemaSnapshot`, and `diff_schemas` with
+  their own parser, so the full schema a consumer declares can be
+  compared against what a database actually holds.
+  `parse_table_full` names the two-level composition (`INFO FOR DB`
+  for mode and permissions, `INFO FOR TABLE` for fields, indexes,
+  and events), because the database level alone yields fieldless
+  tables, which is a trap for anyone diffing against it.
+
+
+- **Nullable fields (`TYPE option<...>`).** `FieldBuilder::nullable(bool)` /
+  `FieldDefinition::with_nullable(bool)` wrap the rendered type in
+  `option<...>` (including record targets: `option<record<blob>>`) so a
+  SCHEMAFULL column can accept `NONE`. The `INFO FOR TABLE` parser
+  round-trips the wrapper, keeping migration diffing stable for nullable
+  columns. Restores parity with surql-py (`nullable=True`, 1.5.8+) and the
+  TS port; rendering for non-nullable fields is byte-identical to before.
 
 - **Row-level filtering on the graph helpers (`conditions`).** `query::graph`
   gained a `conditions` argument on `traverse`, `traverse_raw`,
@@ -21,9 +40,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   since surql-py 1.6.0.
 
   Previously these helpers emitted a bare `SELECT * FROM record->edge` with no
-  filtering hook at all. A caller needing row-level isolation — a mandatory
-  `WHERE tenant_id = …` alongside engine-enforced `PERMISSIONS`, for instance —
-  could not express it, and had to abandon the helpers for a hand-rolled
+  filtering hook at all. A caller needing row-level isolation, a mandatory
+  `WHERE tenant_id = ...` alongside engine-enforced `PERMISSIONS` for
+  instance, could not express it, and had to abandon the helpers for a hand-rolled
   equality-filtered edge table.
 
 - **`query::Condition`.** An owned `Raw(String) | Op(Operator)` carrier with
@@ -35,13 +54,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
-- **BREAKING — graph helper signatures.** The seven helpers above take a new
+- **`DatabaseClient` clones now share ONE engine session.** The SDK
+  mints a session per `Surreal` clone and announces it with lifecycle
+  events the remote router can lose under concurrency, which surfaced
+  as intermittent `Session not found` failures in any service that
+  clones its client per request (an axum state extraction does
+  exactly that). The inner handle now rides an `Arc`, so clones share
+  the service session and session churn stops entirely. Code that
+  wants an independent session asks for one: `caller_session` for a
+  caller-bound session, `client.inner().clone()` for a raw one. Auth
+  calls (`signin`, `authenticate`, `invalidate`) now act on the
+  shared session, which is what a service almost always means; the
+  previous per-clone isolation was an accident of the SDK's `Clone`.
+
+- **BREAKING: graph helper signatures.** The seven helpers above take a new
   trailing `conditions: Option<&[Condition]>` parameter. Rust has no default
   arguments, so this follows the existing convention in this module of
   rendering a Python default argument as a required `Option<T>` parameter (as
   `create_relation`'s `data: Option<Value>` already does). Existing call sites
   migrate by passing `None`, which leaves the emitted SurrealQL unchanged.
-  `count_related` is deliberately **not** included — surql-py does not filter it
+  `count_related` is deliberately **not** included, because surql-py does not filter it
   either, and diverging would break the 1:1 contract.
 
 - **Graph helpers compose through `Query` instead of `format!`.** Every
@@ -61,6 +93,63 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   check goes through the builder, the rendered clause is
   `WHERE (id = <to>) [AND (…)]` rather than `WHERE id = <to>`. Semantically
   identical; noted because it changes the exact statement text.
+
+### Fixed
+
+- **The dependency audit carries its two unfixable advisories in one
+  place.** `.cargo/audit.toml` names each, what would have to change
+  upstream for it to come out, and why it is safe to carry meanwhile.
+  Both workflows now read that file instead of passing a flag with the
+  reasoning written somewhere else. The file governs this repository's
+  own audit and is not published with the crate: a consumer running
+  `cargo audit` sees both advisories and makes their own call.
+
+- **Diff results are now safe to apply to a live database.**
+  Grouped permission actions (`FOR select, create ...`) compare
+  equal to the engine's split echo instead of reporting a permanent
+  false modification. Modify-class diffs render `OVERWRITE` forms:
+  a modified field re-defines with `OVERWRITE`, and a permissions
+  change carries the owning table's FULL definition, because a
+  permissions-only `DEFINE TABLE` would silently reset the table's
+  mode.
+
+- **`OVERWRITE` rendering across the schema layer.** Tables, fields,
+  indexes, events, analyzers, and access methods gain
+  `to_surql_overwrite`, and `generate_table_sql_overwrite` renders a
+  table's full statement set with it. `IF NOT EXISTS` creates and
+  then never updates, so a consumer whose definitions evolve needs
+  the replacing form to bring an existing database up to the code's
+  schema; data is untouched, only definitions are replaced.
+
+- **`DatabaseClient::caller_session` opens per-caller engine
+  sessions.** A cloned SDK handle is its own session, so one
+  connection can hold a root session and record-authenticated caller
+  sessions side by side, with the engine applying `PERMISSIONS` to
+  each session's actor. The method authenticates a record access
+  token on a fresh clone, verifies the engine bound a record identity
+  (refusing database-level tokens that `PERMISSIONS` would not
+  filter), and returns a client whose drop ends the session.
+
+- **Connection credentials reach embedded engines at build time.**
+  `username`/`password` now construct embedded datastores with the
+  root user in place, so anonymous sessions stop acting as owner and
+  the engine is lockable from configuration alone. Remote engines
+  keep the existing signin path.
+
+
+- **`Query::set` / `set_expr` accept dotted paths.** `SET
+  metadata.processing = {...}` is native SurrealDB nested assignment,
+  and the schema layer already accepts dot notation for field
+  definitions, but the update builder rejected any dotted target as an
+  invalid identifier. Targets now validate per segment.
+
+- **`FLEXIBLE` now renders immediately after the `TYPE` clause.** The
+  previous trailing position (`... READONLY FLEXIBLE;`) is a parse error
+  on SurrealDB v3 ("FLEXIBLE must be specified after TYPE"), so any
+  schema combining a flexible object field with `READONLY`, `DEFAULT`,
+  `VALUE`, or `ASSERT` failed to apply. Verified against v3.0.5: the
+  after-TYPE position is accepted in every combination, including
+  `option<object> FLEXIBLE`.
 
 ## [0.30.0] - 2026-07-29
 

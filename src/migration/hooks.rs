@@ -33,6 +33,7 @@
 //!     tables: vec![table_schema("user")],
 //!     edges: vec![],
 //!     buckets: vec![],
+//!     analyzers: vec![],
 //! };
 //! let recorded = SchemaSnapshot::new();
 //! let report = check_schema_drift_from_snapshots(&code, &recorded);
@@ -91,14 +92,17 @@ pub fn severity_for_operation(op: DiffOperation) -> DriftSeverity {
         | DiffOperation::AddField
         | DiffOperation::AddIndex
         | DiffOperation::AddEvent
+        | DiffOperation::AddAnalyzer
         | DiffOperation::AddBucket => DriftSeverity::Info,
         DiffOperation::ModifyField
         | DiffOperation::ModifyPermissions
         | DiffOperation::DropEvent
+        | DiffOperation::ModifyAnalyzer
         | DiffOperation::ModifyBucket => DriftSeverity::Warning,
         DiffOperation::DropTable
         | DiffOperation::DropField
         | DiffOperation::DropIndex
+        | DiffOperation::DropAnalyzer
         | DiffOperation::DropBucket => DriftSeverity::Critical,
     }
 }
@@ -266,6 +270,7 @@ pub fn registry_to_snapshot(registry: &SchemaRegistry) -> SchemaSnapshot {
         tables: registry.tables().into_values().collect(),
         edges: registry.edges().into_values().collect(),
         buckets: registry.buckets().into_values().collect(),
+        analyzers: Vec::new(),
     }
 }
 
@@ -276,6 +281,7 @@ pub fn versioned_to_snapshot(snapshot: &VersionedSnapshot) -> SchemaSnapshot {
         tables: snapshot.tables.values().cloned().collect(),
         edges: snapshot.edges.values().cloned().collect(),
         buckets: snapshot.buckets.values().cloned().collect(),
+        analyzers: Vec::new(),
     }
 }
 
@@ -637,6 +643,7 @@ mod tests {
             index: None,
             event: None,
             bucket: None,
+            analyzer: None,
             description: desc.to_string(),
             forward_sql: String::new(),
             backward_sql: String::new(),
@@ -792,6 +799,7 @@ mod tests {
             tables: vec![table_schema("user")],
             edges: vec![],
             buckets: vec![],
+            analyzers: Vec::new(),
         };
         let report = check_schema_drift_from_snapshots(&snap, &snap);
         assert!(!report.drift_detected);
@@ -804,6 +812,7 @@ mod tests {
             tables: vec![table_schema("user")],
             edges: vec![],
             buckets: vec![],
+            analyzers: Vec::new(),
         };
         let recorded = SchemaSnapshot::new();
         let report = check_schema_drift_from_snapshots(&code, &recorded);
@@ -822,6 +831,7 @@ mod tests {
             tables: vec![table_schema("old")],
             edges: vec![],
             buckets: vec![],
+            analyzers: Vec::new(),
         };
         let report = check_schema_drift_from_snapshots(&code, &recorded);
         assert!(report.drift_detected);

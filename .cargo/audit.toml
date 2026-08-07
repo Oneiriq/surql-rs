@@ -1,0 +1,35 @@
+# Advisories this crate cannot act on, and why each one is safe to
+# carry rather than quietly ignored.
+#
+# `cargo audit` reads `Cargo.lock`, which lists every package the
+# resolver considered. A package in the lockfile is not necessarily a
+# package that gets compiled, and one of the two below is exactly that
+# case. Both entries name what would have to change for the entry to
+# come out, so this file stays a decision rather than a habit.
+#
+# This file governs THIS repository's own audit. It is not published
+# with the crate and does not travel to anyone who depends on it: a
+# consumer running `cargo audit` sees both advisories and makes their
+# own call, which is the right way round.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (rsa: Marvin timing sidechannel) has no fixed
+    # release. It reaches the lockfile through the engine's JWT stack,
+    # `jsonwebtoken -> surrealdb-core -> surrealdb`, and is compiled.
+    # The attack times an in-process RSA private-key operation; this
+    # crate performs none, and the record-access path it added
+    # verifies tokens rather than signing them. Re-evaluate whenever
+    # surrealdb or jsonwebtoken move off the unfixed crate.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0235 (rkyv: out-of-bounds reads validating archives
+    # holding Rc/Arc) is fixed in 0.8.17, which rust_decimal 1.41
+    # cannot take and surrealdb-core pins. It reaches the lockfile
+    # through rust_decimal's OPTIONAL `rkyv` feature, which nothing in
+    # this graph turns on: `cargo tree -i rkyv --all-features --target
+    # all` prints nothing, so the vulnerable code is never compiled
+    # here and no archive is ever deserialised. Re-evaluate whenever
+    # surrealdb moves to a rust_decimal built on rkyv 0.8.
+    "RUSTSEC-2026-0235",
+]

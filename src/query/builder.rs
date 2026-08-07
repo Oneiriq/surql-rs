@@ -245,6 +245,9 @@ pub struct Query {
     pub vector_distance: Option<VectorDistanceType>,
     /// Optional threshold for the MTREE operator.
     pub vector_threshold: Option<f64>,
+    /// Search effort for the index-backed operator. When set, the
+    /// operator renders `<|k,ef|>` and the metric is left to the index.
+    pub vector_ef: Option<i64>,
     /// Full-text search field (the `@@` / `@n@` matches operator).
     pub fulltext_field: Option<String>,
     /// Full-text match reference number, tying the predicate to
@@ -275,6 +278,22 @@ pub(crate) fn validate_identifier(name: &str, context: &str) -> Result<()> {
                  characters and underscores, and cannot start with a digit"
             ),
         });
+    }
+    Ok(())
+}
+
+/// Validate a `SET` assignment target, which may be a dotted path into
+/// a nested object (`metadata.processing`) — SurrealDB assigns nested
+/// fields natively, and the schema layer already accepts dot notation
+/// for field definitions. Each segment validates as an identifier.
+pub(crate) fn validate_set_target(field: &str) -> Result<()> {
+    if field.is_empty() {
+        return Err(SurqlError::Validation {
+            reason: "Field name cannot be empty".to_string(),
+        });
+    }
+    for segment in field.split('.') {
+        validate_identifier(segment, "field name")?;
     }
     Ok(())
 }
@@ -527,7 +546,7 @@ impl Query {
     /// (`set("updated_at", now)` ⇒ `updated_at = '<now>'`).
     pub fn set(mut self, field: impl Into<String>, value: impl Into<Value>) -> Result<Self> {
         let field = field.into();
-        validate_identifier(&field, "field name")?;
+        validate_set_target(&field)?;
         self.update_set_exprs
             .push((field, Expression::value(value)));
         Ok(self)
@@ -538,7 +557,7 @@ impl Query {
     /// (`set_expr("n", field("n") + 1)` ⇒ `n = n + 1`).
     pub fn set_expr(mut self, field: impl Into<String>, expr: Expression) -> Result<Self> {
         let field = field.into();
-        validate_identifier(&field, "field name")?;
+        validate_set_target(&field)?;
         self.update_set_exprs.push((field, expr));
         Ok(self)
     }
@@ -651,6 +670,56 @@ impl Query {
             vector_k: Some(k),
             vector_distance: Some(distance),
             vector_threshold: threshold,
+            vector_ef: None,
+            ..self
+        })
+    }
+
+    /// Configure index-backed KNN search, rendering `<|k,ef|>`.
+    ///
+    /// The second operand decides the plan. An integer is the search
+    /// effort and makes the engine use the field's vector index; a
+    /// metric name (what [`Query::vector_search`] renders) makes it
+    /// compare every row, which is correct and slow. Use this whenever
+    /// the field carries an HNSW or DiskANN index, and let the index's
+    /// own metric apply.
+    ///
+    /// `ef` bounds the candidate list the search keeps. Higher values
+    /// cost more and recall more.
+    ///
+    /// SurrealDB 3.x has no distance threshold on this operator; floats
+    /// in the second position are refused outright. Project the distance
+    /// with `vector::distance::knn()` and filter on it in the same
+    /// `WHERE` when a relevance floor is needed.
+    pub fn vector_search_indexed(
+        self,
+        field: impl Into<String>,
+        vector: Vec<f64>,
+        k: i64,
+        ef: i64,
+    ) -> Result<Self> {
+        if k < 1 {
+            return Err(SurqlError::Validation {
+                reason: format!("k must be at least 1, got {k}"),
+            });
+        }
+        if ef < 1 {
+            return Err(SurqlError::Validation {
+                reason: format!("ef must be at least 1, got {ef}"),
+            });
+        }
+        if vector.is_empty() {
+            return Err(SurqlError::Validation {
+                reason: "Vector cannot be empty".into(),
+            });
+        }
+        Ok(Self {
+            vector_field: Some(field.into()),
+            vector_value: vector,
+            vector_k: Some(k),
+            vector_distance: None,
+            vector_threshold: None,
+            vector_ef: Some(ef),
             ..self
         })
     }
@@ -868,18 +937,25 @@ impl Query {
 
         // Build WHERE conditions (vector search first, then regular).
         let mut where_parts: Vec<String> = Vec::new();
-        if let (Some(field), Some(k), Some(distance), false) = (
+        if let (Some(field), Some(k), false) = (
             &self.vector_field,
             self.vector_k,
-            self.vector_distance,
             self.vector_value.is_empty(),
         ) {
             let vector_str = render_vector(&self.vector_value);
-            let operator = match self.vector_threshold {
-                Some(t) => format!("<|{k},{},{t}|>", distance.to_surql()),
-                None => format!("<|{k},{}|>", distance.to_surql()),
+            // An integer second operand selects the index; a metric name
+            // makes the engine compare every row.
+            let operator = match (self.vector_ef, self.vector_distance, self.vector_threshold) {
+                (Some(ef), _, _) => Some(format!("<|{k},{ef}|>")),
+                (None, Some(distance), Some(t)) => {
+                    Some(format!("<|{k},{},{t}|>", distance.to_surql()))
+                }
+                (None, Some(distance), None) => Some(format!("<|{k},{}|>", distance.to_surql())),
+                (None, None, _) => None,
             };
-            where_parts.push(format!("{field} {operator} {vector_str}"));
+            if let Some(operator) = operator {
+                where_parts.push(format!("{field} {operator} {vector_str}"));
+            }
         }
         if let (Some(field), Some(reference), Some(query)) = (
             &self.fulltext_field,
@@ -1492,6 +1568,40 @@ mod tests {
     }
 
     #[test]
+    fn indexed_vector_search_renders_the_effort_operand() {
+        let q = Query::new()
+            .select(None)
+            .from_table("documents")
+            .unwrap()
+            .vector_search_indexed("embedding", vec![0.1, 0.2, 0.3], 10, 64)
+            .unwrap();
+        // An INTEGER second operand is what selects the index; the
+        // metric form compares every row instead.
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "SELECT * FROM documents WHERE embedding <|10,64|> [0.1, 0.2, 0.3]"
+        );
+
+        for (k, ef) in [(0, 64), (10, 0)] {
+            let err = Query::new()
+                .select(None)
+                .from_table("documents")
+                .unwrap()
+                .vector_search_indexed("embedding", vec![0.1], k, ef);
+            assert!(
+                matches!(err, Err(SurqlError::Validation { .. })),
+                "{k} {ef}"
+            );
+        }
+        let err = Query::new()
+            .select(None)
+            .from_table("documents")
+            .unwrap()
+            .vector_search_indexed("embedding", vec![], 10, 64);
+        assert!(matches!(err, Err(SurqlError::Validation { .. })));
+    }
+
+    #[test]
     fn similarity_score_adds_function_field() {
         let q = Query::new()
             .select(Some(vec!["id".into()]))
@@ -1688,6 +1798,40 @@ mod tests {
     // -----------------------------------------------------------------------
     // Traversal / join
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_accepts_dotted_paths_into_nested_objects() {
+        let q = Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set(
+                "metadata.processing",
+                serde_json::json!({"verdict": "clean"}),
+            )
+            .unwrap()
+            .to_surql()
+            .unwrap();
+        assert!(
+            q.contains("SET metadata.processing = "),
+            "nested assignment must render: {q}",
+        );
+        // Hostile segments still refuse.
+        assert!(Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set("metadata.bad segment", 1)
+            .is_err());
+        assert!(Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set("metadata..double", 1)
+            .is_err());
+        assert!(Query::new()
+            .update_set("file:abc")
+            .unwrap()
+            .set("", 1)
+            .is_err());
+    }
 
     #[test]
     fn traverse_appends_path_to_from() {

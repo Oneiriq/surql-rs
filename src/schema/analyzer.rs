@@ -205,7 +205,17 @@ impl AnalyzerDefinition {
     /// its schema on every connect). Empty tokenizer / filter chains omit their
     /// clause entirely.
     pub fn to_surql_with_options(&self, if_not_exists: bool) -> String {
-        let ine = if if_not_exists { "IF NOT EXISTS " } else { "" };
+        self.render_guard(if if_not_exists { "IF NOT EXISTS " } else { "" })
+    }
+
+    /// Render with `OVERWRITE`, replacing an existing definition while
+    /// leaving stored data untouched. What schema evolution applies
+    /// when a stored definition no longer matches the code.
+    pub fn to_surql_overwrite(&self) -> String {
+        self.render_guard("OVERWRITE ")
+    }
+
+    fn render_guard(&self, ine: &str) -> String {
         let mut sql = format!("DEFINE ANALYZER {ine}{name}", name = self.name);
         if !self.tokenizers.is_empty() {
             let toks = self
@@ -246,6 +256,15 @@ pub fn standard_analyzer(name: impl Into<String>) -> AnalyzerDefinition {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn analyzer_renders_overwrite() {
+        let analyzer =
+            super::AnalyzerDefinition::new("txt").with_tokenizers([super::Tokenizer::Class]);
+        assert!(analyzer
+            .to_surql_overwrite()
+            .starts_with("DEFINE ANALYZER OVERWRITE txt"));
+    }
+
     use super::*;
 
     #[test]

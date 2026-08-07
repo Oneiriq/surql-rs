@@ -64,6 +64,7 @@ use crate::schema::edge::EdgeDefinition;
 use crate::schema::table::TableDefinition;
 
 mod access;
+mod analyzer;
 mod bucket;
 mod db;
 mod edge;
@@ -74,6 +75,7 @@ mod permissions;
 mod table;
 
 pub use access::parse_access;
+pub use analyzer::parse_analyzer;
 pub use bucket::parse_bucket;
 pub use db::parse_db_info;
 pub use edge::parse_edge_info;
@@ -81,7 +83,7 @@ pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
 pub use index::{parse_index, parse_indexes};
 pub use permissions::parse_table_permissions;
-pub use table::{parse_table_info, parse_table_mode};
+pub use table::{parse_table_full, parse_table_info, parse_table_mode};
 
 // --- Shared regex helper -----------------------------------------------------
 
@@ -156,6 +158,9 @@ pub(super) fn pick_map<'a>(
 pub struct DatabaseInfo {
     /// Regular (non-relation) tables.
     pub tables: BTreeMap<String, TableDefinition>,
+    /// Text analyzers.
+    #[serde(default)]
+    pub analyzers: BTreeMap<String, crate::schema::analyzer::AnalyzerDefinition>,
     /// Relation-mode edge tables.
     pub edges: BTreeMap<String, EdgeDefinition>,
     /// Database-level access definitions.
@@ -230,6 +235,41 @@ mod tests {
         assert_eq!(f.field_type, FieldType::String);
         assert!(f.assertion.is_none());
         assert!(!f.readonly);
+    }
+
+    #[test]
+    fn parse_field_option_type_sets_nullable() {
+        let f = parse_field(
+            "deleted_at",
+            "DEFINE FIELD deleted_at ON TABLE file TYPE option<datetime>",
+        )
+        .unwrap();
+        assert_eq!(f.field_type, FieldType::Datetime);
+        assert!(f.nullable);
+    }
+
+    #[test]
+    fn parse_field_option_record_round_trips() {
+        // The full code -> DDL -> parse -> eq cycle that keeps migration
+        // diffing stable for nullable record links.
+        let f = parse_field(
+            "prior",
+            "DEFINE FIELD prior ON TABLE file_version TYPE option<record<file_version>>",
+        )
+        .unwrap();
+        assert_eq!(f.field_type, FieldType::Record);
+        assert_eq!(f.target_table.as_deref(), Some("file_version"));
+        assert!(f.nullable);
+        assert_eq!(
+            f.to_surql("file_version"),
+            "DEFINE FIELD prior ON TABLE file_version TYPE option<record<file_version>>;",
+        );
+    }
+
+    #[test]
+    fn parse_field_plain_type_is_not_nullable() {
+        let f = parse_field("email", "DEFINE FIELD email ON TABLE user TYPE string").unwrap();
+        assert!(!f.nullable);
     }
 
     #[test]

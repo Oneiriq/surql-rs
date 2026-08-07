@@ -321,7 +321,17 @@ impl IndexDefinition {
 
     /// Render with optional `IF NOT EXISTS` clause.
     pub fn to_surql_with_options(&self, table: &str, if_not_exists: bool) -> String {
-        let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        self.render_guard(table, if if_not_exists { " IF NOT EXISTS" } else { "" })
+    }
+
+    /// Render with `OVERWRITE`, replacing an existing definition while
+    /// leaving stored data untouched. What schema evolution applies
+    /// when a stored definition no longer matches the code.
+    pub fn to_surql_overwrite(&self, table: &str) -> String {
+        self.render_guard(table, " OVERWRITE")
+    }
+
+    fn render_guard(&self, table: &str, ine: &str) -> String {
         match self.index_type {
             IndexType::Mtree => {
                 let field = self.columns.first().map_or("", String::as_str);
@@ -452,7 +462,17 @@ impl EventDefinition {
 
     /// Render with optional `IF NOT EXISTS` clause.
     pub fn to_surql_with_options(&self, table: &str, if_not_exists: bool) -> String {
-        let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        self.render_guard(table, if if_not_exists { " IF NOT EXISTS" } else { "" })
+    }
+
+    /// Render with `OVERWRITE`, replacing an existing definition while
+    /// leaving stored data untouched. What schema evolution applies
+    /// when a stored definition no longer matches the code.
+    pub fn to_surql_overwrite(&self, table: &str) -> String {
+        self.render_guard(table, " OVERWRITE")
+    }
+
+    fn render_guard(&self, table: &str, ine: &str) -> String {
         format!(
             "DEFINE EVENT{ine} {name} ON TABLE {table} WHEN {cond} THEN {act};",
             ine = ine,
@@ -592,7 +612,17 @@ impl TableDefinition {
     /// (`... PERMISSIONS FOR select WHERE ... FOR create WHERE ...`), which is
     /// the only valid placement for table permissions in SurrealQL.
     pub fn to_surql_with_options(&self, if_not_exists: bool) -> String {
-        let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+        self.render_guard(if if_not_exists { " IF NOT EXISTS" } else { "" })
+    }
+
+    /// Render with `OVERWRITE`, replacing an existing definition while
+    /// leaving stored data untouched. What schema evolution applies
+    /// when a stored definition no longer matches the code.
+    pub fn to_surql_overwrite(&self) -> String {
+        self.render_guard(" OVERWRITE")
+    }
+
+    fn render_guard(&self, ine: &str) -> String {
         let perms = match &self.permissions {
             Some(perms) if !perms.is_empty() => {
                 let clauses: Vec<String> = perms

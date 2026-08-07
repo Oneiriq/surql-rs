@@ -92,7 +92,7 @@ pub use registry::{
 pub use sql::{
     generate_access_sql, generate_access_sql_with_options, generate_analyzer_sql,
     generate_analyzer_sql_with_options, generate_bucket_sql, generate_bucket_sql_with_options,
-    generate_edge_sql, generate_schema_sql, generate_table_sql,
+    generate_edge_sql, generate_schema_sql, generate_table_sql, generate_table_sql_overwrite,
 };
 pub use table::{
     bm25_index, event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,

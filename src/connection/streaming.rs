@@ -37,6 +37,7 @@ use ulid::Ulid;
 
 use crate::connection::client::DatabaseClient;
 use crate::error::{Result, SurqlError};
+use crate::query::builder::{Condition, WhereCondition};
 
 /// A live-query subscription.
 ///
@@ -63,6 +64,18 @@ use crate::error::{Result, SurqlError};
 /// ```
 pub struct LiveQuery<T> {
     stream: QueryStream<Notification<T>>,
+    /// The handle that ISSUED the `LIVE SELECT`, held for the stream's
+    /// whole life.
+    ///
+    /// `Surreal::clone` gives each clone its own session id, and its
+    /// `Drop` ends that session; a live query belongs to the session
+    /// that started it. So a subscription opened through a borrowed
+    /// handle goes quiet the moment the caller's clone drops, silently,
+    /// with no error and no closed stream to explain it. Owning the
+    /// exact handle that ran the statement is what keeps the session,
+    /// and therefore the subscription, alive. A clone made afterwards
+    /// would be a DIFFERENT session and would not help.
+    _client: DatabaseClient,
     _marker: PhantomData<T>,
 }
 
@@ -81,6 +94,38 @@ where
     /// Fails with [`SurqlError::Streaming`] if the client's protocol
     /// does not support live queries (i.e. `http://` or `https://`).
     pub async fn start(client: &DatabaseClient, target: &str) -> Result<Self> {
+        Self::start_where(client, target, Vec::<Condition>::new()).await
+    }
+
+    /// Start a `LIVE SELECT * FROM <target> WHERE ...` subscription.
+    ///
+    /// Conditions are wrapped in parentheses and joined with `AND`,
+    /// matching [`Query`](crate::query::Query). The engine evaluates
+    /// them per notification, so a subscriber sees only the rows it
+    /// asked for; without this, every consumer of a shared table
+    /// receives every row and has to discard the rest in application
+    /// code, which is where tenant scoping goes wrong.
+    ///
+    /// ```no_run
+    /// use serde_json::Value;
+    /// use surql::connection::{ConnectionConfig, DatabaseClient, LiveQuery};
+    /// use surql::types::operators::eq;
+    ///
+    /// # async fn run() -> surql::Result<()> {
+    /// # let client = DatabaseClient::new(ConnectionConfig::default())?;
+    /// let live: LiveQuery<Value> =
+    ///     LiveQuery::start_where(&client, "file_event", [eq("tenant_id", "acme")]).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn start_where<C, I>(
+        client: &DatabaseClient,
+        target: &str,
+        conditions: I,
+    ) -> Result<Self>
+    where
+        C: WhereCondition,
+        I: IntoIterator<Item = C>,
+    {
         let proto = client.config().protocol()?;
         if !proto.supports_live_queries() {
             return Err(SurqlError::Streaming {
@@ -88,8 +133,12 @@ where
             });
         }
 
-        let surql = format!("LIVE SELECT * FROM {target};");
-        let mut response = client
+        let surql = render_live_select(target, conditions);
+        // Clone BEFORE issuing the statement, and issue it through the
+        // clone this struct keeps: the subscription belongs to whichever
+        // session ran it.
+        let owned = client.clone();
+        let mut response = owned
             .inner()
             .query(surql)
             .await
@@ -98,8 +147,30 @@ where
             response.stream(0).map_err(|e| streaming_err(&e))?;
         Ok(Self {
             stream,
+            _client: owned,
             _marker: PhantomData,
         })
+    }
+}
+
+/// Render the statement, split out so its shape is testable without a
+/// connection.
+fn render_live_select<C, I>(target: &str, conditions: I) -> String
+where
+    C: WhereCondition,
+    I: IntoIterator<Item = C>,
+{
+    let clauses: Vec<String> = conditions
+        .into_iter()
+        .map(|c| format!("({})", c.to_condition()))
+        .collect();
+    if clauses.is_empty() {
+        format!("LIVE SELECT * FROM {target};")
+    } else {
+        format!(
+            "LIVE SELECT * FROM {target} WHERE {};",
+            clauses.join(" AND ")
+        )
     }
 }
 
@@ -230,13 +301,33 @@ impl StreamingManager {
         &self,
         client: &DatabaseClient,
         target: &str,
-        mut callback: F,
+        callback: F,
     ) -> Result<SubscriptionId>
     where
         T: SurrealValue + Unpin + Send + 'static,
         F: FnMut(Notification<T>) + Send + 'static,
     {
-        let mut live: LiveQuery<T> = LiveQuery::start(client, target).await?;
+        self.spawn_where::<T, F, Condition, _>(client, target, Vec::new(), callback)
+            .await
+    }
+
+    /// Start a filtered live query and spawn a task that pipes its
+    /// notifications to `callback`. Conditions carry the semantics
+    /// [`LiveQuery::start_where`] documents.
+    pub async fn spawn_where<T, F, C, I>(
+        &self,
+        client: &DatabaseClient,
+        target: &str,
+        conditions: I,
+        mut callback: F,
+    ) -> Result<SubscriptionId>
+    where
+        T: SurrealValue + Unpin + Send + 'static,
+        F: FnMut(Notification<T>) + Send + 'static,
+        C: WhereCondition,
+        I: IntoIterator<Item = C>,
+    {
+        let mut live: LiveQuery<T> = LiveQuery::start_where(client, target, conditions).await?;
         let id = SubscriptionId::new();
         let handle = tokio::spawn(async move {
             while let Some(item) = live.next().await {
@@ -360,6 +451,31 @@ mod tests {
         let m = StreamingManager::new();
         m.drain_all().await;
         assert_eq!(m.count().await, 0);
+    }
+
+    #[test]
+    fn live_select_renders_its_where_clause() {
+        use crate::types::operators::eq;
+
+        assert_eq!(
+            render_live_select("file_event", Vec::<Condition>::new()),
+            "LIVE SELECT * FROM file_event;",
+        );
+        assert_eq!(
+            render_live_select("file_event", [eq("tenant_id", "acme")]),
+            "LIVE SELECT * FROM file_event WHERE (tenant_id = 'acme');",
+        );
+        // Parenthesised and AND-joined, matching Query.
+        assert_eq!(
+            render_live_select(
+                "file_event",
+                [
+                    Condition::from(eq("tenant_id", "acme")),
+                    Condition::from("dispatched = false"),
+                ],
+            ),
+            "LIVE SELECT * FROM file_event WHERE (tenant_id = 'acme') AND (dispatched = false);",
+        );
     }
 
     #[test]

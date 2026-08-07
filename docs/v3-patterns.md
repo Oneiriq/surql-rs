@@ -212,23 +212,148 @@ lexical recall).
 
 ### `search::score` and scan ordering
 
-The v3 streaming executor's full-text scan yields matching rows **already in BM25
-relevance order**, but does not (in 3.0.x) plumb the per-row score through to
-`search::score(<ref>)`, which returns `0` there. So rank by the scan's natural
-order rather than `ORDER BY search::score(...)`. This is sufficient for
-Reciprocal Rank Fusion, which fuses *ranks*, not raw scores:
+The full-text index decides WHICH rows match. It does not rank them.
+
+`search::score(<ref>)` returns `0` for every row, and the scan yields matches in
+**insertion order**, not relevance order. Measured on 3.2.3 across every form the
+engine accepts: a bare scan, the score projected, `ORDER BY` the projected alias,
+the `@@` operator with no reference number, and an index defined `BM25
+HIGHLIGHTS`. None ranks. `ORDER BY search::score(1)` is a parse error (`Missing
+order idiom search in statement selection`).
+
+The way to see it: seed the same two documents in both insertion orders and
+compare the result order. It mirrors the input.
+
+A consumer that needs relevance has to compute it. The practical shape is the one
+production search already uses: let the index select a bounded candidate window,
+then rescore that window locally, matching the analyzer's tokenizer and stemmer
+so local scoring agrees with what the index matched.
 
 ```rust
-// The sparse leg of hybrid retrieval: rows come back in relevance order.
+// The sparse leg of hybrid retrieval: matches, NOT yet ranked.
 let q = surql::query::helpers::fulltext_search_query(
     "memory", "content", 1, "insider buying", None, "score",
 )?
-.limit(100)?;
-// Fuse the returned order with the dense (vector_search) order via RRF.
+.limit(500)?;   // a rescoring window, not the answer
+// Score the window locally, then fuse ranks with the dense leg.
 ```
+
+An earlier revision of this document said the scan returned rows in BM25 order.
+That was wrong.
 
 v3 also ships a native `search::rrf([$dense, $sparse], k, 60)` function that fuses
 two result lists server-side, if you prefer in-engine fusion.
+
+## 10. The KNN operator's second operand picks the plan
+
+`<|k,...|>` takes a second operand that decides how the search runs:
+
+```text
+embedding <|10,64|>     [...]   -- KnnScan: uses the field's vector index
+embedding <|10,COSINE|> [...]   -- KnnTopK over TableScan: compares every row
+```
+
+An INTEGER is the HNSW search effort (`ef`) and selects the index. A metric name
+makes the engine brute-force the table, which is correct and gets slower with
+every row inserted. The bare `<|k|>` form v1/v2 accepted is gone in v3.
+
+[`Query::vector_search`] renders the metric form, so it remains right for a field
+with no vector index. Use [`Query::vector_search_indexed`] whenever the field
+carries an HNSW or DiskANN index and let the index's own metric apply:
+
+```rust
+let q = surql::query::Query::new()
+    .select(None)
+    .from_table("chunk")?
+    .vector_search_indexed("embedding", query_vector, 10, 64)?;
+```
+
+There is no distance threshold on this operator in v3. A float in the second
+position is refused outright (`only integers are allowed here`), and there is no
+third position. For a relevance floor, project the real distance and filter on it
+in the same `WHERE`:
+
+```text
+SELECT * FROM chunk
+WHERE embedding <|100,64|> $q AND vector::distance::knn() <= 0.65
+LIMIT 10
+```
+
+`vector::distance::knn()` reads the distance the KNN operator already computed,
+so the filter costs nothing extra. Cosine distances run 0.0 for identical
+vectors, 0.2929 at 45 degrees, and 1.0 for orthogonal ones.
+
+## 11. `Surreal::clone` opens a new session, and dropping it kills that session's live queries
+
+In v3 the SDK gives every `Surreal` clone its own session id, and `Drop` sends
+that session id away:
+
+```rust
+fn clone(&self) -> Self {
+    let session_id = Uuid::new_v4();
+    self.inner.clone_session(self.session_id, session_id);
+    // ...
+}
+```
+
+A live query belongs to the session that ran the `LIVE SELECT`. So a
+subscription opened through a handle that later drops goes quiet: no error, no
+closed stream, just silence. It is easy to hit without noticing, because a
+request handler that clones shared state, starts a subscription, and returns the
+stream has done exactly this.
+
+[`LiveQuery`] handles it: it clones the client, issues the statement through
+that clone, and keeps it. Code that talks to the SDK directly has to hold the
+same handle that ran the statement. Cloning afterwards does not work, because
+the new clone is a different session.
+
+The session churn also loses events: the SDK announces every clone and
+drop to the connection router over a side channel, and under
+multi-threaded request traffic the remote router can process a query
+before the session event that should precede it, which fails the
+query with `Session not found`. `DatabaseClient` therefore shares one
+session across its clones and mints new sessions only on request.
+
+## 12. Sessions carry authority, so one connection can serve many callers
+
+Section 11's session-per-clone behaviour cuts both ways. The same
+mechanism that silently kills live queries also means one connection
+can hold sessions with different authority at the same time: clone a
+handle, `authenticate` a token on the clone, and the engine evaluates
+that session against the token's actor while the original handle keeps
+its own.
+
+For a service that fronts many callers over one root connection, that
+turns `PERMISSIONS` clauses from dead weight into a second enforcement
+layer. `DatabaseClient::caller_session` packages the pattern:
+
+```rust
+let caller = client.caller_session(&token).await?;
+let rows = caller.query("SELECT * FROM doc;").await?; // engine-filtered
+drop(caller); // the session ends with the client
+```
+
+The facts underneath, all engine-verified:
+
+- Only RECORD sessions are filtered. The token must come from a
+  `DEFINE ACCESS ... TYPE RECORD` method and carry an `id` claim;
+  the engine then binds `$auth` to that record and applies table and
+  field `PERMISSIONS`. A plain `TYPE JWT` access method yields a
+  database-level session that bypasses them, which is why
+  `caller_session` checks `$auth` and refuses tokens that bind no
+  record identity.
+- Externally minted tokens need no `SIGNIN` or `SIGNUP` clause on the
+  access method. Sign the claims with the declared key and the engine
+  verifies them directly.
+- Enforcement follows the actor. Engine credentials decide only what
+  anonymous sessions may do: without them every anonymous session
+  acts as owner, but an authenticated record session is constrained
+  either way. For embedded engines the connection settings' username
+  and password now reach the datastore at build time, so a locked
+  engine is reachable from configuration alone.
+- Engine refusals are silent. A write a table forbids returns empty
+  rows with no error, so the application layer stays the face that
+  explains refusals and the engine acts as a backstop.
 
 ## What's next
 

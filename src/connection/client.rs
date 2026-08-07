@@ -25,6 +25,7 @@ use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::{
     Database as SdkDatabase, Namespace as SdkNamespace, Record as SdkRecord, Root as SdkRoot, Token,
 };
+use surrealdb::opt::Config as SdkConfig;
 use surrealdb::Surreal;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -39,12 +40,19 @@ use crate::error::{Result, SurqlError};
 /// dynamic [`Any`] engine. All methods are `async` and cancellation-safe
 /// at the tokio level.
 ///
-/// The client is `Clone`-able: every clone shares the same underlying
-/// connection (the `surrealdb` SDK holds its own `Arc`).
+/// The client is `Clone`-able, and every clone shares ONE engine
+/// session: the inner SDK handle rides an `Arc`, because the SDK's
+/// own `Clone` mints a session per clone and sends session lifecycle
+/// events the remote router can lose under concurrency, which
+/// surfaces as `Session not found` on requests. A service that
+/// clones its client per request wants one shared session; code that
+/// needs an independent session says so through
+/// [`DatabaseClient::caller_session`] or an explicit
+/// `client.inner().clone()`.
 #[derive(Debug, Clone)]
 pub struct DatabaseClient {
     config: ConnectionConfig,
-    inner: Surreal<Any>,
+    inner: Arc<Surreal<Any>>,
     connected: Arc<RwLock<bool>>,
     /// Whether the underlying SDK engine has been connected. The SDK connects
     /// a handle once and rejects a second `connect` ("Already connected"), so
@@ -62,7 +70,7 @@ impl DatabaseClient {
         config.validate()?;
         Ok(Self {
             config,
-            inner: Surreal::init(),
+            inner: Arc::new(Surreal::init()),
             connected: Arc::new(RwLock::new(false)),
             engine_connected: Arc::new(RwLock::new(false)),
         })
@@ -236,6 +244,56 @@ impl DatabaseClient {
             .await
             .map_err(|e| connection_err(&e))?;
         Ok(())
+    }
+
+    /// Open an independent engine session over the same connection
+    /// and bind it to a caller identity.
+    ///
+    /// A cloned SDK handle is its own engine session, so the returned
+    /// client authenticates the token without touching this client's
+    /// session, and both run side by side on one connection. The
+    /// engine then evaluates `PERMISSIONS` clauses against the caller
+    /// session while this client keeps its own authority. The session
+    /// ends when the returned client drops. Namespace and database
+    /// come from the token's claims, which is why none are selected
+    /// here.
+    ///
+    /// The token must come from a `DEFINE ACCESS ... TYPE RECORD`
+    /// method and carry an `id` claim: the engine binds a record
+    /// identity only then, and a session without one holds system
+    /// authority that `PERMISSIONS` clauses do not filter. This
+    /// method verifies the binding and refuses otherwise, so a wrong
+    /// token kind errors here instead of yielding an unfiltered
+    /// session. Enforcement does not depend on the engine holding
+    /// credentials: a record session is constrained even on an open
+    /// engine, where only anonymous sessions act as owner.
+    pub async fn caller_session(&self, token: &str) -> Result<DatabaseClient> {
+        self.require_connected()?;
+        let session = DatabaseClient {
+            config: self.config.clone(),
+            // An explicit SDK-level clone: THIS is the one place a
+            // fresh engine session is wanted.
+            inner: Arc::new((*self.inner).clone()),
+            // Fresh flags: disconnecting or invalidating the caller
+            // session must leave the parent client's state alone.
+            connected: Arc::new(RwLock::new(true)),
+            engine_connected: Arc::new(RwLock::new(true)),
+        };
+        session
+            .inner
+            .authenticate(Token::from(token))
+            .await
+            .map_err(|e| connection_err(&e))?;
+        let auth = session.query("RETURN $auth;").await?;
+        let bound = auth.get(0).is_some_and(|v| !v.is_null());
+        if !bound {
+            return Err(SurqlError::Connection {
+                reason: "the engine bound no record identity to the session: the token \
+                         is not from a record access method or lacks an `id` claim"
+                    .to_owned(),
+            });
+        }
+        Ok(session)
     }
 
     /// Invalidate the current session.
@@ -428,12 +486,23 @@ impl DatabaseClient {
         {
             let mut engine_up = self.engine_connected.write().await;
             if !*engine_up {
-                match tokio::time::timeout(
-                    timeout,
-                    self.inner.connect(self.config.url().to_owned()),
-                )
-                .await
-                {
+                // Credentials also reach the engine at build time. An
+                // embedded datastore built without a root user treats
+                // every anonymous session as owner, so locking the
+                // engine needs the user to exist before the first
+                // session. Remote engines ignore the endpoint config
+                // and authenticate through the signin below.
+                let connect = match (self.config.username(), self.config.password()) {
+                    (Some(user), Some(pass)) => self.inner.connect((
+                        self.config.url().to_owned(),
+                        SdkConfig::new().user(SdkRoot {
+                            username: user.to_owned(),
+                            password: pass.to_owned(),
+                        }),
+                    )),
+                    _ => self.inner.connect(self.config.url().to_owned()),
+                };
+                match tokio::time::timeout(timeout, connect).await {
                     Err(_) => {
                         return Err(SurqlError::Connection {
                             reason: format!("connect timed out after {timeout:?}"),
@@ -669,9 +738,12 @@ mod tests {
     }
 
     /// Regression: a connect attempt that gets the engine up but fails a
-    /// later step (here: root signin against an embedded engine, which has no
-    /// root auth) used to die on the SDK's "Already connected" rejection on
-    /// every retry, masking the real error behind it.
+    /// later step (here: root signin) used to die on the SDK's "Already
+    /// connected" rejection on every retry, masking the real error behind
+    /// it. Credentials now initialise embedded engines at build time, so
+    /// the failing-signin state is constructed directly: the engine comes
+    /// up without the config's credentials, the way an external engine
+    /// with different credentials would look.
     #[tokio::test]
     async fn retries_surface_the_failing_step_not_already_connected() {
         let cfg = ConnectionConfig::builder()
@@ -686,6 +758,8 @@ mod tests {
             .build()
             .unwrap();
         let client = DatabaseClient::new(cfg).unwrap();
+        client.inner.connect("mem://".to_owned()).await.unwrap();
+        *client.engine_connected.write().await = true;
         let err = client.connect().await.unwrap_err();
         let msg = err.to_string().to_lowercase();
         assert!(
