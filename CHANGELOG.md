@@ -96,6 +96,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The dependency audit carries its two unfixable advisories in one
+  place.** `.cargo/audit.toml` names each, what would have to change
+  upstream for it to come out, and why it is safe to carry meanwhile.
+  Both workflows now read that file instead of passing a flag with the
+  reasoning written somewhere else. The file governs this repository's
+  own audit and is not published with the crate: a consumer running
+  `cargo audit` sees both advisories and makes their own call.
+
 - **Diff results are now safe to apply to a live database.**
   Grouped permission actions (`FOR select, create ...`) compare
   equal to the engine's split echo instead of reporting a permanent
