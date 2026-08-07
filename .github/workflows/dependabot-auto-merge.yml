@@ -29,9 +29,15 @@ jobs:
           # `timed_out`) remain excluded, so auto-merge still blocks on them.
           allowed-conclusions: success,skipped,neutral
 
-      - name: Approve + auto-merge
+      # No approval: `main` carries no branch protection, so nothing
+      # requires a review before a merge, and asking for one made this
+      # step fail every time with "GitHub Actions is not permitted to
+      # approve pull requests". Granting Actions that right would be a
+      # wider permission than the job needs. Should main ever be
+      # protected, restore the approval and give it a token that is
+      # allowed to make one.
+      - name: Auto-merge
         run: |
-          gh pr review --approve "$PR_URL"
           gh pr merge --auto --squash --delete-branch "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
