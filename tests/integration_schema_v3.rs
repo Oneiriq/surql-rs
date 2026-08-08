@@ -24,15 +24,15 @@ use serde_json::Value;
 
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::migration::diff::{diff_fields, diff_indexes, diff_tables};
-use surql::migration::diff_objects::diff_sequences;
+use surql::migration::diff_objects::{diff_functions, diff_sequences};
 use surql::query::changes::{show_changes_surql, ChangeSet, ChangeSince};
 use surql::query::references::reverse_reference_query;
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
-    array_field, generate_sequence_sql, generate_table_sql, info_for_index_surql, record_field,
-    reverse_reference_field, sequence_schema, string_field, table_schema, unique_index, ChangeFeed,
-    FieldDefinition, IndexBuildStatus, ReferenceAction, SequenceDefinition, TableDefinition,
-    TableMode, ViewDefinition, ViewGroup,
+    array_field, function_schema, generate_function_sql, generate_sequence_sql, generate_table_sql,
+    info_for_index_surql, record_field, reverse_reference_field, sequence_schema, string_field,
+    table_schema, unique_index, ChangeFeed, FieldDefinition, FunctionDefinition, IndexBuildStatus,
+    ReferenceAction, SequenceDefinition, TableDefinition, TableMode, ViewDefinition, ViewGroup,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -507,4 +507,65 @@ async fn sequence_round_trips_and_hands_out_values() {
     apply(&client, &[SequenceDefinition::remove_surql("invoice_no")]).await;
     let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
     assert!(!parsed.sequences.contains_key("invoice_no"));
+}
+
+/// A custom function round-trips through `INFO FOR DB` despite the engine
+/// rewriting what it stores, and is callable.
+#[tokio::test]
+async fn function_round_trips_and_is_callable() {
+    let client = memory_client().await;
+
+    let greet = function_schema("greet", "RETURN 'hi ' + $name;")
+        .arg("name", "string")
+        .arg("loud", "option<bool>")
+        .returns("string")
+        .comment("greeter")
+        .build()
+        .expect("valid function");
+    apply(
+        &client,
+        &generate_function_sql(&greet).expect("function sql"),
+    )
+    .await;
+
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    let stored: Vec<_> = parsed.functions.values().cloned().collect();
+    assert_eq!(stored.len(), 1);
+    // The engine rewrites option<bool> to none | bool, drops the trailing
+    // semicolon, and adds PERMISSIONS FULL; the diff must see through all of
+    // that or the function re-applies on every boot.
+    assert_eq!(stored[0].args[1].arg_type, "none | bool");
+    let diffs = diff_functions(std::slice::from_ref(&greet), &stored);
+    assert!(
+        diffs.is_empty(),
+        "a function re-applies on every boot: {diffs:#?}\nstored: {stored:#?}"
+    );
+
+    let greeting = client
+        .query("RETURN fn::greet('Mat', NONE);")
+        .await
+        .expect("call the function");
+    let greeting = serde_json::to_string(&greeting).expect("serialise");
+    assert!(greeting.contains("hi Mat"), "the function runs: {greeting}");
+
+    // A changed body applies through the OVERWRITE form the diff renders.
+    let shouty = function_schema("greet", "RETURN 'HI ' + $name")
+        .arg("name", "string")
+        .arg("loud", "option<bool>")
+        .returns("string")
+        .comment("greeter")
+        .build()
+        .unwrap();
+    let diffs = diff_functions(std::slice::from_ref(&shouty), &stored);
+    assert_eq!(diffs.len(), 1);
+    apply(&client, &[diffs[0].forward_sql.clone()]).await;
+    let greeting = client
+        .query("RETURN fn::greet('Mat', NONE);")
+        .await
+        .expect("call the replaced function");
+    assert!(serde_json::to_string(&greeting).unwrap().contains("HI Mat"));
+
+    apply(&client, &[FunctionDefinition::remove_surql("greet")]).await;
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    assert!(parsed.functions.is_empty());
 }

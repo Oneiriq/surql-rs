@@ -31,6 +31,8 @@
 //! - [`index`]: [`IndexDefinition`] and the `DEFINE INDEX` builders, plus the
 //!   `CONCURRENTLY` background build and its [`info_for_index_surql`] /
 //!   [`IndexBuildStatus`] progress readout. Re-exported from [`table`].
+//! - [`function`]: [`FunctionDefinition`] and [`function_schema`] for the
+//!   server-side `DEFINE FUNCTION fn::<name>` bodies.
 //! - [`sequence`]: [`SequenceDefinition`] and [`sequence_schema`] for the
 //!   monotonic `DEFINE SEQUENCE` counters behind `sequence::nextval`.
 //! - [`reference`]: [`ReferenceAction`] and the rules governing
@@ -72,6 +74,7 @@ pub mod changefeed;
 pub mod edge;
 pub mod field_type;
 pub mod fields;
+pub mod function;
 pub mod index;
 pub mod parser;
 pub mod reference;
@@ -101,6 +104,7 @@ pub use fields::{
     float_field, int_field, object_field, record_field, reverse_reference_field, string_field,
     validate_field_name, FieldBuilder, FieldDefinition, FieldType,
 };
+pub use function::{function_schema, FunctionArg, FunctionDefinition, FunctionSchemaBuilder};
 pub use index::{info_for_index_surql, IndexBuildStatus};
 pub use parser::{
     parse_access, parse_bucket, parse_db_info, parse_edge_info, parse_event, parse_field,
@@ -116,8 +120,9 @@ pub use sequence::{sequence_schema, SequenceDefinition, SequenceSchemaBuilder};
 pub use sql::{
     generate_access_sql, generate_access_sql_with_options, generate_analyzer_sql,
     generate_analyzer_sql_with_options, generate_bucket_sql, generate_bucket_sql_with_options,
-    generate_edge_sql, generate_schema_sql, generate_sequence_sql,
-    generate_sequence_sql_with_options, generate_table_sql, generate_table_sql_overwrite,
+    generate_edge_sql, generate_function_sql, generate_function_sql_with_options,
+    generate_schema_sql, generate_sequence_sql, generate_sequence_sql_with_options,
+    generate_table_sql, generate_table_sql_overwrite,
 };
 pub use table::{
     bm25_index, event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,

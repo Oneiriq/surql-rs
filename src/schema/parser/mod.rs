@@ -22,6 +22,7 @@
 //! - `index` — `DEFINE INDEX` parsing (UNIQUE / SEARCH / MTREE / HNSW).
 //! - `event` — `DEFINE EVENT` parsing.
 //! - `access` — `DEFINE ACCESS` parsing (JWT + RECORD).
+//! - `function` — `DEFINE FUNCTION` parsing.
 //! - `sequence` — `DEFINE SEQUENCE` parsing.
 //! - `table` — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
 //! - `view` — `DEFINE TABLE ... AS SELECT` (view) parsing.
@@ -63,6 +64,7 @@ use crate::error::{Result, SurqlError};
 use crate::schema::access::AccessDefinition;
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
+use crate::schema::function::FunctionDefinition;
 use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::TableDefinition;
 
@@ -73,6 +75,7 @@ mod db;
 mod edge;
 mod event;
 mod field;
+mod function;
 mod index;
 mod permissions;
 mod sequence;
@@ -86,6 +89,7 @@ pub use db::parse_db_info;
 pub use edge::parse_edge_info;
 pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
+pub use function::parse_function;
 pub use index::{parse_index, parse_indexes};
 pub use permissions::parse_table_permissions;
 pub use sequence::parse_sequence;
@@ -178,6 +182,9 @@ pub struct DatabaseInfo {
     /// Monotonic ID sequences.
     #[serde(default)]
     pub sequences: BTreeMap<String, SequenceDefinition>,
+    /// Custom `fn::` functions, keyed without the `fn::` prefix.
+    #[serde(default)]
+    pub functions: BTreeMap<String, FunctionDefinition>,
 }
 
 #[cfg(test)]

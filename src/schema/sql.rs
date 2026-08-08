@@ -19,6 +19,7 @@ use super::access::AccessDefinition;
 use super::analyzer::AnalyzerDefinition;
 use super::bucket::BucketDefinition;
 use super::edge::EdgeDefinition;
+use super::function::FunctionDefinition;
 use super::sequence::SequenceDefinition;
 use super::table::TableDefinition;
 
@@ -211,6 +212,35 @@ pub fn generate_sequence_sql_with_options(
 ) -> Result<Vec<String>> {
     Ok(vec![
         sequence.to_surql_with_options(if_not_exists, overwrite)?
+    ])
+}
+
+/// Render the `DEFINE FUNCTION` statement(s) for `function`.
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_function_sql, FunctionDefinition};
+///
+/// let f = FunctionDefinition::new("greet", "RETURN 'hi'");
+/// assert_eq!(
+///     generate_function_sql(&f).unwrap()[0],
+///     "DEFINE FUNCTION fn::greet() { RETURN 'hi' };"
+/// );
+/// ```
+pub fn generate_function_sql(function: &FunctionDefinition) -> Result<Vec<String>> {
+    Ok(vec![function.to_surql()?])
+}
+
+/// Render the `DEFINE FUNCTION` statement(s) for `function`, optionally with
+/// `IF NOT EXISTS` / `OVERWRITE` guards for idempotent re-application.
+pub fn generate_function_sql_with_options(
+    function: &FunctionDefinition,
+    if_not_exists: bool,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![
+        function.to_surql_with_options(if_not_exists, overwrite)?
     ])
 }
 
@@ -582,6 +612,32 @@ mod tests {
         use crate::schema::sequence::SequenceDefinition;
         let s = SequenceDefinition::new("s").with_batch(0);
         assert!(generate_sequence_sql(&s).is_err());
+    }
+
+    // ---- generate_function_sql ----
+
+    #[test]
+    fn generate_function_sql_renders_the_statement() {
+        use crate::schema::function::FunctionDefinition;
+        let f = FunctionDefinition::new("greet", "RETURN 'hi'");
+        let stmts = generate_function_sql(&f).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DEFINE FUNCTION fn::greet() { RETURN 'hi' };");
+    }
+
+    #[test]
+    fn generate_function_sql_with_options_overwrite() {
+        use crate::schema::function::FunctionDefinition;
+        let f = FunctionDefinition::new("greet", "RETURN 'hi'");
+        let stmts = generate_function_sql_with_options(&f, false, true).unwrap();
+        assert!(stmts[0].starts_with("DEFINE FUNCTION OVERWRITE fn::greet"));
+    }
+
+    #[test]
+    fn generate_function_sql_validates() {
+        use crate::schema::function::FunctionDefinition;
+        let f = FunctionDefinition::new("greet", "  ");
+        assert!(generate_function_sql(&f).is_err());
     }
 
     // ---- generate_analyzer_sql ----

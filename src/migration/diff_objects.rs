@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use crate::migration::models::{DiffOperation, SchemaDiff};
+use crate::schema::function::FunctionDefinition;
 use crate::schema::sequence::SequenceDefinition;
 
 /// The three [`DiffOperation`] variants one kind of object uses.
@@ -146,9 +147,105 @@ pub fn diff_sequences(code: &[SequenceDefinition], db: &[SequenceDefinition]) ->
     )
 }
 
+/// Compare two function slices.
+///
+/// Both sides go through [`FunctionDefinition::normalized`] first, because
+/// the engine rewrites what it stores (`option<T>` to `none | T`, no trailing
+/// `;`, an explicit `PERMISSIONS FULL`). Comparing the raw spellings would
+/// report a modification on every reconcile.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff_objects::diff_functions;
+/// use surql::migration::DiffOperation;
+/// use surql::schema::FunctionDefinition;
+///
+/// let code = vec![FunctionDefinition::new("greet", "RETURN 'hi'")];
+/// let diffs = diff_functions(&code, &[]);
+/// assert_eq!(diffs[0].operation, DiffOperation::AddFunction);
+/// assert_eq!(diffs[0].backward_sql, "REMOVE FUNCTION IF EXISTS fn::greet;");
+/// ```
+#[must_use]
+pub fn diff_functions(code: &[FunctionDefinition], db: &[FunctionDefinition]) -> Vec<SchemaDiff> {
+    let canonical = |items: &[FunctionDefinition]| -> Vec<FunctionDefinition> {
+        items.iter().map(FunctionDefinition::normalized).collect()
+    };
+    diff_named(
+        &canonical(code),
+        &canonical(db),
+        ObjectDiffKinds {
+            add: DiffOperation::AddFunction,
+            modify: DiffOperation::ModifyFunction,
+            drop: DiffOperation::DropFunction,
+        },
+        |f| f.name.as_str(),
+        |f| f.to_surql().unwrap_or_default(),
+        |f| f.to_surql_overwrite().unwrap_or_default(),
+        FunctionDefinition::to_remove_surql,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn added_function() {
+        let code = vec![FunctionDefinition::new("greet", "RETURN 'hi'")];
+        let diffs = diff_functions(&code, &[]);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::AddFunction);
+        assert_eq!(diffs[0].object.as_deref(), Some("greet"));
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE FUNCTION fn::greet() { RETURN 'hi' } PERMISSIONS FULL;"
+        );
+        assert_eq!(
+            diffs[0].backward_sql,
+            "REMOVE FUNCTION IF EXISTS fn::greet;"
+        );
+    }
+
+    #[test]
+    fn dropped_function() {
+        let db = vec![FunctionDefinition::new("old", "RETURN 1")];
+        let diffs = diff_functions(&[], &db);
+        assert_eq!(diffs[0].operation, DiffOperation::DropFunction);
+        assert_eq!(diffs[0].forward_sql, "REMOVE FUNCTION IF EXISTS fn::old;");
+    }
+
+    #[test]
+    fn modified_function_renders_overwrite_both_ways() {
+        let code = vec![FunctionDefinition::new("f", "RETURN 2")];
+        let db = vec![FunctionDefinition::new("f", "RETURN 1")];
+        let diffs = diff_functions(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyFunction);
+        assert!(diffs[0].forward_sql.contains("OVERWRITE fn::f"));
+        assert!(diffs[0].forward_sql.contains("RETURN 2"));
+        assert!(diffs[0].backward_sql.contains("RETURN 1"));
+    }
+
+    /// The whole point of normalising: what a consumer writes and what the
+    /// engine echoes must not look like a change.
+    #[test]
+    fn the_engine_echo_of_a_function_is_not_a_modification() {
+        let code = vec![
+            crate::schema::function_schema("greet", "RETURN 'hi ' + $name;")
+                .arg("name", "option<string>")
+                .build()
+                .unwrap(),
+        ];
+        let db = vec![
+            crate::schema::function_schema("greet", "RETURN 'hi ' + $name")
+                .arg("name", "none | string")
+                .permissions("FULL")
+                .build()
+                .unwrap(),
+        ];
+        assert!(diff_functions(&code, &db).is_empty());
+    }
 
     #[test]
     fn added_sequence() {

@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::access::parse_access;
 use super::bucket::parse_bucket;
 use super::edge::{parse_edge_endpoints, parse_edge_mode};
+use super::function::parse_function;
 use super::permissions::parse_table_permissions;
 use super::sequence::parse_sequence;
 use super::table::{parse_changefeed, parse_table_mode};
@@ -138,6 +139,17 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
             };
             if let Some(sequence) = parse_sequence(name, def) {
                 out.sequences.insert(name.clone(), sequence);
+            }
+        }
+    }
+
+    if let Some(fc_value) = pick_map(obj, &["fc", "functions"]) {
+        for (name, def_value) in fc_value.as_object().expect("checked by pick_map") {
+            let Some(def) = def_value.as_str() else {
+                continue;
+            };
+            if let Some(function) = parse_function(name, def) {
+                out.functions.insert(name.clone(), function);
             }
         }
     }

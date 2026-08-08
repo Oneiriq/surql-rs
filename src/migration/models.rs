@@ -314,6 +314,12 @@ pub enum DiffOperation {
     ModifySequence,
     /// An existing sequence was removed.
     DropSequence,
+    /// A new custom function was added.
+    AddFunction,
+    /// An existing function's signature, body, or clauses changed.
+    ModifyFunction,
+    /// An existing function was removed.
+    DropFunction,
 }
 
 impl DiffOperation {
@@ -340,6 +346,9 @@ impl DiffOperation {
             Self::AddSequence => "add_sequence",
             Self::ModifySequence => "modify_sequence",
             Self::DropSequence => "drop_sequence",
+            Self::AddFunction => "add_function",
+            Self::ModifyFunction => "modify_function",
+            Self::DropFunction => "drop_function",
         }
     }
 }
@@ -661,6 +670,9 @@ mod tests {
         assert_eq!(DiffOperation::AddSequence.as_str(), "add_sequence");
         assert_eq!(DiffOperation::ModifySequence.as_str(), "modify_sequence");
         assert_eq!(DiffOperation::DropSequence.as_str(), "drop_sequence");
+        assert_eq!(DiffOperation::AddFunction.as_str(), "add_function");
+        assert_eq!(DiffOperation::ModifyFunction.as_str(), "modify_function");
+        assert_eq!(DiffOperation::DropFunction.as_str(), "drop_function");
     }
 
     #[test]
@@ -698,6 +710,9 @@ mod tests {
             DiffOperation::AddSequence,
             DiffOperation::ModifySequence,
             DiffOperation::DropSequence,
+            DiffOperation::AddFunction,
+            DiffOperation::ModifyFunction,
+            DiffOperation::DropFunction,
         ];
         for op in ops {
             let j = serde_json::to_string(&op).unwrap();

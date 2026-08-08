@@ -92,20 +92,23 @@ pub fn severity_for_operation(op: DiffOperation) -> DriftSeverity {
         | DiffOperation::AddEvent
         | DiffOperation::AddAnalyzer
         | DiffOperation::AddBucket
-        | DiffOperation::AddSequence => DriftSeverity::Info,
+        | DiffOperation::AddSequence
+        | DiffOperation::AddFunction => DriftSeverity::Info,
         DiffOperation::ModifyField
         | DiffOperation::ModifyTable
         | DiffOperation::ModifyPermissions
         | DiffOperation::DropEvent
         | DiffOperation::ModifyAnalyzer
         | DiffOperation::ModifyBucket
-        | DiffOperation::ModifySequence => DriftSeverity::Warning,
+        | DiffOperation::ModifySequence
+        | DiffOperation::ModifyFunction => DriftSeverity::Warning,
         DiffOperation::DropTable
         | DiffOperation::DropField
         | DiffOperation::DropIndex
         | DiffOperation::DropAnalyzer
         | DiffOperation::DropBucket
-        | DiffOperation::DropSequence => DriftSeverity::Critical,
+        | DiffOperation::DropSequence
+        | DiffOperation::DropFunction => DriftSeverity::Critical,
     }
 }
 

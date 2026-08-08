@@ -84,6 +84,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `BATCH` and `START` are always rendered, including at their defaults
   (1000 and 0), because the engine echoes them either way.
 
+- **Custom functions (`DEFINE FUNCTION fn::<name>`).**
+  `FunctionDefinition` / `function_schema` render the signature, return
+  type, body, `COMMENT`, and `PERMISSIONS`; `parse_function` reads the
+  `functions` map of `INFO FOR DB` back (splitting arguments on top-level
+  commas so `array<record<x>>` survives, and taking the body from the
+  outermost brace pair so a nested block does not truncate it); and
+  `diff_objects::diff_functions` reports `Add` / `Modify` / `DropFunction`.
+
+  The engine rewrites what it stores — `option<T>` becomes `none | T`, the
+  body loses its trailing `;`, and an omitted `PERMISSIONS` comes back as
+  `PERMISSIONS FULL`. `FunctionDefinition::normalized` applies the same
+  rewrites and the diff compares canonical forms, so a function does not
+  report as modified on every reconcile.
+
 - **`migration::diff_objects`.** `diff_named` captures the add / drop /
   modify shape every database-level named object shares, so a new kind is
   three lines rather than a copy of `diff_buckets`. It lives beside

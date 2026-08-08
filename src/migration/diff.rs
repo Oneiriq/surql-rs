@@ -40,11 +40,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
-use crate::migration::diff_objects::diff_sequences;
+use crate::migration::diff_objects::{diff_functions, diff_sequences};
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::{EdgeDefinition, EdgeMode};
 use crate::schema::fields::FieldDefinition;
+use crate::schema::function::FunctionDefinition;
 use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::{
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
@@ -93,6 +94,10 @@ pub struct SchemaSnapshot {
     /// Defaults to empty so older snapshots still deserialise.
     #[serde(default)]
     pub sequences: Vec<SequenceDefinition>,
+    /// All custom functions known to this snapshot (in discovery order).
+    /// Defaults to empty so older snapshots still deserialise.
+    #[serde(default)]
+    pub functions: Vec<FunctionDefinition>,
 }
 
 impl SchemaSnapshot {
@@ -519,7 +524,7 @@ pub fn diff_buckets(code: &[BucketDefinition], db: &[BucketDefinition]) -> Vec<S
 /// `db` look like `code`.
 ///
 /// The returned diffs are ordered: tables, edges, buckets, analyzers, then
-/// sequences.
+/// sequences, then functions.
 #[must_use]
 pub fn diff_schemas(code: &SchemaSnapshot, db: &SchemaSnapshot) -> Vec<SchemaDiff> {
     let mut out = diff_tables(&code.tables, &db.tables);
@@ -527,6 +532,7 @@ pub fn diff_schemas(code: &SchemaSnapshot, db: &SchemaSnapshot) -> Vec<SchemaDif
     out.extend(diff_buckets(&code.buckets, &db.buckets));
     out.extend(diff_analyzers(&code.analyzers, &db.analyzers));
     out.extend(diff_sequences(&code.sequences, &db.sequences));
+    out.extend(diff_functions(&code.functions, &db.functions));
     out
 }
 
