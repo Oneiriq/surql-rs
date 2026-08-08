@@ -14,6 +14,7 @@ use super::bucket::parse_bucket;
 use super::edge::{parse_edge_endpoints, parse_edge_mode};
 use super::permissions::parse_table_permissions;
 use super::table::{parse_changefeed, parse_table_mode};
+use super::view::parse_view;
 use super::{expect_object, pick_map, DatabaseInfo};
 use crate::error::Result;
 use crate::schema::edge::EdgeDefinition;
@@ -86,6 +87,7 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
                         permissions: parse_table_permissions(def),
                         drop: false,
                         changefeed: parse_changefeed(def),
+                        view: parse_view(def),
                     },
                 );
             }

@@ -14,6 +14,7 @@ use super::event::parse_events;
 use super::field::parse_fields;
 use super::index::parse_indexes;
 use super::permissions::parse_table_permissions;
+use super::view::parse_view;
 use super::{expect_object, pick_map, regex_case_insensitive, value_to_string_map};
 use crate::error::Result;
 use crate::schema::changefeed::ChangeFeed;
@@ -129,6 +130,7 @@ pub fn parse_table_info(
         permissions,
         drop: false,
         changefeed: parse_changefeed(tb_definition),
+        view: parse_view(tb_definition),
     })
 }
 

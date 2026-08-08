@@ -30,7 +30,7 @@ use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
     array_field, generate_table_sql, info_for_index_surql, record_field, reverse_reference_field,
     string_field, table_schema, unique_index, ChangeFeed, FieldDefinition, IndexBuildStatus,
-    ReferenceAction, TableDefinition, TableMode,
+    ReferenceAction, TableDefinition, TableMode, ViewDefinition, ViewGroup,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -355,4 +355,71 @@ async fn changefeed_round_trips_and_replays_mutations() {
         ChangeSet::from_response(&resumed).is_empty(),
         "resuming after the last versionstamp is empty: {resumed}"
     );
+}
+
+/// A pre-computed view table round-trips through the parser and is actually
+/// maintained by the engine as its source table changes.
+#[tokio::test]
+async fn view_table_round_trips_and_is_maintained() {
+    let client = memory_client().await;
+
+    let comment = table_schema("comment")
+        .with_mode(TableMode::Schemaless)
+        .with_fields([string_field("author").build_unchecked().unwrap()]);
+    let stats = table_schema("comment_stats")
+        .with_mode(TableMode::Schemaless)
+        .with_view(
+            ViewDefinition::new(["count() AS total", "author"], ["comment"])
+                .with_group(ViewGroup::by(["author"])),
+        );
+    stats
+        .validate()
+        .expect("a view with no declared fields is valid");
+
+    let mut ddl = generate_table_sql(&comment, true);
+    ddl.extend(generate_table_sql(&stats, true));
+    assert!(
+        ddl.iter()
+            .any(|s| s.contains("TYPE NORMAL") && s.contains("AS SELECT")),
+        "the view clause reaches the statement: {ddl:?}"
+    );
+    apply(&client, &ddl).await;
+
+    let stored = read_back(&client, "comment_stats").await;
+    let diffs = diff_tables(std::slice::from_ref(&stats), std::slice::from_ref(&stored));
+    assert!(
+        diffs.is_empty(),
+        "a view re-applies on every boot: {diffs:#?}\nstored: {stored:#?}"
+    );
+
+    // The engine maintains it: three comments across two authors produce two
+    // rows with the right counts, with no explicit refresh.
+    client
+        .query(
+            "CREATE comment SET author = 'mat';\
+             CREATE comment SET author = 'mat';\
+             CREATE comment SET author = 'nynaeve';",
+        )
+        .await
+        .expect("seed comments");
+    let rows = client
+        .query("SELECT * FROM comment_stats ORDER BY author;")
+        .await
+        .expect("read the view");
+    let body = serde_json::to_string(&rows).expect("serialise");
+    assert!(
+        body.contains("\"total\":2") && body.contains("\"total\":1"),
+        "the view aggregates its source: {body}"
+    );
+}
+
+/// A view holds no field definitions of its own, so declaring them is
+/// rejected before the reconciler could start dropping them every boot.
+#[tokio::test]
+async fn a_view_with_declared_fields_is_rejected() {
+    let stats = table_schema("comment_stats")
+        .with_view(ViewDefinition::new(["count() AS total"], ["comment"]))
+        .with_fields([string_field("total").build_unchecked().unwrap()]);
+    let err = stats.validate().expect_err("fields on a view are rejected");
+    assert!(err.to_string().contains("view"), "{err}");
 }

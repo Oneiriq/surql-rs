@@ -23,6 +23,8 @@
 //! - [`bucket`]: [`BucketDefinition`] + the [`bucket_schema`] /
 //!   [`memory_bucket`] / [`file_bucket`] helpers for SurrealDB v3
 //!   object-storage `DEFINE BUCKET` / `ALTER BUCKET` / `REMOVE BUCKET`.
+//! - [`view`]: [`ViewDefinition`] / [`ViewGroup`], the `AS SELECT` body of a
+//!   pre-computed view table the engine maintains from its sources.
 //! - [`changefeed`]: [`ChangeFeed`], the `CHANGEFEED <duration>
 //!   [INCLUDE ORIGINAL]` mutation log a table can retain; read it back with
 //!   [`crate::query::changes`].
@@ -78,6 +80,7 @@ pub mod themes;
 pub mod utils;
 pub mod validator;
 pub mod validator_utils;
+pub mod view;
 pub mod visualize;
 
 pub use access::{
@@ -99,7 +102,7 @@ pub use index::{info_for_index_surql, IndexBuildStatus};
 pub use parser::{
     parse_access, parse_bucket, parse_db_info, parse_edge_info, parse_event, parse_field,
     parse_fields, parse_index, parse_indexes, parse_table_info, parse_table_mode,
-    parse_table_permissions, DatabaseInfo,
+    parse_table_permissions, parse_view, DatabaseInfo,
 };
 pub use reference::ReferenceAction;
 pub use registry::{
@@ -132,6 +135,7 @@ pub use validator_utils::{
     filter_by_severity, filter_errors, filter_warnings, format_validation_report,
     get_validation_summary, group_by_table, has_errors, ValidationSummary,
 };
+pub use view::{ViewDefinition, ViewGroup};
 pub use visualize::{
     generate_ascii, generate_graphviz, generate_mermaid, visualize_from_registry, visualize_schema,
     OutputFormat, ThemeOption,

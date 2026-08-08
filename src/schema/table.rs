@@ -15,6 +15,7 @@ use crate::error::{Result, SurqlError};
 
 use super::changefeed::ChangeFeed;
 use super::fields::FieldDefinition;
+use super::view::ViewDefinition;
 
 pub use super::index::{
     bm25_index, hnsw_index, index, mtree_index, search_index, unique_index, HnswDistanceType,
@@ -151,6 +152,10 @@ pub struct TableDefinition {
     /// read back with [`crate::query::changes`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub changefeed: Option<ChangeFeed>,
+    /// Pre-computed view body (`TYPE NORMAL ... AS SELECT ...`). A table with
+    /// one is maintained by the engine and holds no declared fields.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub view: Option<ViewDefinition>,
 }
 
 impl TableDefinition {
@@ -169,6 +174,7 @@ impl TableDefinition {
             permissions: None,
             drop: false,
             changefeed: None,
+            view: None,
         }
     }
 
@@ -233,6 +239,13 @@ impl TableDefinition {
         self
     }
 
+    /// Make this a pre-computed view maintained from other tables
+    /// (`TYPE NORMAL ... AS SELECT ...`).
+    pub fn with_view(mut self, view: ViewDefinition) -> Self {
+        self.view = Some(view);
+        self
+    }
+
     /// Validate the table and its contained definitions.
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
@@ -248,6 +261,20 @@ impl TableDefinition {
         }
         for event in &self.events {
             event.validate()?;
+        }
+        if let Some(view) = &self.view {
+            view.validate()?;
+            // The engine computes a view's contents, so it stores no field
+            // definitions for one. Declaring fields anyway would have the
+            // reconciler drop them from the database on every boot.
+            if !self.fields.is_empty() {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "Table {:?} is a view: its fields come from the AS SELECT                          projection, so none may be declared",
+                        self.name
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -284,17 +311,24 @@ impl TableDefinition {
             }
             _ => String::new(),
         };
-        // SurrealQL order: mode, then CHANGEFEED, then PERMISSIONS.
+        // SurrealQL order: TYPE, mode, AS SELECT, CHANGEFEED, PERMISSIONS.
+        // A view carries the explicit `TYPE NORMAL` the engine echoes back.
+        let (kind, view) = match &self.view {
+            Some(view) => ("TYPE NORMAL ", view.to_clause()),
+            None => ("", String::new()),
+        };
         let changefeed = self
             .changefeed
             .as_ref()
             .map(ChangeFeed::to_clause)
             .unwrap_or_default();
         format!(
-            "DEFINE TABLE{ine} {name} {mode}{changefeed}{perms};",
+            "DEFINE TABLE{ine} {name} {kind}{mode}{view}{changefeed}{perms};",
             ine = ine,
             name = self.name,
+            kind = kind,
             mode = self.mode.as_str(),
+            view = view,
             changefeed = changefeed,
             perms = perms,
         )

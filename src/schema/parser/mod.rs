@@ -23,6 +23,7 @@
 //! - `event` — `DEFINE EVENT` parsing.
 //! - `access` — `DEFINE ACCESS` parsing (JWT + RECORD).
 //! - `table` — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
+//! - `view` — `DEFINE TABLE ... AS SELECT` (view) parsing.
 //! - `db` — `INFO FOR DB` parsing + edge partitioning.
 //!
 //! ## Example
@@ -73,6 +74,7 @@ mod field;
 mod index;
 mod permissions;
 mod table;
+mod view;
 
 pub use access::parse_access;
 pub use analyzer::parse_analyzer;
@@ -84,6 +86,7 @@ pub use field::{parse_field, parse_fields};
 pub use index::{parse_index, parse_indexes};
 pub use permissions::parse_table_permissions;
 pub use table::{parse_changefeed, parse_table_full, parse_table_info, parse_table_mode};
+pub use view::parse_view;
 
 // --- Shared regex helper -----------------------------------------------------
 

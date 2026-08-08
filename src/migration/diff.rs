@@ -48,6 +48,7 @@ use crate::schema::table::{
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
     MTreeVectorType, TableDefinition,
 };
+use crate::schema::view::ViewDefinition;
 
 /// Full schema snapshot passed to [`diff_schemas`].
 ///
@@ -651,16 +652,25 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
 
 /// Compare the parts of a `DEFINE TABLE` statement that belong to the table
 /// itself rather than to a field, index, event, or permission rule: the
-/// change feed.
+/// change feed and the `AS SELECT` view body.
 ///
 /// The table mode is deliberately left out. It is carried by the same
 /// `OVERWRITE` statement, so a change to it rides along with any of the other
 /// diffs; making it its own trigger would change long-standing behaviour for
 /// every schema that leaves the mode implicit.
 fn diff_table_body(code: &TableDefinition, db: &TableDefinition) -> Vec<SchemaDiff> {
-    if code.changefeed == db.changefeed {
+    let changefeed_changed = code.changefeed != db.changefeed;
+    // Views compare on the rendered clause with whitespace normalised: the
+    // engine reformats a projection or predicate as it likes, and a diff on
+    // the spacing alone would re-apply the view on every reconcile.
+    let view_changed = !expr_eq(
+        code.view.as_ref().map(ViewDefinition::to_clause).as_deref(),
+        db.view.as_ref().map(ViewDefinition::to_clause).as_deref(),
+    );
+    if !changefeed_changed && !view_changed {
         return Vec::new();
     }
+    let what = if view_changed { "view" } else { "change feed" };
     vec![SchemaDiff {
         operation: DiffOperation::ModifyTable,
         table: code.name.clone(),
@@ -669,9 +679,9 @@ fn diff_table_body(code: &TableDefinition, db: &TableDefinition) -> Vec<SchemaDi
         event: None,
         bucket: None,
         analyzer: None,
-        description: format!("Modify change feed on {}", code.name),
-        // The full definition replaces: a bare CHANGEFEED statement would
-        // silently reset the table's mode and permissions.
+        description: format!("Modify {what} on {}", code.name),
+        // The full definition replaces: a bare CHANGEFEED or AS SELECT
+        // statement would silently reset the table's mode and permissions.
         forward_sql: code.to_surql_overwrite(),
         backward_sql: db.to_surql_overwrite(),
         details: BTreeMap::new(),
@@ -1856,6 +1866,50 @@ mod tests {
         use crate::schema::ChangeFeed;
         let t = table_schema("audit").with_changefeed(ChangeFeed::new("1d"));
         assert!(diff_tables(std::slice::from_ref(&t), std::slice::from_ref(&t)).is_empty());
+    }
+
+    // ----- views -----
+
+    #[test]
+    fn diff_tables_detects_an_added_view() {
+        use crate::schema::{ViewDefinition, ViewGroup};
+        let db = vec![table_schema("stats")];
+        let code = vec![table_schema("stats").with_view(
+            ViewDefinition::new(["count() AS total"], ["comment"]).with_group(ViewGroup::All),
+        )];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert!(diffs[0].description.contains("view"));
+        assert!(diffs[0].forward_sql.contains("TYPE NORMAL"));
+        assert!(diffs[0]
+            .forward_sql
+            .contains("AS SELECT count() AS total FROM comment GROUP ALL"));
+        assert!(!diffs[0].backward_sql.contains("AS SELECT"));
+    }
+
+    #[test]
+    fn diff_tables_detects_a_changed_view_body() {
+        use crate::schema::ViewDefinition;
+        let db = vec![table_schema("stats").with_view(ViewDefinition::new(["id"], ["comment"]))];
+        let code = vec![table_schema("stats")
+            .with_view(ViewDefinition::new(["id"], ["comment"]).with_condition("n > 2"))];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].forward_sql.contains("WHERE n > 2"));
+    }
+
+    #[test]
+    fn diff_tables_ignores_view_whitespace_reformatting() {
+        use crate::schema::ViewDefinition;
+        let db = vec![table_schema("stats")
+            .with_view(ViewDefinition::new(["id"], ["comment"]).with_condition("n   >    2"))];
+        let code = vec![table_schema("stats")
+            .with_view(ViewDefinition::new(["id"], ["comment"]).with_condition("n > 2"))];
+        assert!(
+            diff_tables(&code, &db).is_empty(),
+            "the engine reformats freely; only the meaning may differ"
+        );
     }
 
     // ----- diff_buckets -----

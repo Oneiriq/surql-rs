@@ -59,6 +59,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `ChangeSet::from_response` pulls the `versionstamp` / `changes` pairs out
   of the answer so a consumer can resume where it stopped.
 
+- **Pre-computed view tables (`DEFINE TABLE ... TYPE NORMAL AS SELECT`).**
+  `ViewDefinition` / `ViewGroup` and `TableDefinition::with_view` render
+  `TYPE NORMAL <mode> AS SELECT <projections> FROM <tables> [WHERE ...]
+  [GROUP BY ...|GROUP ALL]`, `parser::parse_view` reads it back, and a
+  changed body reports as `DiffOperation::ModifyTable`.
+
+  The parser splits on top-level commas and keywords only, so
+  `math::max([a, b])` stays one projection and a table literally named
+  `comment` is not mistaken for a `COMMENT` clause. Views compare on the
+  whitespace-normalised clause, because the engine reformats what it stores.
+
+  `TableDefinition::validate` rejects a view that declares fields: the
+  engine computes a view's contents and stores no field definitions for one,
+  so a reconciler would drop the declared fields on every boot.
+
 - **`array<record<table>>` field types.** An ARRAY field with a
   `target_table` now renders `array<record<{target}>>` instead of a bare
   `array`, which is the shape a to-many reference needs. A `target_table`
