@@ -96,6 +96,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The guides document what this release adds.** Nullable fields and
+  `OVERWRITE` rendering are in the schema guide, reading a live
+  database back through `parse_db_info` and `parse_table_full` is in
+  the migrations guide. Two examples that predate this release are
+  corrected while passing: `SchemaSnapshot::from_registry` does not
+  exist and never did, and a `SchemaSnapshot` struct literal stops
+  compiling every time the type gains a kind of definition, so both
+  now use the constructors. Every example in the changed pages was
+  compiled against the crate rather than read over.
+
 - **The dependency audit carries its two unfixable advisories in one
   place.** `.cargo/audit.toml` names each, what would have to change
   upstream for it to come out, and why it is safe to carry meanwhile.

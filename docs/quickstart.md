@@ -91,8 +91,12 @@ REMOVE TABLE IF EXISTS user;
 ```rust
 use surql::migration::diff::{diff_schemas, SchemaSnapshot};
 
-let code_side = SchemaSnapshot::from_registry(&registry);
-let db_side   = /* fetched via INFO FOR DB once the client lands */;
+let code_side = SchemaSnapshot::from_all_parts(
+    registry.tables().into_values(),
+    registry.edges().into_values(),
+    registry.buckets().into_values(),
+);
+let db_side = SchemaSnapshot::from_parts(db_tables, db_edges);
 let diff = diff_schemas(&code_side, &db_side);
 for op in diff {
     println!("{}: {}", op.operation, op.target_name);

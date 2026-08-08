@@ -37,7 +37,25 @@ let user = table_schema("user")
 | `computed_field`     | computed (`VALUE <expr>`) |
 
 All field builders share the same chainable methods: `assertion`,
-`default`, `value`, `readonly`, `flexible`, `permissions`.
+`default`, `value`, `readonly`, `flexible`, `permissions`, `nullable`.
+
+### Nullable fields
+
+`nullable(true)` wraps the rendered type in `option<...>`, so a
+SCHEMAFULL column accepts `NONE`:
+
+```rust
+use surql::schema::{int_field, record_field, string_field};
+
+int_field("size_bytes").nullable(true);              // TYPE option<int>
+record_field("blob", Some("blob")).nullable(true);   // TYPE option<record<blob>>
+string_field("digest").nullable(true);               // TYPE option<string>
+```
+
+`FieldDefinition::with_nullable(bool)` does the same on an already
+built definition. The `INFO FOR TABLE` parser round-trips the wrapper,
+so a nullable column diffs against a live database as itself rather
+than as a change.
 
 ## Indexes
 
@@ -98,6 +116,35 @@ let stmts = generate_schema_sql(
     false, // if_not_exists
 )?;
 ```
+
+### Replacing definitions that already exist
+
+`IF NOT EXISTS` creates a definition once and then never touches it, so
+a schema that evolves needs the replacing form to bring an existing
+database up to what the code declares. Every definition renders it:
+
+```rust
+use surql::schema::sql::generate_table_sql_overwrite;
+
+// The table's own statement, replacing form.
+let sql = user.to_surql_overwrite();
+
+// The table and everything under it: fields, indexes, events.
+let stmts = generate_table_sql_overwrite(&user);
+```
+
+`to_surql_overwrite` is on tables, fields, indexes, events, analyzers
+and access methods. The ones that belong to a table take the table
+name, because a field renders as `DEFINE FIELD ... ON <table>`:
+
+```rust
+let field_sql = email_field.to_surql_overwrite("user");
+let index_sql = email_index.to_surql_overwrite("user");
+```
+
+Edges and access methods return a `Result`, because their rendering can
+refuse; the rest return a `String`. `OVERWRITE` replaces the definition
+and leaves the stored data alone.
 
 ## What's next
 
