@@ -107,12 +107,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   The parser locates clause keywords outside quoted runs, so a value like
   `'leave a comment about permissions'` is not cut at its own words.
 
-- **`migration::diff_objects`.** `diff_named` captures the add / drop /
-  modify shape every database-level named object shares, so a new kind is
-  three lines rather than a copy of `diff_buckets`. It lives beside
-  `migration::diff` because that module is already well past the 1000-LOC
-  budget. `SchemaDiff` gained one `object: Option<String>` field naming the
-  object such a diff targets.
+- **`migration::diff_objects`.** Every database-level object diff now lives
+  here: `diff_buckets` and `diff_analyzers` moved across (re-exported from
+  `migration::diff`, so no path changes), and `diff_named` captures the add
+  / drop / modify shape they share, so a new kind is three lines rather than
+  another copy of the walk. Net effect: `migration::diff` is smaller than it
+  was before this release despite gaining change-feed and view diffing.
+  `SchemaDiff` gained one `object: Option<String>` field naming the object
+  such a diff targets.
 
 - **`array<record<table>>` field types.** An ARRAY field with a
   `target_table` now renders `array<record<{target}>>` instead of a bare
