@@ -9,6 +9,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **A field that gained `REFERENCE` silently tracked nothing for its
+  existing rows.** The engine backfills nothing when the clause is
+  added, and a self-assignment registers nothing either; only an actual
+  value change does. Applying the DDL a diff renders therefore left
+  `<~` blind to every row that predated the clause, and whatever
+  consumed the reverse references undercounted with no error anywhere.
+  `schema::reference_backfill_sql(table, field)` renders the rewrite
+  that makes the tracking true (NONE-and-back per row, shaped by two
+  probed `FOR` quirks: `SELECT VALUE id` because `FOR` refuses object
+  rows, `?? []` because it refuses an empty selection). The field diff
+  carries it in `details` with a `SchemaDiff::reference_backfill_sql()`
+  accessor rather than inside `forward_sql`, because it is DML an
+  application's own events may refuse and a live reconciler must choose
+  where it runs; the migration generator, whose files a person reviews,
+  writes it into the file right after the DDL, and registration inside
+  the same transaction is probed behaviour.
+
+  Getting the rewrite through a migration file exposed a second bug:
+  the statement splitter cut on every semicolon, which shattered any
+  statement with a braced body — the backfill's `FOR` loop, and equally
+  a `DEFINE FUNCTION` with more than one statement in it. The splitter
+  now respects brace and parenthesis nesting and string literals, so a
+  statement ends only at a top-level semicolon.
+
 - **`surql schema tables` / `export` / `validate` and `surql bucket list`
   read every database as empty.** The CLI passed the raw
   `client.query("INFO FOR DB;")` response to `parse_db_info`, but `query`

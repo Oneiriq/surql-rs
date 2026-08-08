@@ -86,6 +86,34 @@ pub(super) fn render_reference_clause(action: ReferenceAction) -> String {
     format!(" REFERENCE ON DELETE {}", action.as_str())
 }
 
+/// The row rewrite a field needs after GAINING `REFERENCE`, without
+/// which the engine's tracking lies about every row that already held a
+/// value.
+///
+/// Probed against v3.x: adding the clause backfills nothing, and a
+/// self-assignment (`SET field = field`) registers nothing either;
+/// only an actual value change does. So this walks every row holding a
+/// value and rewrites it NONE-and-back. Two engine quirks shape the
+/// statement: `FOR` refuses object rows, so the id list is `SELECT
+/// VALUE id`, and `FOR` refuses an empty selection, hence `?? []`.
+///
+/// The statement carries no transaction wrapper so it can ride inside
+/// whatever transaction runs the DDL; registration works when the
+/// rewrite shares a transaction with the `DEFINE FIELD OVERWRITE`
+/// (probed). Run it AFTER the clause is defined, never before. And it
+/// is a real UPDATE of every row: `VALUE` columns recompute and events
+/// fire, so an event that guards the field must be lifted around it,
+/// which is the caller's judgement, not this function's.
+pub fn reference_backfill_sql(table: &str, field: &str) -> Result<String> {
+    crate::query::builder::validate_identifier(table, "reference backfill table")?;
+    crate::query::builder::validate_identifier(field, "reference backfill field")?;
+    Ok(format!(
+        "FOR $rid IN ((SELECT VALUE id FROM {table} WHERE {field} IS NOT NONE) ?? []) \
+         {{ LET $held = $rid.{field}; UPDATE $rid SET {field} = NONE; \
+         UPDATE $rid SET {field} = $held; }};"
+    ))
+}
+
 /// Validate that a field can carry `REFERENCE`.
 ///
 /// Returns [`SurqlError::Validation`] for a nested field name or for a type
@@ -280,6 +308,25 @@ mod tests {
         assert!(validate_computed("x", false, Some("1"), None).is_err());
         assert!(validate_computed("x", false, None, Some("1")).is_err());
         assert!(validate_computed("x", false, None, None).is_ok());
+    }
+
+    #[test]
+    fn backfill_rewrites_none_and_back() {
+        let sql = reference_backfill_sql("file", "blob").unwrap();
+        assert!(sql.contains("SELECT VALUE id FROM file"), "{sql}");
+        assert!(sql.contains("?? []"), "{sql}");
+        assert!(sql.contains("SET blob = NONE"), "{sql}");
+        assert!(sql.contains("SET blob = $held"), "{sql}");
+        assert!(
+            !sql.contains("BEGIN"),
+            "carries no transaction wrapper: {sql}"
+        );
+    }
+
+    #[test]
+    fn backfill_refuses_names_that_are_not_identifiers() {
+        assert!(reference_backfill_sql("file; REMOVE TABLE file", "blob").is_err());
+        assert!(reference_backfill_sql("file", "blob = NONE --").is_err());
     }
 
     #[test]

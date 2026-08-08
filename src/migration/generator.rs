@@ -273,9 +273,19 @@ pub fn generate_migration_from_diffs(
         });
     }
 
+    // A field that gained REFERENCE carries the rewrite its
+    // pre-existing rows need; the generated file is the reviewed
+    // artifact, so the DML belongs here, right after the DDL it
+    // completes. The executor wraps the whole migration in one
+    // transaction, and registration inside the transaction that
+    // defines the clause is probed behaviour.
     let up_statements: Vec<String> = diffs
         .iter()
-        .filter_map(|d| normalise_statement(&d.forward_sql))
+        .flat_map(|d| {
+            normalise_statement(&d.forward_sql)
+                .into_iter()
+                .chain(d.reference_backfill_sql().and_then(normalise_statement))
+        })
         .collect();
 
     let down_statements: Vec<String> = diffs
@@ -698,6 +708,45 @@ mod tests {
         assert_eq!(reloaded.down, down);
         assert_eq!(reloaded.description, "Create user");
         assert_eq!(m, reloaded);
+
+        cleanup(&dir);
+    }
+
+    /// A field that gains `REFERENCE` puts its rewrite in the file,
+    /// right after the DDL, and the whole thing survives the trip back
+    /// through `load_migration` as one statement: the rewrite is a
+    /// `FOR` body full of semicolons, which is exactly what the
+    /// statement splitter used to shatter.
+    #[test]
+    fn a_gained_reference_rides_the_generated_file() {
+        use crate::migration::diff::diff_fields;
+        use crate::schema::{record_field, ReferenceAction};
+
+        let dir = unique_temp_dir("reference-backfill");
+        let old = record_field("link", Some("b"))
+            .nullable(true)
+            .build_unchecked()
+            .unwrap();
+        let new = record_field("link", Some("b"))
+            .nullable(true)
+            .reference(ReferenceAction::Ignore)
+            .build_unchecked()
+            .unwrap();
+        let diffs = diff_fields("f", &[new], &[old]);
+        assert_eq!(diffs.len(), 1);
+
+        let m = generate_migration_from_diffs("gain_reference", &diffs, &dir).unwrap();
+        let reloaded = load_migration(&m.path).unwrap();
+        assert_eq!(reloaded.up.len(), 2, "{:#?}", reloaded.up);
+        assert!(reloaded.up[0].contains("REFERENCE ON DELETE IGNORE"));
+        assert!(reloaded.up[1].starts_with("FOR $rid"), "{}", reloaded.up[1]);
+        assert!(
+            reloaded.up[1].contains("SET link = $held"),
+            "the dance survives the file as one statement: {}",
+            reloaded.up[1]
+        );
+        // Removing the clause needs no un-backfill: down is the old DDL alone.
+        assert_eq!(reloaded.down.len(), 1, "{:#?}", reloaded.down);
 
         cleanup(&dir);
     }

@@ -115,7 +115,7 @@ pub use parser::{
     parse_fields, parse_index, parse_indexes, parse_sequence, parse_table_info, parse_table_mode,
     parse_table_permissions, parse_view, DatabaseInfo,
 };
-pub use reference::ReferenceAction;
+pub use reference::{reference_backfill_sql, ReferenceAction};
 pub use registry::{
     clear_registry, get_registered_buckets, get_registered_edges, get_registered_tables,
     get_registry, register_bucket, register_edge, register_table, SchemaRegistry,

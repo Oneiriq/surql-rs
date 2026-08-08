@@ -409,19 +409,45 @@ fn parse_metadata_line(line: &str) -> Option<(String, String)> {
     Some((key.trim().to_string(), value.trim().to_string()))
 }
 
+/// Split a migration section into statements on `;`, respecting the
+/// nesting a statement may legitimately contain. A `DEFINE FUNCTION`
+/// body and a `FOR` loop both carry semicolons inside `{ }`, string
+/// literals may carry anything at all, and splitting inside either
+/// shatters one statement into fragments that individually fail to
+/// parse. Only a semicolon at depth zero, outside every quote, ends a
+/// statement.
 fn split_statements(lines: &[String]) -> Vec<String> {
     let joined = lines.join("\n");
     let mut statements = Vec::new();
     let mut current = String::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
 
     for ch in joined.chars() {
         current.push(ch);
-        if ch == ';' {
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() && trimmed != ";" {
-                statements.push(trimmed);
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
             }
-            current.clear();
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '{' | '(' => depth += 1,
+            '}' | ')' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() && trimmed != ";" {
+                    statements.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => {}
         }
     }
 
@@ -802,6 +828,45 @@ mod tests {
     }
 
     // --- load_migration ----------------------------------------------------
+
+    fn split(text: &str) -> Vec<String> {
+        split_statements(&[text.to_string()])
+    }
+
+    /// A `DEFINE FUNCTION` body and a `FOR` loop both hold semicolons
+    /// inside braces; splitting there shatters one statement into
+    /// fragments that individually fail to parse. The reference
+    /// backfill rewrite is exactly this shape, and it must survive a
+    /// trip through a migration file.
+    #[test]
+    fn split_statements_respects_nesting_and_strings() {
+        let function = split(
+            "DEFINE FUNCTION fn::double($n: int) { LET $d = $n * 2; RETURN $d; };\n\
+             DEFINE TABLE t SCHEMAFULL;",
+        );
+        assert_eq!(function.len(), 2, "{function:#?}");
+        assert!(function[0].contains("RETURN $d;"), "{}", function[0]);
+
+        let dance = split(
+            "FOR $rid IN ((SELECT VALUE id FROM f WHERE link IS NOT NONE) ?? []) \
+             { LET $held = $rid.link; UPDATE $rid SET link = NONE; \
+             UPDATE $rid SET link = $held; };\n\
+             DEFINE TABLE t SCHEMAFULL;",
+        );
+        assert_eq!(dance.len(), 2, "{dance:#?}");
+        assert!(dance[0].starts_with("FOR $rid"), "{}", dance[0]);
+        assert!(dance[0].ends_with("};"), "{}", dance[0]);
+
+        let strings = split("CREATE t SET s = 'a;{b}(c'; CREATE u SET n = \"d;e\";");
+        assert_eq!(strings.len(), 2, "{strings:#?}");
+
+        let escaped = split("CREATE t SET s = 'it\\'s; fine'; CREATE u SET n = 1;");
+        assert_eq!(escaped.len(), 2, "{escaped:#?}");
+
+        // The old behaviour survives for the plain cases.
+        let plain = split("DEFINE TABLE a SCHEMAFULL; DEFINE TABLE b SCHEMAFULL");
+        assert_eq!(plain.len(), 2, "{plain:#?}");
+    }
 
     #[test]
     fn load_migration_happy_path() {

@@ -427,6 +427,22 @@ pub struct SchemaDiff {
     pub details: BTreeMap<String, serde_json::Value>,
 }
 
+impl SchemaDiff {
+    /// The row rewrite this change needs before reference tracking is
+    /// trustworthy: populated only when an existing field GAINS
+    /// `REFERENCE`, because the engine backfills nothing and a
+    /// self-assignment registers nothing (see
+    /// [`crate::schema::reference_backfill_sql`]). Run it after
+    /// `forward_sql`, in the same transaction or a later one; anything
+    /// that applies the DDL and skips this undercounts silently on
+    /// every pre-existing row.
+    pub fn reference_backfill_sql(&self) -> Option<&str> {
+        self.details
+            .get("reference_backfill_sql")
+            .and_then(serde_json::Value::as_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

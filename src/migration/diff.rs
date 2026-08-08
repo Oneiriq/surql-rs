@@ -753,6 +753,27 @@ fn generate_modify_field_diff(
         "new_type".into(),
         serde_json::Value::String(new_field.field_type.as_str().into()),
     );
+    let mut description = format!("Modify field {} in {}", new_field.name, table);
+    // Gaining REFERENCE is the one field change whose DDL alone leaves
+    // the database lying: the engine backfills nothing, so every row
+    // that already held a value stays invisible to `<~` until it is
+    // rewritten (see [`crate::schema::reference_backfill_sql`]). The
+    // rewrite rides `details` rather than `forward_sql` because it is
+    // DML an application's own events may refuse, so a live reconciler
+    // must choose where it runs; the migration generator, whose files
+    // a person reviews, includes it right after the DDL.
+    if old_field.reference.is_none() && new_field.reference.is_some() {
+        // The Err arm is unreachable for schema-borne names, which
+        // were validated at definition time; a name the validator
+        // refuses could not have rendered the DDL above either.
+        if let Ok(backfill) = crate::schema::reference_backfill_sql(table, &new_field.name) {
+            details.insert(
+                "reference_backfill_sql".into(),
+                serde_json::Value::String(backfill),
+            );
+            description.push_str(" (gains REFERENCE: existing rows need the backfill rewrite)");
+        }
+    }
     SchemaDiff {
         operation: DiffOperation::ModifyField,
         table: table.to_string(),
@@ -762,7 +783,7 @@ fn generate_modify_field_diff(
         bucket: None,
         analyzer: None,
         object: None,
-        description: format!("Modify field {} in {}", new_field.name, table),
+        description,
         forward_sql,
         backward_sql,
         details,
@@ -1324,6 +1345,68 @@ mod tests {
             diffs[0].details.get("new_type"),
             Some(&serde_json::json!("int"))
         );
+    }
+
+    fn linked(action: Option<crate::schema::ReferenceAction>) -> FieldDefinition {
+        let mut field = f("blob", FieldType::Record);
+        field.target_table = Some("blob".into());
+        field.reference = action;
+        field
+    }
+
+    /// Gaining `REFERENCE` is the one field change whose DDL alone
+    /// leaves the tracking wrong for every pre-existing row, so that
+    /// diff carries the rewrite and says so.
+    #[test]
+    fn a_gained_reference_carries_its_backfill() {
+        use crate::schema::ReferenceAction;
+        let diffs = diff_fields(
+            "file",
+            &[linked(Some(ReferenceAction::Ignore))],
+            &[linked(None)],
+        );
+        assert_eq!(diffs.len(), 1);
+        let backfill = diffs[0]
+            .reference_backfill_sql()
+            .expect("the rewrite rides the diff");
+        assert!(backfill.contains("SELECT VALUE id FROM file"), "{backfill}");
+        assert!(backfill.contains("?? []"), "{backfill}");
+        assert!(backfill.contains("SET blob = NONE"), "{backfill}");
+        assert!(
+            diffs[0].description.contains("backfill"),
+            "{}",
+            diffs[0].description
+        );
+    }
+
+    /// Everything else about a reference leaves the rewrite out: a
+    /// changed action re-renders DDL over tracking that already exists,
+    /// and a removed clause has nothing to register.
+    #[test]
+    fn other_reference_changes_carry_no_backfill() {
+        use crate::schema::ReferenceAction;
+        let changed = diff_fields(
+            "file",
+            &[linked(Some(ReferenceAction::Cascade))],
+            &[linked(Some(ReferenceAction::Ignore))],
+        );
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].reference_backfill_sql().is_none());
+
+        let removed = diff_fields(
+            "file",
+            &[linked(None)],
+            &[linked(Some(ReferenceAction::Ignore))],
+        );
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].reference_backfill_sql().is_none());
+
+        // A NEW field with REFERENCE has no pre-existing values to
+        // register; the add diff stays plain DDL.
+        let added = diff_fields("file", &[linked(Some(ReferenceAction::Ignore))], &[]);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].operation, DiffOperation::AddField);
+        assert!(added[0].reference_backfill_sql().is_none());
     }
 
     #[test]

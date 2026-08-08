@@ -636,3 +636,118 @@ async fn parse_db_info_reads_the_raw_query_response() {
     let parsed = parse_db_info(&raw).expect("parse the wrapped response");
     assert!(parsed.tables.contains_key("user"), "{parsed:?}");
 }
+
+/// The engine backfills nothing when a field gains `REFERENCE`, and a
+/// self-assignment registers nothing either: after the DDL alone every
+/// pre-existing row is invisible to `<~`. The diff knows this and
+/// carries the rewrite; applying both halves makes the tracking true,
+/// and the result round-trips with no residual change.
+#[tokio::test]
+async fn a_gained_reference_backfills_pre_existing_rows() {
+    let client = memory_client().await;
+
+    // v1: a plain record link, no REFERENCE, with a row already in it.
+    let target = table_schema("b")
+        .with_mode(TableMode::Schemafull)
+        .with_fields([string_field("name").build_unchecked().unwrap()]);
+    let old_link = record_field("link", Some("b"))
+        .nullable(true)
+        .build_unchecked()
+        .unwrap();
+    let holder_v1 = table_schema("f")
+        .with_mode(TableMode::Schemafull)
+        .with_fields([old_link.clone()]);
+    let mut ddl = generate_table_sql(&target, true);
+    ddl.extend(generate_table_sql(&holder_v1, true));
+    apply(&client, &ddl).await;
+    client
+        .query("CREATE b:one SET name = 'target'; CREATE f:alpha SET link = b:one;")
+        .await
+        .expect("pre-reference rows");
+
+    // v2: the same field gains REFERENCE. The diff carries both halves.
+    let new_link = record_field("link", Some("b"))
+        .nullable(true)
+        .reference(ReferenceAction::Ignore)
+        .build_unchecked()
+        .unwrap();
+    let diffs = diff_fields("f", std::slice::from_ref(&new_link), &[old_link]);
+    assert_eq!(diffs.len(), 1, "{diffs:#?}");
+    let backfill = diffs[0]
+        .reference_backfill_sql()
+        .expect("a gained reference carries its backfill")
+        .to_owned();
+
+    // The DDL alone: the pre-existing row is invisible. This is the
+    // engine behaviour the rewrite exists for; if this half ever fails,
+    // the engine learned to backfill and the rewrite can retire.
+    apply(&client, &[diffs[0].forward_sql.clone()]).await;
+    let unseen = client
+        .query("SELECT VALUE <~f FROM b:one;")
+        .await
+        .expect("reverse read");
+    assert_eq!(
+        serde_json::to_string(&unseen).unwrap(),
+        "[[[]]]",
+        "the engine now backfills on its own; retire the rewrite",
+    );
+
+    // The rewrite the diff carries makes the tracking true.
+    apply(&client, &[backfill]).await;
+    let seen = client
+        .query("SELECT VALUE <~f FROM b:one;")
+        .await
+        .expect("reverse read");
+    assert!(
+        serde_json::to_string(&seen).unwrap().contains("f:alpha"),
+        "{seen:?}"
+    );
+
+    // And the field round-trips: no residual diff, no boot loop.
+    let stored = read_back(&client, "f").await;
+    let residual = diff_fields("f", &[new_link], &stored.fields);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// Registration works when the rewrite shares one buffered transaction
+/// with the DDL that defines the clause, which is exactly how the
+/// migration executor runs a generated file: DDL, then dance, one
+/// `BEGIN ... COMMIT`.
+#[tokio::test]
+async fn the_backfill_registers_inside_the_ddl_transaction() {
+    use surql::connection::Transaction;
+    use surql::schema::reference_backfill_sql;
+
+    let client = memory_client().await;
+    client
+        .query(
+            "DEFINE TABLE b SCHEMAFULL; DEFINE FIELD name ON b TYPE string;\
+             DEFINE TABLE f SCHEMAFULL; DEFINE FIELD link ON f TYPE option<record<b>>;",
+        )
+        .await
+        .expect("base schema");
+    client
+        .query("CREATE b:one SET name = 'target'; CREATE f:alpha SET link = b:one;")
+        .await
+        .expect("pre-reference rows");
+
+    let mut tx = Transaction::begin(&client).await.expect("begin");
+    tx.execute(
+        "DEFINE FIELD OVERWRITE link ON f TYPE option<record<b>> REFERENCE ON DELETE IGNORE;",
+    )
+    .await
+    .expect("buffer ddl");
+    tx.execute(&reference_backfill_sql("f", "link").expect("render backfill"))
+        .await
+        .expect("buffer dance");
+    tx.commit().await.expect("commit");
+
+    let seen = client
+        .query("SELECT VALUE <~f FROM b:one;")
+        .await
+        .expect("reverse read");
+    assert!(
+        serde_json::to_string(&seen).unwrap().contains("f:alpha"),
+        "{seen:?}"
+    );
+}

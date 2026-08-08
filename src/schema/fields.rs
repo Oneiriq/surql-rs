@@ -493,6 +493,13 @@ impl FieldBuilder {
     ///
     /// Only valid on a top-level `record<table>` / `array<record<table>>`
     /// field; [`build`](Self::build) rejects anything else.
+    ///
+    /// Adding this to a field that already has rows tracks NOTHING for
+    /// them: the engine registers a reference on value change only, and
+    /// even a self-assignment does not count. Run
+    /// [`reference_backfill_sql`](super::reference_backfill_sql) after
+    /// the DDL, or take it from the schema diff, which carries it for
+    /// exactly this case.
     pub fn reference(mut self, action: ReferenceAction) -> Self {
         self.inner.reference = Some(action);
         self
