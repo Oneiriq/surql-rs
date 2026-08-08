@@ -93,7 +93,8 @@ pub fn severity_for_operation(op: DiffOperation) -> DriftSeverity {
         | DiffOperation::AddAnalyzer
         | DiffOperation::AddBucket
         | DiffOperation::AddSequence
-        | DiffOperation::AddFunction => DriftSeverity::Info,
+        | DiffOperation::AddFunction
+        | DiffOperation::AddParam => DriftSeverity::Info,
         DiffOperation::ModifyField
         | DiffOperation::ModifyTable
         | DiffOperation::ModifyPermissions
@@ -101,14 +102,16 @@ pub fn severity_for_operation(op: DiffOperation) -> DriftSeverity {
         | DiffOperation::ModifyAnalyzer
         | DiffOperation::ModifyBucket
         | DiffOperation::ModifySequence
-        | DiffOperation::ModifyFunction => DriftSeverity::Warning,
+        | DiffOperation::ModifyFunction
+        | DiffOperation::ModifyParam => DriftSeverity::Warning,
         DiffOperation::DropTable
         | DiffOperation::DropField
         | DiffOperation::DropIndex
         | DiffOperation::DropAnalyzer
         | DiffOperation::DropBucket
         | DiffOperation::DropSequence
-        | DiffOperation::DropFunction => DriftSeverity::Critical,
+        | DiffOperation::DropFunction
+        | DiffOperation::DropParam => DriftSeverity::Critical,
     }
 }
 

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::function::FunctionDefinition;
+use crate::schema::param::ParamDefinition;
 use crate::schema::sequence::SequenceDefinition;
 
 /// The three [`DiffOperation`] variants one kind of object uses.
@@ -186,9 +187,87 @@ pub fn diff_functions(code: &[FunctionDefinition], db: &[FunctionDefinition]) ->
     )
 }
 
+/// Compare two param slices.
+///
+/// Both sides go through [`ParamDefinition::normalized`] first, for the same
+/// reason as [`diff_functions`]: the engine echoes an explicit
+/// `PERMISSIONS FULL` a consumer never wrote.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff_objects::diff_params;
+/// use surql::migration::DiffOperation;
+/// use surql::schema::ParamDefinition;
+///
+/// let code = vec![ParamDefinition::new("APP", "'oneiriq'")];
+/// let diffs = diff_params(&code, &[]);
+/// assert_eq!(diffs[0].operation, DiffOperation::AddParam);
+/// assert_eq!(diffs[0].backward_sql, "REMOVE PARAM IF EXISTS $APP;");
+/// ```
+#[must_use]
+pub fn diff_params(code: &[ParamDefinition], db: &[ParamDefinition]) -> Vec<SchemaDiff> {
+    let canonical = |items: &[ParamDefinition]| -> Vec<ParamDefinition> {
+        items.iter().map(ParamDefinition::normalized).collect()
+    };
+    diff_named(
+        &canonical(code),
+        &canonical(db),
+        ObjectDiffKinds {
+            add: DiffOperation::AddParam,
+            modify: DiffOperation::ModifyParam,
+            drop: DiffOperation::DropParam,
+        },
+        |p| p.name.as_str(),
+        |p| p.to_surql().unwrap_or_default(),
+        |p| p.to_surql_overwrite().unwrap_or_default(),
+        ParamDefinition::to_remove_surql,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn added_param() {
+        let code = vec![ParamDefinition::new("APP", "'oneiriq'")];
+        let diffs = diff_params(&code, &[]);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::AddParam);
+        assert_eq!(diffs[0].object.as_deref(), Some("APP"));
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE PARAM $APP VALUE 'oneiriq' PERMISSIONS FULL;"
+        );
+        assert_eq!(diffs[0].backward_sql, "REMOVE PARAM IF EXISTS $APP;");
+    }
+
+    #[test]
+    fn dropped_param() {
+        let db = vec![ParamDefinition::new("OLD", "1")];
+        let diffs = diff_params(&[], &db);
+        assert_eq!(diffs[0].operation, DiffOperation::DropParam);
+        assert_eq!(diffs[0].forward_sql, "REMOVE PARAM IF EXISTS $OLD;");
+    }
+
+    #[test]
+    fn modified_param_renders_overwrite_both_ways() {
+        let code = vec![ParamDefinition::new("P", "2")];
+        let db = vec![ParamDefinition::new("P", "1")];
+        let diffs = diff_params(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyParam);
+        assert!(diffs[0].forward_sql.contains("OVERWRITE $P VALUE 2"));
+        assert!(diffs[0].backward_sql.contains("OVERWRITE $P VALUE 1"));
+    }
+
+    #[test]
+    fn the_engine_echo_of_a_param_is_not_a_modification() {
+        let code = vec![ParamDefinition::new("P", "'hello'")];
+        let db = vec![ParamDefinition::new("P", "'hello'").with_permissions("FULL")];
+        assert!(diff_params(&code, &db).is_empty());
+    }
 
     #[test]
     fn added_function() {

@@ -23,6 +23,7 @@
 //! - `event` — `DEFINE EVENT` parsing.
 //! - `access` — `DEFINE ACCESS` parsing (JWT + RECORD).
 //! - `function` — `DEFINE FUNCTION` parsing.
+//! - `param` — `DEFINE PARAM` parsing.
 //! - `sequence` — `DEFINE SEQUENCE` parsing.
 //! - `table` — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
 //! - `view` — `DEFINE TABLE ... AS SELECT` (view) parsing.
@@ -65,6 +66,7 @@ use crate::schema::access::AccessDefinition;
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
 use crate::schema::function::FunctionDefinition;
+use crate::schema::param::ParamDefinition;
 use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::TableDefinition;
 
@@ -77,6 +79,7 @@ mod event;
 mod field;
 mod function;
 mod index;
+mod param;
 mod permissions;
 mod sequence;
 mod table;
@@ -91,6 +94,7 @@ pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
 pub use function::parse_function;
 pub use index::{parse_index, parse_indexes};
+pub use param::parse_param;
 pub use permissions::parse_table_permissions;
 pub use sequence::parse_sequence;
 pub use table::{parse_changefeed, parse_table_full, parse_table_info, parse_table_mode};
@@ -102,6 +106,56 @@ pub use view::parse_view;
 /// the parser submodules.
 pub(super) fn regex_case_insensitive(pattern: &str) -> Regex {
     Regex::new(&format!("(?i){pattern}")).expect("valid regex pattern")
+}
+
+// --- Shared keyword scanning -------------------------------------------------
+
+/// Find `keyword` case-insensitively at a word boundary, skipping anything
+/// inside a quoted run.
+///
+/// Clause keywords are also ordinary English words, so a definition whose
+/// value or comment happens to contain `COMMENT` or `PERMISSIONS` must not be
+/// cut there. Returns the byte offset at which the keyword starts.
+pub(super) fn find_keyword_unquoted(text: &str, keyword: &str) -> Option<usize> {
+    let haystack = text.to_ascii_uppercase();
+    let needle = keyword.to_ascii_uppercase();
+    let bytes = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return None;
+    }
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            None if b == b'\'' || b == b'"' => {
+                quote = Some(b);
+                i += 1;
+                continue;
+            }
+            None => {}
+        }
+        if bytes[i..i + needle.len()] == *needle
+            && (i == 0 || !is_word_byte(bytes[i - 1]))
+            && (i + needle.len() == bytes.len() || !is_word_byte(bytes[i + needle.len()]))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 // --- Shared JSON helpers -----------------------------------------------------
@@ -185,6 +239,9 @@ pub struct DatabaseInfo {
     /// Custom `fn::` functions, keyed without the `fn::` prefix.
     #[serde(default)]
     pub functions: BTreeMap<String, FunctionDefinition>,
+    /// Database-level params, keyed without the leading `$`.
+    #[serde(default)]
+    pub params: BTreeMap<String, ParamDefinition>,
 }
 
 #[cfg(test)]

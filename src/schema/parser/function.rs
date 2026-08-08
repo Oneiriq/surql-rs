@@ -7,6 +7,7 @@
 //! depth-aware (a generic like `array<record<x>>` carries its own commas) and
 //! the body is taken from the outermost brace pair.
 
+use super::find_keyword_unquoted as find_keyword;
 use crate::schema::function::{FunctionArg, FunctionDefinition};
 
 /// Parse one `DEFINE FUNCTION` statement.
@@ -137,7 +138,7 @@ fn push_trimmed(out: &mut Vec<String>, value: &str) {
 }
 
 /// Read the quoted operand of `keyword` from the tail of a statement.
-pub(super) fn extract_quoted_after(tail: &str, keyword: &str) -> Option<String> {
+pub(crate) fn extract_quoted_after(tail: &str, keyword: &str) -> Option<String> {
     let at = find_keyword(tail, keyword)?;
     let rest = tail[at + keyword.len()..].trim_start();
     let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
@@ -147,7 +148,7 @@ pub(super) fn extract_quoted_after(tail: &str, keyword: &str) -> Option<String> 
 }
 
 /// Read the `PERMISSIONS` clause body from the tail of a statement.
-pub(super) fn extract_permissions(tail: &str) -> Option<String> {
+pub(crate) fn extract_permissions(tail: &str) -> Option<String> {
     let at = find_keyword(tail, "PERMISSIONS")?;
     let mut rest = tail[at + "PERMISSIONS".len()..].trim();
     if let Some(at) = find_keyword(rest, "COMMENT") {
@@ -159,26 +160,6 @@ pub(super) fn extract_permissions(tail: &str) -> Option<String> {
     } else {
         Some(rest.to_string())
     }
-}
-
-/// Case-insensitive, word-boundary keyword search.
-pub(super) fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
-    let haystack = text.to_ascii_uppercase();
-    let needle = keyword.to_ascii_uppercase();
-    let bytes = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() || needle.len() > bytes.len() {
-        return None;
-    }
-    (0..=bytes.len() - needle.len()).find(|&i| {
-        bytes[i..i + needle.len()] == *needle
-            && (i == 0 || !is_word_byte(bytes[i - 1]))
-            && (i + needle.len() == bytes.len() || !is_word_byte(bytes[i + needle.len()]))
-    })
-}
-
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 #[cfg(test)]

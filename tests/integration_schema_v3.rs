@@ -24,15 +24,16 @@ use serde_json::Value;
 
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::migration::diff::{diff_fields, diff_indexes, diff_tables};
-use surql::migration::diff_objects::{diff_functions, diff_sequences};
+use surql::migration::diff_objects::{diff_functions, diff_params, diff_sequences};
 use surql::query::changes::{show_changes_surql, ChangeSet, ChangeSince};
 use surql::query::references::reverse_reference_query;
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
-    array_field, function_schema, generate_function_sql, generate_sequence_sql, generate_table_sql,
-    info_for_index_surql, record_field, reverse_reference_field, sequence_schema, string_field,
-    table_schema, unique_index, ChangeFeed, FieldDefinition, FunctionDefinition, IndexBuildStatus,
-    ReferenceAction, SequenceDefinition, TableDefinition, TableMode, ViewDefinition, ViewGroup,
+    array_field, function_schema, generate_function_sql, generate_param_sql, generate_sequence_sql,
+    generate_table_sql, info_for_index_surql, param_schema, record_field, reverse_reference_field,
+    sequence_schema, string_field, table_schema, unique_index, ChangeFeed, FieldDefinition,
+    FunctionDefinition, IndexBuildStatus, ParamDefinition, ReferenceAction, SequenceDefinition,
+    TableDefinition, TableMode, ViewDefinition, ViewGroup,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -568,4 +569,54 @@ async fn function_round_trips_and_is_callable() {
     apply(&client, &[FunctionDefinition::remove_surql("greet")]).await;
     let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
     assert!(parsed.functions.is_empty());
+}
+
+/// A database-level param round-trips through `INFO FOR DB` and is readable
+/// from a query without being bound.
+#[tokio::test]
+async fn param_round_trips_and_is_readable() {
+    let client = memory_client().await;
+
+    let app = param_schema("APP_NAME", "'oneiriq'")
+        .comment("display name")
+        .build()
+        .expect("valid param");
+    apply(&client, &generate_param_sql(&app).expect("param sql")).await;
+
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    let stored: Vec<_> = parsed.params.values().cloned().collect();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].value, "'oneiriq'");
+    // The engine adds PERMISSIONS FULL the code never wrote; the diff must
+    // see through it or the param re-applies on every boot.
+    assert_eq!(stored[0].permissions.as_deref(), Some("FULL"));
+    let diffs = diff_params(std::slice::from_ref(&app), &stored);
+    assert!(
+        diffs.is_empty(),
+        "a param re-applies on every boot: {diffs:#?}\nstored: {stored:#?}"
+    );
+
+    let read = client
+        .query("RETURN $APP_NAME;")
+        .await
+        .expect("read the param");
+    assert!(serde_json::to_string(&read).unwrap().contains("oneiriq"));
+
+    // A changed value applies through the OVERWRITE form the diff renders.
+    let renamed = param_schema("APP_NAME", "'oneiriq-rs'")
+        .comment("display name")
+        .build()
+        .unwrap();
+    let diffs = diff_params(std::slice::from_ref(&renamed), &stored);
+    assert_eq!(diffs.len(), 1);
+    apply(&client, &[diffs[0].forward_sql.clone()]).await;
+    let read = client
+        .query("RETURN $APP_NAME;")
+        .await
+        .expect("read the replaced param");
+    assert!(serde_json::to_string(&read).unwrap().contains("oneiriq-rs"));
+
+    apply(&client, &[ParamDefinition::remove_surql("APP_NAME")]).await;
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    assert!(parsed.params.is_empty());
 }

@@ -320,6 +320,12 @@ pub enum DiffOperation {
     ModifyFunction,
     /// An existing function was removed.
     DropFunction,
+    /// A new database-level param was added.
+    AddParam,
+    /// An existing param's value or clauses changed.
+    ModifyParam,
+    /// An existing param was removed.
+    DropParam,
 }
 
 impl DiffOperation {
@@ -349,6 +355,9 @@ impl DiffOperation {
             Self::AddFunction => "add_function",
             Self::ModifyFunction => "modify_function",
             Self::DropFunction => "drop_function",
+            Self::AddParam => "add_param",
+            Self::ModifyParam => "modify_param",
+            Self::DropParam => "drop_param",
         }
     }
 }
@@ -673,6 +682,9 @@ mod tests {
         assert_eq!(DiffOperation::AddFunction.as_str(), "add_function");
         assert_eq!(DiffOperation::ModifyFunction.as_str(), "modify_function");
         assert_eq!(DiffOperation::DropFunction.as_str(), "drop_function");
+        assert_eq!(DiffOperation::AddParam.as_str(), "add_param");
+        assert_eq!(DiffOperation::ModifyParam.as_str(), "modify_param");
+        assert_eq!(DiffOperation::DropParam.as_str(), "drop_param");
     }
 
     #[test]
@@ -713,6 +725,9 @@ mod tests {
             DiffOperation::AddFunction,
             DiffOperation::ModifyFunction,
             DiffOperation::DropFunction,
+            DiffOperation::AddParam,
+            DiffOperation::ModifyParam,
+            DiffOperation::DropParam,
         ];
         for op in ops {
             let j = serde_json::to_string(&op).unwrap();

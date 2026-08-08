@@ -20,6 +20,7 @@ use super::analyzer::AnalyzerDefinition;
 use super::bucket::BucketDefinition;
 use super::edge::EdgeDefinition;
 use super::function::FunctionDefinition;
+use super::param::ParamDefinition;
 use super::sequence::SequenceDefinition;
 use super::table::TableDefinition;
 
@@ -242,6 +243,33 @@ pub fn generate_function_sql_with_options(
     Ok(vec![
         function.to_surql_with_options(if_not_exists, overwrite)?
     ])
+}
+
+/// Render the `DEFINE PARAM` statement(s) for `param`.
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_param_sql, ParamDefinition};
+///
+/// let p = ParamDefinition::new("APP", "'oneiriq'");
+/// assert_eq!(
+///     generate_param_sql(&p).unwrap()[0],
+///     "DEFINE PARAM $APP VALUE 'oneiriq';"
+/// );
+/// ```
+pub fn generate_param_sql(param: &ParamDefinition) -> Result<Vec<String>> {
+    Ok(vec![param.to_surql()?])
+}
+
+/// Render the `DEFINE PARAM` statement(s) for `param`, optionally with
+/// `IF NOT EXISTS` / `OVERWRITE` guards for idempotent re-application.
+pub fn generate_param_sql_with_options(
+    param: &ParamDefinition,
+    if_not_exists: bool,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![param.to_surql_with_options(if_not_exists, overwrite)?])
 }
 
 /// Render a complete SurrealQL schema script.
@@ -638,6 +666,32 @@ mod tests {
         use crate::schema::function::FunctionDefinition;
         let f = FunctionDefinition::new("greet", "  ");
         assert!(generate_function_sql(&f).is_err());
+    }
+
+    // ---- generate_param_sql ----
+
+    #[test]
+    fn generate_param_sql_renders_the_statement() {
+        use crate::schema::param::ParamDefinition;
+        let p = ParamDefinition::new("APP", "'oneiriq'");
+        let stmts = generate_param_sql(&p).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DEFINE PARAM $APP VALUE 'oneiriq';");
+    }
+
+    #[test]
+    fn generate_param_sql_with_options_overwrite() {
+        use crate::schema::param::ParamDefinition;
+        let p = ParamDefinition::new("APP", "1");
+        let stmts = generate_param_sql_with_options(&p, false, true).unwrap();
+        assert!(stmts[0].starts_with("DEFINE PARAM OVERWRITE $APP"));
+    }
+
+    #[test]
+    fn generate_param_sql_validates() {
+        use crate::schema::param::ParamDefinition;
+        let p = ParamDefinition::new("APP", " ");
+        assert!(generate_param_sql(&p).is_err());
     }
 
     // ---- generate_analyzer_sql ----

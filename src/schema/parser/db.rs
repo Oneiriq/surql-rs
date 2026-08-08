@@ -13,6 +13,7 @@ use super::access::parse_access;
 use super::bucket::parse_bucket;
 use super::edge::{parse_edge_endpoints, parse_edge_mode};
 use super::function::parse_function;
+use super::param::parse_param;
 use super::permissions::parse_table_permissions;
 use super::sequence::parse_sequence;
 use super::table::{parse_changefeed, parse_table_mode};
@@ -35,6 +36,30 @@ fn is_edge_definition(definition: &str) -> bool {
         parse_edge_mode(definition),
         crate::schema::edge::EdgeMode::Relation,
     )
+}
+
+/// Read one database-level map (`{ "<name>": "DEFINE ..." }`) into a keyed
+/// collection, skipping non-string entries and definitions `parse` rejects.
+///
+/// Every kind of database-level object arrives in this shape, so the walk
+/// exists once rather than per kind.
+fn collect<T>(
+    obj: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    parse: impl Fn(&str, &str) -> Option<T>,
+) -> std::collections::BTreeMap<String, T> {
+    let Some(value) = pick_map(obj, keys) else {
+        return std::collections::BTreeMap::new();
+    };
+    value
+        .as_object()
+        .expect("checked by pick_map")
+        .iter()
+        .filter_map(|(name, def)| {
+            let parsed = parse(name, def.as_str()?)?;
+            Some((name.clone(), parsed))
+        })
+        .collect()
 }
 
 // --- Public parser -----------------------------------------------------------
@@ -96,63 +121,16 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
         }
     }
 
-    if let Some(ac_value) = pick_map(obj, &["ac", "accesses"]) {
-        for (name, def_value) in ac_value.as_object().expect("checked by pick_map") {
-            let Some(def) = def_value.as_str() else {
-                continue;
-            };
-            if let Some(access) = parse_access(name, def) {
-                out.accesses.insert(name.clone(), access);
-            }
-        }
-    }
-
-    if let Some(az_value) = pick_map(obj, &["az", "analyzers"]) {
-        for (name, def_value) in az_value.as_object().expect("checked by pick_map") {
-            let Some(def) = def_value.as_str() else {
-                continue;
-            };
-            // Lenient like access parsing: an analyzer this crate
-            // cannot model yet is skipped rather than failing the
-            // whole introspection.
-            if let Ok(analyzer) = super::analyzer::parse_analyzer(name, def) {
-                out.analyzers.insert(name.clone(), analyzer);
-            }
-        }
-    }
-
-    if let Some(bu_value) = pick_map(obj, &["bu", "buckets"]) {
-        for (name, def_value) in bu_value.as_object().expect("checked by pick_map") {
-            let Some(def) = def_value.as_str() else {
-                continue;
-            };
-            if let Some(bucket) = parse_bucket(name, def) {
-                out.buckets.insert(name.clone(), bucket);
-            }
-        }
-    }
-
-    if let Some(sq_value) = pick_map(obj, &["sq", "sequences"]) {
-        for (name, def_value) in sq_value.as_object().expect("checked by pick_map") {
-            let Some(def) = def_value.as_str() else {
-                continue;
-            };
-            if let Some(sequence) = parse_sequence(name, def) {
-                out.sequences.insert(name.clone(), sequence);
-            }
-        }
-    }
-
-    if let Some(fc_value) = pick_map(obj, &["fc", "functions"]) {
-        for (name, def_value) in fc_value.as_object().expect("checked by pick_map") {
-            let Some(def) = def_value.as_str() else {
-                continue;
-            };
-            if let Some(function) = parse_function(name, def) {
-                out.functions.insert(name.clone(), function);
-            }
-        }
-    }
+    out.accesses = collect(obj, &["ac", "accesses"], parse_access);
+    // Lenient like the rest: a definition this crate cannot model yet is
+    // skipped rather than failing the whole introspection.
+    out.analyzers = collect(obj, &["az", "analyzers"], |name, def| {
+        super::analyzer::parse_analyzer(name, def).ok()
+    });
+    out.buckets = collect(obj, &["bu", "buckets"], parse_bucket);
+    out.sequences = collect(obj, &["sq", "sequences"], parse_sequence);
+    out.functions = collect(obj, &["fc", "functions"], parse_function);
+    out.params = collect(obj, &["pa", "params"], parse_param);
 
     Ok(out)
 }

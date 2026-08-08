@@ -98,6 +98,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   rewrites and the diff compares canonical forms, so a function does not
   report as modified on every reconcile.
 
+- **Database params (`DEFINE PARAM $<name>`).** `ParamDefinition` /
+  `param_schema` render the value, `COMMENT`, and `PERMISSIONS`;
+  `parse_param` reads the `params` map of `INFO FOR DB` back; and
+  `diff_objects::diff_params` reports `Add` / `Modify` / `DropParam`. As with
+  functions, `normalized` fills in the `PERMISSIONS FULL` the engine echoes.
+
+  The parser locates clause keywords outside quoted runs, so a value like
+  `'leave a comment about permissions'` is not cut at its own words.
+
 - **`migration::diff_objects`.** `diff_named` captures the add / drop /
   modify shape every database-level named object shares, so a new kind is
   three lines rather than a copy of `diff_buckets`. It lives beside
