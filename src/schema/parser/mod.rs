@@ -630,6 +630,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_db_info_unwraps_the_query_response_shape() {
+        // `DatabaseClient::query` answers one result per statement, so
+        // the INFO object arrives as `[ { ... } ]`. Every caller used
+        // to index the wrapper by hand; the CLI forgot, and
+        // `unwrap_or_default` turned the parse failure into an empty
+        // database report.
+        let bare = json!({
+            "tb": { "user": "DEFINE TABLE user SCHEMAFULL" }
+        });
+        let wrapped = json!([{
+            "tb": { "user": "DEFINE TABLE user SCHEMAFULL" }
+        }]);
+        let from_bare = parse_db_info(&bare).unwrap();
+        let from_wrapped = parse_db_info(&wrapped).unwrap();
+        assert_eq!(from_bare.tables.len(), 1);
+        assert_eq!(from_wrapped.tables.len(), from_bare.tables.len());
+        assert!(from_wrapped.tables.contains_key("user"));
+    }
+
+    #[test]
     fn parse_db_info_empty_object_returns_empty() {
         let db = parse_db_info(&json!({})).unwrap();
         assert!(db.tables.is_empty());

@@ -620,3 +620,19 @@ async fn param_round_trips_and_is_readable() {
     let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
     assert!(parsed.params.is_empty());
 }
+
+/// The exact call the CLI makes: the raw `query` response, wrapper and
+/// all, straight into the parser. This shape used to fail to parse,
+/// and `unwrap_or_default` at the CLI call sites turned the failure
+/// into `surql schema tables` reporting every database as empty.
+#[tokio::test]
+async fn parse_db_info_reads_the_raw_query_response() {
+    let client = memory_client().await;
+    client
+        .query("DEFINE TABLE user SCHEMAFULL; DEFINE FIELD name ON user TYPE string;")
+        .await
+        .expect("define table");
+    let raw = client.query("INFO FOR DB;").await.expect("INFO FOR DB");
+    let parsed = parse_db_info(&raw).expect("parse the wrapped response");
+    assert!(parsed.tables.contains_key("user"), "{parsed:?}");
+}

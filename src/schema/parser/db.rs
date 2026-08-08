@@ -19,7 +19,7 @@ use super::sequence::parse_sequence;
 use super::table::{parse_changefeed, parse_table_mode};
 use super::view::parse_view;
 use super::{expect_object, pick_map, DatabaseInfo};
-use crate::error::Result;
+use crate::error::{Result, SurqlError};
 use crate::schema::edge::EdgeDefinition;
 use crate::schema::table::TableDefinition;
 
@@ -74,9 +74,22 @@ fn collect<T>(
 /// [`DatabaseInfo::tables`]. Buckets are parsed into
 /// [`DatabaseInfo::buckets`].
 ///
+/// Accepts either the INFO object itself or the value
+/// [`query`](crate::DatabaseClient::query) returns for `INFO FOR DB;`,
+/// which wraps each statement's result in an array. An INFO response is
+/// never itself an array, so the two shapes cannot be confused; before
+/// this tolerance every caller had to remember to index the wrapper,
+/// and the CLI forgot, reading every database as empty.
+///
 /// Returns [`crate::error::SurqlError::SchemaParse`] when the top-level value
-/// is not a JSON object.
+/// is not a JSON object (or a one-statement array holding one).
 pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
+    let info = match info.as_array() {
+        Some(items) => items.first().ok_or_else(|| SurqlError::SchemaParse {
+            reason: "INFO FOR DB: response held no statement result".to_string(),
+        })?,
+        None => info,
+    };
     let obj = expect_object(info, "INFO FOR DB")?;
 
     let mut out = DatabaseInfo::default();

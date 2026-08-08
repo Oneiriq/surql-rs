@@ -7,6 +7,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **`surql schema tables` / `export` / `validate` and `surql bucket list`
+  read every database as empty.** The CLI passed the raw
+  `client.query("INFO FOR DB;")` response to `parse_db_info`, but `query`
+  answers one result per statement, so the INFO object arrives wrapped in
+  a one-element array the parser refused; `unwrap_or_default()` at all
+  four call sites turned that refusal into an empty database report.
+  `parse_db_info` now accepts either shape (an INFO response is never
+  itself an array, so the two cannot be confused), and the call sites
+  surface parse errors instead of defaulting them, so an echo the parser
+  cannot read is now a message rather than a silent nothing.
+
 ### Added
 
 - **Record references (`DEFINE FIELD ... REFERENCE`).** `FieldDefinition`
