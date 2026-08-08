@@ -23,6 +23,10 @@
 //! - [`bucket`]: [`BucketDefinition`] + the [`bucket_schema`] /
 //!   [`memory_bucket`] / [`file_bucket`] helpers for SurrealDB v3
 //!   object-storage `DEFINE BUCKET` / `ALTER BUCKET` / `REMOVE BUCKET`.
+//! - [`reference`]: [`ReferenceAction`] and the rules governing
+//!   `DEFINE FIELD ... REFERENCE ON DELETE ...` record-reference tracking,
+//!   whose reverse half is a `COMPUTED <~table` field
+//!   ([`reverse_reference_field`]).
 //!
 //! Each value object exposes a `to_surql*` method that renders the matching
 //! `DEFINE` statement.
@@ -55,8 +59,10 @@ pub mod access;
 pub mod analyzer;
 pub mod bucket;
 pub mod edge;
+pub mod field_type;
 pub mod fields;
 pub mod parser;
+pub mod reference;
 pub mod registry;
 pub mod sql;
 pub mod table;
@@ -77,14 +83,15 @@ pub use bucket::{
 pub use edge::{bidirectional_edge, edge_schema, typed_edge, EdgeDefinition, EdgeMode};
 pub use fields::{
     array_field, bool_field, bytes_field, computed_field, datetime_field, field, file_field,
-    float_field, int_field, object_field, record_field, string_field, validate_field_name,
-    FieldBuilder, FieldDefinition, FieldType,
+    float_field, int_field, object_field, record_field, reverse_reference_field, string_field,
+    validate_field_name, FieldBuilder, FieldDefinition, FieldType,
 };
 pub use parser::{
     parse_access, parse_bucket, parse_db_info, parse_edge_info, parse_event, parse_field,
     parse_fields, parse_index, parse_indexes, parse_table_info, parse_table_mode,
     parse_table_permissions, DatabaseInfo,
 };
+pub use reference::ReferenceAction;
 pub use registry::{
     clear_registry, get_registered_buckets, get_registered_edges, get_registered_tables,
     get_registry, register_bucket, register_edge, register_table, SchemaRegistry,

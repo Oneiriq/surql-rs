@@ -17,6 +17,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, SurqlError};
 use crate::types::check_reserved_word;
 
+pub use super::field_type::FieldType;
+
+use super::reference::{
+    render_reference_clause, validate_computed, validate_reference_target, ReferenceAction,
+};
+
 fn field_name_part_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").expect("valid regex"))
@@ -40,72 +46,6 @@ fn detect_target_table_from_value(value: &str) -> Option<String> {
     type_record_coercion_regex()
         .captures(value.trim())
         .map(|caps| caps[1].to_string())
-}
-
-/// SurrealDB field types supported by `DEFINE FIELD`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FieldType {
-    /// `string`
-    String,
-    /// `int`
-    Int,
-    /// `float`
-    Float,
-    /// `bool`
-    Bool,
-    /// `datetime`
-    Datetime,
-    /// `duration`
-    Duration,
-    /// `decimal`
-    Decimal,
-    /// `number`
-    Number,
-    /// `object`
-    Object,
-    /// `array`
-    Array,
-    /// `record`
-    Record,
-    /// `geometry`
-    Geometry,
-    /// `file` — a SurrealDB v3 file pointer into a bucket
-    /// (see [`crate::schema::bucket`]).
-    File,
-    /// `bytes` — raw binary data.
-    Bytes,
-    /// `any`
-    Any,
-}
-
-impl FieldType {
-    /// Render the type as SurrealQL keyword.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::String => "string",
-            Self::Int => "int",
-            Self::Float => "float",
-            Self::Bool => "bool",
-            Self::Datetime => "datetime",
-            Self::Duration => "duration",
-            Self::Decimal => "decimal",
-            Self::Number => "number",
-            Self::Object => "object",
-            Self::Array => "array",
-            Self::Record => "record",
-            Self::Geometry => "geometry",
-            Self::File => "file",
-            Self::Bytes => "bytes",
-            Self::Any => "any",
-        }
-    }
-}
-
-impl std::fmt::Display for FieldType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Immutable field definition for table schemas.
@@ -146,8 +86,10 @@ pub struct FieldDefinition {
     /// Whether the field allows flexible schema.
     #[serde(default)]
     pub flexible: bool,
-    /// For RECORD fields, the target table this field links to. When set,
-    /// renders `TYPE record<{target_table}>` instead of bare `record`.
+    /// The table a link points at. On a RECORD field this renders
+    /// `TYPE record<{target_table}>` instead of bare `record`; on an ARRAY
+    /// field it renders `TYPE array<record<{target_table}>>`, the shape
+    /// reference tracking needs for a to-many link.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub target_table: Option<String>,
     /// Whether the field accepts `NONE`, rendering `TYPE option<{inner}>`.
@@ -160,6 +102,15 @@ pub struct FieldDefinition {
     /// snapshots written before this field existed deserialize cleanly.
     #[serde(default)]
     pub nullable: bool,
+    /// Reference tracking (`REFERENCE ON DELETE <action>`). See
+    /// [`crate::schema::reference`] for what the engine accepts.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reference: Option<ReferenceAction>,
+    /// Expression recomputed on every read (`COMPUTED <expr>`), as opposed to
+    /// the stored [`Self::value`]. This is where a `<~table` reverse-reference
+    /// lookup lives.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub computed: Option<String>,
 }
 
 impl FieldDefinition {
@@ -179,6 +130,8 @@ impl FieldDefinition {
             flexible: false,
             target_table: None,
             nullable: false,
+            reference: None,
+            computed: None,
         }
     }
 
@@ -240,12 +193,37 @@ impl FieldDefinition {
         self
     }
 
-    /// Validate the field definition against SurrealDB identifier rules.
+    /// Track incoming links to this field (`REFERENCE ON DELETE <action>`).
+    pub fn with_reference(mut self, action: ReferenceAction) -> Self {
+        self.reference = Some(action);
+        self
+    }
+
+    /// Set the `COMPUTED` expression, recomputed on every read.
+    pub fn with_computed(mut self, expression: impl Into<String>) -> Self {
+        self.computed = Some(expression.into());
+        self
+    }
+
+    /// Validate the field definition against SurrealDB identifier rules,
+    /// plus the `REFERENCE` and `COMPUTED` restrictions the engine enforces.
     ///
     /// Returns [`SurqlError::Validation`] for an empty name, empty segments,
     /// or segments that contain invalid characters.
     pub fn validate(&self) -> Result<()> {
-        validate_field_name(&self.name)
+        validate_field_name(&self.name)?;
+        if self.reference.is_some() {
+            validate_reference_target(&self.name, self.field_type, self.target_table.as_deref())?;
+        }
+        if self.computed.is_some() {
+            validate_computed(
+                &self.name,
+                self.readonly,
+                self.value.as_deref(),
+                self.default.as_deref(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Render the `DEFINE FIELD` statement for this field on the given table.
@@ -286,18 +264,26 @@ impl FieldDefinition {
             type_clause
         };
         let mut sql = format!(
-            "DEFINE FIELD{ine} {name} ON TABLE {table} TYPE {ty}",
+            "DEFINE FIELD{ine} {name} ON TABLE {table}",
             ine = ine,
             name = self.name,
             table = table,
-            ty = type_clause,
         );
+        if !self.omits_type_clause() {
+            write!(sql, " TYPE {type_clause}").expect("writing to String cannot fail");
+        }
         // SurrealDB v3 requires FLEXIBLE immediately after the TYPE
         // clause; rendering it after READONLY (this crate's previous
         // trailing position) is a parse error: "FLEXIBLE must be
         // specified after TYPE". Verified against v3.0.5.
         if self.flexible {
             sql.push_str(" FLEXIBLE");
+        }
+        if let Some(action) = self.reference {
+            sql.push_str(&render_reference_clause(action));
+        }
+        if let Some(computed) = &self.computed {
+            write!(sql, " COMPUTED {computed}").expect("writing to String cannot fail");
         }
         if let Some(assertion) = &self.assertion {
             write!(sql, " ASSERT {}", assertion).expect("writing to String cannot fail");
@@ -317,22 +303,37 @@ impl FieldDefinition {
         sql
     }
 
-    /// Resolve the `TYPE` clause, honoring a RECORD `target_table` by emitting
-    /// `record<target>`. The returned boolean indicates whether a redundant
+    /// A `COMPUTED` field with no declared type renders no `TYPE` clause,
+    /// which is how the engine stores `DEFINE FIELD x ON t COMPUTED <~y`.
+    /// Any explicit type (including `option<...>`) is emitted as usual.
+    fn omits_type_clause(&self) -> bool {
+        self.computed.is_some()
+            && self.field_type == FieldType::Any
+            && !self.nullable
+            && self.target_table.is_none()
+    }
+
+    /// Resolve the `TYPE` clause, honoring a `target_table` by emitting
+    /// `record<target>` for a RECORD field and `array<record<target>>` for an
+    /// ARRAY field. The returned boolean indicates whether a redundant
     /// `type::record("target", $value)` VALUE coercion should be dropped.
     fn resolve_type_clause(&self) -> (String, bool) {
-        if self.field_type == FieldType::Record {
-            if let Some(target) = &self.target_table {
+        let Some(target) = self.target_table.as_deref() else {
+            return (self.field_type.as_str().to_string(), false);
+        };
+        match self.field_type {
+            FieldType::Record => {
                 let drop_value = self
                     .value
                     .as_deref()
                     .and_then(detect_target_table_from_value)
                     .as_deref()
-                    == Some(target.as_str());
-                return (format!("record<{target}>"), drop_value);
+                    == Some(target);
+                (format!("record<{target}>"), drop_value)
             }
+            FieldType::Array => (format!("array<record<{target}>>"), false),
+            _ => (self.field_type.as_str().to_string(), false),
         }
-        (self.field_type.as_str().to_string(), false)
     }
 }
 
@@ -488,6 +489,21 @@ impl FieldBuilder {
         self
     }
 
+    /// Track incoming links to this field (`REFERENCE ON DELETE <action>`).
+    ///
+    /// Only valid on a top-level `record<table>` / `array<record<table>>`
+    /// field; [`build`](Self::build) rejects anything else.
+    pub fn reference(mut self, action: ReferenceAction) -> Self {
+        self.inner.reference = Some(action);
+        self
+    }
+
+    /// Set the `COMPUTED` expression, recomputed on every read.
+    pub fn computed(mut self, expression: impl Into<String>) -> Self {
+        self.inner.computed = Some(expression.into());
+        self
+    }
+
     /// Finalise the builder, returning the field and an optional reserved-word
     /// warning message for the caller to log.
     pub fn build(mut self) -> Result<(FieldDefinition, Option<String>)> {
@@ -581,16 +597,38 @@ pub fn record_field(name: impl Into<String>, table: Option<&str>) -> FieldBuilde
     builder
 }
 
-/// Convenience constructor for a computed field.
+/// Convenience constructor for a stored computed field (`VALUE` + `READONLY`).
 ///
-/// Computed fields are always read-only; the Python implementation hard-codes
-/// `readonly=True`, so this helper does the same.
+/// The Python implementation hard-codes `readonly=True`, so this helper does
+/// the same. For a value the engine recomputes on every read, use
+/// [`FieldBuilder::computed`] instead.
 pub fn computed_field(
     name: impl Into<String>,
     value: impl Into<String>,
     field_type: FieldType,
 ) -> FieldBuilder {
     field(name, field_type).value(value).readonly(true)
+}
+
+/// Convenience constructor for the reverse half of a record reference:
+/// `DEFINE FIELD {name} ON TABLE {t} COMPUTED <~{source}`.
+///
+/// `source` is the table whose `REFERENCE` field points back at this one. The
+/// field is untyped, matching how the engine stores it.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::schema::reverse_reference_field;
+///
+/// let (f, _) = reverse_reference_field("comments", "comment").build().unwrap();
+/// assert_eq!(
+///     f.to_surql("person"),
+///     "DEFINE FIELD comments ON TABLE person COMPUTED <~comment;",
+/// );
+/// ```
+pub fn reverse_reference_field(name: impl Into<String>, source: &str) -> FieldBuilder {
+    field(name, FieldType::Any).computed(format!("<~{source}"))
 }
 
 /// Convenience constructor for a `file` field.
@@ -660,33 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn field_type_as_str_matches_lowercase() {
-        assert_eq!(FieldType::String.as_str(), "string");
-        assert_eq!(FieldType::Datetime.as_str(), "datetime");
-        assert_eq!(FieldType::Any.as_str(), "any");
-    }
-
-    #[test]
-    fn field_type_file_and_bytes_as_str() {
-        assert_eq!(FieldType::File.as_str(), "file");
-        assert_eq!(FieldType::Bytes.as_str(), "bytes");
-    }
-
-    #[test]
-    fn field_type_file_bytes_serde_roundtrip() {
-        for ft in [FieldType::File, FieldType::Bytes] {
-            let json = serde_json::to_string(&ft).unwrap();
-            let back: FieldType = serde_json::from_str(&json).unwrap();
-            assert_eq!(ft, back);
-        }
-        assert_eq!(serde_json::to_string(&FieldType::File).unwrap(), "\"file\"");
-        assert_eq!(
-            serde_json::to_string(&FieldType::Bytes).unwrap(),
-            "\"bytes\""
-        );
-    }
-
-    #[test]
     fn builder_file_field_emits_type_file() {
         let (f, _) = file_field("avatar").build().unwrap();
         assert_eq!(f.field_type, FieldType::File);
@@ -704,23 +715,6 @@ mod tests {
             f.to_surql("doc"),
             "DEFINE FIELD blob ON TABLE doc TYPE bytes;"
         );
-    }
-
-    #[test]
-    fn field_type_display_matches_as_str() {
-        assert_eq!(format!("{}", FieldType::Int), "int");
-    }
-
-    #[test]
-    fn field_type_serializes_lowercase() {
-        let json = serde_json::to_string(&FieldType::Datetime).unwrap();
-        assert_eq!(json, "\"datetime\"");
-    }
-
-    #[test]
-    fn field_type_deserializes_lowercase() {
-        let ft: FieldType = serde_json::from_str("\"bool\"").unwrap();
-        assert_eq!(ft, FieldType::Bool);
     }
 
     #[test]

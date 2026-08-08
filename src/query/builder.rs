@@ -35,6 +35,7 @@ use crate::types::operators::{quote_value_public, Operator, OperatorExpr};
 use super::expressions::Expression;
 use super::helpers::{DataMap, ReturnFormat, VectorDistanceType};
 use super::hints::{render_hints, QueryHint};
+use super::references::reverse_reference_projection;
 
 /// SurrealQL operation kind held by [`Query`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -627,6 +628,52 @@ impl Query {
     pub fn traverse(self, path: impl Into<String>) -> Self {
         Self {
             graph_traversal: Some(path.into()),
+            ..self
+        }
+    }
+
+    /// Append a reverse-reference lookup (`<~<table>`) to the projection.
+    ///
+    /// This is the read half of
+    /// [`DEFINE FIELD ... REFERENCE`](crate::schema::reference): it walks
+    /// incoming links back to the records that point at each selected row.
+    /// `fields` narrows the returned shape via the `.{ a, b }` destructuring
+    /// form; pass `None` for whole records.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::query::builder::Query;
+    ///
+    /// let q = Query::new()
+    ///     .select(None)
+    ///     .from_table("comic_book").unwrap()
+    ///     .reverse_traverse("person", None, "owners");
+    /// assert_eq!(
+    ///     q.to_surql().unwrap(),
+    ///     "SELECT *, <~person AS owners FROM comic_book",
+    /// );
+    ///
+    /// let projected = Query::new()
+    ///     .select(None)
+    ///     .from_table("comic_book").unwrap()
+    ///     .reverse_traverse("person", Some(&["id", "name"]), "owners");
+    /// assert_eq!(
+    ///     projected.to_surql().unwrap(),
+    ///     "SELECT *, <~person.{ id, name } AS owners FROM comic_book",
+    /// );
+    /// ```
+    pub fn reverse_traverse(
+        self,
+        table: impl AsRef<str>,
+        fields: Option<&[&str]>,
+        alias: impl AsRef<str>,
+    ) -> Self {
+        let expr = reverse_reference_projection(table.as_ref(), fields, alias.as_ref());
+        let mut projection = self.fields;
+        projection.push(expr);
+        Self {
+            fields: projection,
             ..self
         }
     }

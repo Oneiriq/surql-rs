@@ -1135,9 +1135,11 @@ fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
         && a.field_type == b.field_type
         && a.readonly == b.readonly
         && a.flexible == b.flexible
+        && a.reference == b.reference
         && expr_eq(a.assertion.as_deref(), b.assertion.as_deref())
         && expr_eq(a.default.as_deref(), b.default.as_deref())
         && expr_eq(a.value.as_deref(), b.value.as_deref())
+        && expr_eq(a.computed.as_deref(), b.computed.as_deref())
 }
 
 /// Expand comma-grouped action keys (`"select, create"`) into one

@@ -12,6 +12,8 @@
 //!   [`build_relate_query`] renderers plus async
 //!   `*_many` helpers *(feature `client`)*.
 //! - [`graph_query`]: fluent [`GraphQuery`] builder.
+//! - [`references`]: reverse-reference (`<~`) projection helpers, the read
+//!   half of [`DEFINE FIELD ... REFERENCE`](crate::schema::reference).
 //! - [`executor`] *(feature `client`)*: async execution on top of
 //!   [`DatabaseClient`](crate::DatabaseClient).
 //! - [`crud`] *(feature `client`)*: JSON-in / JSON-out record CRUD helpers.
@@ -34,6 +36,7 @@ pub mod graph;
 pub mod graph_query;
 pub mod helpers;
 pub mod hints;
+pub mod references;
 pub mod results;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod typed;
@@ -56,6 +59,7 @@ pub use hints::{
     merge_hints, render_hints, validate_hint, ExplainHint, FetchHint, FetchStrategy, HintRenderer,
     HintType, IndexHint, ParallelHint, QueryHint, TimeoutHint,
 };
+pub use references::{reverse_reference_projection, reverse_reference_query};
 pub use results::{
     aggregate, count_result, extract_many, extract_one, extract_result, extract_scalar, has_result,
     has_results, paginated, record, records, success, AggregateResult, CountResult, ListResult,

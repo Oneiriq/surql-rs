@@ -7,6 +7,42 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **Record references (`DEFINE FIELD ... REFERENCE`).** `FieldDefinition`
+  gained `reference: Option<ReferenceAction>` (`IGNORE` / `REJECT` /
+  `CASCADE` / `UNSET`) and `computed: Option<String>`, with
+  `FieldBuilder::reference` / `::computed` and the
+  `reverse_reference_field(name, source)` constructor for the reverse half
+  (`COMPUTED <~source`). `Query::reverse_traverse` and
+  `query::references::reverse_reference_query` render the `<~table` /
+  `<~table.{ a, b }` projection that reads incoming links back.
+
+  The `REFERENCE` clause always spells out its `ON DELETE` action, because a
+  bare `REFERENCE` is what `INFO FOR TABLE` echoes as `ON DELETE IGNORE`;
+  emitting the short form would diff against the database forever. The
+  parser reads both forms, and the assertion / default / value extractors
+  now stop at `REFERENCE` and `COMPUTED`, which the engine emits *after*
+  `ASSERT`.
+
+  `FieldDefinition::validate` rejects what v3.0.5 rejects: `REFERENCE` on a
+  nested field (`metadata.comics`) or on anything that is not a
+  `record<table>` / `array<record<table>>` link, and `COMPUTED` beside
+  `READONLY`, `VALUE`, or `DEFAULT`. Union types (`array<record<x>> |
+  string`), which the engine also rejects, are not expressible here.
+
+- **`array<record<table>>` field types.** An ARRAY field with a
+  `target_table` now renders `array<record<{target}>>` instead of a bare
+  `array`, which is the shape a to-many reference needs. A `target_table`
+  on an ARRAY field was previously carried but never rendered, so this
+  changes emitted DDL for any definition that set both.
+
+### Changed
+
+- **`schema::fields` split.** `FieldType` moved to `schema::field_type` and
+  is re-exported from `schema::fields`, keeping both modules inside the
+  repository's 1000-LOC budget. No path changes for consumers.
+
 
 ## [0.31.0] - 2026-08-07
 
