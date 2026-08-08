@@ -23,12 +23,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use surql::connection::{ConnectionConfig, DatabaseClient};
-use surql::migration::diff::diff_fields;
+use surql::migration::diff::{diff_fields, diff_indexes};
 use surql::query::references::reverse_reference_query;
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
-    array_field, generate_table_sql, record_field, reverse_reference_field, string_field,
-    table_schema, FieldDefinition, ReferenceAction, TableDefinition, TableMode,
+    array_field, generate_table_sql, info_for_index_surql, record_field, reverse_reference_field,
+    string_field, table_schema, unique_index, FieldDefinition, IndexBuildStatus, ReferenceAction,
+    TableDefinition, TableMode,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -245,4 +246,54 @@ async fn nested_reference_is_rejected_before_it_reaches_the_engine() {
         )
         .await;
     assert!(applied.is_err(), "engine rejects a nested REFERENCE");
+}
+
+/// A `CONCURRENTLY` index is accepted by the engine, still enforces its
+/// constraint, and — because the engine drops the directive from the stored
+/// definition — produces no residual diff on the next reconcile.
+#[tokio::test]
+async fn concurrent_index_builds_and_leaves_no_residual_diff() {
+    let client = memory_client().await;
+
+    let user = table_schema("user")
+        .with_mode(TableMode::Schemafull)
+        .with_fields([string_field("email").build_unchecked().unwrap()])
+        .with_indexes([unique_index("email_idx", ["email"]).with_concurrently(true)]);
+
+    let ddl = generate_table_sql(&user, true);
+    assert!(
+        ddl.iter().any(|s| s.contains("UNIQUE CONCURRENTLY;")),
+        "the directive reaches the statement: {ddl:?}"
+    );
+    apply(&client, &ddl).await;
+
+    let stored = read_back(&client, "user").await;
+    let diffs = diff_indexes("user", &user.indexes, &stored.indexes);
+    assert!(
+        diffs.is_empty(),
+        "a CONCURRENTLY index re-applies on every boot: {diffs:#?}"
+    );
+    assert!(
+        !stored.indexes[0].concurrently,
+        "the engine does not store the build directive"
+    );
+
+    // Progress is readable, and by the time the statement returns on an
+    // in-memory engine with no rows the build is already done.
+    let info = client
+        .query(&info_for_index_surql("email_idx", "user"))
+        .await
+        .expect("INFO FOR INDEX");
+    let status = IndexBuildStatus::from_info(&info).expect("build status");
+    assert!(status.is_ready(), "index build reported ready: {status:?}");
+
+    // The index is real: the uniqueness constraint bites.
+    client
+        .query("CREATE user:a SET email = 'a@example.com';")
+        .await
+        .expect("first row");
+    let clash = client
+        .query("CREATE user:b SET email = 'a@example.com';")
+        .await;
+    assert!(clash.is_err(), "the concurrent index enforces UNIQUE");
 }

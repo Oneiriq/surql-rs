@@ -23,6 +23,9 @@
 //! - [`bucket`]: [`BucketDefinition`] + the [`bucket_schema`] /
 //!   [`memory_bucket`] / [`file_bucket`] helpers for SurrealDB v3
 //!   object-storage `DEFINE BUCKET` / `ALTER BUCKET` / `REMOVE BUCKET`.
+//! - [`index`]: [`IndexDefinition`] and the `DEFINE INDEX` builders, plus the
+//!   `CONCURRENTLY` background build and its [`info_for_index_surql`] /
+//!   [`IndexBuildStatus`] progress readout. Re-exported from [`table`].
 //! - [`reference`]: [`ReferenceAction`] and the rules governing
 //!   `DEFINE FIELD ... REFERENCE ON DELETE ...` record-reference tracking,
 //!   whose reverse half is a `COMPUTED <~table` field
@@ -61,6 +64,7 @@ pub mod bucket;
 pub mod edge;
 pub mod field_type;
 pub mod fields;
+pub mod index;
 pub mod parser;
 pub mod reference;
 pub mod registry;
@@ -86,6 +90,7 @@ pub use fields::{
     float_field, int_field, object_field, record_field, reverse_reference_field, string_field,
     validate_field_name, FieldBuilder, FieldDefinition, FieldType,
 };
+pub use index::{info_for_index_surql, IndexBuildStatus};
 pub use parser::{
     parse_access, parse_bucket, parse_db_info, parse_edge_info, parse_event, parse_field,
     parse_fields, parse_index, parse_indexes, parse_table_info, parse_table_mode,

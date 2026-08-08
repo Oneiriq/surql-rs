@@ -31,6 +31,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `READONLY`, `VALUE`, or `DEFAULT`. Union types (`array<record<x>> |
   string`), which the engine also rejects, are not expressible here.
 
+- **Background index builds (`DEFINE INDEX ... CONCURRENTLY`).**
+  `IndexDefinition::with_concurrently` appends the directive, which lets a
+  large index populate without blocking the statement.
+  `info_for_index_surql(name, table)` renders the progress query and
+  `IndexBuildStatus::from_info` reads the `{ building: { status, initial,
+  pending, updated } }` answer, including through the array
+  `DatabaseClient::query` wraps results in.
+
+  v3.0.5 accepts `CONCURRENTLY` and then echoes the index back **without**
+  it, so the parser deliberately reports `concurrently: false` and no
+  comparison looks at the member. Storing it as parsed would make every
+  background-built index diff forever.
+
 - **`array<record<table>>` field types.** An ARRAY field with a
   `target_table` now renders `array<record<{target}>>` instead of a bare
   `array`, which is the shape a to-many reference needs. A `target_table`
@@ -39,9 +52,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
-- **`schema::fields` split.** `FieldType` moved to `schema::field_type` and
-  is re-exported from `schema::fields`, keeping both modules inside the
-  repository's 1000-LOC budget. No path changes for consumers.
+- **Module splits to stay inside the 1000-LOC budget.** `FieldType` moved to
+  `schema::field_type` and `IndexDefinition` (with `IndexType`, the distance
+  and vector-type enums, and the `index` / `unique_index` / `search_index` /
+  `bm25_index` / `mtree_index` / `hnsw_index` builders) moved to
+  `schema::index`. Both are re-exported from their previous homes
+  (`schema::fields`, `schema::table`), so no consumer path changes.
 
 
 ## [0.31.0] - 2026-08-07

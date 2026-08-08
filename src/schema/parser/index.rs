@@ -126,6 +126,11 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
         analyzer,
         bm25,
         highlights,
+        // `CONCURRENTLY` is a build directive the engine drops from the
+        // definition it echoes, so a parsed index is never concurrent. Reading
+        // it back as `true` would make a background-built index look modified
+        // on every reconcile.
+        concurrently: false,
     })
 }
 
