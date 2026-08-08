@@ -308,6 +308,12 @@ pub enum DiffOperation {
     /// An existing bucket had its backend / readonly / permissions / comment
     /// changed.
     ModifyBucket,
+    /// A new ID sequence was added.
+    AddSequence,
+    /// An existing sequence's batch / start / timeout changed.
+    ModifySequence,
+    /// An existing sequence was removed.
+    DropSequence,
 }
 
 impl DiffOperation {
@@ -331,6 +337,9 @@ impl DiffOperation {
             Self::AddBucket => "add_bucket",
             Self::DropBucket => "drop_bucket",
             Self::ModifyBucket => "modify_bucket",
+            Self::AddSequence => "add_sequence",
+            Self::ModifySequence => "modify_sequence",
+            Self::DropSequence => "drop_sequence",
         }
     }
 }
@@ -356,6 +365,7 @@ impl std::fmt::Display for DiffOperation {
 ///     event: None,
 ///     bucket: None,
 ///     analyzer: None,
+///     object: None,
 ///     description: "Add user table".into(),
 ///     forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
 ///     backward_sql: "REMOVE TABLE user;".into(),
@@ -382,6 +392,12 @@ pub struct SchemaDiff {
     /// Analyzer name, when the operation concerns an analyzer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzer: Option<String>,
+    /// Name of the database-level object the change targets, for the kinds
+    /// that are not tables, buckets, or analyzers: sequences, functions, and
+    /// params. One field rather than three, because every such object is
+    /// identified the same way and carries no table context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
     /// Human-readable description.
     pub description: String,
     /// SurrealQL that applies the change (forward).
@@ -642,6 +658,9 @@ mod tests {
         assert_eq!(DiffOperation::AddBucket.as_str(), "add_bucket");
         assert_eq!(DiffOperation::DropBucket.as_str(), "drop_bucket");
         assert_eq!(DiffOperation::ModifyBucket.as_str(), "modify_bucket");
+        assert_eq!(DiffOperation::AddSequence.as_str(), "add_sequence");
+        assert_eq!(DiffOperation::ModifySequence.as_str(), "modify_sequence");
+        assert_eq!(DiffOperation::DropSequence.as_str(), "drop_sequence");
     }
 
     #[test]
@@ -676,6 +695,9 @@ mod tests {
             DiffOperation::AddBucket,
             DiffOperation::DropBucket,
             DiffOperation::ModifyBucket,
+            DiffOperation::AddSequence,
+            DiffOperation::ModifySequence,
+            DiffOperation::DropSequence,
         ];
         for op in ops {
             let j = serde_json::to_string(&op).unwrap();
@@ -694,6 +716,7 @@ mod tests {
             event: None,
             bucket: None,
             analyzer: None,
+            object: None,
             description: "Add user table".into(),
             forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
             backward_sql: "REMOVE TABLE user;".into(),
@@ -714,6 +737,7 @@ mod tests {
             event: None,
             bucket: None,
             analyzer: None,
+            object: None,
             description: "Add email field".into(),
             forward_sql: "DEFINE FIELD email ON TABLE user TYPE string;".into(),
             backward_sql: "REMOVE FIELD email ON TABLE user;".into(),
@@ -735,6 +759,7 @@ mod tests {
             event: None,
             bucket: None,
             analyzer: None,
+            object: None,
             description: "change age".into(),
             forward_sql: "DEFINE FIELD age ON TABLE user TYPE int;".into(),
             backward_sql: "DEFINE FIELD age ON TABLE user TYPE string;".into(),

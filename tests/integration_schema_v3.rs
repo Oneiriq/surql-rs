@@ -24,13 +24,15 @@ use serde_json::Value;
 
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::migration::diff::{diff_fields, diff_indexes, diff_tables};
+use surql::migration::diff_objects::diff_sequences;
 use surql::query::changes::{show_changes_surql, ChangeSet, ChangeSince};
 use surql::query::references::reverse_reference_query;
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
-    array_field, generate_table_sql, info_for_index_surql, record_field, reverse_reference_field,
-    string_field, table_schema, unique_index, ChangeFeed, FieldDefinition, IndexBuildStatus,
-    ReferenceAction, TableDefinition, TableMode, ViewDefinition, ViewGroup,
+    array_field, generate_sequence_sql, generate_table_sql, info_for_index_surql, record_field,
+    reverse_reference_field, sequence_schema, string_field, table_schema, unique_index, ChangeFeed,
+    FieldDefinition, IndexBuildStatus, ReferenceAction, SequenceDefinition, TableDefinition,
+    TableMode, ViewDefinition, ViewGroup,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -422,4 +424,87 @@ async fn a_view_with_declared_fields_is_rejected() {
         .with_fields([string_field("total").build_unchecked().unwrap()]);
     let err = stats.validate().expect_err("fields on a view are rejected");
     assert!(err.to_string().contains("view"), "{err}");
+}
+
+/// A sequence round-trips through `INFO FOR DB` and actually hands out
+/// increasing values.
+#[tokio::test]
+async fn sequence_round_trips_and_hands_out_values() {
+    let client = memory_client().await;
+
+    let invoice = sequence_schema("invoice_no")
+        .batch(100)
+        .start(500)
+        .build()
+        .expect("valid sequence");
+    apply(
+        &client,
+        &generate_sequence_sql(&invoice).expect("sequence sql"),
+    )
+    .await;
+
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    let stored: Vec<_> = parsed.sequences.values().cloned().collect();
+    assert_eq!(
+        stored,
+        vec![invoice.clone()],
+        "the engine echoes what we declared"
+    );
+    let diffs = diff_sequences(std::slice::from_ref(&invoice), &stored);
+    assert!(
+        diffs.is_empty(),
+        "a sequence re-applies on every boot: {diffs:#?}"
+    );
+
+    // A bare sequence takes the engine's defaults, which the renderer spells
+    // out, so it too compares equal after a round trip.
+    let bare = SequenceDefinition::new("plain");
+    apply(
+        &client,
+        &generate_sequence_sql(&bare).expect("sequence sql"),
+    )
+    .await;
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    assert_eq!(parsed.sequences.get("plain"), Some(&bare));
+
+    let first = client
+        .query(&format!(
+            "RETURN {};",
+            SequenceDefinition::nextval_surql("invoice_no")
+        ))
+        .await
+        .expect("draw a value");
+    let second = client
+        .query(&format!(
+            "RETURN {};",
+            SequenceDefinition::nextval_surql("invoice_no")
+        ))
+        .await
+        .expect("draw another value");
+    let first = serde_json::to_string(&first).expect("serialise");
+    let second = serde_json::to_string(&second).expect("serialise");
+    assert_ne!(
+        first, second,
+        "the sequence advances: {first} then {second}"
+    );
+
+    // A modification applies through the OVERWRITE form the diff renders.
+    let widened = sequence_schema("invoice_no")
+        .batch(250)
+        .start(500)
+        .build()
+        .unwrap();
+    let diffs = diff_sequences(std::slice::from_ref(&widened), &stored);
+    assert_eq!(diffs.len(), 1);
+    apply(&client, &[diffs[0].forward_sql.clone()]).await;
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    assert_eq!(
+        parsed.sequences.get("invoice_no").map(|s| s.batch),
+        Some(250)
+    );
+
+    // And the removal the drop diff renders takes it away again.
+    apply(&client, &[SequenceDefinition::remove_surql("invoice_no")]).await;
+    let parsed = parse_db_info(&info_for_db(&client).await).expect("parse INFO FOR DB");
+    assert!(!parsed.sequences.contains_key("invoice_no"));
 }

@@ -74,6 +74,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   engine computes a view's contents and stores no field definitions for one,
   so a reconciler would drop the declared fields on every boot.
 
+- **ID sequences (`DEFINE SEQUENCE`).** `SequenceDefinition` /
+  `sequence_schema` render `BATCH` / `START` / `TIMEOUT` and the
+  `REMOVE SEQUENCE IF EXISTS` and `sequence::nextval("<name>")` statements;
+  `parse_sequence` reads the `sequences` map of `INFO FOR DB` back;
+  `DatabaseInfo::sequences` and `SchemaSnapshot::sequences` carry them; and
+  `diff_objects::diff_sequences` reports `Add` / `Modify` / `DropSequence`.
+
+  `BATCH` and `START` are always rendered, including at their defaults
+  (1000 and 0), because the engine echoes them either way.
+
+- **`migration::diff_objects`.** `diff_named` captures the add / drop /
+  modify shape every database-level named object shares, so a new kind is
+  three lines rather than a copy of `diff_buckets`. It lives beside
+  `migration::diff` because that module is already well past the 1000-LOC
+  budget. `SchemaDiff` gained one `object: Option<String>` field naming the
+  object such a diff targets.
+
 - **`array<record<table>>` field types.** An ARRAY field with a
   `target_table` now renders `array<record<{target}>>` instead of a bare
   `array`, which is the shape a to-many reference needs. A `target_table`
@@ -81,6 +98,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   changes emitted DDL for any definition that set both.
 
 ### Changed
+
+- **BREAKING: `SchemaSnapshot` and `SchemaDiff` gained fields.**
+  `SchemaSnapshot::sequences` and `SchemaDiff::object` both default on
+  deserialize, so stored snapshots still load, but a struct literal that
+  names every field stops compiling. Use the constructors
+  (`SchemaSnapshot::new` / `from_parts` / `from_all_parts`) or
+  `..Default::default()`, as the shipped examples now do.
 
 - **Module splits to stay inside the 1000-LOC budget.** `FieldType` moved to
   `schema::field_type` and `IndexDefinition` (with `IndexType`, the distance

@@ -31,6 +31,8 @@
 //! - [`index`]: [`IndexDefinition`] and the `DEFINE INDEX` builders, plus the
 //!   `CONCURRENTLY` background build and its [`info_for_index_surql`] /
 //!   [`IndexBuildStatus`] progress readout. Re-exported from [`table`].
+//! - [`sequence`]: [`SequenceDefinition`] and [`sequence_schema`] for the
+//!   monotonic `DEFINE SEQUENCE` counters behind `sequence::nextval`.
 //! - [`reference`]: [`ReferenceAction`] and the rules governing
 //!   `DEFINE FIELD ... REFERENCE ON DELETE ...` record-reference tracking,
 //!   whose reverse half is a `COMPUTED <~table` field
@@ -74,6 +76,7 @@ pub mod index;
 pub mod parser;
 pub mod reference;
 pub mod registry;
+pub mod sequence;
 pub mod sql;
 pub mod table;
 pub mod themes;
@@ -101,7 +104,7 @@ pub use fields::{
 pub use index::{info_for_index_surql, IndexBuildStatus};
 pub use parser::{
     parse_access, parse_bucket, parse_db_info, parse_edge_info, parse_event, parse_field,
-    parse_fields, parse_index, parse_indexes, parse_table_info, parse_table_mode,
+    parse_fields, parse_index, parse_indexes, parse_sequence, parse_table_info, parse_table_mode,
     parse_table_permissions, parse_view, DatabaseInfo,
 };
 pub use reference::ReferenceAction;
@@ -109,10 +112,12 @@ pub use registry::{
     clear_registry, get_registered_buckets, get_registered_edges, get_registered_tables,
     get_registry, register_bucket, register_edge, register_table, SchemaRegistry,
 };
+pub use sequence::{sequence_schema, SequenceDefinition, SequenceSchemaBuilder};
 pub use sql::{
     generate_access_sql, generate_access_sql_with_options, generate_analyzer_sql,
     generate_analyzer_sql_with_options, generate_bucket_sql, generate_bucket_sql_with_options,
-    generate_edge_sql, generate_schema_sql, generate_table_sql, generate_table_sql_overwrite,
+    generate_edge_sql, generate_schema_sql, generate_sequence_sql,
+    generate_sequence_sql_with_options, generate_table_sql, generate_table_sql_overwrite,
 };
 pub use table::{
     bm25_index, event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,

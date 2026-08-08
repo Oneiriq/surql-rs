@@ -13,6 +13,7 @@ use super::access::parse_access;
 use super::bucket::parse_bucket;
 use super::edge::{parse_edge_endpoints, parse_edge_mode};
 use super::permissions::parse_table_permissions;
+use super::sequence::parse_sequence;
 use super::table::{parse_changefeed, parse_table_mode};
 use super::view::parse_view;
 use super::{expect_object, pick_map, DatabaseInfo};
@@ -126,6 +127,17 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
             };
             if let Some(bucket) = parse_bucket(name, def) {
                 out.buckets.insert(name.clone(), bucket);
+            }
+        }
+    }
+
+    if let Some(sq_value) = pick_map(obj, &["sq", "sequences"]) {
+        for (name, def_value) in sq_value.as_object().expect("checked by pick_map") {
+            let Some(def) = def_value.as_str() else {
+                continue;
+            };
+            if let Some(sequence) = parse_sequence(name, def) {
+                out.sequences.insert(name.clone(), sequence);
             }
         }
     }

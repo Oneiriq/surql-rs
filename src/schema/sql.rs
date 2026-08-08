@@ -19,6 +19,7 @@ use super::access::AccessDefinition;
 use super::analyzer::AnalyzerDefinition;
 use super::bucket::BucketDefinition;
 use super::edge::EdgeDefinition;
+use super::sequence::SequenceDefinition;
 use super::table::TableDefinition;
 
 /// Render all `DEFINE` statements required to create `table`.
@@ -182,6 +183,35 @@ pub fn generate_bucket_sql_with_options(
     overwrite: bool,
 ) -> Result<Vec<String>> {
     Ok(vec![bucket.to_surql_with_options(if_not_exists, overwrite)?])
+}
+
+/// Render the `DEFINE SEQUENCE` statement(s) for `sequence`.
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_sequence_sql, SequenceDefinition};
+///
+/// let s = SequenceDefinition::new("invoice_no");
+/// assert_eq!(
+///     generate_sequence_sql(&s).unwrap()[0],
+///     "DEFINE SEQUENCE invoice_no BATCH 1000 START 0;"
+/// );
+/// ```
+pub fn generate_sequence_sql(sequence: &SequenceDefinition) -> Result<Vec<String>> {
+    Ok(vec![sequence.to_surql()?])
+}
+
+/// Render the `DEFINE SEQUENCE` statement(s) for `sequence`, optionally with
+/// `IF NOT EXISTS` / `OVERWRITE` guards for idempotent re-application.
+pub fn generate_sequence_sql_with_options(
+    sequence: &SequenceDefinition,
+    if_not_exists: bool,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![
+        sequence.to_surql_with_options(if_not_exists, overwrite)?
+    ])
 }
 
 /// Render a complete SurrealQL schema script.
@@ -526,6 +556,32 @@ mod tests {
         let mut b = memory_bucket("avatars");
         b.backend = String::new();
         assert!(generate_bucket_sql(&b).is_err());
+    }
+
+    // ---- generate_sequence_sql ----
+
+    #[test]
+    fn generate_sequence_sql_renders_the_defaults() {
+        use crate::schema::sequence::SequenceDefinition;
+        let s = SequenceDefinition::new("invoice_no");
+        let stmts = generate_sequence_sql(&s).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DEFINE SEQUENCE invoice_no BATCH 1000 START 0;");
+    }
+
+    #[test]
+    fn generate_sequence_sql_with_options_overwrite() {
+        use crate::schema::sequence::SequenceDefinition;
+        let s = SequenceDefinition::new("s");
+        let stmts = generate_sequence_sql_with_options(&s, false, true).unwrap();
+        assert!(stmts[0].starts_with("DEFINE SEQUENCE OVERWRITE s"));
+    }
+
+    #[test]
+    fn generate_sequence_sql_validates() {
+        use crate::schema::sequence::SequenceDefinition;
+        let s = SequenceDefinition::new("s").with_batch(0);
+        assert!(generate_sequence_sql(&s).is_err());
     }
 
     // ---- generate_analyzer_sql ----

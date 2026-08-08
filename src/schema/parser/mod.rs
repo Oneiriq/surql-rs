@@ -22,6 +22,7 @@
 //! - `index` — `DEFINE INDEX` parsing (UNIQUE / SEARCH / MTREE / HNSW).
 //! - `event` — `DEFINE EVENT` parsing.
 //! - `access` — `DEFINE ACCESS` parsing (JWT + RECORD).
+//! - `sequence` — `DEFINE SEQUENCE` parsing.
 //! - `table` — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
 //! - `view` — `DEFINE TABLE ... AS SELECT` (view) parsing.
 //! - `db` — `INFO FOR DB` parsing + edge partitioning.
@@ -62,6 +63,7 @@ use crate::error::{Result, SurqlError};
 use crate::schema::access::AccessDefinition;
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
+use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::TableDefinition;
 
 mod access;
@@ -73,6 +75,7 @@ mod event;
 mod field;
 mod index;
 mod permissions;
+mod sequence;
 mod table;
 mod view;
 
@@ -85,6 +88,7 @@ pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
 pub use index::{parse_index, parse_indexes};
 pub use permissions::parse_table_permissions;
+pub use sequence::parse_sequence;
 pub use table::{parse_changefeed, parse_table_full, parse_table_info, parse_table_mode};
 pub use view::parse_view;
 
@@ -171,6 +175,9 @@ pub struct DatabaseInfo {
     /// Object-storage bucket definitions.
     #[serde(default)]
     pub buckets: BTreeMap<String, BucketDefinition>,
+    /// Monotonic ID sequences.
+    #[serde(default)]
+    pub sequences: BTreeMap<String, SequenceDefinition>,
 }
 
 #[cfg(test)]

@@ -40,10 +40,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::migration::diff_objects::diff_sequences;
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::{EdgeDefinition, EdgeMode};
 use crate::schema::fields::FieldDefinition;
+use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::{
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
     MTreeVectorType, TableDefinition,
@@ -65,8 +67,7 @@ use crate::schema::view::ViewDefinition;
 /// let snapshot = SchemaSnapshot {
 ///     tables: vec![table_schema("user")],
 ///     edges: vec![],
-///     buckets: vec![],
-///     analyzers: vec![],
+///     ..Default::default()
 /// };
 /// assert_eq!(snapshot.tables.len(), 1);
 /// ```
@@ -88,6 +89,10 @@ pub struct SchemaSnapshot {
     /// deserialise.
     #[serde(default)]
     pub analyzers: Vec<crate::schema::analyzer::AnalyzerDefinition>,
+    /// All ID sequences known to this snapshot (in discovery order).
+    /// Defaults to empty so older snapshots still deserialise.
+    #[serde(default)]
+    pub sequences: Vec<SequenceDefinition>,
 }
 
 impl SchemaSnapshot {
@@ -106,8 +111,7 @@ impl SchemaSnapshot {
         Self {
             tables: tables.into_iter().collect(),
             edges: edges.into_iter().collect(),
-            buckets: Vec::new(),
-            analyzers: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -122,7 +126,7 @@ impl SchemaSnapshot {
             tables: tables.into_iter().collect(),
             edges: edges.into_iter().collect(),
             buckets: buckets.into_iter().collect(),
-            analyzers: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -514,13 +518,15 @@ pub fn diff_buckets(code: &[BucketDefinition], db: &[BucketDefinition]) -> Vec<S
 /// Diff two complete snapshots and return every change required to make
 /// `db` look like `code`.
 ///
-/// The returned diffs are ordered: tables first, then edges, then buckets.
+/// The returned diffs are ordered: tables, edges, buckets, analyzers, then
+/// sequences.
 #[must_use]
 pub fn diff_schemas(code: &SchemaSnapshot, db: &SchemaSnapshot) -> Vec<SchemaDiff> {
     let mut out = diff_tables(&code.tables, &db.tables);
     out.extend(diff_edges(&code.edges, &db.edges));
     out.extend(diff_buckets(&code.buckets, &db.buckets));
     out.extend(diff_analyzers(&code.analyzers, &db.analyzers));
+    out.extend(diff_sequences(&code.sequences, &db.sequences));
     out
 }
 
@@ -543,6 +549,7 @@ pub fn diff_analyzers(
             event: None,
             bucket: None,
             analyzer: Some(name.to_owned()),
+            object: None,
             description: format!("{op:?} {name}"),
             forward_sql: forward,
             backward_sql: backward,
@@ -679,6 +686,7 @@ fn diff_table_body(code: &TableDefinition, db: &TableDefinition) -> Vec<SchemaDi
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Modify {what} on {}", code.name),
         // The full definition replaces: a bare CHANGEFEED or AS SELECT
         // statement would silently reset the table's mode and permissions.
@@ -699,6 +707,7 @@ fn modify_permissions_full(table: &str, forward_sql: String, backward_sql: Strin
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Modify permissions for {table}"),
         forward_sql,
         backward_sql,
@@ -724,6 +733,7 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add table {}", table.name),
         forward_sql,
         backward_sql,
@@ -750,6 +760,7 @@ fn generate_drop_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop table {}", table.name),
         forward_sql: format!("REMOVE TABLE {};", table.name),
         backward_sql: format!("DEFINE TABLE {} {};", table.name, table.mode.as_str()),
@@ -787,6 +798,7 @@ fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add field {} to {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -805,6 +817,7 @@ fn generate_drop_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff 
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop field {} from {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -838,6 +851,7 @@ fn generate_modify_field_diff(
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Modify field {} in {}", new_field.name, table),
         forward_sql,
         backward_sql,
@@ -876,6 +890,7 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add index {} to {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -905,6 +920,7 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop index {} from {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -933,6 +949,7 @@ fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         event: Some(ev.name.clone()),
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add event {} to {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -958,6 +975,7 @@ fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         event: Some(ev.name.clone()),
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop event {} from {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -980,6 +998,7 @@ fn generate_modify_permissions_diff(
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Modify permissions for {table}"),
         forward_sql,
         backward_sql,
@@ -1015,6 +1034,7 @@ fn generate_add_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add edge {}", edge.name),
         forward_sql,
         backward_sql,
@@ -1050,6 +1070,7 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop edge {}", edge.name),
         forward_sql: format!("REMOVE TABLE {};", edge.name),
         backward_sql: String::new(),
@@ -1081,6 +1102,7 @@ fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
         event: None,
         bucket: Some(bucket.name.clone()),
         analyzer: None,
+        object: None,
         description: format!("Add bucket {}", bucket.name),
         forward_sql,
         backward_sql,
@@ -1104,6 +1126,7 @@ fn generate_drop_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
         event: None,
         bucket: Some(bucket.name.clone()),
         analyzer: None,
+        object: None,
         description: format!("Drop bucket {}", bucket.name),
         forward_sql,
         backward_sql,
@@ -1134,6 +1157,7 @@ fn generate_modify_bucket_diff(code: &BucketDefinition, db: &BucketDefinition) -
         event: None,
         bucket: Some(code.name.clone()),
         analyzer: None,
+        object: None,
         description: format!("Modify bucket {}", code.name),
         forward_sql,
         backward_sql,
