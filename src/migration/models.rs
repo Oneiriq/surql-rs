@@ -275,6 +275,10 @@ pub enum DiffOperation {
     AddTable,
     /// An existing table was removed.
     DropTable,
+    /// An existing table's own definition changed — its change feed or its
+    /// `AS SELECT` view body. Field / index / event / permission changes have
+    /// their own variants.
+    ModifyTable,
     /// A new field was added to an existing table.
     AddField,
     /// An existing field was removed.
@@ -312,6 +316,7 @@ impl DiffOperation {
         match self {
             Self::AddTable => "add_table",
             Self::DropTable => "drop_table",
+            Self::ModifyTable => "modify_table",
             Self::AddField => "add_field",
             Self::DropField => "drop_field",
             Self::ModifyField => "modify_field",
@@ -622,6 +627,7 @@ mod tests {
     fn diff_operation_as_str_values() {
         assert_eq!(DiffOperation::AddTable.as_str(), "add_table");
         assert_eq!(DiffOperation::DropTable.as_str(), "drop_table");
+        assert_eq!(DiffOperation::ModifyTable.as_str(), "modify_table");
         assert_eq!(DiffOperation::AddField.as_str(), "add_field");
         assert_eq!(DiffOperation::DropField.as_str(), "drop_field");
         assert_eq!(DiffOperation::ModifyField.as_str(), "modify_field");
@@ -658,6 +664,7 @@ mod tests {
         let ops = [
             DiffOperation::AddTable,
             DiffOperation::DropTable,
+            DiffOperation::ModifyTable,
             DiffOperation::AddField,
             DiffOperation::DropField,
             DiffOperation::ModifyField,

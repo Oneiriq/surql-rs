@@ -5,17 +5,42 @@
 //! submodule stays under the 1000-LOC budget; see parent [`super`] for
 //! the public entry points.
 
+use std::sync::OnceLock;
+
+use regex::Regex;
 use serde_json::Value;
 
 use super::event::parse_events;
 use super::field::parse_fields;
 use super::index::parse_indexes;
 use super::permissions::parse_table_permissions;
-use super::{expect_object, pick_map, value_to_string_map};
+use super::{expect_object, pick_map, regex_case_insensitive, value_to_string_map};
 use crate::error::Result;
+use crate::schema::changefeed::ChangeFeed;
 use crate::schema::table::{TableDefinition, TableMode};
 
+/// Matches `CHANGEFEED <duration> [INCLUDE ORIGINAL]`, the form the engine
+/// both accepts and echoes.
+fn changefeed_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex_case_insensitive(r"\bCHANGEFEED\s+(\S+?)\s*(\bINCLUDE\s+ORIGINAL\b)?(?:\s|;|$)")
+    })
+}
+
 // --- Public parsers ----------------------------------------------------------
+
+/// Parse the `CHANGEFEED` clause out of a `DEFINE TABLE` statement.
+///
+/// Returns `None` for a table with no change feed.
+pub fn parse_changefeed(definition: &str) -> Option<ChangeFeed> {
+    let caps = changefeed_regex().captures(definition)?;
+    let duration = caps.get(1)?.as_str().trim_end_matches(';');
+    if duration.is_empty() {
+        return None;
+    }
+    Some(ChangeFeed::new(duration).include_original(caps.get(2).is_some()))
+}
 
 /// Parse the `DEFINE TABLE` statement into a [`TableMode`].
 ///
@@ -103,5 +128,56 @@ pub fn parse_table_info(
         events,
         permissions,
         drop: false,
+        changefeed: parse_changefeed(tb_definition),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changefeed_without_original() {
+        let cf =
+            parse_changefeed("DEFINE TABLE evt TYPE ANY SCHEMALESS CHANGEFEED 1d PERMISSIONS NONE")
+                .expect("changefeed");
+        assert_eq!(cf.duration, "1d");
+        assert!(!cf.include_original);
+    }
+
+    #[test]
+    fn changefeed_with_original() {
+        let cf = parse_changefeed(
+            "DEFINE TABLE evt TYPE ANY SCHEMALESS CHANGEFEED 3d INCLUDE ORIGINAL PERMISSIONS NONE",
+        )
+        .expect("changefeed");
+        assert_eq!(cf.duration, "3d");
+        assert!(cf.include_original);
+    }
+
+    #[test]
+    fn changefeed_at_the_end_of_a_statement() {
+        let cf =
+            parse_changefeed("DEFINE TABLE evt SCHEMALESS CHANGEFEED 6h;").expect("changefeed");
+        assert_eq!(cf.duration, "6h");
+    }
+
+    #[test]
+    fn no_changefeed_is_none() {
+        assert!(parse_changefeed("DEFINE TABLE evt SCHEMAFULL PERMISSIONS NONE").is_none());
+        assert!(parse_changefeed("").is_none());
+    }
+
+    #[test]
+    fn table_info_carries_the_changefeed_from_the_db_define() {
+        let table = parse_table_info(
+            "evt",
+            &serde_json::json!({ "fields": {} }),
+            Some("DEFINE TABLE evt TYPE ANY SCHEMALESS CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS NONE"),
+        )
+        .unwrap();
+        let cf = table.changefeed.expect("changefeed");
+        assert_eq!(cf.duration, "1h");
+        assert!(cf.include_original);
+    }
 }

@@ -44,6 +44,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   comparison looks at the member. Storing it as parsed would make every
   background-built index diff forever.
 
+- **Table change feeds (`DEFINE TABLE ... CHANGEFEED`).** `ChangeFeed` and
+  `TableDefinition::with_changefeed` render
+  `CHANGEFEED <duration> [INCLUDE ORIGINAL]` between the mode and the
+  `PERMISSIONS` clause, `parse_changefeed` reads it back out of the
+  `INFO FOR DB` echo, and `diff_tables` reports a change as the new
+  `DiffOperation::ModifyTable` carrying the full `DEFINE TABLE OVERWRITE`
+  form (a bare `CHANGEFEED` statement would reset the table's mode and
+  permissions).
+
+  The read side is `query::changes`: `show_changes_surql(table, since,
+  limit)` renders
+  `SHOW CHANGES FOR TABLE <t> SINCE <versionstamp|d'...'> [LIMIT n]`, and
+  `ChangeSet::from_response` pulls the `versionstamp` / `changes` pairs out
+  of the answer so a consumer can resume where it stopped.
+
 - **`array<record<table>>` field types.** An ARRAY field with a
   `target_table` now renders `array<record<{target}>>` instead of a bare
   `array`, which is the shape a to-many reference needs. A `target_table`

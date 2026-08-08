@@ -617,6 +617,7 @@ fn diff_table_pair_inner(code: &TableDefinition, db: &TableDefinition) -> Vec<Sc
     let mut out = diff_fields(&code.name, &code.fields, &db.fields);
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
+    out.extend(diff_table_body(code, db));
     if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
         // The full definition replaces: a permissions-only DEFINE
         // TABLE would silently reset the table's mode.
@@ -646,6 +647,35 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
         }
     }
     out
+}
+
+/// Compare the parts of a `DEFINE TABLE` statement that belong to the table
+/// itself rather than to a field, index, event, or permission rule: the
+/// change feed.
+///
+/// The table mode is deliberately left out. It is carried by the same
+/// `OVERWRITE` statement, so a change to it rides along with any of the other
+/// diffs; making it its own trigger would change long-standing behaviour for
+/// every schema that leaves the mode implicit.
+fn diff_table_body(code: &TableDefinition, db: &TableDefinition) -> Vec<SchemaDiff> {
+    if code.changefeed == db.changefeed {
+        return Vec::new();
+    }
+    vec![SchemaDiff {
+        operation: DiffOperation::ModifyTable,
+        table: code.name.clone(),
+        field: None,
+        index: None,
+        event: None,
+        bucket: None,
+        analyzer: None,
+        description: format!("Modify change feed on {}", code.name),
+        // The full definition replaces: a bare CHANGEFEED statement would
+        // silently reset the table's mode and permissions.
+        forward_sql: code.to_surql_overwrite(),
+        backward_sql: db.to_surql_overwrite(),
+        details: BTreeMap::new(),
+    }]
 }
 
 /// A permissions change carried as the owning definition's full
@@ -1772,6 +1802,60 @@ mod tests {
     fn diff_edges_identical_yields_nothing() {
         let e = relation_edge("likes").with_fields([f("weight", FieldType::Int)]);
         assert!(diff_edges(std::slice::from_ref(&e), std::slice::from_ref(&e)).is_empty());
+    }
+
+    // ----- change feeds -----
+
+    #[test]
+    fn diff_tables_detects_an_added_changefeed() {
+        use crate::schema::ChangeFeed;
+        let db = vec![table_schema("audit")];
+        let code = vec![table_schema("audit").with_changefeed(ChangeFeed::new("1d"))];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert_eq!(diffs[0].table, "audit");
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE TABLE OVERWRITE audit SCHEMAFULL CHANGEFEED 1d;"
+        );
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE TABLE OVERWRITE audit SCHEMAFULL;"
+        );
+    }
+
+    #[test]
+    fn diff_tables_detects_a_dropped_changefeed() {
+        use crate::schema::ChangeFeed;
+        let db = vec![table_schema("audit").with_changefeed(ChangeFeed::new("1d"))];
+        let code = vec![table_schema("audit")];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert!(!diffs[0].forward_sql.contains("CHANGEFEED"));
+        assert!(diffs[0].backward_sql.contains("CHANGEFEED 1d"));
+    }
+
+    #[test]
+    fn diff_tables_detects_a_changed_retention_window() {
+        use crate::schema::ChangeFeed;
+        let db = vec![table_schema("audit").with_changefeed(ChangeFeed::new("1d"))];
+        let code = vec![
+            table_schema("audit").with_changefeed(ChangeFeed::new("3d").include_original(true))
+        ];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0]
+            .forward_sql
+            .contains("CHANGEFEED 3d INCLUDE ORIGINAL"));
+    }
+
+    #[test]
+    fn diff_tables_ignores_an_unchanged_changefeed() {
+        use crate::schema::ChangeFeed;
+        let t = table_schema("audit").with_changefeed(ChangeFeed::new("1d"));
+        assert!(diff_tables(std::slice::from_ref(&t), std::slice::from_ref(&t)).is_empty());
     }
 
     // ----- diff_buckets -----

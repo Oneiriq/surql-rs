@@ -83,7 +83,7 @@ pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
 pub use index::{parse_index, parse_indexes};
 pub use permissions::parse_table_permissions;
-pub use table::{parse_table_full, parse_table_info, parse_table_mode};
+pub use table::{parse_changefeed, parse_table_full, parse_table_info, parse_table_mode};
 
 // --- Shared regex helper -----------------------------------------------------
 

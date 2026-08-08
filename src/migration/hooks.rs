@@ -95,6 +95,7 @@ pub fn severity_for_operation(op: DiffOperation) -> DriftSeverity {
         | DiffOperation::AddAnalyzer
         | DiffOperation::AddBucket => DriftSeverity::Info,
         DiffOperation::ModifyField
+        | DiffOperation::ModifyTable
         | DiffOperation::ModifyPermissions
         | DiffOperation::DropEvent
         | DiffOperation::ModifyAnalyzer

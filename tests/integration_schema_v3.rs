@@ -23,13 +23,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use surql::connection::{ConnectionConfig, DatabaseClient};
-use surql::migration::diff::{diff_fields, diff_indexes};
+use surql::migration::diff::{diff_fields, diff_indexes, diff_tables};
+use surql::query::changes::{show_changes_surql, ChangeSet, ChangeSince};
 use surql::query::references::reverse_reference_query;
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
     array_field, generate_table_sql, info_for_index_surql, record_field, reverse_reference_field,
-    string_field, table_schema, unique_index, FieldDefinition, IndexBuildStatus, ReferenceAction,
-    TableDefinition, TableMode,
+    string_field, table_schema, unique_index, ChangeFeed, FieldDefinition, IndexBuildStatus,
+    ReferenceAction, TableDefinition, TableMode,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -296,4 +297,62 @@ async fn concurrent_index_builds_and_leaves_no_residual_diff() {
         .query("CREATE user:b SET email = 'a@example.com';")
         .await;
     assert!(clash.is_err(), "the concurrent index enforces UNIQUE");
+}
+
+/// A `CHANGEFEED` survives the round trip and actually records mutations,
+/// which `SHOW CHANGES FOR TABLE` replays.
+#[tokio::test]
+async fn changefeed_round_trips_and_replays_mutations() {
+    let client = memory_client().await;
+
+    let audit = table_schema("audit")
+        .with_mode(TableMode::Schemaless)
+        .with_changefeed(ChangeFeed::new("1d").include_original(true));
+    apply(&client, &generate_table_sql(&audit, true)).await;
+
+    let stored = read_back(&client, "audit").await;
+    assert_eq!(
+        stored.changefeed, audit.changefeed,
+        "the engine echoes the feed the code declared"
+    );
+    let diffs = diff_tables(std::slice::from_ref(&audit), std::slice::from_ref(&stored));
+    assert!(
+        diffs.is_empty(),
+        "a CHANGEFEED table re-applies on every boot: {diffs:#?}"
+    );
+
+    client
+        .query("CREATE audit:a SET action = 'created'; UPDATE audit:a SET action = 'edited';")
+        .await
+        .expect("mutate the table");
+
+    let statement = show_changes_surql("audit", &ChangeSince::Versionstamp(1), Some(50))
+        .expect("render SHOW CHANGES");
+    let response = client
+        .query(&statement)
+        .await
+        .expect("read the change feed");
+    let sets = ChangeSet::from_response(&response);
+    assert!(
+        !sets.is_empty(),
+        "the feed replayed at least one changeset: {response}"
+    );
+    assert!(
+        sets.windows(2)
+            .all(|w| w[0].versionstamp <= w[1].versionstamp),
+        "versionstamps come back in order: {sets:?}"
+    );
+    let body = serde_json::to_string(&sets).expect("serialise");
+    assert!(body.contains("edited"), "the update is in the feed: {body}");
+
+    // Resuming past the last versionstamp yields nothing new.
+    let last = sets.last().expect("a changeset").versionstamp;
+    let resumed = client
+        .query(&show_changes_surql("audit", &ChangeSince::Versionstamp(last + 1), None).unwrap())
+        .await
+        .expect("resume the change feed");
+    assert!(
+        ChangeSet::from_response(&resumed).is_empty(),
+        "resuming after the last versionstamp is empty: {resumed}"
+    );
 }

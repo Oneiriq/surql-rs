@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
 
+use super::changefeed::ChangeFeed;
 use super::fields::FieldDefinition;
 
 pub use super::index::{
@@ -146,6 +147,10 @@ pub struct TableDefinition {
     /// Whether this table is marked for deletion.
     #[serde(default)]
     pub drop: bool,
+    /// Mutation-log retention (`CHANGEFEED <duration> [INCLUDE ORIGINAL]`),
+    /// read back with [`crate::query::changes`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub changefeed: Option<ChangeFeed>,
 }
 
 impl TableDefinition {
@@ -163,6 +168,7 @@ impl TableDefinition {
             events: Vec::new(),
             permissions: None,
             drop: false,
+            changefeed: None,
         }
     }
 
@@ -221,6 +227,12 @@ impl TableDefinition {
         self
     }
 
+    /// Retain a mutation log for this table (`CHANGEFEED <duration>`).
+    pub fn with_changefeed(mut self, changefeed: ChangeFeed) -> Self {
+        self.changefeed = Some(changefeed);
+        self
+    }
+
     /// Validate the table and its contained definitions.
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
@@ -272,11 +284,18 @@ impl TableDefinition {
             }
             _ => String::new(),
         };
+        // SurrealQL order: mode, then CHANGEFEED, then PERMISSIONS.
+        let changefeed = self
+            .changefeed
+            .as_ref()
+            .map(ChangeFeed::to_clause)
+            .unwrap_or_default();
         format!(
-            "DEFINE TABLE{ine} {name} {mode}{perms};",
+            "DEFINE TABLE{ine} {name} {mode}{changefeed}{perms};",
             ine = ine,
             name = self.name,
             mode = self.mode.as_str(),
+            changefeed = changefeed,
             perms = perms,
         )
     }

@@ -23,6 +23,9 @@
 //! - [`bucket`]: [`BucketDefinition`] + the [`bucket_schema`] /
 //!   [`memory_bucket`] / [`file_bucket`] helpers for SurrealDB v3
 //!   object-storage `DEFINE BUCKET` / `ALTER BUCKET` / `REMOVE BUCKET`.
+//! - [`changefeed`]: [`ChangeFeed`], the `CHANGEFEED <duration>
+//!   [INCLUDE ORIGINAL]` mutation log a table can retain; read it back with
+//!   [`crate::query::changes`].
 //! - [`index`]: [`IndexDefinition`] and the `DEFINE INDEX` builders, plus the
 //!   `CONCURRENTLY` background build and its [`info_for_index_surql`] /
 //!   [`IndexBuildStatus`] progress readout. Re-exported from [`table`].
@@ -61,6 +64,7 @@
 pub mod access;
 pub mod analyzer;
 pub mod bucket;
+pub mod changefeed;
 pub mod edge;
 pub mod field_type;
 pub mod fields;
@@ -84,6 +88,7 @@ pub use analyzer::{analyzer, standard_analyzer, AnalyzerDefinition, TokenFilter,
 pub use bucket::{
     bucket_schema, file_bucket, memory_bucket, BucketDefinition, BucketSchemaBuilder,
 };
+pub use changefeed::ChangeFeed;
 pub use edge::{bidirectional_edge, edge_schema, typed_edge, EdgeDefinition, EdgeMode};
 pub use fields::{
     array_field, bool_field, bytes_field, computed_field, datetime_field, field, file_field,
