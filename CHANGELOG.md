@@ -9,6 +9,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`global_helpers_configure_and_invalidate` flaked against its own
+  binary.** The cache integration tests run concurrently in one process,
+  and `is_cached_returns_false_when_no_manager` calls `close_cache()`,
+  which empties the process-global manager slot; landing between another
+  test's `configure_cache` and its reads of that slot, it made
+  `invalidate` and `clear_cache` report zero. The two tests that touch
+  the global slot now serialize on a shared lock, the pattern the cache
+  module's own unit tests already use. Test-only; no library change.
+
 - **A field that gained `REFERENCE` silently tracked nothing for its
   existing rows.** The engine backfills nothing when the clause is
   added, and a self-assignment registers nothing either; only an actual

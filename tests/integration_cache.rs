@@ -13,6 +13,13 @@ use surql::cache::{
     get_cache_manager, invalidate, is_cached, CacheBackendKind, CacheConfig, CacheManager,
     CacheOptions,
 };
+use tokio::sync::Mutex;
+
+/// Serializes the tests that touch the process-global cache manager:
+/// Cargo runs this binary's tests concurrently, so an unguarded
+/// `close_cache` in one test empties the slot mid-flight in another.
+/// Tokio's mutex does not poison; a panicking holder just unlocks.
+static GLOBAL_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn fresh_manager(prefix: &str) -> CacheManager {
     let cfg = CacheConfig::builder()
@@ -103,6 +110,7 @@ async fn options_validation_rejects_zero_ttl() {
 
 #[tokio::test]
 async fn global_helpers_configure_and_invalidate() {
+    let _guard = GLOBAL_LOCK.lock().await;
     let cfg = CacheConfig::builder().key_prefix("it_gbl:").build();
     let manager = configure_cache(cfg).unwrap();
     manager.clear().await.unwrap();
@@ -128,6 +136,7 @@ async fn global_helpers_configure_and_invalidate() {
 
 #[tokio::test]
 async fn is_cached_returns_false_when_no_manager() {
+    let _guard = GLOBAL_LOCK.lock().await;
     // Even if prior test installed a manager, call close_cache to make
     // `is_cached` observe the absent state; it should not error.
     close_cache().await.unwrap();
