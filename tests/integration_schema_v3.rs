@@ -751,3 +751,25 @@ async fn the_backfill_registers_inside_the_ddl_transaction() {
         "{seen:?}"
     );
 }
+
+/// The exact shape a caller gets from `query`: the raw response,
+/// wrapper and all, straight into the table parser. Mirrors
+/// `parse_db_info_reads_the_raw_query_response` — same tolerance, same
+/// unambiguity argument, so no caller has to remember which parsers
+/// need the wrapper indexed off.
+#[tokio::test]
+async fn parse_table_full_reads_the_raw_query_response() {
+    let client = memory_client().await;
+    client
+        .query("DEFINE TABLE gadget SCHEMAFULL; DEFINE FIELD name ON gadget TYPE string;")
+        .await
+        .expect("define table");
+    let raw = client
+        .query("INFO FOR TABLE gadget;")
+        .await
+        .expect("INFO FOR TABLE");
+    let parsed = parse_table_full("gadget", "DEFINE TABLE gadget SCHEMAFULL", &raw)
+        .expect("parse the wrapped response");
+    assert_eq!(parsed.mode, TableMode::Schemafull);
+    assert!(parsed.fields.iter().any(|f| f.name == "name"), "{parsed:?}");
+}

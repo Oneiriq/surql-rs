@@ -16,7 +16,7 @@ use super::index::parse_indexes;
 use super::permissions::parse_table_permissions;
 use super::view::parse_view;
 use super::{expect_object, pick_map, regex_case_insensitive, value_to_string_map};
-use crate::error::Result;
+use crate::error::{Result, SurqlError};
 use crate::schema::changefeed::ChangeFeed;
 use crate::schema::table::{TableDefinition, TableMode};
 
@@ -63,12 +63,39 @@ pub fn parse_table_mode(definition: &str) -> TableMode {
     }
 }
 
+/// The complete definition for one table from the two `INFO` levels:
+/// the database's `DEFINE TABLE` echo carries mode and permissions,
+/// and the table's own `INFO FOR TABLE` carries fields, indexes, and
+/// events. `INFO FOR DB` alone yields fieldless tables, which is a
+/// trap for anyone diffing against it.
+///
+/// Delegates to [`parse_table_info`], so `table_info` may be the bare
+/// INFO object or the one-element array
+/// [`query`](crate::DatabaseClient::query) returns for the statement.
+///
+/// Returns [`crate::error::SurqlError::SchemaParse`] when `table_info`
+/// is not a JSON object (or a one-statement array holding one).
+pub fn parse_table_full(
+    table_name: &str,
+    db_define: &str,
+    table_info: &Value,
+) -> Result<TableDefinition> {
+    parse_table_info(table_name, table_info, Some(db_define))
+}
+
 /// Parse a SurrealDB `INFO FOR TABLE` response into a [`TableDefinition`].
 ///
 /// Accepts either the short-key shape (`fd`, `ix`, `ev`) or the long-key shape
 /// (`fields`, `indexes`, `events`). Unknown enum values surface as the default
 /// variant (for example `FieldType::Any` for unknown types), matching the
 /// Python behaviour.
+///
+/// Accepts either the INFO object itself or the value
+/// [`query`](crate::DatabaseClient::query) returns for
+/// `INFO FOR TABLE <name>;`, which wraps each statement's result in an
+/// array. An INFO response is never itself an array, so the two shapes
+/// cannot be confused; callers that index the wrapper themselves keep
+/// working, since indexing yields the bare object.
 ///
 /// SurrealDB v3's `INFO FOR TABLE` does **not** include the table-level
 /// `DEFINE TABLE` statement, so table mode and `PERMISSIONS` cannot be
@@ -80,25 +107,18 @@ pub fn parse_table_mode(definition: &str) -> TableMode {
 /// on v3.
 ///
 /// Returns [`crate::error::SurqlError::SchemaParse`] when the top-level value
-/// The complete definition for one table from the two `INFO` levels:
-/// the database's `DEFINE TABLE` echo carries mode and permissions,
-/// and the table's own `INFO FOR TABLE` carries fields, indexes, and
-/// events. `INFO FOR DB` alone yields fieldless tables, which is a
-/// trap for anyone diffing against it.
-pub fn parse_table_full(
-    table_name: &str,
-    db_define: &str,
-    table_info: &Value,
-) -> Result<TableDefinition> {
-    parse_table_info(table_name, table_info, Some(db_define))
-}
-
-/// is not a JSON object.
+/// is not a JSON object (or a one-statement array holding one).
 pub fn parse_table_info(
     table_name: &str,
     info: &Value,
     define_table: Option<&str>,
 ) -> Result<TableDefinition> {
+    let info = match info.as_array() {
+        Some(items) => items.first().ok_or_else(|| SurqlError::SchemaParse {
+            reason: format!("INFO FOR TABLE {table_name}: response held no statement result"),
+        })?,
+        None => info,
+    };
     let obj = expect_object(info, &format!("INFO FOR TABLE {table_name}"))?;
 
     let tb_definition =

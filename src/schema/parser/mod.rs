@@ -588,6 +588,39 @@ mod tests {
         assert!(t.fields.is_empty());
     }
 
+    #[test]
+    fn parse_table_info_unwraps_the_query_response_shape() {
+        // `DatabaseClient::query` answers one result per statement, so
+        // the INFO object arrives as `[ { ... } ]`. Same tolerance as
+        // `parse_db_info`: an INFO response is never itself an array.
+        let bare = json!({
+            "tb": "DEFINE TABLE user SCHEMAFULL",
+            "fields": { "email": "DEFINE FIELD email ON TABLE user TYPE string" }
+        });
+        let wrapped = json!([{
+            "tb": "DEFINE TABLE user SCHEMAFULL",
+            "fields": { "email": "DEFINE FIELD email ON TABLE user TYPE string" }
+        }]);
+        let from_bare = parse_table_info("user", &bare, None).unwrap();
+        let from_wrapped = parse_table_info("user", &wrapped, None).unwrap();
+        assert_eq!(from_bare, from_wrapped);
+        assert_eq!(from_wrapped.mode, TableMode::Schemafull);
+        assert_eq!(from_wrapped.fields.len(), 1);
+    }
+
+    #[test]
+    fn parse_table_full_unwraps_the_query_response_shape() {
+        let info = json!({
+            "fields": { "email": "DEFINE FIELD email ON TABLE user TYPE string" }
+        });
+        let wrapped = json!([info.clone()]);
+        let define = "DEFINE TABLE user SCHEMAFULL";
+        let from_bare = parse_table_full("user", define, &info).unwrap();
+        let from_wrapped = parse_table_full("user", define, &wrapped).unwrap();
+        assert_eq!(from_bare, from_wrapped);
+        assert_eq!(from_wrapped.mode, TableMode::Schemafull);
+    }
+
     // ---- parse_db_info ------------------------------------------------------
 
     #[test]

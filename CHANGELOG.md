@@ -9,6 +9,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`parse_table_full`, `parse_table_info`, and `parse_edge_info` refused
+  the response shape `query` actually returns.** `query` answers one
+  result per statement, so an `INFO FOR TABLE` object arrives wrapped in
+  a one-element array that only `parse_db_info` had learned to unwrap;
+  every other caller had to remember to index `[0]` first. The table and
+  edge parsers now accept either shape by the same argument — an INFO
+  response is never itself an array, so the two cannot be confused — and
+  callers that already index the wrapper keep working, since indexing
+  yields the bare object. No other public parser takes the response
+  value, so none can carry the same footgun.
+
 - **`global_helpers_configure_and_invalidate` flaked against its own
   binary.** The cache integration tests run concurrently in one process,
   and `is_cached_returns_false_when_no_manager` calls `close_cache()`,
