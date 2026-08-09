@@ -7,6 +7,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-09
+
 ### Fixed
 
 - **`parse_table_full`, `parse_table_info`, and `parse_edge_info` refused
