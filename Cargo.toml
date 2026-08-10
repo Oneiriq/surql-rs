@@ -168,7 +168,7 @@ pretty_assertions = "1.4"
 tempfile = "3.13"
 assert_cmd = "2.2"
 predicates = "3.1"
-base64 = "0.22"
+base64 = "0.23"
 
 [profile.release]
 opt-level = 3
