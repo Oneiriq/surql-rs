@@ -7,6 +7,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-08-12
+
 ### Added
 
 - **DISKANN vector indexes and the F16 element type (SurrealDB 3.2).**
