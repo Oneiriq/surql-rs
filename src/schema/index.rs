@@ -4,15 +4,23 @@
 //! 1000-LOC budget. Everything here is re-exported from `schema::table`, so
 //! existing paths keep resolving.
 //!
-//! Covers the plain / `UNIQUE` / `FULLTEXT` forms plus the `MTREE` and `HNSW`
-//! vector indexes, and the `CONCURRENTLY` build directive that lets a large
-//! index populate in the background.
+//! Covers the plain / `UNIQUE` / `FULLTEXT` forms plus the `MTREE`, `HNSW`,
+//! and `DISKANN` vector indexes, and the `CONCURRENTLY` build directive that
+//! lets a large index populate in the background. The vector vocabulary
+//! (distance metrics, element types, vector builders) lives in
+//! [`super::index_vector`] and is re-exported here.
 
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+
+pub use super::index_vector::{
+    diskann_index, hnsw_index, mtree_index, DiskAnnDistanceType, HnswDistanceType,
+    MTreeDistanceType, MTreeVectorType, DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE,
+    DISKANN_DEFAULT_L_BUILD,
+};
 
 /// Index type supported by `DEFINE INDEX`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -30,6 +38,10 @@ pub enum IndexType {
     Mtree,
     /// HNSW vector similarity index.
     Hnsw,
+    /// DISKANN vector similarity index (SurrealDB 3.2+): an on-disk graph
+    /// built for corpora too large for HNSW's memory residency. Reached by
+    /// the same `<|k,ef|>` KNN operator.
+    Diskann,
 }
 
 impl IndexType {
@@ -41,6 +53,7 @@ impl IndexType {
             Self::Standard => "INDEX",
             Self::Mtree => "MTREE",
             Self::Hnsw => "HNSW",
+            Self::Diskann => "DISKANN",
         }
     }
 }
@@ -51,118 +64,10 @@ impl std::fmt::Display for IndexType {
     }
 }
 
-/// Distance metric for MTREE vector indexes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum MTreeDistanceType {
-    /// Cosine distance.
-    Cosine,
-    /// Euclidean (L2) distance.
-    Euclidean,
-    /// Manhattan (L1) distance.
-    Manhattan,
-    /// Minkowski distance.
-    Minkowski,
-}
-
-impl MTreeDistanceType {
-    /// Render as SurrealQL keyword.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cosine => "COSINE",
-            Self::Euclidean => "EUCLIDEAN",
-            Self::Manhattan => "MANHATTAN",
-            Self::Minkowski => "MINKOWSKI",
-        }
-    }
-}
-
-impl std::fmt::Display for MTreeDistanceType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Distance metric for HNSW vector indexes (superset of [`MTreeDistanceType`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum HnswDistanceType {
-    /// Chebyshev distance.
-    Chebyshev,
-    /// Cosine distance.
-    Cosine,
-    /// Euclidean distance.
-    Euclidean,
-    /// Hamming distance.
-    Hamming,
-    /// Jaccard distance.
-    Jaccard,
-    /// Manhattan distance.
-    Manhattan,
-    /// Minkowski distance.
-    Minkowski,
-    /// Pearson correlation distance.
-    Pearson,
-}
-
-impl HnswDistanceType {
-    /// Render as SurrealQL keyword.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Chebyshev => "CHEBYSHEV",
-            Self::Cosine => "COSINE",
-            Self::Euclidean => "EUCLIDEAN",
-            Self::Hamming => "HAMMING",
-            Self::Jaccard => "JACCARD",
-            Self::Manhattan => "MANHATTAN",
-            Self::Minkowski => "MINKOWSKI",
-            Self::Pearson => "PEARSON",
-        }
-    }
-}
-
-impl std::fmt::Display for HnswDistanceType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Numeric type for vector components in MTREE/HNSW indexes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum MTreeVectorType {
-    /// 64-bit float.
-    F64,
-    /// 32-bit float.
-    F32,
-    /// 64-bit integer.
-    I64,
-    /// 32-bit integer.
-    I32,
-    /// 16-bit integer.
-    I16,
-}
-
-impl MTreeVectorType {
-    /// Render as SurrealQL keyword.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::F64 => "F64",
-            Self::F32 => "F32",
-            Self::I64 => "I64",
-            Self::I32 => "I32",
-            Self::I16 => "I16",
-        }
-    }
-}
-
-impl std::fmt::Display for MTreeVectorType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// Immutable index definition describing one or more columns of a table.
+// The bools mirror independent DDL flags (BM25 / HIGHLIGHTS / HASHED_VECTOR /
+// CONCURRENTLY); folding them into enums would only rename the same states.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDefinition {
     /// Index name.
@@ -190,6 +95,24 @@ pub struct IndexDefinition {
     /// HNSW maximum bidirectional links per node.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub m: Option<u32>,
+    /// DISKANN-specific distance metric.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub diskann_distance: Option<DiskAnnDistanceType>,
+    /// DISKANN graph out-degree (`DEGREE`, engine default 64).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub degree: Option<u32>,
+    /// DISKANN build-time candidate list size (`L_BUILD`, engine default 100).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub l_build: Option<u32>,
+    /// DISKANN pruning slack (`ALPHA`, engine default 1.2), stored as the
+    /// decimal literal the statement carries. The engine echoes a float
+    /// literal with a trailing `f` suffix (`ALPHA 1.2f`), which the parser
+    /// strips so code and echo compare equal.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub alpha: Option<String>,
+    /// Whether a DISKANN index stores hashed vectors (`HASHED_VECTOR`).
+    #[serde(default)]
+    pub hashed_vector: bool,
     /// Full-text `SEARCH` analyzer name. `None` renders the historical default
     /// (`ascii`); set via [`IndexDefinition::with_analyzer`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -237,6 +160,11 @@ impl IndexDefinition {
             hnsw_distance: None,
             efc: None,
             m: None,
+            diskann_distance: None,
+            degree: None,
+            l_build: None,
+            alpha: None,
+            hashed_vector: false,
             analyzer: None,
             bm25: false,
             highlights: false,
@@ -282,10 +210,38 @@ impl IndexDefinition {
         self
     }
 
+    /// Set the DISKANN graph out-degree (`DEGREE`).
+    pub fn with_degree(mut self, degree: u32) -> Self {
+        self.degree = Some(degree);
+        self
+    }
+
+    /// Set the DISKANN build-time candidate list size (`L_BUILD`).
+    pub fn with_l_build(mut self, l_build: u32) -> Self {
+        self.l_build = Some(l_build);
+        self
+    }
+
+    /// Set the DISKANN pruning slack (`ALPHA`). Stored via the canonical
+    /// `Display` rendering (`1.2` stays `1.2`, `2.0` becomes `2`), which is
+    /// the shape the engine echoes back once its `f` suffix is stripped.
+    pub fn with_alpha(mut self, alpha: f64) -> Self {
+        self.alpha = Some(alpha.to_string());
+        self
+    }
+
+    /// Store hashed vectors on a DISKANN index (`HASHED_VECTOR`).
+    pub fn with_hashed_vector(mut self, hashed_vector: bool) -> Self {
+        self.hashed_vector = hashed_vector;
+        self
+    }
+
     /// Validate the index definition.
     ///
     /// Returns [`SurqlError::Validation`] when the name or column list is
-    /// empty, or when vector-index fields are missing required members.
+    /// empty, when vector-index fields are missing required members, or when
+    /// a vector index carries a member combination the engine is known to
+    /// refuse (see [`Self::validate_vector_members`]).
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(SurqlError::Validation {
@@ -297,11 +253,77 @@ impl IndexDefinition {
                 reason: format!("Index {:?} must have at least one column", self.name),
             });
         }
-        if matches!(self.index_type, IndexType::Mtree | IndexType::Hnsw) && self.dimension.is_none()
+        if matches!(
+            self.index_type,
+            IndexType::Mtree | IndexType::Hnsw | IndexType::Diskann
+        ) && self.dimension.is_none()
         {
             return Err(SurqlError::Validation {
                 reason: format!("Vector index {:?} requires a dimension", self.name),
             });
+        }
+        self.validate_vector_members()
+    }
+
+    /// Engine-shaped refusals for the vector kinds, caught before a
+    /// statement is sent (all probed against SurrealDB 3.2.4).
+    ///
+    /// - MTREE parses only `F64` / `F32` / `I64` / `I32` / `I16` element
+    ///   types; `F16` / `I8` / `U8` are a parse error.
+    /// - DISKANN accepts only `F32` / `F16` / `I8` / `U8` element types.
+    /// - DISKANN accepts only the metrics [`DiskAnnDistanceType`] can spell
+    ///   (`EUCLIDEAN`, `COSINE`, `INNER_PRODUCT`, `COSINE_NORMALIZED`); a
+    ///   metric aimed at it through the MTREE/HNSW members would be silently
+    ///   dropped by the renderer, so that mistake is refused here instead.
+    ///
+    /// HNSW accepts every [`MTreeVectorType`] variant, so it needs no check.
+    fn validate_vector_members(&self) -> Result<()> {
+        if self.index_type == IndexType::Mtree {
+            if let Some(vt) = self.vector_type {
+                if matches!(
+                    vt,
+                    MTreeVectorType::F16 | MTreeVectorType::I8 | MTreeVectorType::U8
+                ) {
+                    return Err(SurqlError::Validation {
+                        reason: format!(
+                            "MTREE index {:?} cannot use TYPE {}: the engine only accepts \
+                             F64, F32, I64, I32, or I16 for MTREE",
+                            self.name,
+                            vt.as_str()
+                        ),
+                    });
+                }
+            }
+        }
+        if self.index_type == IndexType::Diskann {
+            if let Some(vt) = self.vector_type {
+                if !matches!(
+                    vt,
+                    MTreeVectorType::F32
+                        | MTreeVectorType::F16
+                        | MTreeVectorType::I8
+                        | MTreeVectorType::U8
+                ) {
+                    return Err(SurqlError::Validation {
+                        reason: format!(
+                            "DISKANN index {:?} cannot use TYPE {}: the engine only accepts \
+                             F32, F16, I8, or U8 for DISKANN",
+                            self.name,
+                            vt.as_str()
+                        ),
+                    });
+                }
+            }
+            if self.distance.is_some() || self.hnsw_distance.is_some() {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "DISKANN index {:?} takes its metric through diskann_distance \
+                         (EUCLIDEAN, COSINE, INNER_PRODUCT, or COSINE_NORMALIZED); the engine \
+                         refuses every other MTREE/HNSW metric for DISKANN",
+                        self.name
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -371,6 +393,7 @@ impl IndexDefinition {
                 self.push_tail(&mut sql);
                 sql
             }
+            IndexType::Diskann => self.render_diskann(table, ine),
             _ => {
                 let columns = self.columns.join(", ");
                 let mut sql = format!(
@@ -399,6 +422,44 @@ impl IndexDefinition {
                 sql
             }
         }
+    }
+
+    /// Render the `DISKANN` form. The engine always echoes DIST / TYPE /
+    /// DEGREE / L_BUILD / ALPHA back with its defaults filled in, even when
+    /// the definition never stated them, so this spells them all — the same
+    /// lesson as the sequence BATCH/START echo. A definition that omitted
+    /// one would never compare equal to its own echo, and a reconcile would
+    /// re-apply the index on every boot.
+    fn render_diskann(&self, table: &str, ine: &str) -> String {
+        let field = self.columns.first().map_or("", String::as_str);
+        let dim = self.dimension.unwrap_or(0);
+        let dist = self
+            .diskann_distance
+            .unwrap_or(DiskAnnDistanceType::Euclidean);
+        let vt = self.vector_type.unwrap_or(MTreeVectorType::F32);
+        let degree = self.degree.unwrap_or(DISKANN_DEFAULT_DEGREE);
+        let l_build = self.l_build.unwrap_or(DISKANN_DEFAULT_L_BUILD);
+        let alpha = self.alpha.as_deref().unwrap_or(DISKANN_DEFAULT_ALPHA);
+        let mut sql = format!(
+            "DEFINE INDEX{ine} {name} ON TABLE {table} COLUMNS {field} DISKANN \
+             DIMENSION {dim} DIST {dist} TYPE {vt} DEGREE {degree} L_BUILD {l_build} \
+             ALPHA {alpha}",
+            ine = ine,
+            name = self.name,
+            table = table,
+            field = field,
+            dim = dim,
+            dist = dist.as_str(),
+            vt = vt.as_str(),
+            degree = degree,
+            l_build = l_build,
+            alpha = alpha,
+        );
+        if self.hashed_vector {
+            sql.push_str(" HASHED_VECTOR");
+        }
+        self.push_tail(&mut sql);
+        sql
     }
 
     /// Close a rendered statement, appending the `CONCURRENTLY` build
@@ -545,61 +606,6 @@ where
         .with_bm25()
 }
 
-/// Build an MTREE vector index.
-pub fn mtree_index(
-    name: impl Into<String>,
-    column: impl Into<String>,
-    dimension: u32,
-    distance: MTreeDistanceType,
-    vector_type: MTreeVectorType,
-) -> IndexDefinition {
-    IndexDefinition {
-        name: name.into(),
-        columns: vec![column.into()],
-        index_type: IndexType::Mtree,
-        dimension: Some(dimension),
-        distance: Some(distance),
-        vector_type: Some(vector_type),
-        hnsw_distance: None,
-        efc: None,
-        m: None,
-        analyzer: None,
-        bm25: false,
-        highlights: false,
-        concurrently: false,
-    }
-}
-
-/// Build an HNSW vector index.
-///
-/// `efc` and `m` are optional tuning parameters; when omitted, the server
-/// defaults are used.
-pub fn hnsw_index(
-    name: impl Into<String>,
-    column: impl Into<String>,
-    dimension: u32,
-    distance: HnswDistanceType,
-    vector_type: MTreeVectorType,
-    efc: Option<u32>,
-    m: Option<u32>,
-) -> IndexDefinition {
-    IndexDefinition {
-        name: name.into(),
-        columns: vec![column.into()],
-        index_type: IndexType::Hnsw,
-        dimension: Some(dimension),
-        distance: None,
-        vector_type: Some(vector_type),
-        hnsw_distance: Some(distance),
-        efc,
-        m,
-        analyzer: None,
-        bm25: false,
-        highlights: false,
-        concurrently: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,21 +707,7 @@ mod tests {
         assert_eq!(IndexType::Standard.as_str(), "INDEX");
         assert_eq!(IndexType::Mtree.as_str(), "MTREE");
         assert_eq!(IndexType::Hnsw.as_str(), "HNSW");
-    }
-
-    #[test]
-    fn mtree_distance_display() {
-        assert_eq!(format!("{}", MTreeDistanceType::Cosine), "COSINE");
-    }
-
-    #[test]
-    fn hnsw_distance_display() {
-        assert_eq!(format!("{}", HnswDistanceType::Chebyshev), "CHEBYSHEV");
-    }
-
-    #[test]
-    fn mtree_vector_type_display() {
-        assert_eq!(format!("{}", MTreeVectorType::F32), "F32");
+        assert_eq!(IndexType::Diskann.as_str(), "DISKANN");
     }
 
     #[test]
@@ -783,58 +775,6 @@ mod tests {
     }
 
     #[test]
-    fn mtree_index_to_surql() {
-        let idx = mtree_index(
-            "embedding_idx",
-            "embedding",
-            1536,
-            MTreeDistanceType::Cosine,
-            MTreeVectorType::F32,
-        );
-        let sql = idx.to_surql("doc");
-        assert!(sql.contains(
-            "DEFINE INDEX embedding_idx ON TABLE doc COLUMNS embedding MTREE DIMENSION 1536"
-        ));
-        assert!(sql.contains("DIST COSINE"));
-        assert!(sql.contains("TYPE F32"));
-    }
-
-    #[test]
-    fn hnsw_index_to_surql_with_efc_m() {
-        let idx = hnsw_index(
-            "feat_idx",
-            "features",
-            128,
-            HnswDistanceType::Cosine,
-            MTreeVectorType::F32,
-            Some(500),
-            Some(16),
-        );
-        let sql = idx.to_surql("doc");
-        assert!(sql.contains("HNSW DIMENSION 128"));
-        assert!(sql.contains("DIST COSINE"));
-        assert!(sql.contains("TYPE F32"));
-        assert!(sql.contains("EFC 500"));
-        assert!(sql.contains("M 16"));
-    }
-
-    #[test]
-    fn hnsw_index_without_efc_m_omits_them() {
-        let idx = hnsw_index(
-            "feat_idx",
-            "features",
-            64,
-            HnswDistanceType::Euclidean,
-            MTreeVectorType::F64,
-            None,
-            None,
-        );
-        let sql = idx.to_surql("doc");
-        assert!(!sql.contains("EFC"));
-        assert!(!sql.contains("M 12"));
-    }
-
-    #[test]
     fn index_to_surql_if_not_exists() {
         let idx = unique_index("email_idx", ["email"]);
         assert_eq!(
@@ -868,5 +808,129 @@ mod tests {
     fn index_validate_hnsw_requires_dimension() {
         let idx = IndexDefinition::new("x", ["v"]).with_type(IndexType::Hnsw);
         assert!(idx.validate().is_err());
+    }
+
+    #[test]
+    fn index_validate_diskann_requires_dimension() {
+        let mut idx = IndexDefinition::new("x", ["v"]).with_type(IndexType::Diskann);
+        assert!(idx.validate().is_err());
+        idx.dimension = Some(64);
+        assert!(idx.validate().is_ok());
+    }
+
+    #[test]
+    fn index_validate_refuses_f16_on_mtree() {
+        let idx = mtree_index("x", "v", 8, MTreeDistanceType::Cosine, MTreeVectorType::F16);
+        let err = idx.validate().expect_err("MTREE refuses F16");
+        assert!(
+            err.to_string().contains("F64, F32, I64, I32, or I16"),
+            "{err}"
+        );
+        let idx = mtree_index("x", "v", 8, MTreeDistanceType::Cosine, MTreeVectorType::U8);
+        assert!(idx.validate().is_err());
+    }
+
+    #[test]
+    fn index_validate_refuses_wide_types_on_diskann() {
+        for vt in [
+            MTreeVectorType::F64,
+            MTreeVectorType::I64,
+            MTreeVectorType::I32,
+            MTreeVectorType::I16,
+        ] {
+            let idx = diskann_index("x", "v", 8, DiskAnnDistanceType::Cosine, vt);
+            let err = idx.validate().expect_err("DISKANN refuses the wide types");
+            assert!(err.to_string().contains("F32, F16, I8, or U8"), "{err}");
+        }
+        for vt in [
+            MTreeVectorType::F32,
+            MTreeVectorType::F16,
+            MTreeVectorType::I8,
+            MTreeVectorType::U8,
+        ] {
+            let idx = diskann_index("x", "v", 8, DiskAnnDistanceType::Cosine, vt);
+            assert!(idx.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn index_validate_refuses_a_foreign_metric_on_diskann() {
+        let mut idx = diskann_index(
+            "x",
+            "v",
+            8,
+            DiskAnnDistanceType::Cosine,
+            MTreeVectorType::F32,
+        );
+        idx.hnsw_distance = Some(HnswDistanceType::Manhattan);
+        let err = idx.validate().expect_err("DISKANN refuses HNSW metrics");
+        assert!(err.to_string().contains("diskann_distance"), "{err}");
+    }
+
+    #[test]
+    fn diskann_renders_the_defaults_even_when_unset() {
+        // A hand-assembled definition with an empty tail still spells the
+        // engine's defaults, per the echo discipline.
+        let mut idx = IndexDefinition::new("pc", ["v"]).with_type(IndexType::Diskann);
+        idx.dimension = Some(3);
+        assert_eq!(
+            idx.to_surql("t"),
+            "DEFINE INDEX pc ON TABLE t COLUMNS v DISKANN DIMENSION 3 \
+             DIST EUCLIDEAN TYPE F32 DEGREE 64 L_BUILD 100 ALPHA 1.2;"
+        );
+    }
+
+    #[test]
+    fn with_alpha_stores_the_canonical_decimal() {
+        let idx = diskann_index(
+            "pc",
+            "v",
+            3,
+            DiskAnnDistanceType::Cosine,
+            MTreeVectorType::F32,
+        )
+        .with_alpha(1.5);
+        assert_eq!(idx.alpha.as_deref(), Some("1.5"));
+        assert_eq!(
+            diskann_index(
+                "pc",
+                "v",
+                3,
+                DiskAnnDistanceType::Cosine,
+                MTreeVectorType::F32
+            )
+            .with_alpha(2.0)
+            .alpha
+            .as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn diskann_survives_serde_and_defaults_on_old_snapshots() {
+        let idx = diskann_index(
+            "pc",
+            "v",
+            3,
+            DiskAnnDistanceType::CosineNormalized,
+            MTreeVectorType::I8,
+        )
+        .with_degree(48)
+        .with_hashed_vector(true);
+        let json = serde_json::to_string(&idx).unwrap();
+        let back: IndexDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(idx, back);
+        // Stored snapshots and old contracts predate every DISKANN member;
+        // they must keep deserialising with the members defaulted off.
+        let legacy: IndexDefinition = serde_json::from_str(
+            r#"{"name":"i","columns":["a"],"type":"HNSW","dimension":8,"efc":150}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.index_type, IndexType::Hnsw);
+        assert_eq!(legacy.diskann_distance, None);
+        assert_eq!(legacy.degree, None);
+        assert_eq!(legacy.l_build, None);
+        assert_eq!(legacy.alpha, None);
+        assert!(!legacy.hashed_vector);
     }
 }
