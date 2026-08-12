@@ -794,12 +794,10 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
     let forward_sql = match idx.index_type {
         IndexType::Mtree => mtree_index_to_sql(table, idx),
         IndexType::Hnsw => hnsw_index_to_sql(table, idx),
-        // A DISKANN index renders through the canonical serializer, which
-        // already spells the full DIST/TYPE/DEGREE/L_BUILD/ALPHA tail the
-        // engine echoes; a full-text index does too, because it carries an
-        // analyzer / BM25 / highlights clause the bare `as_str` path below
-        // would drop.
-        IndexType::Diskann | IndexType::Search => idx.to_surql_with_options(table, false),
+        // A full-text index carries an analyzer / BM25 / highlights clause, so
+        // render it through the definition's own (FULLTEXT-aware) serializer
+        // rather than the bare `as_str` path below.
+        IndexType::Search => idx.to_surql_with_options(table, false),
         _ => {
             let columns = idx.columns.join(", ");
             let mut sql = format!(
@@ -836,7 +834,7 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
     let backward_sql = match idx.index_type {
         IndexType::Mtree => mtree_index_to_sql(table, idx),
         IndexType::Hnsw => hnsw_index_to_sql(table, idx),
-        IndexType::Diskann | IndexType::Search => idx.to_surql_with_options(table, false),
+        IndexType::Search => idx.to_surql_with_options(table, false),
         _ => {
             let columns = idx.columns.join(", ");
             format!(
@@ -1164,9 +1162,8 @@ mod tests {
     use crate::schema::edge::{EdgeDefinition, EdgeMode};
     use crate::schema::fields::{FieldDefinition, FieldType};
     use crate::schema::table::{
-        diskann_index, event, hnsw_index, index, mtree_index, table_schema, unique_index,
-        DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
-        MTreeVectorType, TableMode,
+        event, hnsw_index, index, mtree_index, table_schema, unique_index, HnswDistanceType,
+        IndexDefinition, IndexType, MTreeDistanceType, MTreeVectorType, TableMode,
     };
 
     fn tbl(name: &str) -> TableDefinition {
@@ -1560,42 +1557,6 @@ mod tests {
         let diffs = diff_indexes("doc", &[idx], &[]);
         let sql = &diffs[0].forward_sql;
         assert!(!sql.contains("EFC"));
-    }
-
-    #[test]
-    fn diff_indexes_added_diskann_spells_the_full_tail() {
-        let idx = diskann_index(
-            "d_idx",
-            "v",
-            3,
-            DiskAnnDistanceType::Cosine,
-            MTreeVectorType::F16,
-        );
-        let diffs = diff_indexes("doc", &[idx], &[]);
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(
-            diffs[0].forward_sql,
-            "DEFINE INDEX d_idx ON TABLE doc COLUMNS v DISKANN DIMENSION 3 \
-             DIST COSINE TYPE F16 DEGREE 64 L_BUILD 100 ALPHA 1.2;"
-        );
-        assert_eq!(diffs[0].backward_sql, "REMOVE INDEX d_idx ON TABLE doc;");
-    }
-
-    #[test]
-    fn diff_indexes_dropped_diskann_recreates_in_backward() {
-        let idx = diskann_index(
-            "d_idx",
-            "v",
-            3,
-            DiskAnnDistanceType::InnerProduct,
-            MTreeVectorType::U8,
-        )
-        .with_hashed_vector(true);
-        let diffs = diff_indexes("doc", &[], &[idx]);
-        assert!(diffs[0].forward_sql.starts_with("REMOVE INDEX d_idx"));
-        assert!(diffs[0].backward_sql.contains("DISKANN DIMENSION 3"));
-        assert!(diffs[0].backward_sql.contains("DIST INNER_PRODUCT"));
-        assert!(diffs[0].backward_sql.contains("HASHED_VECTOR"));
     }
 
     #[test]

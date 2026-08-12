@@ -7,41 +7,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Added
-
-- **DISKANN vector indexes and the F16 element type (SurrealDB 3.2).**
-  `IndexType::Diskann` and the `diskann_index(name, column, dimension,
-  distance, vector_type)` builder define the on-disk ANN graph the 3.2
-  engine parses, with `with_degree` / `with_l_build` / `with_alpha` /
-  `with_hashed_vector` for the tuning tail and `DiskAnnDistanceType` for
-  the metric — its own enum (`EUCLIDEAN` / `COSINE` / `INNER_PRODUCT` /
-  `COSINE_NORMALIZED`) because the engine's DISKANN set neither contains
-  nor is contained by the HNSW one. `MTreeVectorType` gained `F16`, `I8`,
-  and `U8`, which HNSW also accepts. The `<|k,ef|>` KNN operator reaches a
-  DISKANN index through the same `KnnScan` plan HNSW gets. This unblocks
-  downstream F16/DiskANN adoption (copal roadmap item 6).
-
-  The engine echoes a DISKANN index back with `DIST` / `TYPE` / `DEGREE` /
-  `L_BUILD` / `ALPHA` always spelled — defaults `EUCLIDEAN` / `F32` / 64 /
-  100 / 1.2 filled in even when the definition never stated them, and a
-  float `ALPHA` carrying a trailing `f` suffix (`ALPHA 1.2f`). The same
-  lesson as the sequence `BATCH`/`START` echo applies: the renderer and
-  builder spell the defaults explicitly, and the parser strips the `f`
-  suffix, so a definition compares equal to its own echo instead of
-  re-applying on every reconcile boot.
-
-  `IndexDefinition::validate` refuses what the probed engine refuses, by
-  name: a DISKANN element type outside `F32` / `F16` / `I8` / `U8`, an
-  MTREE element type among the new `F16` / `I8` / `U8` (MTREE still parses
-  only its historical five), and an MTREE/HNSW metric aimed at a DISKANN
-  index, which only `diskann_distance` can carry. The new
-  `IndexDefinition` members (`diskann_distance`, `degree`, `l_build`,
-  `alpha`, `hashed_vector`) all default off in serde, so stored snapshots
-  and old contracts deserialise unchanged. The vector-index vocabulary
-  moved to `schema::index_vector` to keep `schema::index` under the
-  1000-LOC budget; every existing path re-resolves through the old
-  re-exports.
-
 ## [0.32.0] - 2026-08-11
 
 ### Security

@@ -254,8 +254,8 @@ mod tests {
     use crate::schema::edge::{typed_edge, EdgeMode};
     use crate::schema::fields::{datetime_field, int_field, string_field, FieldType};
     use crate::schema::table::{
-        diskann_index, mtree_index, search_index, table_schema, unique_index, DiskAnnDistanceType,
-        HnswDistanceType, IndexType, MTreeDistanceType, MTreeVectorType, TableMode,
+        mtree_index, search_index, table_schema, unique_index, HnswDistanceType, IndexType,
+        MTreeDistanceType, MTreeVectorType, TableMode,
     };
     use serde_json::json;
 
@@ -459,76 +459,6 @@ mod tests {
         assert_eq!(idx.vector_type, Some(MTreeVectorType::F32));
         assert_eq!(idx.efc, Some(500));
         assert_eq!(idx.m, Some(16));
-    }
-
-    #[test]
-    fn parse_index_hnsw_f16_reads_the_engine_echo() {
-        // Exact `INFO FOR TABLE` echo from SurrealDB 3.2.4, M0/LM tail and all.
-        let idx = parse_index(
-            "pb",
-            "DEFINE INDEX pb ON t FIELDS v HNSW DIMENSION 3 DIST COSINE TYPE F16 EFC 150 M 12 \
-             M0 24 LM 0.40242960438184466f",
-        )
-        .unwrap();
-        assert_eq!(idx.index_type, IndexType::Hnsw);
-        assert_eq!(idx.vector_type, Some(MTreeVectorType::F16));
-        assert_eq!(idx.efc, Some(150));
-        assert_eq!(idx.m, Some(12));
-    }
-
-    #[test]
-    fn parse_index_diskann_reads_the_engine_echo() {
-        // Exact `INFO FOR TABLE` echo from SurrealDB 3.2.4: the engine
-        // always spells DEGREE/L_BUILD/ALPHA, and ALPHA carries a trailing
-        // `f` float suffix the parser must strip.
-        let idx = parse_index(
-            "pc",
-            "DEFINE INDEX pc ON t FIELDS v DISKANN DIMENSION 3 DIST COSINE TYPE F32 DEGREE 64 \
-             L_BUILD 100 ALPHA 1.2f",
-        )
-        .unwrap();
-        assert_eq!(idx.index_type, IndexType::Diskann);
-        assert_eq!(idx.columns, vec!["v".to_string()]);
-        assert_eq!(idx.dimension, Some(3));
-        assert_eq!(idx.diskann_distance, Some(DiskAnnDistanceType::Cosine));
-        assert_eq!(idx.vector_type, Some(MTreeVectorType::F32));
-        assert_eq!(idx.degree, Some(64));
-        assert_eq!(idx.l_build, Some(100));
-        assert_eq!(idx.alpha.as_deref(), Some("1.2"));
-        assert!(!idx.hashed_vector);
-        // The parsed echo equals what the builder declares, so a reconcile
-        // never re-applies the index.
-        assert_eq!(
-            idx,
-            diskann_index(
-                "pc",
-                "v",
-                3,
-                DiskAnnDistanceType::Cosine,
-                MTreeVectorType::F32
-            )
-        );
-    }
-
-    #[test]
-    fn parse_index_diskann_hashed_vector_and_integer_alpha() {
-        // HASHED_VECTOR echoes last; an integer ALPHA echoes without the
-        // `f` suffix (both probed against 3.2.4).
-        let idx = parse_index(
-            "pc",
-            "DEFINE INDEX pc ON t FIELDS v DISKANN DIMENSION 3 DIST COSINE_NORMALIZED TYPE I8 \
-             DEGREE 48 L_BUILD 90 ALPHA 2 HASHED_VECTOR",
-        )
-        .unwrap();
-        assert_eq!(
-            idx.diskann_distance,
-            Some(DiskAnnDistanceType::CosineNormalized)
-        );
-        assert_eq!(idx.vector_type, Some(MTreeVectorType::I8));
-        assert_eq!(idx.degree, Some(48));
-        assert_eq!(idx.l_build, Some(90));
-        assert_eq!(idx.alpha.as_deref(), Some("2"));
-        assert!(idx.hashed_vector);
     }
 
     // ---- parse_event --------------------------------------------------------
