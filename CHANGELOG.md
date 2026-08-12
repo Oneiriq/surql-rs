@@ -7,6 +7,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-11
+
 ### Security
 
 - **`surrealdb` is required at 3.1.5 or later.** The 3.0 line carries
@@ -25,6 +27,193 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   presets became `TableStyle` values loaded with `load_style`. Two
   call sites (the streaming subscription id and the CLI table
   renderer) moved to the new names; behaviour is unchanged.
+
+- **`parse_table_full`, `parse_table_info`, and `parse_edge_info` refused
+  the response shape `query` actually returns.** `query` answers one
+  result per statement, so an `INFO FOR TABLE` object arrives wrapped in
+  a one-element array that only `parse_db_info` had learned to unwrap;
+  every other caller had to remember to index `[0]` first. The table and
+  edge parsers now accept either shape by the same argument — an INFO
+  response is never itself an array, so the two cannot be confused — and
+  callers that already index the wrapper keep working, since indexing
+  yields the bare object. No other public parser takes the response
+  value, so none can carry the same footgun.
+
+- **`global_helpers_configure_and_invalidate` flaked against its own
+  binary.** The cache integration tests run concurrently in one process,
+  and `is_cached_returns_false_when_no_manager` calls `close_cache()`,
+  which empties the process-global manager slot; landing between another
+  test's `configure_cache` and its reads of that slot, it made
+  `invalidate` and `clear_cache` report zero. The two tests that touch
+  the global slot now serialize on a shared lock, the pattern the cache
+  module's own unit tests already use. Test-only; no library change.
+
+- **A field that gained `REFERENCE` silently tracked nothing for its
+  existing rows.** The engine backfills nothing when the clause is
+  added, and a self-assignment registers nothing either; only an actual
+  value change does. Applying the DDL a diff renders therefore left
+  `<~` blind to every row that predated the clause, and whatever
+  consumed the reverse references undercounted with no error anywhere.
+  `schema::reference_backfill_sql(table, field)` renders the rewrite
+  that makes the tracking true (NONE-and-back per row, shaped by two
+  probed `FOR` quirks: `SELECT VALUE id` because `FOR` refuses object
+  rows, `?? []` because it refuses an empty selection). The field diff
+  carries it in `details` with a `SchemaDiff::reference_backfill_sql()`
+  accessor rather than inside `forward_sql`, because it is DML an
+  application's own events may refuse and a live reconciler must choose
+  where it runs; the migration generator, whose files a person reviews,
+  writes it into the file right after the DDL, and registration inside
+  the same transaction is probed behaviour.
+
+  Getting the rewrite through a migration file exposed a second bug:
+  the statement splitter cut on every semicolon, which shattered any
+  statement with a braced body — the backfill's `FOR` loop, and equally
+  a `DEFINE FUNCTION` with more than one statement in it. The splitter
+  now respects brace and parenthesis nesting and string literals, so a
+  statement ends only at a top-level semicolon.
+
+- **`surql schema tables` / `export` / `validate` and `surql bucket list`
+  read every database as empty.** The CLI passed the raw
+  `client.query("INFO FOR DB;")` response to `parse_db_info`, but `query`
+  answers one result per statement, so the INFO object arrives wrapped in
+  a one-element array the parser refused; `unwrap_or_default()` at all
+  four call sites turned that refusal into an empty database report.
+  `parse_db_info` now accepts either shape (an INFO response is never
+  itself an array, so the two cannot be confused), and the call sites
+  surface parse errors instead of defaulting them, so an echo the parser
+  cannot read is now a message rather than a silent nothing.
+
+### Added
+
+- **Record references (`DEFINE FIELD ... REFERENCE`).** `FieldDefinition`
+  gained `reference: Option<ReferenceAction>` (`IGNORE` / `REJECT` /
+  `CASCADE` / `UNSET`) and `computed: Option<String>`, with
+  `FieldBuilder::reference` / `::computed` and the
+  `reverse_reference_field(name, source)` constructor for the reverse half
+  (`COMPUTED <~source`). `Query::reverse_traverse` and
+  `query::references::reverse_reference_query` render the `<~table` /
+  `<~table.{ a, b }` projection that reads incoming links back.
+
+  The `REFERENCE` clause always spells out its `ON DELETE` action, because a
+  bare `REFERENCE` is what `INFO FOR TABLE` echoes as `ON DELETE IGNORE`;
+  emitting the short form would diff against the database forever. The
+  parser reads both forms, and the assertion / default / value extractors
+  now stop at `REFERENCE` and `COMPUTED`, which the engine emits *after*
+  `ASSERT`.
+
+  `FieldDefinition::validate` rejects what v3.0.5 rejects: `REFERENCE` on a
+  nested field (`metadata.comics`) or on anything that is not a
+  `record<table>` / `array<record<table>>` link, and `COMPUTED` beside
+  `READONLY`, `VALUE`, or `DEFAULT`. Union types (`array<record<x>> |
+  string`), which the engine also rejects, are not expressible here.
+
+- **Background index builds (`DEFINE INDEX ... CONCURRENTLY`).**
+  `IndexDefinition::with_concurrently` appends the directive, which lets a
+  large index populate without blocking the statement.
+  `info_for_index_surql(name, table)` renders the progress query and
+  `IndexBuildStatus::from_info` reads the `{ building: { status, initial,
+  pending, updated } }` answer, including through the array
+  `DatabaseClient::query` wraps results in.
+
+  v3.0.5 accepts `CONCURRENTLY` and then echoes the index back **without**
+  it, so the parser deliberately reports `concurrently: false` and no
+  comparison looks at the member. Storing it as parsed would make every
+  background-built index diff forever.
+
+- **Table change feeds (`DEFINE TABLE ... CHANGEFEED`).** `ChangeFeed` and
+  `TableDefinition::with_changefeed` render
+  `CHANGEFEED <duration> [INCLUDE ORIGINAL]` between the mode and the
+  `PERMISSIONS` clause, `parse_changefeed` reads it back out of the
+  `INFO FOR DB` echo, and `diff_tables` reports a change as the new
+  `DiffOperation::ModifyTable` carrying the full `DEFINE TABLE OVERWRITE`
+  form (a bare `CHANGEFEED` statement would reset the table's mode and
+  permissions).
+
+  The read side is `query::changes`: `show_changes_surql(table, since,
+  limit)` renders
+  `SHOW CHANGES FOR TABLE <t> SINCE <versionstamp|d'...'> [LIMIT n]`, and
+  `ChangeSet::from_response` pulls the `versionstamp` / `changes` pairs out
+  of the answer so a consumer can resume where it stopped.
+
+- **Pre-computed view tables (`DEFINE TABLE ... TYPE NORMAL AS SELECT`).**
+  `ViewDefinition` / `ViewGroup` and `TableDefinition::with_view` render
+  `TYPE NORMAL <mode> AS SELECT <projections> FROM <tables> [WHERE ...]
+  [GROUP BY ...|GROUP ALL]`, `parser::parse_view` reads it back, and a
+  changed body reports as `DiffOperation::ModifyTable`.
+
+  The parser splits on top-level commas and keywords only, so
+  `math::max([a, b])` stays one projection and a table literally named
+  `comment` is not mistaken for a `COMMENT` clause. Views compare on the
+  whitespace-normalised clause, because the engine reformats what it stores.
+
+  `TableDefinition::validate` rejects a view that declares fields: the
+  engine computes a view's contents and stores no field definitions for one,
+  so a reconciler would drop the declared fields on every boot.
+
+- **ID sequences (`DEFINE SEQUENCE`).** `SequenceDefinition` /
+  `sequence_schema` render `BATCH` / `START` / `TIMEOUT` and the
+  `REMOVE SEQUENCE IF EXISTS` and `sequence::nextval("<name>")` statements;
+  `parse_sequence` reads the `sequences` map of `INFO FOR DB` back;
+  `DatabaseInfo::sequences` and `SchemaSnapshot::sequences` carry them; and
+  `diff_objects::diff_sequences` reports `Add` / `Modify` / `DropSequence`.
+
+  `BATCH` and `START` are always rendered, including at their defaults
+  (1000 and 0), because the engine echoes them either way.
+
+- **Custom functions (`DEFINE FUNCTION fn::<name>`).**
+  `FunctionDefinition` / `function_schema` render the signature, return
+  type, body, `COMMENT`, and `PERMISSIONS`; `parse_function` reads the
+  `functions` map of `INFO FOR DB` back (splitting arguments on top-level
+  commas so `array<record<x>>` survives, and taking the body from the
+  outermost brace pair so a nested block does not truncate it); and
+  `diff_objects::diff_functions` reports `Add` / `Modify` / `DropFunction`.
+
+  The engine rewrites what it stores — `option<T>` becomes `none | T`, the
+  body loses its trailing `;`, and an omitted `PERMISSIONS` comes back as
+  `PERMISSIONS FULL`. `FunctionDefinition::normalized` applies the same
+  rewrites and the diff compares canonical forms, so a function does not
+  report as modified on every reconcile.
+
+- **Database params (`DEFINE PARAM $<name>`).** `ParamDefinition` /
+  `param_schema` render the value, `COMMENT`, and `PERMISSIONS`;
+  `parse_param` reads the `params` map of `INFO FOR DB` back; and
+  `diff_objects::diff_params` reports `Add` / `Modify` / `DropParam`. As with
+  functions, `normalized` fills in the `PERMISSIONS FULL` the engine echoes.
+
+  The parser locates clause keywords outside quoted runs, so a value like
+  `'leave a comment about permissions'` is not cut at its own words.
+
+- **`migration::diff_objects`.** Every database-level object diff now lives
+  here: `diff_buckets` and `diff_analyzers` moved across (re-exported from
+  `migration::diff`, so no path changes), and `diff_named` captures the add
+  / drop / modify shape they share, so a new kind is three lines rather than
+  another copy of the walk. Net effect: `migration::diff` is smaller than it
+  was before this release despite gaining change-feed and view diffing.
+  `SchemaDiff` gained one `object: Option<String>` field naming the object
+  such a diff targets.
+
+- **`array<record<table>>` field types.** An ARRAY field with a
+  `target_table` now renders `array<record<{target}>>` instead of a bare
+  `array`, which is the shape a to-many reference needs. A `target_table`
+  on an ARRAY field was previously carried but never rendered, so this
+  changes emitted DDL for any definition that set both.
+
+### Changed
+
+- **BREAKING: `SchemaSnapshot` and `SchemaDiff` gained fields.**
+  `SchemaSnapshot::sequences` and `SchemaDiff::object` both default on
+  deserialize, so stored snapshots still load, but a struct literal that
+  names every field stops compiling. Use the constructors
+  (`SchemaSnapshot::new` / `from_parts` / `from_all_parts`) or
+  `..Default::default()`, as the shipped examples now do.
+
+- **Module splits to stay inside the 1000-LOC budget.** `FieldType` moved to
+  `schema::field_type` and `IndexDefinition` (with `IndexType`, the distance
+  and vector-type enums, and the `index` / `unique_index` / `search_index` /
+  `bm25_index` / `mtree_index` / `hnsw_index` builders) moved to
+  `schema::index`. Both are re-exported from their previous homes
+  (`schema::fields`, `schema::table`), so no consumer path changes.
+
 
 ## [0.31.0] - 2026-08-07
 

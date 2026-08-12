@@ -11,7 +11,10 @@
 //! - [`batch`]: pure [`build_upsert_query`] /
 //!   [`build_relate_query`] renderers plus async
 //!   `*_many` helpers *(feature `client`)*.
+//! - [`changes`]: `SHOW CHANGES FOR TABLE` change-feed reads.
 //! - [`graph_query`]: fluent [`GraphQuery`] builder.
+//! - [`references`]: reverse-reference (`<~`) projection helpers, the read
+//!   half of [`DEFINE FIELD ... REFERENCE`](crate::schema::reference).
 //! - [`executor`] *(feature `client`)*: async execution on top of
 //!   [`DatabaseClient`](crate::DatabaseClient).
 //! - [`crud`] *(feature `client`)*: JSON-in / JSON-out record CRUD helpers.
@@ -22,6 +25,7 @@
 
 pub mod batch;
 pub mod builder;
+pub mod changes;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod crud;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
@@ -34,12 +38,14 @@ pub mod graph;
 pub mod graph_query;
 pub mod helpers;
 pub mod hints;
+pub mod references;
 pub mod results;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod typed;
 
 pub use batch::{build_relate_query, build_upsert_query, RelateItem};
 pub use builder::{Condition, Operation, OrderField, Query, WhereCondition};
+pub use changes::{show_changes_surql, ChangeSet, ChangeSince};
 pub use expressions::{
     abs_, array_contains, array_length, as_, avg, cast, ceil, concat, count, count_all, count_if,
     field, floor, func, lower, math_abs, math_ceil, math_floor, math_max, math_mean, math_min,
@@ -56,6 +62,7 @@ pub use hints::{
     merge_hints, render_hints, validate_hint, ExplainHint, FetchHint, FetchStrategy, HintRenderer,
     HintType, IndexHint, ParallelHint, QueryHint, TimeoutHint,
 };
+pub use references::{reverse_reference_projection, reverse_reference_query};
 pub use results::{
     aggregate, count_result, extract_many, extract_one, extract_result, extract_scalar, has_result,
     has_results, paginated, record, records, success, AggregateResult, CountResult, ListResult,

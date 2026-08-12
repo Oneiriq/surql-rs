@@ -22,7 +22,11 @@
 //! - `index` — `DEFINE INDEX` parsing (UNIQUE / SEARCH / MTREE / HNSW).
 //! - `event` — `DEFINE EVENT` parsing.
 //! - `access` — `DEFINE ACCESS` parsing (JWT + RECORD).
+//! - `function` — `DEFINE FUNCTION` parsing.
+//! - `param` — `DEFINE PARAM` parsing.
+//! - `sequence` — `DEFINE SEQUENCE` parsing.
 //! - `table` — `DEFINE TABLE` + `INFO FOR TABLE` parsing.
+//! - `view` — `DEFINE TABLE ... AS SELECT` (view) parsing.
 //! - `db` — `INFO FOR DB` parsing + edge partitioning.
 //!
 //! ## Example
@@ -61,6 +65,9 @@ use crate::error::{Result, SurqlError};
 use crate::schema::access::AccessDefinition;
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
+use crate::schema::function::FunctionDefinition;
+use crate::schema::param::ParamDefinition;
+use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::TableDefinition;
 
 mod access;
@@ -70,9 +77,13 @@ mod db;
 mod edge;
 mod event;
 mod field;
+mod function;
 mod index;
+mod param;
 mod permissions;
+mod sequence;
 mod table;
+mod view;
 
 pub use access::parse_access;
 pub use analyzer::parse_analyzer;
@@ -81,9 +92,13 @@ pub use db::parse_db_info;
 pub use edge::parse_edge_info;
 pub use event::{parse_event, parse_events};
 pub use field::{parse_field, parse_fields};
+pub use function::parse_function;
 pub use index::{parse_index, parse_indexes};
+pub use param::parse_param;
 pub use permissions::parse_table_permissions;
-pub use table::{parse_table_full, parse_table_info, parse_table_mode};
+pub use sequence::parse_sequence;
+pub use table::{parse_changefeed, parse_table_full, parse_table_info, parse_table_mode};
+pub use view::parse_view;
 
 // --- Shared regex helper -----------------------------------------------------
 
@@ -91,6 +106,56 @@ pub use table::{parse_table_full, parse_table_info, parse_table_mode};
 /// the parser submodules.
 pub(super) fn regex_case_insensitive(pattern: &str) -> Regex {
     Regex::new(&format!("(?i){pattern}")).expect("valid regex pattern")
+}
+
+// --- Shared keyword scanning -------------------------------------------------
+
+/// Find `keyword` case-insensitively at a word boundary, skipping anything
+/// inside a quoted run.
+///
+/// Clause keywords are also ordinary English words, so a definition whose
+/// value or comment happens to contain `COMMENT` or `PERMISSIONS` must not be
+/// cut there. Returns the byte offset at which the keyword starts.
+pub(super) fn find_keyword_unquoted(text: &str, keyword: &str) -> Option<usize> {
+    let haystack = text.to_ascii_uppercase();
+    let needle = keyword.to_ascii_uppercase();
+    let bytes = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return None;
+    }
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            None if b == b'\'' || b == b'"' => {
+                quote = Some(b);
+                i += 1;
+                continue;
+            }
+            None => {}
+        }
+        if bytes[i..i + needle.len()] == *needle
+            && (i == 0 || !is_word_byte(bytes[i - 1]))
+            && (i + needle.len() == bytes.len() || !is_word_byte(bytes[i + needle.len()]))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 // --- Shared JSON helpers -----------------------------------------------------
@@ -168,6 +233,15 @@ pub struct DatabaseInfo {
     /// Object-storage bucket definitions.
     #[serde(default)]
     pub buckets: BTreeMap<String, BucketDefinition>,
+    /// Monotonic ID sequences.
+    #[serde(default)]
+    pub sequences: BTreeMap<String, SequenceDefinition>,
+    /// Custom `fn::` functions, keyed without the `fn::` prefix.
+    #[serde(default)]
+    pub functions: BTreeMap<String, FunctionDefinition>,
+    /// Database-level params, keyed without the leading `$`.
+    #[serde(default)]
+    pub params: BTreeMap<String, ParamDefinition>,
 }
 
 #[cfg(test)]
@@ -514,6 +588,39 @@ mod tests {
         assert!(t.fields.is_empty());
     }
 
+    #[test]
+    fn parse_table_info_unwraps_the_query_response_shape() {
+        // `DatabaseClient::query` answers one result per statement, so
+        // the INFO object arrives as `[ { ... } ]`. Same tolerance as
+        // `parse_db_info`: an INFO response is never itself an array.
+        let bare = json!({
+            "tb": "DEFINE TABLE user SCHEMAFULL",
+            "fields": { "email": "DEFINE FIELD email ON TABLE user TYPE string" }
+        });
+        let wrapped = json!([{
+            "tb": "DEFINE TABLE user SCHEMAFULL",
+            "fields": { "email": "DEFINE FIELD email ON TABLE user TYPE string" }
+        }]);
+        let from_bare = parse_table_info("user", &bare, None).unwrap();
+        let from_wrapped = parse_table_info("user", &wrapped, None).unwrap();
+        assert_eq!(from_bare, from_wrapped);
+        assert_eq!(from_wrapped.mode, TableMode::Schemafull);
+        assert_eq!(from_wrapped.fields.len(), 1);
+    }
+
+    #[test]
+    fn parse_table_full_unwraps_the_query_response_shape() {
+        let info = json!({
+            "fields": { "email": "DEFINE FIELD email ON TABLE user TYPE string" }
+        });
+        let wrapped = json!([info.clone()]);
+        let define = "DEFINE TABLE user SCHEMAFULL";
+        let from_bare = parse_table_full("user", define, &info).unwrap();
+        let from_wrapped = parse_table_full("user", define, &wrapped).unwrap();
+        assert_eq!(from_bare, from_wrapped);
+        assert_eq!(from_wrapped.mode, TableMode::Schemafull);
+    }
+
     // ---- parse_db_info ------------------------------------------------------
 
     #[test]
@@ -553,6 +660,26 @@ mod tests {
         assert_eq!(db.tables.len(), 1);
         assert_eq!(db.accesses.len(), 1);
         assert_eq!(db.accesses.get("api").unwrap().access_type, AccessType::Jwt);
+    }
+
+    #[test]
+    fn parse_db_info_unwraps_the_query_response_shape() {
+        // `DatabaseClient::query` answers one result per statement, so
+        // the INFO object arrives as `[ { ... } ]`. Every caller used
+        // to index the wrapper by hand; the CLI forgot, and
+        // `unwrap_or_default` turned the parse failure into an empty
+        // database report.
+        let bare = json!({
+            "tb": { "user": "DEFINE TABLE user SCHEMAFULL" }
+        });
+        let wrapped = json!([{
+            "tb": { "user": "DEFINE TABLE user SCHEMAFULL" }
+        }]);
+        let from_bare = parse_db_info(&bare).unwrap();
+        let from_wrapped = parse_db_info(&wrapped).unwrap();
+        assert_eq!(from_bare.tables.len(), 1);
+        assert_eq!(from_wrapped.tables.len(), from_bare.tables.len());
+        assert!(from_wrapped.tables.contains_key("user"));
     }
 
     #[test]

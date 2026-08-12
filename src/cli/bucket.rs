@@ -184,7 +184,7 @@ async fn define(
 async fn list(settings: &crate::settings::Settings) -> Result<()> {
     let client = connected_client(settings).await?;
     let info = client.query("INFO FOR DB;").await?;
-    let parsed = parse_db_info(&info).unwrap_or_default();
+    let parsed = parse_db_info(&info)?;
     if parsed.buckets.is_empty() {
         fmt::info("no buckets defined");
         return Ok(());

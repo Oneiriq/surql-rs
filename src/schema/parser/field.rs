@@ -11,6 +11,7 @@ use regex::Regex;
 
 use super::regex_case_insensitive;
 use crate::schema::fields::{FieldDefinition, FieldType};
+use crate::schema::reference::ReferenceAction;
 
 // --- Regex accessors ---------------------------------------------------------
 
@@ -32,6 +33,14 @@ fn flexible_regex() -> &'static Regex {
 fn record_target_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| regex_case_insensitive(r"record\s*<\s*(\w+)\s*>"))
+}
+
+/// Matches the `REFERENCE` marker and its optional `ON DELETE <action>` tail.
+/// A bare `REFERENCE` means `ON DELETE IGNORE`, which is also what the engine
+/// echoes back from `INFO FOR TABLE`.
+fn reference_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"\bREFERENCE\b(?:\s+ON\s+DELETE\s+(\w+))?"))
 }
 
 /// Matches `TYPE option<inner>` where `inner` is a bare type word or a
@@ -61,6 +70,21 @@ pub fn parse_fields(fd: &std::collections::BTreeMap<String, String>) -> Vec<Fiel
         .collect()
 }
 
+/// Resolve the `REFERENCE` clause. A bare `REFERENCE` and an explicit
+/// `REFERENCE ON DELETE IGNORE` both yield [`ReferenceAction::Ignore`].
+fn extract_reference(definition: &str) -> Option<ReferenceAction> {
+    let caps = reference_regex().captures(definition)?;
+    Some(
+        caps.get(1)
+            .and_then(|m| ReferenceAction::from_keyword(m.as_str()))
+            .unwrap_or(ReferenceAction::Ignore),
+    )
+}
+
+fn extract_computed(definition: &str) -> Option<String> {
+    extract_clause(definition, "COMPUTED", &terminators_excluding("COMPUTED"))
+}
+
 /// Parse one `DEFINE FIELD` statement.
 ///
 /// Returns `None` when the definition string is empty.
@@ -80,6 +104,8 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
         flexible: extract_flexible(definition),
         target_table: extract_target_table(definition),
         nullable,
+        reference: extract_reference(definition),
+        computed: extract_computed(definition),
     })
 }
 
@@ -221,28 +247,42 @@ fn extract_clause(definition: &str, keyword: &str, terminators: &[&str]) -> Opti
     Some(body.to_string())
 }
 
+/// Clause keywords that can follow any of `ASSERT` / `DEFAULT` / `VALUE` /
+/// `COMPUTED` and therefore terminate its body. `REFERENCE` is in the list
+/// because the engine echoes it *after* `ASSERT`
+/// (`... ASSERT true REFERENCE ON DELETE REJECT ...`), which would otherwise
+/// swallow the whole reference clause into the assertion.
+const CLAUSE_TERMINATORS: &[&str] = &[
+    "ASSERT",
+    "DEFAULT",
+    "VALUE",
+    "COMPUTED",
+    "READONLY",
+    "FLEXIBLE",
+    "REFERENCE",
+    "PERMISSIONS",
+    "COMMENT",
+];
+
+/// [`CLAUSE_TERMINATORS`] minus the clause being extracted.
+fn terminators_excluding(keyword: &str) -> Vec<&'static str> {
+    CLAUSE_TERMINATORS
+        .iter()
+        .copied()
+        .filter(|k| *k != keyword)
+        .collect()
+}
+
 fn extract_assertion(definition: &str) -> Option<String> {
-    extract_clause(
-        definition,
-        "ASSERT",
-        &["DEFAULT", "VALUE", "READONLY", "FLEXIBLE", "PERMISSIONS"],
-    )
+    extract_clause(definition, "ASSERT", &terminators_excluding("ASSERT"))
 }
 
 fn extract_default(definition: &str) -> Option<String> {
-    extract_clause(
-        definition,
-        "DEFAULT",
-        &["VALUE", "READONLY", "FLEXIBLE", "PERMISSIONS", "ASSERT"],
-    )
+    extract_clause(definition, "DEFAULT", &terminators_excluding("DEFAULT"))
 }
 
 fn extract_value(definition: &str) -> Option<String> {
-    extract_clause(
-        definition,
-        "VALUE",
-        &["DEFAULT", "READONLY", "FLEXIBLE", "PERMISSIONS", "ASSERT"],
-    )
+    extract_clause(definition, "VALUE", &terminators_excluding("VALUE"))
 }
 
 fn extract_readonly(definition: &str) -> bool {
@@ -256,6 +296,110 @@ fn extract_flexible(definition: &str) -> bool {
 #[cfg(test)]
 mod echo_tests {
     use crate::schema::fields::FieldType;
+    use crate::schema::reference::ReferenceAction;
+
+    /// The engine echoes a bare `REFERENCE` with its default action spelled
+    /// out; the renderer does the same, so the pair compares equal.
+    #[test]
+    fn engine_echo_reference_round_trips() {
+        let field = super::parse_field(
+            "author",
+            "DEFINE FIELD author ON comment TYPE none | record<person> \
+             REFERENCE ON DELETE CASCADE PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::Record);
+        assert!(field.nullable);
+        assert_eq!(field.target_table.as_deref(), Some("person"));
+        assert_eq!(field.reference, Some(ReferenceAction::Cascade));
+        assert_eq!(
+            field.to_surql("comment"),
+            "DEFINE FIELD author ON TABLE comment TYPE option<record<person>> \
+             REFERENCE ON DELETE CASCADE;"
+        );
+    }
+
+    #[test]
+    fn bare_reference_reads_as_the_ignore_default() {
+        let field = super::parse_field(
+            "f",
+            "DEFINE FIELD f ON comment TYPE record<person> REFERENCE",
+        )
+        .unwrap();
+        assert_eq!(field.reference, Some(ReferenceAction::Ignore));
+    }
+
+    #[test]
+    fn array_of_record_reference_round_trips() {
+        let field = super::parse_field(
+            "c",
+            "DEFINE FIELD c ON comment TYPE array<record<person>> \
+             REFERENCE ON DELETE UNSET PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::Array);
+        assert_eq!(field.target_table.as_deref(), Some("person"));
+        assert_eq!(field.reference, Some(ReferenceAction::Unset));
+        assert_eq!(
+            field.to_surql("comment"),
+            "DEFINE FIELD c ON TABLE comment TYPE array<record<person>> \
+             REFERENCE ON DELETE UNSET;"
+        );
+    }
+
+    /// The engine emits `ASSERT <expr> REFERENCE ...`, so the assertion body
+    /// must stop at the `REFERENCE` keyword.
+    #[test]
+    fn reference_after_assert_does_not_leak_into_the_assertion() {
+        let field = super::parse_field(
+            "b",
+            "DEFINE FIELD b ON comment TYPE none | record<person> ASSERT true \
+             REFERENCE ON DELETE REJECT PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.assertion.as_deref(), Some("true"));
+        assert_eq!(field.reference, Some(ReferenceAction::Reject));
+    }
+
+    #[test]
+    fn computed_field_round_trips_without_a_type() {
+        let field = super::parse_field(
+            "comments",
+            "DEFINE FIELD comments ON person COMPUTED <~comment PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::Any);
+        assert_eq!(field.computed.as_deref(), Some("<~comment"));
+        assert!(field.reference.is_none());
+        assert_eq!(
+            field.to_surql("person"),
+            "DEFINE FIELD comments ON TABLE person COMPUTED <~comment;"
+        );
+    }
+
+    #[test]
+    fn computed_field_keeps_a_declared_type() {
+        let field = super::parse_field(
+            "c1",
+            "DEFINE FIELD c1 ON comment TYPE none | string COMPUTED 'x' PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(field.field_type, FieldType::String);
+        assert!(field.nullable);
+        assert_eq!(field.computed.as_deref(), Some("'x'"));
+        assert_eq!(
+            field.to_surql("comment"),
+            "DEFINE FIELD c1 ON TABLE comment TYPE option<string> COMPUTED 'x';"
+        );
+    }
+
+    #[test]
+    fn a_plain_field_gains_no_reference_or_computed() {
+        let field =
+            super::parse_field("text", "DEFINE FIELD text ON comment TYPE none | string").unwrap();
+        assert!(field.reference.is_none());
+        assert!(field.computed.is_none());
+    }
 
     #[test]
     fn engine_echo_none_union_parses_as_nullable() {

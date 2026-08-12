@@ -19,6 +19,9 @@ use super::access::AccessDefinition;
 use super::analyzer::AnalyzerDefinition;
 use super::bucket::BucketDefinition;
 use super::edge::EdgeDefinition;
+use super::function::FunctionDefinition;
+use super::param::ParamDefinition;
+use super::sequence::SequenceDefinition;
 use super::table::TableDefinition;
 
 /// Render all `DEFINE` statements required to create `table`.
@@ -182,6 +185,91 @@ pub fn generate_bucket_sql_with_options(
     overwrite: bool,
 ) -> Result<Vec<String>> {
     Ok(vec![bucket.to_surql_with_options(if_not_exists, overwrite)?])
+}
+
+/// Render the `DEFINE SEQUENCE` statement(s) for `sequence`.
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_sequence_sql, SequenceDefinition};
+///
+/// let s = SequenceDefinition::new("invoice_no");
+/// assert_eq!(
+///     generate_sequence_sql(&s).unwrap()[0],
+///     "DEFINE SEQUENCE invoice_no BATCH 1000 START 0;"
+/// );
+/// ```
+pub fn generate_sequence_sql(sequence: &SequenceDefinition) -> Result<Vec<String>> {
+    Ok(vec![sequence.to_surql()?])
+}
+
+/// Render the `DEFINE SEQUENCE` statement(s) for `sequence`, optionally with
+/// `IF NOT EXISTS` / `OVERWRITE` guards for idempotent re-application.
+pub fn generate_sequence_sql_with_options(
+    sequence: &SequenceDefinition,
+    if_not_exists: bool,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![
+        sequence.to_surql_with_options(if_not_exists, overwrite)?
+    ])
+}
+
+/// Render the `DEFINE FUNCTION` statement(s) for `function`.
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_function_sql, FunctionDefinition};
+///
+/// let f = FunctionDefinition::new("greet", "RETURN 'hi'");
+/// assert_eq!(
+///     generate_function_sql(&f).unwrap()[0],
+///     "DEFINE FUNCTION fn::greet() { RETURN 'hi' };"
+/// );
+/// ```
+pub fn generate_function_sql(function: &FunctionDefinition) -> Result<Vec<String>> {
+    Ok(vec![function.to_surql()?])
+}
+
+/// Render the `DEFINE FUNCTION` statement(s) for `function`, optionally with
+/// `IF NOT EXISTS` / `OVERWRITE` guards for idempotent re-application.
+pub fn generate_function_sql_with_options(
+    function: &FunctionDefinition,
+    if_not_exists: bool,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![
+        function.to_surql_with_options(if_not_exists, overwrite)?
+    ])
+}
+
+/// Render the `DEFINE PARAM` statement(s) for `param`.
+///
+/// # Examples
+///
+/// ```
+/// use surql::schema::{generate_param_sql, ParamDefinition};
+///
+/// let p = ParamDefinition::new("APP", "'oneiriq'");
+/// assert_eq!(
+///     generate_param_sql(&p).unwrap()[0],
+///     "DEFINE PARAM $APP VALUE 'oneiriq';"
+/// );
+/// ```
+pub fn generate_param_sql(param: &ParamDefinition) -> Result<Vec<String>> {
+    Ok(vec![param.to_surql()?])
+}
+
+/// Render the `DEFINE PARAM` statement(s) for `param`, optionally with
+/// `IF NOT EXISTS` / `OVERWRITE` guards for idempotent re-application.
+pub fn generate_param_sql_with_options(
+    param: &ParamDefinition,
+    if_not_exists: bool,
+    overwrite: bool,
+) -> Result<Vec<String>> {
+    Ok(vec![param.to_surql_with_options(if_not_exists, overwrite)?])
 }
 
 /// Render a complete SurrealQL schema script.
@@ -526,6 +614,84 @@ mod tests {
         let mut b = memory_bucket("avatars");
         b.backend = String::new();
         assert!(generate_bucket_sql(&b).is_err());
+    }
+
+    // ---- generate_sequence_sql ----
+
+    #[test]
+    fn generate_sequence_sql_renders_the_defaults() {
+        use crate::schema::sequence::SequenceDefinition;
+        let s = SequenceDefinition::new("invoice_no");
+        let stmts = generate_sequence_sql(&s).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DEFINE SEQUENCE invoice_no BATCH 1000 START 0;");
+    }
+
+    #[test]
+    fn generate_sequence_sql_with_options_overwrite() {
+        use crate::schema::sequence::SequenceDefinition;
+        let s = SequenceDefinition::new("s");
+        let stmts = generate_sequence_sql_with_options(&s, false, true).unwrap();
+        assert!(stmts[0].starts_with("DEFINE SEQUENCE OVERWRITE s"));
+    }
+
+    #[test]
+    fn generate_sequence_sql_validates() {
+        use crate::schema::sequence::SequenceDefinition;
+        let s = SequenceDefinition::new("s").with_batch(0);
+        assert!(generate_sequence_sql(&s).is_err());
+    }
+
+    // ---- generate_function_sql ----
+
+    #[test]
+    fn generate_function_sql_renders_the_statement() {
+        use crate::schema::function::FunctionDefinition;
+        let f = FunctionDefinition::new("greet", "RETURN 'hi'");
+        let stmts = generate_function_sql(&f).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DEFINE FUNCTION fn::greet() { RETURN 'hi' };");
+    }
+
+    #[test]
+    fn generate_function_sql_with_options_overwrite() {
+        use crate::schema::function::FunctionDefinition;
+        let f = FunctionDefinition::new("greet", "RETURN 'hi'");
+        let stmts = generate_function_sql_with_options(&f, false, true).unwrap();
+        assert!(stmts[0].starts_with("DEFINE FUNCTION OVERWRITE fn::greet"));
+    }
+
+    #[test]
+    fn generate_function_sql_validates() {
+        use crate::schema::function::FunctionDefinition;
+        let f = FunctionDefinition::new("greet", "  ");
+        assert!(generate_function_sql(&f).is_err());
+    }
+
+    // ---- generate_param_sql ----
+
+    #[test]
+    fn generate_param_sql_renders_the_statement() {
+        use crate::schema::param::ParamDefinition;
+        let p = ParamDefinition::new("APP", "'oneiriq'");
+        let stmts = generate_param_sql(&p).unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0], "DEFINE PARAM $APP VALUE 'oneiriq';");
+    }
+
+    #[test]
+    fn generate_param_sql_with_options_overwrite() {
+        use crate::schema::param::ParamDefinition;
+        let p = ParamDefinition::new("APP", "1");
+        let stmts = generate_param_sql_with_options(&p, false, true).unwrap();
+        assert!(stmts[0].starts_with("DEFINE PARAM OVERWRITE $APP"));
+    }
+
+    #[test]
+    fn generate_param_sql_validates() {
+        use crate::schema::param::ParamDefinition;
+        let p = ParamDefinition::new("APP", " ");
+        assert!(generate_param_sql(&p).is_err());
     }
 
     // ---- generate_analyzer_sql ----
