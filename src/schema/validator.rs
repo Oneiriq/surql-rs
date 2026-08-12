@@ -477,6 +477,9 @@ pub fn validate_index(
     if code_index.index_type == IndexType::Hnsw {
         results.extend(validate_hnsw_index(table_name, code_index, db_index));
     }
+    if code_index.index_type == IndexType::Diskann {
+        results.extend(validate_diskann_index(table_name, code_index, db_index));
+    }
 
     results
 }
@@ -585,6 +588,94 @@ fn validate_hnsw_index(
             "HNSW index M mismatch",
             code_index.m.map(|m| m.to_string()),
             db_index.m.map(|m| m.to_string()),
+        ));
+    }
+
+    results
+}
+
+fn validate_diskann_index(
+    table_name: &str,
+    code_index: &IndexDefinition,
+    db_index: &IndexDefinition,
+) -> Vec<ValidationResult> {
+    let mut results = Vec::new();
+    let index_field = format!("index:{}", code_index.name);
+
+    if code_index.dimension != db_index.dimension {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Error,
+            table_name,
+            Some(index_field.clone()),
+            "DISKANN index dimension mismatch",
+            code_index.dimension.map(|d| d.to_string()),
+            db_index.dimension.map(|d| d.to_string()),
+        ));
+    }
+
+    if code_index.diskann_distance != db_index.diskann_distance {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Warning,
+            table_name,
+            Some(index_field.clone()),
+            "DISKANN index distance metric mismatch",
+            code_index.diskann_distance.map(|d| d.as_str().to_string()),
+            db_index.diskann_distance.map(|d| d.as_str().to_string()),
+        ));
+    }
+
+    if code_index.vector_type != db_index.vector_type {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Warning,
+            table_name,
+            Some(index_field.clone()),
+            "DISKANN index vector type mismatch",
+            code_index.vector_type.map(|v| v.as_str().to_string()),
+            db_index.vector_type.map(|v| v.as_str().to_string()),
+        ));
+    }
+
+    if code_index.degree != db_index.degree {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Warning,
+            table_name,
+            Some(index_field.clone()),
+            "DISKANN index DEGREE mismatch",
+            code_index.degree.map(|d| d.to_string()),
+            db_index.degree.map(|d| d.to_string()),
+        ));
+    }
+
+    if code_index.l_build != db_index.l_build {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Warning,
+            table_name,
+            Some(index_field.clone()),
+            "DISKANN index L_BUILD mismatch",
+            code_index.l_build.map(|l| l.to_string()),
+            db_index.l_build.map(|l| l.to_string()),
+        ));
+    }
+
+    if code_index.alpha != db_index.alpha {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Warning,
+            table_name,
+            Some(index_field.clone()),
+            "DISKANN index ALPHA mismatch",
+            code_index.alpha.clone(),
+            db_index.alpha.clone(),
+        ));
+    }
+
+    if code_index.hashed_vector != db_index.hashed_vector {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Warning,
+            table_name,
+            Some(index_field),
+            "DISKANN index HASHED_VECTOR mismatch",
+            Some(code_index.hashed_vector.to_string()),
+            Some(db_index.hashed_vector.to_string()),
         ));
     }
 

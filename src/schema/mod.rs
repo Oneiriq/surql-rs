@@ -9,9 +9,9 @@
 //!   [`computed_field`]).
 //! - [`table`]: [`TableDefinition`] + [`TableMode`], [`IndexDefinition`] /
 //!   [`IndexType`] / [`MTreeDistanceType`] / [`HnswDistanceType`] /
-//!   [`MTreeVectorType`], and [`EventDefinition`]; plus [`table_schema`],
-//!   [`index`], [`unique_index`], [`search_index`], [`mtree_index`],
-//!   [`hnsw_index`], [`event`] builders.
+//!   [`DiskAnnDistanceType`] / [`MTreeVectorType`], and [`EventDefinition`];
+//!   plus [`table_schema`], [`index`], [`unique_index`], [`search_index`],
+//!   [`mtree_index`], [`hnsw_index`], [`diskann_index`], [`event`] builders.
 //! - [`edge`]: [`EdgeDefinition`] + [`EdgeMode`] and [`edge_schema`] /
 //!   [`typed_edge`] / [`bidirectional_edge`] helpers.
 //! - [`access`]: [`AccessDefinition`] + [`AccessType`], [`JwtConfig`] /
@@ -31,6 +31,9 @@
 //! - [`index`]: [`IndexDefinition`] and the `DEFINE INDEX` builders, plus the
 //!   `CONCURRENTLY` background build and its [`info_for_index_surql`] /
 //!   [`IndexBuildStatus`] progress readout. Re-exported from [`table`].
+//! - [`index_vector`]: the vector-index vocabulary (distance metrics,
+//!   element types) and the MTREE / HNSW / DISKANN builders. Re-exported
+//!   from [`index`].
 //! - [`function`]: [`FunctionDefinition`] and [`function_schema`] for the
 //!   server-side `DEFINE FUNCTION fn::<name>` bodies.
 //! - [`param`]: [`ParamDefinition`] and [`param_schema`] for the
@@ -78,6 +81,7 @@ pub mod field_type;
 pub mod fields;
 pub mod function;
 pub mod index;
+pub mod index_vector;
 pub mod param;
 pub mod parser;
 pub mod reference;
@@ -130,9 +134,9 @@ pub use sql::{
     generate_table_sql_overwrite,
 };
 pub use table::{
-    bm25_index, event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,
-    EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
-    MTreeVectorType, TableDefinition, TableMode,
+    bm25_index, diskann_index, event, hnsw_index, index, mtree_index, search_index, table_schema,
+    unique_index, DiskAnnDistanceType, EventDefinition, HnswDistanceType, IndexDefinition,
+    IndexType, MTreeDistanceType, MTreeVectorType, TableDefinition, TableMode,
 };
 pub use themes::{
     dark_ascii, dark_color_scheme, dark_graphviz, dark_mermaid, dark_theme, forest_ascii,
