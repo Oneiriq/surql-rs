@@ -32,6 +32,7 @@
 //! See [`discovery`] for the exact grammar.
 
 pub mod diff;
+pub mod diff_objects;
 pub mod discovery;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod executor;

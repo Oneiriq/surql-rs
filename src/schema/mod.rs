@@ -23,6 +23,24 @@
 //! - [`bucket`]: [`BucketDefinition`] + the [`bucket_schema`] /
 //!   [`memory_bucket`] / [`file_bucket`] helpers for SurrealDB v3
 //!   object-storage `DEFINE BUCKET` / `ALTER BUCKET` / `REMOVE BUCKET`.
+//! - [`view`]: [`ViewDefinition`] / [`ViewGroup`], the `AS SELECT` body of a
+//!   pre-computed view table the engine maintains from its sources.
+//! - [`changefeed`]: [`ChangeFeed`], the `CHANGEFEED <duration>
+//!   [INCLUDE ORIGINAL]` mutation log a table can retain; read it back with
+//!   [`crate::query::changes`].
+//! - [`index`]: [`IndexDefinition`] and the `DEFINE INDEX` builders, plus the
+//!   `CONCURRENTLY` background build and its [`info_for_index_surql`] /
+//!   [`IndexBuildStatus`] progress readout. Re-exported from [`table`].
+//! - [`function`]: [`FunctionDefinition`] and [`function_schema`] for the
+//!   server-side `DEFINE FUNCTION fn::<name>` bodies.
+//! - [`param`]: [`ParamDefinition`] and [`param_schema`] for the
+//!   database-level `DEFINE PARAM $<name>` constants.
+//! - [`sequence`]: [`SequenceDefinition`] and [`sequence_schema`] for the
+//!   monotonic `DEFINE SEQUENCE` counters behind `sequence::nextval`.
+//! - [`reference`]: [`ReferenceAction`] and the rules governing
+//!   `DEFINE FIELD ... REFERENCE ON DELETE ...` record-reference tracking,
+//!   whose reverse half is a `COMPUTED <~table` field
+//!   ([`reverse_reference_field`]).
 //!
 //! Each value object exposes a `to_surql*` method that renders the matching
 //! `DEFINE` statement.
@@ -54,16 +72,24 @@
 pub mod access;
 pub mod analyzer;
 pub mod bucket;
+pub mod changefeed;
 pub mod edge;
+pub mod field_type;
 pub mod fields;
+pub mod function;
+pub mod index;
+pub mod param;
 pub mod parser;
+pub mod reference;
 pub mod registry;
+pub mod sequence;
 pub mod sql;
 pub mod table;
 pub mod themes;
 pub mod utils;
 pub mod validator;
 pub mod validator_utils;
+pub mod view;
 pub mod visualize;
 
 pub use access::{
@@ -74,25 +100,34 @@ pub use analyzer::{analyzer, standard_analyzer, AnalyzerDefinition, TokenFilter,
 pub use bucket::{
     bucket_schema, file_bucket, memory_bucket, BucketDefinition, BucketSchemaBuilder,
 };
+pub use changefeed::ChangeFeed;
 pub use edge::{bidirectional_edge, edge_schema, typed_edge, EdgeDefinition, EdgeMode};
 pub use fields::{
     array_field, bool_field, bytes_field, computed_field, datetime_field, field, file_field,
-    float_field, int_field, object_field, record_field, string_field, validate_field_name,
-    FieldBuilder, FieldDefinition, FieldType,
+    float_field, int_field, object_field, record_field, reverse_reference_field, string_field,
+    validate_field_name, FieldBuilder, FieldDefinition, FieldType,
 };
+pub use function::{function_schema, FunctionArg, FunctionDefinition, FunctionSchemaBuilder};
+pub use index::{info_for_index_surql, IndexBuildStatus};
+pub use param::{param_schema, ParamDefinition, ParamSchemaBuilder};
 pub use parser::{
     parse_access, parse_bucket, parse_db_info, parse_edge_info, parse_event, parse_field,
-    parse_fields, parse_index, parse_indexes, parse_table_info, parse_table_mode,
-    parse_table_permissions, DatabaseInfo,
+    parse_fields, parse_index, parse_indexes, parse_sequence, parse_table_info, parse_table_mode,
+    parse_table_permissions, parse_view, DatabaseInfo,
 };
+pub use reference::{reference_backfill_sql, ReferenceAction};
 pub use registry::{
     clear_registry, get_registered_buckets, get_registered_edges, get_registered_tables,
     get_registry, register_bucket, register_edge, register_table, SchemaRegistry,
 };
+pub use sequence::{sequence_schema, SequenceDefinition, SequenceSchemaBuilder};
 pub use sql::{
     generate_access_sql, generate_access_sql_with_options, generate_analyzer_sql,
     generate_analyzer_sql_with_options, generate_bucket_sql, generate_bucket_sql_with_options,
-    generate_edge_sql, generate_schema_sql, generate_table_sql, generate_table_sql_overwrite,
+    generate_edge_sql, generate_function_sql, generate_function_sql_with_options,
+    generate_param_sql, generate_param_sql_with_options, generate_schema_sql,
+    generate_sequence_sql, generate_sequence_sql_with_options, generate_table_sql,
+    generate_table_sql_overwrite,
 };
 pub use table::{
     bm25_index, event, hnsw_index, index, mtree_index, search_index, table_schema, unique_index,
@@ -115,6 +150,7 @@ pub use validator_utils::{
     filter_by_severity, filter_errors, filter_warnings, format_validation_report,
     get_validation_summary, group_by_table, has_errors, ValidationSummary,
 };
+pub use view::{ViewDefinition, ViewGroup};
 pub use visualize::{
     generate_ascii, generate_graphviz, generate_mermaid, visualize_from_registry, visualize_schema,
     OutputFormat, ThemeOption,

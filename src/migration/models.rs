@@ -275,6 +275,10 @@ pub enum DiffOperation {
     AddTable,
     /// An existing table was removed.
     DropTable,
+    /// An existing table's own definition changed — its change feed or its
+    /// `AS SELECT` view body. Field / index / event / permission changes have
+    /// their own variants.
+    ModifyTable,
     /// A new field was added to an existing table.
     AddField,
     /// An existing field was removed.
@@ -304,6 +308,24 @@ pub enum DiffOperation {
     /// An existing bucket had its backend / readonly / permissions / comment
     /// changed.
     ModifyBucket,
+    /// A new ID sequence was added.
+    AddSequence,
+    /// An existing sequence's batch / start / timeout changed.
+    ModifySequence,
+    /// An existing sequence was removed.
+    DropSequence,
+    /// A new custom function was added.
+    AddFunction,
+    /// An existing function's signature, body, or clauses changed.
+    ModifyFunction,
+    /// An existing function was removed.
+    DropFunction,
+    /// A new database-level param was added.
+    AddParam,
+    /// An existing param's value or clauses changed.
+    ModifyParam,
+    /// An existing param was removed.
+    DropParam,
 }
 
 impl DiffOperation {
@@ -312,6 +334,7 @@ impl DiffOperation {
         match self {
             Self::AddTable => "add_table",
             Self::DropTable => "drop_table",
+            Self::ModifyTable => "modify_table",
             Self::AddField => "add_field",
             Self::DropField => "drop_field",
             Self::ModifyField => "modify_field",
@@ -326,6 +349,15 @@ impl DiffOperation {
             Self::AddBucket => "add_bucket",
             Self::DropBucket => "drop_bucket",
             Self::ModifyBucket => "modify_bucket",
+            Self::AddSequence => "add_sequence",
+            Self::ModifySequence => "modify_sequence",
+            Self::DropSequence => "drop_sequence",
+            Self::AddFunction => "add_function",
+            Self::ModifyFunction => "modify_function",
+            Self::DropFunction => "drop_function",
+            Self::AddParam => "add_param",
+            Self::ModifyParam => "modify_param",
+            Self::DropParam => "drop_param",
         }
     }
 }
@@ -351,6 +383,7 @@ impl std::fmt::Display for DiffOperation {
 ///     event: None,
 ///     bucket: None,
 ///     analyzer: None,
+///     object: None,
 ///     description: "Add user table".into(),
 ///     forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
 ///     backward_sql: "REMOVE TABLE user;".into(),
@@ -377,6 +410,12 @@ pub struct SchemaDiff {
     /// Analyzer name, when the operation concerns an analyzer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyzer: Option<String>,
+    /// Name of the database-level object the change targets, for the kinds
+    /// that are not tables, buckets, or analyzers: sequences, functions, and
+    /// params. One field rather than three, because every such object is
+    /// identified the same way and carries no table context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
     /// Human-readable description.
     pub description: String,
     /// SurrealQL that applies the change (forward).
@@ -386,6 +425,22 @@ pub struct SchemaDiff {
     /// Extra operation-specific details.
     #[serde(default)]
     pub details: BTreeMap<String, serde_json::Value>,
+}
+
+impl SchemaDiff {
+    /// The row rewrite this change needs before reference tracking is
+    /// trustworthy: populated only when an existing field GAINS
+    /// `REFERENCE`, because the engine backfills nothing and a
+    /// self-assignment registers nothing (see
+    /// [`crate::schema::reference_backfill_sql`]). Run it after
+    /// `forward_sql`, in the same transaction or a later one; anything
+    /// that applies the DDL and skips this undercounts silently on
+    /// every pre-existing row.
+    pub fn reference_backfill_sql(&self) -> Option<&str> {
+        self.details
+            .get("reference_backfill_sql")
+            .and_then(serde_json::Value::as_str)
+    }
 }
 
 #[cfg(test)]
@@ -622,6 +677,7 @@ mod tests {
     fn diff_operation_as_str_values() {
         assert_eq!(DiffOperation::AddTable.as_str(), "add_table");
         assert_eq!(DiffOperation::DropTable.as_str(), "drop_table");
+        assert_eq!(DiffOperation::ModifyTable.as_str(), "modify_table");
         assert_eq!(DiffOperation::AddField.as_str(), "add_field");
         assert_eq!(DiffOperation::DropField.as_str(), "drop_field");
         assert_eq!(DiffOperation::ModifyField.as_str(), "modify_field");
@@ -636,6 +692,15 @@ mod tests {
         assert_eq!(DiffOperation::AddBucket.as_str(), "add_bucket");
         assert_eq!(DiffOperation::DropBucket.as_str(), "drop_bucket");
         assert_eq!(DiffOperation::ModifyBucket.as_str(), "modify_bucket");
+        assert_eq!(DiffOperation::AddSequence.as_str(), "add_sequence");
+        assert_eq!(DiffOperation::ModifySequence.as_str(), "modify_sequence");
+        assert_eq!(DiffOperation::DropSequence.as_str(), "drop_sequence");
+        assert_eq!(DiffOperation::AddFunction.as_str(), "add_function");
+        assert_eq!(DiffOperation::ModifyFunction.as_str(), "modify_function");
+        assert_eq!(DiffOperation::DropFunction.as_str(), "drop_function");
+        assert_eq!(DiffOperation::AddParam.as_str(), "add_param");
+        assert_eq!(DiffOperation::ModifyParam.as_str(), "modify_param");
+        assert_eq!(DiffOperation::DropParam.as_str(), "drop_param");
     }
 
     #[test]
@@ -658,6 +723,7 @@ mod tests {
         let ops = [
             DiffOperation::AddTable,
             DiffOperation::DropTable,
+            DiffOperation::ModifyTable,
             DiffOperation::AddField,
             DiffOperation::DropField,
             DiffOperation::ModifyField,
@@ -669,6 +735,15 @@ mod tests {
             DiffOperation::AddBucket,
             DiffOperation::DropBucket,
             DiffOperation::ModifyBucket,
+            DiffOperation::AddSequence,
+            DiffOperation::ModifySequence,
+            DiffOperation::DropSequence,
+            DiffOperation::AddFunction,
+            DiffOperation::ModifyFunction,
+            DiffOperation::DropFunction,
+            DiffOperation::AddParam,
+            DiffOperation::ModifyParam,
+            DiffOperation::DropParam,
         ];
         for op in ops {
             let j = serde_json::to_string(&op).unwrap();
@@ -687,6 +762,7 @@ mod tests {
             event: None,
             bucket: None,
             analyzer: None,
+            object: None,
             description: "Add user table".into(),
             forward_sql: "DEFINE TABLE user SCHEMAFULL;".into(),
             backward_sql: "REMOVE TABLE user;".into(),
@@ -707,6 +783,7 @@ mod tests {
             event: None,
             bucket: None,
             analyzer: None,
+            object: None,
             description: "Add email field".into(),
             forward_sql: "DEFINE FIELD email ON TABLE user TYPE string;".into(),
             backward_sql: "REMOVE FIELD email ON TABLE user;".into(),
@@ -728,6 +805,7 @@ mod tests {
             event: None,
             bucket: None,
             analyzer: None,
+            object: None,
             description: "change age".into(),
             forward_sql: "DEFINE FIELD age ON TABLE user TYPE int;".into(),
             backward_sql: "DEFINE FIELD age ON TABLE user TYPE string;".into(),

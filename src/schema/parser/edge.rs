@@ -58,7 +58,7 @@ use super::field::parse_fields;
 use super::index::parse_indexes;
 use super::permissions::parse_table_permissions;
 use super::{expect_object, pick_map, regex_case_insensitive, value_to_string_map};
-use crate::error::Result;
+use crate::error::{Result, SurqlError};
 use crate::schema::edge::{EdgeDefinition, EdgeMode};
 
 // --- Regex accessors ---------------------------------------------------------
@@ -144,8 +144,15 @@ pub(super) fn parse_edge_endpoints(definition: &str) -> (Option<String>, Option<
 /// declare them. Without this strip, `diff_edges(parsed, code)` would
 /// flag every edge with a spurious "added field" diff.
 ///
+/// Accepts either the INFO object itself or the value
+/// [`query`](crate::DatabaseClient::query) returns for
+/// `INFO FOR TABLE <name>;`, which wraps each statement's result in an
+/// array. An INFO response is never itself an array, so the two shapes
+/// cannot be confused; callers that index the wrapper themselves keep
+/// working, since indexing yields the bare object.
+///
 /// Returns [`crate::error::SurqlError::SchemaParse`] when the top-level
-/// JSON value is not an object.
+/// JSON value is not an object (or a one-statement array holding one).
 ///
 /// ## Example
 ///
@@ -175,6 +182,12 @@ pub fn parse_edge_info(
     info: &Value,
     define_table: Option<&str>,
 ) -> Result<EdgeDefinition> {
+    let info = match info.as_array() {
+        Some(items) => items.first().ok_or_else(|| SurqlError::SchemaParse {
+            reason: format!("INFO FOR TABLE {edge_name}: response held no statement result"),
+        })?,
+        None => info,
+    };
     let obj = expect_object(info, &format!("INFO FOR TABLE {edge_name}"))?;
 
     // The caller-supplied DEFINE TABLE wins; fall back to the legacy
@@ -232,6 +245,22 @@ mod tests {
         assert!(parse_edge_info("likes", &Value::Null, None).is_err());
         assert!(parse_edge_info("likes", &json!("not an object"), None).is_err());
         assert!(parse_edge_info("likes", &json!([1, 2, 3]), None).is_err());
+    }
+
+    #[test]
+    fn unwraps_the_query_response_shape() {
+        // `DatabaseClient::query` answers one result per statement, so
+        // the INFO object arrives as `[ { ... } ]`. Same tolerance as
+        // `parse_db_info`: an INFO response is never itself an array.
+        let info = json!({
+            "fields": { "weight": "DEFINE FIELD weight ON likes TYPE float" }
+        });
+        let wrapped = json!([info.clone()]);
+        let define = "DEFINE TABLE likes TYPE RELATION FROM user TO product";
+        let from_bare = parse_edge_info("likes", &info, Some(define)).unwrap();
+        let from_wrapped = parse_edge_info("likes", &wrapped, Some(define)).unwrap();
+        assert_eq!(from_bare, from_wrapped);
+        assert_eq!(from_wrapped.mode, EdgeMode::Relation);
     }
 
     #[test]

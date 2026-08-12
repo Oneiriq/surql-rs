@@ -16,6 +16,9 @@
 //! - [`diff_events`] — compare two sets of [`EventDefinition`]s for a table.
 //! - [`diff_permissions`] — compare two permission maps for a table.
 //! - [`diff_edges`] — compare two sets of [`EdgeDefinition`]s.
+//! - [`diff_buckets`] / [`diff_analyzers`] — re-exported from
+//!   [`crate::migration::diff_objects`], which holds every database-level
+//!   object diff.
 //! - [`diff_schemas`] — aggregate diff across full [`SchemaSnapshot`]s.
 //!
 //! ## Deviation from Python
@@ -40,14 +43,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+pub use crate::migration::diff_objects::{diff_analyzers, diff_buckets};
+use crate::migration::diff_objects::{diff_functions, diff_params, diff_sequences};
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::{EdgeDefinition, EdgeMode};
 use crate::schema::fields::FieldDefinition;
+use crate::schema::function::FunctionDefinition;
+use crate::schema::param::ParamDefinition;
+use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::{
     EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
     MTreeVectorType, TableDefinition,
 };
+use crate::schema::view::ViewDefinition;
 
 /// Full schema snapshot passed to [`diff_schemas`].
 ///
@@ -64,8 +73,7 @@ use crate::schema::table::{
 /// let snapshot = SchemaSnapshot {
 ///     tables: vec![table_schema("user")],
 ///     edges: vec![],
-///     buckets: vec![],
-///     analyzers: vec![],
+///     ..Default::default()
 /// };
 /// assert_eq!(snapshot.tables.len(), 1);
 /// ```
@@ -87,6 +95,18 @@ pub struct SchemaSnapshot {
     /// deserialise.
     #[serde(default)]
     pub analyzers: Vec<crate::schema::analyzer::AnalyzerDefinition>,
+    /// All ID sequences known to this snapshot (in discovery order).
+    /// Defaults to empty so older snapshots still deserialise.
+    #[serde(default)]
+    pub sequences: Vec<SequenceDefinition>,
+    /// All custom functions known to this snapshot (in discovery order).
+    /// Defaults to empty so older snapshots still deserialise.
+    #[serde(default)]
+    pub functions: Vec<FunctionDefinition>,
+    /// All database-level params known to this snapshot (in discovery order).
+    /// Defaults to empty so older snapshots still deserialise.
+    #[serde(default)]
+    pub params: Vec<ParamDefinition>,
 }
 
 impl SchemaSnapshot {
@@ -105,8 +125,7 @@ impl SchemaSnapshot {
         Self {
             tables: tables.into_iter().collect(),
             edges: edges.into_iter().collect(),
-            buckets: Vec::new(),
-            analyzers: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -121,7 +140,7 @@ impl SchemaSnapshot {
             tables: tables.into_iter().collect(),
             edges: edges.into_iter().collect(),
             buckets: buckets.into_iter().collect(),
-            analyzers: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -460,121 +479,20 @@ pub fn diff_edges(code: &[EdgeDefinition], db: &[EdgeDefinition]) -> Vec<SchemaD
     out
 }
 
-/// Compare two bucket slices.
-///
-/// Buckets present in `code` but absent in `db` are added
-/// ([`DiffOperation::AddBucket`], forward `DEFINE BUCKET`, backward
-/// `REMOVE BUCKET`). Buckets present in `db` but absent in `code` are dropped
-/// ([`DiffOperation::DropBucket`], forward `REMOVE`, backward `DEFINE`).
-/// Buckets present in both whose definition differs are modified
-/// ([`DiffOperation::ModifyBucket`], forward `ALTER` `code`←`db`, backward
-/// `ALTER` `db`←`code`).
-///
-/// ## Examples
-///
-/// ```
-/// use surql::migration::diff::diff_buckets;
-/// use surql::schema::memory_bucket;
-///
-/// let code = vec![memory_bucket("avatars")];
-/// let db = vec![];
-/// let diffs = diff_buckets(&code, &db);
-/// assert_eq!(diffs.len(), 1);
-/// assert!(diffs[0].forward_sql.starts_with("DEFINE BUCKET avatars"));
-/// assert_eq!(diffs[0].backward_sql, "REMOVE BUCKET avatars;");
-/// ```
-#[must_use]
-pub fn diff_buckets(code: &[BucketDefinition], db: &[BucketDefinition]) -> Vec<SchemaDiff> {
-    let code_map = index_by_name(code, |b| b.name.as_str());
-    let db_map = index_by_name(db, |b| b.name.as_str());
-    let mut out: Vec<SchemaDiff> = Vec::new();
-
-    for name in sorted_keys(&code_map) {
-        if !db_map.contains_key(name) {
-            out.push(generate_add_bucket_diff(code_map[name]));
-        }
-    }
-    for name in sorted_keys(&db_map) {
-        if !code_map.contains_key(name) {
-            out.push(generate_drop_bucket_diff(db_map[name]));
-        }
-    }
-    for name in sorted_keys(&code_map) {
-        if let Some(db_bucket) = db_map.get(name) {
-            let code_bucket = code_map[name];
-            if code_bucket != *db_bucket {
-                out.push(generate_modify_bucket_diff(code_bucket, db_bucket));
-            }
-        }
-    }
-    out
-}
-
 /// Diff two complete snapshots and return every change required to make
 /// `db` look like `code`.
 ///
-/// The returned diffs are ordered: tables first, then edges, then buckets.
+/// The returned diffs are ordered: tables, edges, buckets, analyzers, then
+/// sequences, functions, then params.
 #[must_use]
 pub fn diff_schemas(code: &SchemaSnapshot, db: &SchemaSnapshot) -> Vec<SchemaDiff> {
     let mut out = diff_tables(&code.tables, &db.tables);
     out.extend(diff_edges(&code.edges, &db.edges));
     out.extend(diff_buckets(&code.buckets, &db.buckets));
     out.extend(diff_analyzers(&code.analyzers, &db.analyzers));
-    out
-}
-
-/// Compare analyzers by name: added ones render plain, changed ones
-/// render `OVERWRITE`, and removed ones carry the removal for the
-/// caller to decide about.
-pub fn diff_analyzers(
-    code: &[crate::schema::analyzer::AnalyzerDefinition],
-    db: &[crate::schema::analyzer::AnalyzerDefinition],
-) -> Vec<SchemaDiff> {
-    let code_map = index_by_name(code, |a| a.name.as_str());
-    let db_map = index_by_name(db, |a| a.name.as_str());
-    let mut out = Vec::new();
-    let analyzer_diff =
-        |op: DiffOperation, name: &str, forward: String, backward: String| SchemaDiff {
-            operation: op,
-            table: String::new(),
-            field: None,
-            index: None,
-            event: None,
-            bucket: None,
-            analyzer: Some(name.to_owned()),
-            description: format!("{op:?} {name}"),
-            forward_sql: forward,
-            backward_sql: backward,
-            details: BTreeMap::new(),
-        };
-    for name in sorted_keys(&code_map) {
-        let analyzer = code_map[name];
-        match db_map.get(name) {
-            None => out.push(analyzer_diff(
-                DiffOperation::AddAnalyzer,
-                name,
-                analyzer.to_surql(),
-                format!("REMOVE ANALYZER IF EXISTS {name};"),
-            )),
-            Some(db_analyzer) if *db_analyzer != analyzer => out.push(analyzer_diff(
-                DiffOperation::ModifyAnalyzer,
-                name,
-                analyzer.to_surql_overwrite(),
-                db_analyzer.to_surql_overwrite(),
-            )),
-            Some(_) => {}
-        }
-    }
-    for name in sorted_keys(&db_map) {
-        if !code_map.contains_key(name) {
-            out.push(analyzer_diff(
-                DiffOperation::DropAnalyzer,
-                name,
-                format!("REMOVE ANALYZER IF EXISTS {name};"),
-                db_map[name].to_surql(),
-            ));
-        }
-    }
+    out.extend(diff_sequences(&code.sequences, &db.sequences));
+    out.extend(diff_functions(&code.functions, &db.functions));
+    out.extend(diff_params(&code.params, &db.params));
     out
 }
 
@@ -617,6 +535,7 @@ fn diff_table_pair_inner(code: &TableDefinition, db: &TableDefinition) -> Vec<Sc
     let mut out = diff_fields(&code.name, &code.fields, &db.fields);
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
+    out.extend(diff_table_body(code, db));
     if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
         // The full definition replaces: a permissions-only DEFINE
         // TABLE would silently reset the table's mode.
@@ -648,6 +567,45 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
     out
 }
 
+/// Compare the parts of a `DEFINE TABLE` statement that belong to the table
+/// itself rather than to a field, index, event, or permission rule: the
+/// change feed and the `AS SELECT` view body.
+///
+/// The table mode is deliberately left out. It is carried by the same
+/// `OVERWRITE` statement, so a change to it rides along with any of the other
+/// diffs; making it its own trigger would change long-standing behaviour for
+/// every schema that leaves the mode implicit.
+fn diff_table_body(code: &TableDefinition, db: &TableDefinition) -> Vec<SchemaDiff> {
+    let changefeed_changed = code.changefeed != db.changefeed;
+    // Views compare on the rendered clause with whitespace normalised: the
+    // engine reformats a projection or predicate as it likes, and a diff on
+    // the spacing alone would re-apply the view on every reconcile.
+    let view_changed = !expr_eq(
+        code.view.as_ref().map(ViewDefinition::to_clause).as_deref(),
+        db.view.as_ref().map(ViewDefinition::to_clause).as_deref(),
+    );
+    if !changefeed_changed && !view_changed {
+        return Vec::new();
+    }
+    let what = if view_changed { "view" } else { "change feed" };
+    vec![SchemaDiff {
+        operation: DiffOperation::ModifyTable,
+        table: code.name.clone(),
+        field: None,
+        index: None,
+        event: None,
+        bucket: None,
+        analyzer: None,
+        object: None,
+        description: format!("Modify {what} on {}", code.name),
+        // The full definition replaces: a bare CHANGEFEED or AS SELECT
+        // statement would silently reset the table's mode and permissions.
+        forward_sql: code.to_surql_overwrite(),
+        backward_sql: db.to_surql_overwrite(),
+        details: BTreeMap::new(),
+    }]
+}
+
 /// A permissions change carried as the owning definition's full
 /// `OVERWRITE` form.
 fn modify_permissions_full(table: &str, forward_sql: String, backward_sql: String) -> SchemaDiff {
@@ -659,6 +617,7 @@ fn modify_permissions_full(table: &str, forward_sql: String, backward_sql: Strin
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Modify permissions for {table}"),
         forward_sql,
         backward_sql,
@@ -684,6 +643,7 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add table {}", table.name),
         forward_sql,
         backward_sql,
@@ -710,6 +670,7 @@ fn generate_drop_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop table {}", table.name),
         forward_sql: format!("REMOVE TABLE {};", table.name),
         backward_sql: format!("DEFINE TABLE {} {};", table.name, table.mode.as_str()),
@@ -747,6 +708,7 @@ fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add field {} to {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -765,6 +727,7 @@ fn generate_drop_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff 
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop field {} from {}", field.name, table),
         forward_sql,
         backward_sql,
@@ -790,6 +753,27 @@ fn generate_modify_field_diff(
         "new_type".into(),
         serde_json::Value::String(new_field.field_type.as_str().into()),
     );
+    let mut description = format!("Modify field {} in {}", new_field.name, table);
+    // Gaining REFERENCE is the one field change whose DDL alone leaves
+    // the database lying: the engine backfills nothing, so every row
+    // that already held a value stays invisible to `<~` until it is
+    // rewritten (see [`crate::schema::reference_backfill_sql`]). The
+    // rewrite rides `details` rather than `forward_sql` because it is
+    // DML an application's own events may refuse, so a live reconciler
+    // must choose where it runs; the migration generator, whose files
+    // a person reviews, includes it right after the DDL.
+    if old_field.reference.is_none() && new_field.reference.is_some() {
+        // The Err arm is unreachable for schema-borne names, which
+        // were validated at definition time; a name the validator
+        // refuses could not have rendered the DDL above either.
+        if let Ok(backfill) = crate::schema::reference_backfill_sql(table, &new_field.name) {
+            details.insert(
+                "reference_backfill_sql".into(),
+                serde_json::Value::String(backfill),
+            );
+            description.push_str(" (gains REFERENCE: existing rows need the backfill rewrite)");
+        }
+    }
     SchemaDiff {
         operation: DiffOperation::ModifyField,
         table: table.to_string(),
@@ -798,7 +782,8 @@ fn generate_modify_field_diff(
         event: None,
         bucket: None,
         analyzer: None,
-        description: format!("Modify field {} in {}", new_field.name, table),
+        object: None,
+        description,
         forward_sql,
         backward_sql,
         details,
@@ -836,6 +821,7 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add index {} to {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -865,6 +851,7 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop index {} from {}", idx.name, table),
         forward_sql,
         backward_sql,
@@ -893,6 +880,7 @@ fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         event: Some(ev.name.clone()),
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add event {} to {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -918,6 +906,7 @@ fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         event: Some(ev.name.clone()),
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop event {} from {}", ev.name, table),
         forward_sql,
         backward_sql,
@@ -940,6 +929,7 @@ fn generate_modify_permissions_diff(
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Modify permissions for {table}"),
         forward_sql,
         backward_sql,
@@ -975,6 +965,7 @@ fn generate_add_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Add edge {}", edge.name),
         forward_sql,
         backward_sql,
@@ -1010,95 +1001,12 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         event: None,
         bucket: None,
         analyzer: None,
+        object: None,
         description: format!("Drop edge {}", edge.name),
         forward_sql: format!("REMOVE TABLE {};", edge.name),
         backward_sql: String::new(),
         details: BTreeMap::new(),
     }]
-}
-
-fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
-    // `to_surql` only fails validation; an invalid bucket still yields a
-    // best-effort render so callers can surface it via dry-run (matching the
-    // "infallible diff constructor" contract of the other generators).
-    let forward_sql = bucket.to_surql().unwrap_or_else(|_| {
-        format!(
-            "DEFINE BUCKET {} BACKEND \"{}\";",
-            bucket.name, bucket.backend
-        )
-    });
-    let backward_sql = bucket.to_remove_surql();
-    let mut details = BTreeMap::new();
-    details.insert(
-        "backend".to_string(),
-        serde_json::Value::String(bucket.backend.clone()),
-    );
-    SchemaDiff {
-        operation: DiffOperation::AddBucket,
-        table: String::new(),
-        field: None,
-        index: None,
-        event: None,
-        bucket: Some(bucket.name.clone()),
-        analyzer: None,
-        description: format!("Add bucket {}", bucket.name),
-        forward_sql,
-        backward_sql,
-        details,
-    }
-}
-
-fn generate_drop_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
-    let forward_sql = bucket.to_remove_surql();
-    let backward_sql = bucket.to_surql().unwrap_or_else(|_| {
-        format!(
-            "DEFINE BUCKET {} BACKEND \"{}\";",
-            bucket.name, bucket.backend
-        )
-    });
-    SchemaDiff {
-        operation: DiffOperation::DropBucket,
-        table: String::new(),
-        field: None,
-        index: None,
-        event: None,
-        bucket: Some(bucket.name.clone()),
-        analyzer: None,
-        description: format!("Drop bucket {}", bucket.name),
-        forward_sql,
-        backward_sql,
-        details: BTreeMap::new(),
-    }
-}
-
-fn generate_modify_bucket_diff(code: &BucketDefinition, db: &BucketDefinition) -> SchemaDiff {
-    // Forward turns the db-side bucket into the code-side one; backward
-    // reverses it. Both use ALTER so existing files are preserved (a
-    // DEFINE OVERWRITE would re-create the bucket).
-    let forward_sql = code.to_alter_surql(db, false);
-    let backward_sql = db.to_alter_surql(code, false);
-    let mut details = BTreeMap::new();
-    details.insert(
-        "old_backend".to_string(),
-        serde_json::Value::String(db.backend.clone()),
-    );
-    details.insert(
-        "new_backend".to_string(),
-        serde_json::Value::String(code.backend.clone()),
-    );
-    SchemaDiff {
-        operation: DiffOperation::ModifyBucket,
-        table: String::new(),
-        field: None,
-        index: None,
-        event: None,
-        bucket: Some(code.name.clone()),
-        analyzer: None,
-        description: format!("Modify bucket {}", code.name),
-        forward_sql,
-        backward_sql,
-        details,
-    }
 }
 
 fn render_permission_statements(table: &str, perms: Option<&BTreeMap<String, String>>) -> String {
@@ -1135,9 +1043,11 @@ fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
         && a.field_type == b.field_type
         && a.readonly == b.readonly
         && a.flexible == b.flexible
+        && a.reference == b.reference
         && expr_eq(a.assertion.as_deref(), b.assertion.as_deref())
         && expr_eq(a.default.as_deref(), b.default.as_deref())
         && expr_eq(a.value.as_deref(), b.value.as_deref())
+        && expr_eq(a.computed.as_deref(), b.computed.as_deref())
 }
 
 /// Expand comma-grouped action keys (`"select, create"`) into one
@@ -1220,7 +1130,7 @@ fn hnsw_index_to_sql(table: &str, idx: &IndexDefinition) -> String {
     sql
 }
 
-fn index_by_name<'a, T, F>(items: &'a [T], key: F) -> BTreeMap<&'a str, &'a T>
+pub(super) fn index_by_name<'a, T, F>(items: &'a [T], key: F) -> BTreeMap<&'a str, &'a T>
 where
     F: Fn(&'a T) -> &'a str,
 {
@@ -1231,7 +1141,7 @@ where
     map
 }
 
-fn sorted_keys<'a, V>(map: &'a BTreeMap<&'a str, V>) -> Vec<&'a str> {
+pub(super) fn sorted_keys<'a, V>(map: &'a BTreeMap<&'a str, V>) -> Vec<&'a str> {
     // BTreeMap iterates in key order already, so we just need to collect
     // the keys into a concrete vector to avoid holding the borrow across
     // the map while iterating mutably elsewhere.
@@ -1435,6 +1345,68 @@ mod tests {
             diffs[0].details.get("new_type"),
             Some(&serde_json::json!("int"))
         );
+    }
+
+    fn linked(action: Option<crate::schema::ReferenceAction>) -> FieldDefinition {
+        let mut field = f("blob", FieldType::Record);
+        field.target_table = Some("blob".into());
+        field.reference = action;
+        field
+    }
+
+    /// Gaining `REFERENCE` is the one field change whose DDL alone
+    /// leaves the tracking wrong for every pre-existing row, so that
+    /// diff carries the rewrite and says so.
+    #[test]
+    fn a_gained_reference_carries_its_backfill() {
+        use crate::schema::ReferenceAction;
+        let diffs = diff_fields(
+            "file",
+            &[linked(Some(ReferenceAction::Ignore))],
+            &[linked(None)],
+        );
+        assert_eq!(diffs.len(), 1);
+        let backfill = diffs[0]
+            .reference_backfill_sql()
+            .expect("the rewrite rides the diff");
+        assert!(backfill.contains("SELECT VALUE id FROM file"), "{backfill}");
+        assert!(backfill.contains("?? []"), "{backfill}");
+        assert!(backfill.contains("SET blob = NONE"), "{backfill}");
+        assert!(
+            diffs[0].description.contains("backfill"),
+            "{}",
+            diffs[0].description
+        );
+    }
+
+    /// Everything else about a reference leaves the rewrite out: a
+    /// changed action re-renders DDL over tracking that already exists,
+    /// and a removed clause has nothing to register.
+    #[test]
+    fn other_reference_changes_carry_no_backfill() {
+        use crate::schema::ReferenceAction;
+        let changed = diff_fields(
+            "file",
+            &[linked(Some(ReferenceAction::Cascade))],
+            &[linked(Some(ReferenceAction::Ignore))],
+        );
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].reference_backfill_sql().is_none());
+
+        let removed = diff_fields(
+            "file",
+            &[linked(None)],
+            &[linked(Some(ReferenceAction::Ignore))],
+        );
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].reference_backfill_sql().is_none());
+
+        // A NEW field with REFERENCE has no pre-existing values to
+        // register; the add diff stays plain DDL.
+        let added = diff_fields("file", &[linked(Some(ReferenceAction::Ignore))], &[]);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].operation, DiffOperation::AddField);
+        assert!(added[0].reference_backfill_sql().is_none());
     }
 
     #[test]
@@ -1772,69 +1744,6 @@ mod tests {
         assert!(diff_edges(std::slice::from_ref(&e), std::slice::from_ref(&e)).is_empty());
     }
 
-    // ----- diff_buckets -----
-
-    #[test]
-    fn diff_buckets_detects_added() {
-        use crate::schema::bucket::memory_bucket;
-        let code = vec![memory_bucket("avatars")];
-        let diffs = diff_buckets(&code, &[]);
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].operation, DiffOperation::AddBucket);
-        assert_eq!(diffs[0].bucket.as_deref(), Some("avatars"));
-        assert!(diffs[0].forward_sql.starts_with("DEFINE BUCKET avatars"));
-        assert_eq!(diffs[0].backward_sql, "REMOVE BUCKET avatars;");
-        assert!(diffs[0].table.is_empty());
-    }
-
-    #[test]
-    fn diff_buckets_detects_dropped() {
-        use crate::schema::bucket::memory_bucket;
-        let db = vec![memory_bucket("old")];
-        let diffs = diff_buckets(&[], &db);
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].operation, DiffOperation::DropBucket);
-        assert_eq!(diffs[0].forward_sql, "REMOVE BUCKET old;");
-        assert!(diffs[0].backward_sql.starts_with("DEFINE BUCKET old"));
-    }
-
-    #[test]
-    fn diff_buckets_detects_modified_readonly() {
-        use crate::schema::bucket::memory_bucket;
-        let code = vec![memory_bucket("b").with_readonly(true)];
-        let db = vec![memory_bucket("b")];
-        let diffs = diff_buckets(&code, &db);
-        assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].operation, DiffOperation::ModifyBucket);
-        assert_eq!(diffs[0].forward_sql, "ALTER BUCKET b READONLY;");
-        assert_eq!(diffs[0].backward_sql, "ALTER BUCKET b DROP READONLY;");
-    }
-
-    #[test]
-    fn diff_buckets_modified_backend_records_details() {
-        use crate::schema::bucket::{memory_bucket, BucketDefinition};
-        let code = vec![BucketDefinition::new("b", "s3://x")];
-        let db = vec![memory_bucket("b")];
-        let diffs = diff_buckets(&code, &db);
-        assert_eq!(diffs[0].operation, DiffOperation::ModifyBucket);
-        assert!(diffs[0].forward_sql.contains("BACKEND \"s3://x\""));
-        assert_eq!(
-            diffs[0].details.get("old_backend"),
-            Some(&serde_json::json!("memory"))
-        );
-        assert_eq!(
-            diffs[0].details.get("new_backend"),
-            Some(&serde_json::json!("s3://x"))
-        );
-    }
-
-    #[test]
-    fn diff_buckets_identical_yields_nothing() {
-        use crate::schema::bucket::memory_bucket;
-        let a = vec![memory_bucket("b").with_comment("c")];
-        assert!(diff_buckets(&a, &a).is_empty());
-    }
-
     #[test]
     fn diff_schemas_includes_buckets() {
         use crate::schema::bucket::memory_bucket;
@@ -1846,6 +1755,114 @@ mod tests {
             .any(|d| d.operation == DiffOperation::AddBucket));
         assert!(diffs.iter().any(|d| d.operation == DiffOperation::AddTable));
     }
+    #[test]
+    fn snapshot_without_buckets_key_deserialises() {
+        // Older snapshots predate the `buckets` field; #[serde(default)]
+        // must let them load with an empty bucket list.
+        let json = r#"{ "tables": [], "edges": [] }"#;
+        let snap: SchemaSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.buckets.is_empty());
+    }
+
+    // ----- change feeds -----
+
+    #[test]
+    fn diff_tables_detects_an_added_changefeed() {
+        use crate::schema::ChangeFeed;
+        let db = vec![table_schema("audit")];
+        let code = vec![table_schema("audit").with_changefeed(ChangeFeed::new("1d"))];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert_eq!(diffs[0].table, "audit");
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE TABLE OVERWRITE audit SCHEMAFULL CHANGEFEED 1d;"
+        );
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE TABLE OVERWRITE audit SCHEMAFULL;"
+        );
+    }
+
+    #[test]
+    fn diff_tables_detects_a_dropped_changefeed() {
+        use crate::schema::ChangeFeed;
+        let db = vec![table_schema("audit").with_changefeed(ChangeFeed::new("1d"))];
+        let code = vec![table_schema("audit")];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert!(!diffs[0].forward_sql.contains("CHANGEFEED"));
+        assert!(diffs[0].backward_sql.contains("CHANGEFEED 1d"));
+    }
+
+    #[test]
+    fn diff_tables_detects_a_changed_retention_window() {
+        use crate::schema::ChangeFeed;
+        let db = vec![table_schema("audit").with_changefeed(ChangeFeed::new("1d"))];
+        let code = vec![
+            table_schema("audit").with_changefeed(ChangeFeed::new("3d").include_original(true))
+        ];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0]
+            .forward_sql
+            .contains("CHANGEFEED 3d INCLUDE ORIGINAL"));
+    }
+
+    #[test]
+    fn diff_tables_ignores_an_unchanged_changefeed() {
+        use crate::schema::ChangeFeed;
+        let t = table_schema("audit").with_changefeed(ChangeFeed::new("1d"));
+        assert!(diff_tables(std::slice::from_ref(&t), std::slice::from_ref(&t)).is_empty());
+    }
+
+    // ----- views -----
+
+    #[test]
+    fn diff_tables_detects_an_added_view() {
+        use crate::schema::{ViewDefinition, ViewGroup};
+        let db = vec![table_schema("stats")];
+        let code = vec![table_schema("stats").with_view(
+            ViewDefinition::new(["count() AS total"], ["comment"]).with_group(ViewGroup::All),
+        )];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert!(diffs[0].description.contains("view"));
+        assert!(diffs[0].forward_sql.contains("TYPE NORMAL"));
+        assert!(diffs[0]
+            .forward_sql
+            .contains("AS SELECT count() AS total FROM comment GROUP ALL"));
+        assert!(!diffs[0].backward_sql.contains("AS SELECT"));
+    }
+
+    #[test]
+    fn diff_tables_detects_a_changed_view_body() {
+        use crate::schema::ViewDefinition;
+        let db = vec![table_schema("stats").with_view(ViewDefinition::new(["id"], ["comment"]))];
+        let code = vec![table_schema("stats")
+            .with_view(ViewDefinition::new(["id"], ["comment"]).with_condition("n > 2"))];
+        let diffs = diff_tables(&code, &db);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].forward_sql.contains("WHERE n > 2"));
+    }
+
+    #[test]
+    fn diff_tables_ignores_view_whitespace_reformatting() {
+        use crate::schema::ViewDefinition;
+        let db = vec![table_schema("stats")
+            .with_view(ViewDefinition::new(["id"], ["comment"]).with_condition("n   >    2"))];
+        let code = vec![table_schema("stats")
+            .with_view(ViewDefinition::new(["id"], ["comment"]).with_condition("n > 2"))];
+        assert!(
+            diff_tables(&code, &db).is_empty(),
+            "the engine reformats freely; only the meaning may differ"
+        );
+    }
+
+    // ----- diff_buckets -----
 
     // ----- diff_schemas aggregator -----
 
@@ -2000,15 +2017,6 @@ mod tests {
         let back: SchemaSnapshot = serde_json::from_str(&j).unwrap();
         assert_eq!(snap, back);
         assert_eq!(back.buckets.len(), 1);
-    }
-
-    #[test]
-    fn snapshot_without_buckets_key_deserialises() {
-        // Older snapshots predate the `buckets` field; #[serde(default)]
-        // must let them load with an empty bucket list.
-        let json = r#"{ "tables": [], "edges": [] }"#;
-        let snap: SchemaSnapshot = serde_json::from_str(json).unwrap();
-        assert!(snap.buckets.is_empty());
     }
 
     #[test]
