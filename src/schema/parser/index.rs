@@ -2,8 +2,8 @@
 //!
 //! Extracts [`IndexDefinition`] values from SurrealDB `INFO FOR TABLE`
 //! responses, including the vector-index variants (`UNIQUE`, `SEARCH`,
-//! `MTREE`, `HNSW`). Split out of the monolithic `parser.rs` so each
-//! submodule stays under the 1000-LOC budget; see parent [`super`] for
+//! `MTREE`, `HNSW`, `DISKANN`). Split out of the monolithic `parser.rs` so
+//! each submodule stays under the 1000-LOC budget; see parent [`super`] for
 //! the public entry points.
 
 use std::sync::OnceLock;
@@ -13,7 +13,8 @@ use regex::Regex;
 use super::field::type_regex;
 use super::regex_case_insensitive;
 use crate::schema::table::{
-    HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType, MTreeVectorType,
+    DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
+    MTreeVectorType,
 };
 
 // --- Regex accessors ---------------------------------------------------------
@@ -21,14 +22,14 @@ use crate::schema::table::{
 fn columns_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex_case_insensitive(r"COLUMNS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|\s*;|\s*$)")
+        regex_case_insensitive(r"COLUMNS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|DISKANN|\s*;|\s*$)")
     })
 }
 
 fn fields_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex_case_insensitive(r"FIELDS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|\s*;|\s*$)")
+        regex_case_insensitive(r"FIELDS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|DISKANN|\s*;|\s*$)")
     })
 }
 
@@ -55,6 +56,24 @@ fn m_regex() -> &'static Regex {
 fn analyzer_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| regex_case_insensitive(r"ANALYZER\s+(\w+)"))
+}
+
+fn degree_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"\bDEGREE\s+(\d+)"))
+}
+
+fn l_build_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"\bL_BUILD\s+(\d+)"))
+}
+
+/// `ALPHA <decimal>`. The engine echoes a float literal with a trailing `f`
+/// suffix (`ALPHA 1.2f`) and an integer literal bare (`ALPHA 2`); the capture
+/// excludes the suffix so the stored value matches what code declares.
+fn alpha_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| regex_case_insensitive(r"\bALPHA\s+(\d+(?:\.\d+)?)"))
 }
 
 // --- Public parsers ----------------------------------------------------------
@@ -87,6 +106,11 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
     let mut hnsw_distance = None;
     let mut efc = None;
     let mut m = None;
+    let mut diskann_distance = None;
+    let mut degree = None;
+    let mut l_build = None;
+    let mut alpha = None;
+    let mut hashed_vector = false;
     let mut analyzer = None;
     let mut bm25 = false;
     let mut highlights = false;
@@ -103,6 +127,15 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
             hnsw_distance = extract_hnsw_distance(definition);
             efc = extract_hnsw_efc(definition);
             m = extract_hnsw_m(definition);
+        }
+        IndexType::Diskann => {
+            dimension = extract_dimension(definition);
+            vector_type = extract_vector_type(definition);
+            diskann_distance = extract_diskann_distance(definition);
+            degree = extract_diskann_degree(definition);
+            l_build = extract_diskann_l_build(definition);
+            alpha = extract_diskann_alpha(definition);
+            hashed_vector = definition.to_uppercase().contains("HASHED_VECTOR");
         }
         IndexType::Search => {
             analyzer = extract_analyzer(definition);
@@ -123,6 +156,11 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
         hnsw_distance,
         efc,
         m,
+        diskann_distance,
+        degree,
+        l_build,
+        alpha,
+        hashed_vector,
         analyzer,
         bm25,
         highlights,
@@ -169,6 +207,8 @@ fn extract_index_type(definition: &str) -> IndexType {
         IndexType::Hnsw
     } else if upper.contains("MTREE") {
         IndexType::Mtree
+    } else if upper.contains("DISKANN") {
+        IndexType::Diskann
     } else {
         IndexType::Standard
     }
@@ -209,18 +249,34 @@ fn extract_hnsw_distance(definition: &str) -> Option<HnswDistanceType> {
     }
 }
 
+fn extract_diskann_distance(definition: &str) -> Option<DiskAnnDistanceType> {
+    let caps = distance_regex().captures(definition)?;
+    let m = caps.get(1)?;
+    match m.as_str().to_uppercase().as_str() {
+        "COSINE" => Some(DiskAnnDistanceType::Cosine),
+        "COSINE_NORMALIZED" => Some(DiskAnnDistanceType::CosineNormalized),
+        "EUCLIDEAN" => Some(DiskAnnDistanceType::Euclidean),
+        "INNER_PRODUCT" => Some(DiskAnnDistanceType::InnerProduct),
+        _ => None,
+    }
+}
+
 fn extract_vector_type(definition: &str) -> Option<MTreeVectorType> {
-    // MTREE/HNSW `TYPE` clauses usually appear after `MTREE` / `HNSW`. Scan
-    // every TYPE occurrence in case the first one is swallowed by the field
-    // type clause (SurrealDB uses `TYPE` twice for these indexes).
+    // Vector `TYPE` clauses usually appear after `MTREE` / `HNSW` /
+    // `DISKANN`. Scan every TYPE occurrence in case the first one is
+    // swallowed by the field type clause (SurrealDB uses `TYPE` twice for
+    // these indexes).
     for caps in type_regex().captures_iter(definition) {
         let Some(m) = caps.get(1) else { continue };
         match m.as_str().to_uppercase().as_str() {
             "F64" => return Some(MTreeVectorType::F64),
             "F32" => return Some(MTreeVectorType::F32),
+            "F16" => return Some(MTreeVectorType::F16),
             "I64" => return Some(MTreeVectorType::I64),
             "I32" => return Some(MTreeVectorType::I32),
             "I16" => return Some(MTreeVectorType::I16),
+            "I8" => return Some(MTreeVectorType::I8),
+            "U8" => return Some(MTreeVectorType::U8),
             _ => {}
         }
     }
@@ -239,6 +295,27 @@ fn extract_hnsw_m(definition: &str) -> Option<u32> {
         .captures(definition)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse().ok())
+}
+
+fn extract_diskann_degree(definition: &str) -> Option<u32> {
+    degree_regex()
+        .captures(definition)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok())
+}
+
+fn extract_diskann_l_build(definition: &str) -> Option<u32> {
+    l_build_regex()
+        .captures(definition)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok())
+}
+
+fn extract_diskann_alpha(definition: &str) -> Option<String> {
+    alpha_regex()
+        .captures(definition)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
 }
 
 /// Extract the `SEARCH ANALYZER <name>` analyzer. The historical `ascii`

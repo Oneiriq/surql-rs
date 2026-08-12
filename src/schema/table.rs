@@ -18,8 +18,9 @@ use super::fields::FieldDefinition;
 use super::view::ViewDefinition;
 
 pub use super::index::{
-    bm25_index, hnsw_index, index, mtree_index, search_index, unique_index, HnswDistanceType,
-    IndexDefinition, IndexType, MTreeDistanceType, MTreeVectorType,
+    bm25_index, diskann_index, hnsw_index, index, mtree_index, search_index, unique_index,
+    DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
+    MTreeVectorType,
 };
 
 /// Table schema mode.

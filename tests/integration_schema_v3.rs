@@ -25,15 +25,17 @@ use serde_json::Value;
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::migration::diff::{diff_fields, diff_indexes, diff_tables};
 use surql::migration::diff_objects::{diff_functions, diff_params, diff_sequences};
+use surql::query::builder::Query;
 use surql::query::changes::{show_changes_surql, ChangeSet, ChangeSince};
 use surql::query::references::reverse_reference_query;
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
-    array_field, function_schema, generate_function_sql, generate_param_sql, generate_sequence_sql,
-    generate_table_sql, info_for_index_surql, param_schema, record_field, reverse_reference_field,
-    sequence_schema, string_field, table_schema, unique_index, ChangeFeed, FieldDefinition,
-    FunctionDefinition, IndexBuildStatus, ParamDefinition, ReferenceAction, SequenceDefinition,
-    TableDefinition, TableMode, ViewDefinition, ViewGroup,
+    array_field, diskann_index, function_schema, generate_function_sql, generate_param_sql,
+    generate_sequence_sql, generate_table_sql, hnsw_index, info_for_index_surql, param_schema,
+    record_field, reverse_reference_field, sequence_schema, string_field, table_schema,
+    unique_index, ChangeFeed, DiskAnnDistanceType, FieldDefinition, FunctionDefinition,
+    HnswDistanceType, IndexBuildStatus, MTreeVectorType, ParamDefinition, ReferenceAction,
+    SequenceDefinition, TableDefinition, TableMode, ViewDefinition, ViewGroup,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -750,6 +752,135 @@ async fn the_backfill_registers_inside_the_ddl_transaction() {
         serde_json::to_string(&seen).unwrap().contains("f:alpha"),
         "{seen:?}"
     );
+}
+
+/// The vector table every DISKANN / F16 case below builds on: one array
+/// column carrying three DISKANN/HNSW variants of the new surface.
+fn vector_schema() -> TableDefinition {
+    table_schema("vec")
+        .with_mode(TableMode::Schemafull)
+        .with_fields([array_field("v").build_unchecked().unwrap()])
+        .with_indexes([
+            // F16 elements on the established HNSW kind. EFC/M are spelled
+            // because the engine echoes its 150/12 defaults regardless.
+            hnsw_index(
+                "pb",
+                "v",
+                3,
+                HnswDistanceType::Cosine,
+                MTreeVectorType::F16,
+                Some(150),
+                Some(12),
+            ),
+            // A bare DISKANN: the builder fills DEGREE/L_BUILD/ALPHA with
+            // the engine defaults the echo always spells.
+            diskann_index(
+                "pc",
+                "v",
+                3,
+                DiskAnnDistanceType::Cosine,
+                MTreeVectorType::F32,
+            ),
+            // The full tail: tuned DEGREE/L_BUILD/ALPHA plus HASHED_VECTOR.
+            diskann_index(
+                "pd",
+                "v",
+                3,
+                DiskAnnDistanceType::CosineNormalized,
+                MTreeVectorType::F16,
+            )
+            .with_degree(48)
+            .with_l_build(90)
+            .with_alpha(1.5)
+            .with_hashed_vector(true),
+        ])
+}
+
+/// DISKANN and F16 definitions survive the whole code -> DDL -> engine ->
+/// `INFO` -> parser -> diff cycle with no residual change — the guard
+/// against every boot re-applying the same index forever.
+#[tokio::test]
+async fn diskann_and_f16_indexes_round_trip_through_the_parser() {
+    let client = memory_client().await;
+    let vec_table = vector_schema();
+    apply(&client, &generate_table_sql(&vec_table, true)).await;
+
+    let stored = read_back(&client, "vec").await;
+    let diffs = diff_indexes("vec", &vec_table.indexes, &stored.indexes);
+    assert!(
+        diffs.is_empty(),
+        "a DISKANN/F16 index re-applies on every boot: {diffs:#?}"
+    );
+
+    // Stronger than the name-keyed diff: every member the engine echoes
+    // parses back to exactly what the builder declared, ALPHA `f` suffix
+    // and all.
+    for code in &vec_table.indexes {
+        let stored_idx = stored
+            .indexes
+            .iter()
+            .find(|i| i.name == code.name)
+            .unwrap_or_else(|| panic!("stored table lost index {}", code.name));
+        assert_eq!(stored_idx, code, "{} drifted through the echo", code.name);
+    }
+}
+
+/// The `<|k,ef|>` KNN operator reaches a DISKANN index through the same
+/// `KnnScan` plan HNSW gets, and the bare `<|k|>` form stays a hard error.
+/// DISKANN is the only index on the table, so the plan cannot be riding
+/// anything else.
+#[tokio::test]
+async fn knn_scan_reaches_a_diskann_index() {
+    let client = memory_client().await;
+    let near = table_schema("near")
+        .with_mode(TableMode::Schemafull)
+        .with_fields([array_field("v").build_unchecked().unwrap()])
+        .with_indexes([diskann_index(
+            "pc",
+            "v",
+            3,
+            DiskAnnDistanceType::Cosine,
+            MTreeVectorType::F16,
+        )]);
+    apply(&client, &generate_table_sql(&near, true)).await;
+    client
+        .query("CREATE near:one SET v = [1.0, 2.0, 3.0]; CREATE near:two SET v = [1.1, 2.0, 3.0];")
+        .await
+        .expect("seed vectors");
+
+    let query = Query::new()
+        .from_table("near")
+        .expect("table")
+        .select(Some(vec!["id".into()]))
+        .vector_search_indexed("v", vec![1.0, 2.0, 3.0], 2, 40)
+        .expect("knn query")
+        .to_surql()
+        .expect("render");
+    let explain = client
+        .query(&format!("{} EXPLAIN;", query.trim_end_matches(';')))
+        .await
+        .expect("EXPLAIN");
+    let plan = serde_json::to_string(&explain).expect("serialise plan");
+    assert!(
+        plan.contains("KnnScan"),
+        "the index carries the scan: {plan}"
+    );
+    assert!(
+        plan.contains("\"index\":\"pc\""),
+        "the plan names the DISKANN index: {plan}"
+    );
+
+    let rows = client.query(&query).await.expect("run KNN");
+    let rows = serde_json::to_string(&rows).expect("serialise rows");
+    assert!(rows.contains("near:one"), "{rows}");
+    assert!(rows.contains("near:two"), "{rows}");
+
+    // The KTree-era bare form is gone; only `<|k,EF|>` (or an explicit
+    // metric for brute force) survives in 3.x.
+    let bare = client
+        .query("SELECT id FROM near WHERE v <|2|> [1.0, 2.0, 3.0];")
+        .await;
+    assert!(bare.is_err(), "the engine refuses the bare <|k|> form");
 }
 
 /// The exact shape a caller gets from `query`: the raw response,
