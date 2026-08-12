@@ -94,6 +94,14 @@ jobs:
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --all-features
 
+      # The rust-cache post step walks target/ after the job and treats
+      # the package-verification dir cargo leaves behind as a workspace,
+      # probing tests/ and trybuild/ cache locations that never existed
+      # there. The probes land as failure-level annotations on a
+      # succeeding job. The dir has served its purpose by now.
+      - name: Drop the package-verification dir
+        run: rm -rf target/package
+
   approval:
     name: Approve crates.io publish
     needs: verify
