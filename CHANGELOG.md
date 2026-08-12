@@ -7,9 +7,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.32.0] - 2026-08-09
+## [0.32.0] - 2026-08-11
+
+### Security
+
+- **`surrealdb` is required at 3.1.5 or later.** The 3.0 line carries
+  twenty-five published advisories (five high), all patched by 3.1.0
+  or 3.1.5, and the old `"3.0"` requirement let a consumer resolve a
+  vulnerable engine and let this repository's own lock sit on one.
+  The requirement now names the first fully patched version, so every
+  downstream resolution is forced past the set; the lock moves to the
+  current 3.2 line with it.
 
 ### Fixed
+
+- **The default branch compiles again.** The ulid 3 and comfy-table 8
+  major bumps landed with APIs this crate no longer had:
+  `Ulid::new()` became `Ulid::generate()`, and comfy-table's string
+  presets became `TableStyle` values loaded with `load_style`. Two
+  call sites (the streaming subscription id and the CLI table
+  renderer) moved to the new names; behaviour is unchanged.
 
 - **`parse_table_full`, `parse_table_info`, and `parse_edge_info` refused
   the response shape `query` actually returns.** `query` answers one
