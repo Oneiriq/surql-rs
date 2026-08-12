@@ -204,7 +204,7 @@ pub struct SubscriptionId(Ulid);
 
 impl SubscriptionId {
     fn new() -> Self {
-        Self(Ulid::new())
+        Self(Ulid::generate())
     }
 
     /// String representation (ULID).

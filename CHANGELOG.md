@@ -7,6 +7,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **The default branch compiles again.** The ulid 3 and comfy-table 8
+  major bumps landed with APIs this crate no longer had:
+  `Ulid::new()` became `Ulid::generate()`, and comfy-table's string
+  presets became `TableStyle` values loaded with `load_style`. Two
+  call sites (the streaming subscription id and the CLI table
+  renderer) moved to the new names; behaviour is unchanged.
 
 ## [0.31.0] - 2026-08-07
 
