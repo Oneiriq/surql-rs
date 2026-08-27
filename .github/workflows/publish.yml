@@ -138,3 +138,10 @@ jobs:
 
       - name: Publish
         run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # Same cosmetic-annotation fix the verify job carries: the
+      # rust-cache post step walks the target/package/<crate>/ dir
+      # cargo publish leaves behind as if it were a workspace, and its
+      # probes land as failure-level annotations on a succeeding job.
+      - name: Drop the package-verification dir
+        run: rm -rf target/package
