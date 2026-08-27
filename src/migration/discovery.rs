@@ -595,7 +595,7 @@ pub(crate) mod sha2_lite {
         }
         padded.extend_from_slice(&bit_len.to_be_bytes());
 
-        for chunk in padded.chunks_exact(64) {
+        for chunk in padded.as_chunks::<64>().0 {
             process_chunk(chunk, &mut h);
         }
 

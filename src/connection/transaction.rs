@@ -45,7 +45,7 @@ pub struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     /// Begin a new transaction bound to `client`.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn begin(client: &'a DatabaseClient) -> Result<Transaction<'a>> {
         // Surface an early error if the client is not connected, so the
         // caller learns about it before issuing `execute` calls.
@@ -76,7 +76,7 @@ impl<'a> Transaction<'a> {
     /// The statement is **not** executed until [`Transaction::commit`]
     /// is called. Returns [`serde_json::Value::Null`] on success; the
     /// actual result becomes available in `commit`'s response.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn execute(&mut self, surql: &str) -> Result<Value> {
         if !self.is_active() {
             return Err(SurqlError::Transaction {
@@ -127,7 +127,7 @@ impl<'a> Transaction<'a> {
     /// Since queued statements are buffered client-side until commit,
     /// there is nothing to undo server-side; this simply discards the
     /// buffer and marks the transaction as terminated.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn rollback(mut self) -> Result<()> {
         if !self.is_active() {
             return Err(SurqlError::Transaction {
