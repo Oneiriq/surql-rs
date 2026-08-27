@@ -7,6 +7,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-08-27
+
+### Fixed
+
+- `DatabaseClient` re-establishes its session and retries once when the
+  engine expires a long-lived authenticated session ("The session has
+  expired"). Before this, a service holding a connection past the
+  session duration failed every request until restarted. The replay
+  only happens on clients whose authority is the config credentials;
+  `caller_session` clones and credential-less connections surface the
+  error unchanged, because replaying service credentials there would
+  swap the session's identity.
+
 ## [0.33.0] - 2026-08-12
 
 ### Added
