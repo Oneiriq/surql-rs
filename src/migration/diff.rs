@@ -47,7 +47,7 @@ pub use crate::migration::diff_objects::{diff_analyzers, diff_buckets};
 use crate::migration::diff_objects::{diff_functions, diff_params, diff_sequences};
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
-use crate::schema::edge::{EdgeDefinition, EdgeMode};
+use crate::schema::edge::EdgeDefinition;
 use crate::schema::fields::FieldDefinition;
 use crate::schema::function::FunctionDefinition;
 use crate::schema::param::ParamDefinition;
@@ -435,7 +435,14 @@ pub fn diff_events(
 /// Compare two permission maps for the named table.
 ///
 /// Emits at most one [`SchemaDiff`] describing the delta. If the maps are
-/// equal, returns an empty vector.
+/// equal, returns an empty vector. Both directions render
+/// `ALTER TABLE <table> PERMISSIONS ...`, which replaces the permission set
+/// and leaves every other clause of the table alone; an absent map renders
+/// `PERMISSIONS NONE`, the engine's default for a table.
+///
+/// [`diff_tables`] and [`diff_edges`] carry permission changes as the full
+/// `DEFINE TABLE OVERWRITE` statement instead, since they have the whole
+/// definition to hand.
 #[must_use]
 pub fn diff_permissions(
     table: &str,
@@ -553,16 +560,11 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
     if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
-        match (code.to_surql_overwrite(), db.to_surql_overwrite()) {
-            (Ok(forward), Ok(backward)) => {
-                out.push(modify_permissions_full(&code.name, forward, backward));
-            }
-            _ => out.extend(diff_permissions(
-                &code.name,
-                code.permissions.as_ref(),
-                db.permissions.as_ref(),
-            )),
-        }
+        out.push(modify_permissions_full(
+            &code.name,
+            edge_define_sql(code, true),
+            edge_define_sql(db, true),
+        ));
     }
     out
 }
@@ -940,23 +942,10 @@ fn generate_modify_permissions_diff(
 }
 
 fn generate_add_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
-    let mut forward_sql = match edge.mode {
-        EdgeMode::Relation => {
-            let mut s = format!("DEFINE TABLE {} TYPE RELATION", edge.name);
-            if let Some(from) = edge.from_table.as_deref() {
-                s.push_str(" FROM ");
-                s.push_str(from);
-            }
-            if let Some(to) = edge.to_table.as_deref() {
-                s.push_str(" TO ");
-                s.push_str(to);
-            }
-            s
-        }
-        EdgeMode::Schemafull => format!("DEFINE TABLE {} SCHEMAFULL", edge.name),
-        EdgeMode::Schemaless => format!("DEFINE TABLE {} SCHEMALESS", edge.name),
-    };
-    forward_sql.push(';');
+    // One statement carries the mode, the endpoints, and the permissions. A
+    // separate permissions statement would re-define the table it just
+    // created, and its OVERWRITE form would reset `TYPE RELATION`.
+    let forward_sql = edge_define_sql(edge, false);
     let backward_sql = format!("REMOVE TABLE {};", edge.name);
 
     let mut out = vec![SchemaDiff {
@@ -982,16 +971,39 @@ fn generate_add_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
     for ev in &edge.events {
         out.push(generate_add_event_diff(&edge.name, ev));
     }
-    if let Some(perms) = edge.permissions.as_ref() {
-        if !perms.is_empty() {
-            out.push(generate_modify_permissions_diff(
-                &edge.name,
-                Some(perms),
-                None,
-            ));
-        }
-    }
     out
+}
+
+/// Render an edge's `DEFINE TABLE` statement, in its `OVERWRITE` form when
+/// `overwrite` is set.
+///
+/// The canonical renderer refuses a `RELATION` edge that names only one
+/// endpoint (or none). The engine accepts that shape and constrains just the
+/// side that is named, so it renders here instead of vanishing from the diff.
+fn edge_define_sql(edge: &EdgeDefinition, overwrite: bool) -> String {
+    let canonical = if overwrite {
+        edge.to_surql_overwrite()
+    } else {
+        edge.to_surql()
+    };
+    canonical.unwrap_or_else(|_| {
+        let guard = if overwrite { " OVERWRITE" } else { "" };
+        let mut sql = format!("DEFINE TABLE{guard} {} TYPE RELATION", edge.name);
+        if let Some(from) = edge.from_table.as_deref() {
+            sql.push_str(" FROM ");
+            sql.push_str(from);
+        }
+        if let Some(to) = edge.to_table.as_deref() {
+            sql.push_str(" TO ");
+            sql.push_str(to);
+        }
+        if let Some(rules) = permission_rules(edge.permissions.as_ref()) {
+            sql.push_str(" PERMISSIONS ");
+            sql.push_str(&rules);
+        }
+        sql.push(';');
+        sql
+    })
 }
 
 fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
@@ -1011,27 +1023,27 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
     }]
 }
 
+/// Render a permission map as an `ALTER TABLE ... PERMISSIONS` statement.
+///
+/// `ALTER` replaces the table's whole permission set and nothing else, so the
+/// table's mode, type, endpoints, and fields survive. `DEFINE TABLE` could not
+/// carry a permissions-only change: the plain form fails on a table that
+/// exists, and the `OVERWRITE` form resets every clause it does not repeat.
+/// An absent or empty map is the engine's default for a table, `NONE`.
 fn render_permission_statements(table: &str, perms: Option<&BTreeMap<String, String>>) -> String {
-    let Some(perms) = perms else {
-        return String::new();
-    };
-    if perms.is_empty() {
-        return String::new();
-    }
-    // Table permissions render inline on a single `DEFINE TABLE` statement (the
-    // only valid placement for table-level PERMISSIONS), matching the schema
-    // renderer. This was previously a malformed `DEFINE FIELD PERMISSIONS FOR
-    // {action} ON TABLE ...` per action, which SurrealDB rejects.
-    //
-    // NOTE: this re-defines only the permissions; a `SCHEMAFULL` table would
-    // fall back to the `SCHEMALESS` default, so a full-fidelity permission
-    // migration should re-emit the table mode (a future improvement once the
-    // diff carries it here).
+    let rules = permission_rules(perms).unwrap_or_else(|| "NONE".to_owned());
+    format!("ALTER TABLE {table} PERMISSIONS {rules};")
+}
+
+/// The `FOR <action> WHERE <rule>` clauses of a permission map, or `None`
+/// when there are none.
+fn permission_rules(perms: Option<&BTreeMap<String, String>>) -> Option<String> {
+    let perms = perms.filter(|p| !p.is_empty())?;
     let clauses: Vec<String> = perms
         .iter()
         .map(|(action, condition)| format!("FOR {action} WHERE {condition}"))
         .collect();
-    format!("DEFINE TABLE {table} PERMISSIONS {};", clauses.join(" "))
+    Some(clauses.join(" "))
 }
 
 fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
@@ -1644,12 +1656,13 @@ mod tests {
         let diffs = diff_permissions("t", Some(&new_perms), None);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].operation, DiffOperation::ModifyPermissions);
-        assert!(diffs[0]
-            .forward_sql
-            .starts_with("DEFINE TABLE t PERMISSIONS"));
-        assert!(diffs[0].forward_sql.contains("FOR select WHERE true"));
+        assert_eq!(
+            diffs[0].forward_sql,
+            "ALTER TABLE t PERMISSIONS FOR select WHERE true;"
+        );
         assert!(!diffs[0].forward_sql.contains("DEFINE FIELD PERMISSIONS"));
-        assert_eq!(diffs[0].backward_sql, "");
+        // The rollback restores the table default rather than doing nothing.
+        assert_eq!(diffs[0].backward_sql, "ALTER TABLE t PERMISSIONS NONE;");
     }
 
     #[test]
@@ -1658,8 +1671,11 @@ mod tests {
         old_perms.insert("select".into(), "$auth.id = id".into());
         let diffs = diff_permissions("t", None, Some(&old_perms));
         assert_eq!(diffs.len(), 1);
-        assert_eq!(diffs[0].forward_sql, "");
-        assert!(diffs[0].backward_sql.contains("$auth.id = id"));
+        assert_eq!(diffs[0].forward_sql, "ALTER TABLE t PERMISSIONS NONE;");
+        assert_eq!(
+            diffs[0].backward_sql,
+            "ALTER TABLE t PERMISSIONS FOR select WHERE $auth.id = id;"
+        );
     }
 
     #[test]
@@ -1716,6 +1732,40 @@ mod tests {
         assert!(diffs[0].forward_sql.contains("TYPE RELATION"));
         assert!(diffs[0].forward_sql.contains("FROM user"));
         assert!(diffs[0].forward_sql.contains("TO post"));
+    }
+
+    /// The permissions ride the one `DEFINE TABLE` that creates the edge; a
+    /// second statement would fail on the table the first one made.
+    #[test]
+    fn an_added_edge_carries_its_permissions_inline() {
+        let code = vec![relation_edge("likes").with_permissions([("select", "true")])];
+        let diffs = diff_edges(&code, &[]);
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE TABLE likes TYPE RELATION FROM user TO post \
+             PERMISSIONS FOR select WHERE true;"
+        );
+    }
+
+    /// A relation edge naming one endpoint is valid to the engine; its
+    /// permission change still renders one whole `OVERWRITE` statement.
+    #[test]
+    fn a_half_constrained_edge_changes_permissions_in_one_statement() {
+        let db = EdgeDefinition::new("tagged").with_from_table("user");
+        let code = db.clone().with_permissions([("select", "true")]);
+        let diffs = diff_edges(&[code], &[db]);
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyPermissions);
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE TABLE OVERWRITE tagged TYPE RELATION FROM user \
+             PERMISSIONS FOR select WHERE true;"
+        );
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE TABLE OVERWRITE tagged TYPE RELATION FROM user;"
+        );
     }
 
     #[test]
@@ -2018,9 +2068,9 @@ mod tests {
         code.insert("create".into(), "true".into());
         let diffs = diff_permissions("t", Some(&code), None);
         let fwd = &diffs[0].forward_sql;
-        // One DEFINE TABLE statement carrying both actions inline (the valid
+        // One table-level statement carrying both actions inline (the valid
         // placement), not separate malformed DEFINE FIELD statements.
-        assert_eq!(fwd.matches("DEFINE TABLE").count(), 1);
+        assert_eq!(fwd.matches("ALTER TABLE").count(), 1);
         assert!(fwd.contains("FOR select WHERE true"));
         assert!(fwd.contains("FOR create WHERE true"));
         assert!(!fwd.contains("DEFINE FIELD PERMISSIONS"));
