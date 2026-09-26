@@ -142,23 +142,14 @@ impl CacheBackend for MemoryCache {
     }
 
     async fn clear(&self, pattern: Option<&str>) -> Result<usize> {
+        let matcher = pattern.map(compile_glob).transpose()?;
         let mut guard = self.inner.write().await;
-        let count = match pattern {
-            None => {
-                let n = guard.len();
-                guard.clear();
-                n
-            }
-            Some(pat) => {
-                let re = compile_glob(pat);
-                let to_remove: Vec<String> =
-                    guard.keys().filter(|k| re.is_match(k)).cloned().collect();
-                for k in &to_remove {
-                    guard.remove(k);
-                }
-                to_remove.len()
-            }
-        };
+        let before = guard.len();
+        match matcher {
+            None => guard.clear(),
+            Some(re) => guard.retain(|k, _| !re.is_match(k)),
+        }
+        let count = before.saturating_sub(guard.len());
         self.stats.set_size(guard.len() as u64);
         Ok(count)
     }

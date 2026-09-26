@@ -371,6 +371,17 @@ mod tests {
         assert_eq!(m.get::<u32>("product:1").await.unwrap(), Some(3));
     }
 
+    /// Regression: a non-ASCII pattern failed to compile and fell back to
+    /// `.*`, so invalidating `café:*` wiped the whole cache.
+    #[tokio::test]
+    async fn invalidate_pattern_with_non_ascii_is_scoped() {
+        let m = manager();
+        m.set("café:1", &1u32, None, &[]).await.unwrap();
+        m.set("user:1", &2u32, None, &[]).await.unwrap();
+        assert_eq!(m.invalidate_pattern("café:*").await.unwrap(), 1);
+        assert_eq!(m.get::<u32>("user:1").await.unwrap(), Some(2));
+    }
+
     #[tokio::test]
     async fn clear_empties_cache_and_resets_stats() {
         let m = manager();
