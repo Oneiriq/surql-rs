@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::Result;
 
+use super::get_cache_manager;
 use super::manager::CacheManager;
-use super::{get_cache_manager, get_or_init_manager};
 
 /// Evaluate `fetch` only if `key` is absent from the global cache.
 ///
@@ -57,20 +57,14 @@ where
 /// a list of JSON-serialisable arguments.
 ///
 /// Mirrors `cache_key_for` from the Python port; the digest is a
-/// SHA-256 of the combined identifier + sorted-argument JSON.
+/// SHA-256 of the JSON array `[module, name, args]`. Hashing a JSON
+/// array keeps the parts apart, so `("a.b", "c")` and `("a", "b.c")`
+/// get different keys even though both read `a.b.c` in the key text.
 pub fn cache_key_for<T: Serialize + ?Sized>(module: &str, name: &str, args: &T) -> Result<String> {
-    let args_json = serde_json::to_string(args)?;
-    let mut hasher = Sha256::new();
-    hasher.update(module.as_bytes());
-    hasher.update(b".");
-    hasher.update(name.as_bytes());
-    hasher.update(b"(");
-    hasher.update(args_json.as_bytes());
-    hasher.update(b")");
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().take(8).fold(String::new(), |mut acc, byte| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{byte:02x}");
+    let identity = serde_json::to_string(&(module, name, args))?;
+    let digest = Sha256::digest(identity.as_bytes());
+    let hex = digest.iter().take(8).fold(String::new(), |mut acc, byte| {
+        acc.push_str(&format!("{byte:02x}"));
         acc
     });
     Ok(format!("{module}.{name}:{hex}"))
@@ -84,14 +78,6 @@ pub async fn is_cached(key: &str) -> Result<bool> {
         Some(m) => m.exists(key).await,
         None => Ok(false),
     }
-}
-
-/// Internal helper: get-or-init the manager, used by the decorator
-/// when `configure_cache` has not been called but we still want a
-/// default memory cache.
-#[allow(dead_code)]
-pub(crate) fn ensure_default_manager() -> CacheManager {
-    get_or_init_manager()
 }
 
 #[cfg(test)]
@@ -109,6 +95,16 @@ mod tests {
     fn cache_key_for_differs_on_args() {
         let k1 = cache_key_for("mod", "fun", &("a", 1)).unwrap();
         let k2 = cache_key_for("mod", "fun", &("a", 2)).unwrap();
+        assert_ne!(k1, k2);
+    }
+
+    /// Regression: the hash input was `module.name(args)`, so a dot moved
+    /// between module and name hashed the same text and the two calls
+    /// shared one cache entry.
+    #[test]
+    fn cache_key_for_keeps_module_and_name_apart() {
+        let k1 = cache_key_for("a.b", "c", &()).unwrap();
+        let k2 = cache_key_for("a", "b.c", &()).unwrap();
         assert_ne!(k1, k2);
     }
 
