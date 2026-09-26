@@ -5,16 +5,13 @@
 //! `surql.orchestration.strategy.CanaryStrategy`.
 
 use async_trait::async_trait;
-use tokio::task::JoinSet;
 use tracing::{error, info};
 
 use crate::error::{Result, SurqlError};
 use crate::orchestration::coordinator::DeploymentPlan;
-use crate::orchestration::environment::EnvironmentConfig;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
-use crate::orchestration::strategies::{
-    deploy_to_environment, resolve_plan_environments, DeploymentStrategy,
-};
+use crate::orchestration::strategies::concurrent::deploy_all;
+use crate::orchestration::strategies::{resolve_plan_environments, DeploymentStrategy};
 
 /// Deploy to the first `canary_percentage` of environments, then the rest.
 #[derive(Debug, Clone, Copy)]
@@ -67,12 +64,12 @@ impl DeploymentStrategy for CanaryStrategy {
         }
 
         let canary_count = canary_slice(envs.len(), self.canary_percentage);
-        let (canary, remaining) = envs.split_at(canary_count);
-        let canary: Vec<EnvironmentConfig> = canary.to_vec();
-        let remaining: Vec<EnvironmentConfig> = remaining.to_vec();
+        let (canary, remaining) = envs
+            .split_at_checked(canary_count)
+            .unwrap_or((envs.as_slice(), &[]));
 
         info!(canary = canary.len(), "deploying_to_canary");
-        let canary_results = fan_out(&canary, plan).await?;
+        let canary_results = deploy_all(canary, plan, None).await;
         let failed = canary_results
             .iter()
             .any(|r| r.status == DeploymentStatus::Failed);
@@ -82,56 +79,24 @@ impl DeploymentStrategy for CanaryStrategy {
         }
 
         info!(remaining = remaining.len(), "canary_successful_proceeding");
-        let rest_results = fan_out(&remaining, plan).await?;
+        let rest_results = deploy_all(remaining, plan, None).await;
         let mut out = canary_results;
         out.extend(rest_results);
         Ok(out)
     }
 }
 
+/// Size of the canary batch: Python's `max(1, int(total * pct / 100))`,
+/// capped at `total`.
+///
+/// `int()` truncates, so the count is the number of `n` in `1..=total`
+/// with `n <= total * pct / 100`. Counting keeps the arithmetic in `f64`
+/// without casting a float back to an integer.
 fn canary_slice(total: usize, pct: f64) -> usize {
-    // Mirrors py's `max(1, int(len(envs) * pct / 100))`.
-    if total == 0 {
-        return 0;
-    }
-    // Python's `int()` truncates toward zero; `f64 as usize` does the same
-    // for non-negative finite values, which is what the API contract guarantees.
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_precision_loss
-    )]
-    let raw = (total as f64 * pct / 100.0) as usize;
+    let as_f64 = |n: usize| u32::try_from(n).map_or(f64::from(u32::MAX), f64::from);
+    let limit = as_f64(total) * pct / 100.0;
+    let raw = (1..=total).take_while(|n| as_f64(*n) <= limit).count();
     raw.max(1).min(total)
-}
-
-async fn fan_out(
-    envs: &[EnvironmentConfig],
-    plan: &DeploymentPlan,
-) -> Result<Vec<DeploymentResult>> {
-    if envs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut join = JoinSet::new();
-    for (idx, env) in envs.iter().cloned().enumerate() {
-        let plan = plan.clone();
-        join.spawn(async move {
-            let result = deploy_to_environment(&env, &plan).await;
-            (idx, result)
-        });
-    }
-    let mut buffer: Vec<Option<DeploymentResult>> = (0..envs.len()).map(|_| None).collect();
-    while let Some(res) = join.join_next().await {
-        match res {
-            Ok((idx, result)) => buffer[idx] = Some(result),
-            Err(join_err) => {
-                return Err(SurqlError::Orchestration {
-                    reason: format!("task join failed: {join_err}"),
-                });
-            }
-        }
-    }
-    Ok(buffer.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
@@ -167,5 +132,9 @@ mod tests {
         assert_eq!(canary_slice(5, 1.0), 1);
         // Always at most `total`.
         assert_eq!(canary_slice(2, 50.0), 1);
+        assert_eq!(canary_slice(1, 50.0), 1);
+        assert_eq!(canary_slice(3, 50.0), 1);
+        assert_eq!(canary_slice(4, 50.0), 2);
+        assert_eq!(canary_slice(200, 12.5), 25);
     }
 }

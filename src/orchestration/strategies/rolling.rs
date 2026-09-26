@@ -7,16 +7,13 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::task::JoinSet;
 use tracing::{error, info};
 
 use crate::error::Result;
 use crate::orchestration::coordinator::DeploymentPlan;
-use crate::orchestration::environment::EnvironmentConfig;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
-use crate::orchestration::strategies::{
-    deploy_to_environment, resolve_plan_environments, DeploymentStrategy,
-};
+use crate::orchestration::strategies::concurrent::deploy_all;
+use crate::orchestration::strategies::{resolve_plan_environments, DeploymentStrategy};
 
 /// Deploy in fixed-size batches with a pause between them.
 #[derive(Debug, Clone, Copy)]
@@ -66,39 +63,13 @@ impl DeploymentStrategy for RollingStrategy {
         let envs = resolve_plan_environments(plan).await?;
         let mut out: Vec<DeploymentResult> = Vec::with_capacity(envs.len());
 
-        let mut index = 0usize;
-        let total = envs.len();
-        let mut batch_num = 0usize;
-        while index < total {
-            let end = (index + self.batch_size).min(total);
-            let batch: Vec<EnvironmentConfig> = envs[index..end].to_vec();
-            batch_num += 1;
+        let batches = envs.chunks(self.batch_size.max(1));
+        let total = batches.len();
+        for (index, batch) in batches.enumerate() {
+            let batch_num = index + 1;
             info!(batch = batch_num, size = batch.len(), "deploying_batch");
 
-            let mut join = JoinSet::new();
-            for (local_idx, env) in batch.into_iter().enumerate() {
-                let plan = plan.clone();
-                join.spawn(async move {
-                    let result = deploy_to_environment(&env, &plan).await;
-                    (local_idx, result)
-                });
-            }
-
-            let mut batch_results: Vec<Option<DeploymentResult>> =
-                (0..(end - index)).map(|_| None).collect();
-            while let Some(res) = join.join_next().await {
-                match res {
-                    Ok((local_idx, result)) => batch_results[local_idx] = Some(result),
-                    Err(join_err) => {
-                        return Err(crate::error::SurqlError::Orchestration {
-                            reason: format!("task join failed: {join_err}"),
-                        });
-                    }
-                }
-            }
-
-            let batch_results: Vec<DeploymentResult> =
-                batch_results.into_iter().flatten().collect();
+            let batch_results = deploy_all(batch, plan, None).await;
             let failed = batch_results
                 .iter()
                 .any(|r| r.status == DeploymentStatus::Failed);
@@ -108,9 +79,7 @@ impl DeploymentStrategy for RollingStrategy {
                 error!(batch = batch_num, "batch_failed_stopping");
                 break;
             }
-
-            index = end;
-            if index < total && !self.batch_pause.is_zero() {
+            if batch_num < total && !self.batch_pause.is_zero() {
                 tokio::time::sleep(self.batch_pause).await;
             }
         }

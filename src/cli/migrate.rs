@@ -14,7 +14,8 @@ use crate::error::{Result, SurqlError};
 use crate::migration::{
     create_blank_migration, create_migration_plan, discover_migrations, execute_migration_plan,
     get_migration_history, get_migration_status, migrate_down as lib_migrate_down,
-    squash_migrations, validate_migrations, MigrationDirection, MigrationPlan, SquashOptions,
+    squash_migrations, validate_migrations, MigrationDirection, MigrationPlan, MigrationState,
+    MigrationStatus, SquashOptions,
 };
 
 /// `surql migrate <subcommand>` commands.
@@ -153,7 +154,7 @@ async fn up(
 
     let statuses = execute_migration_plan(&client, selected).await?;
     render_statuses(&statuses);
-    Ok(())
+    fail_on_failed(&statuses)
 }
 
 async fn down(
@@ -179,7 +180,7 @@ async fn down(
 
     let statuses = lib_migrate_down(&client, migrations_dir, steps).await?;
     render_statuses(&statuses);
-    Ok(())
+    fail_on_failed(&statuses)
 }
 
 async fn status(settings: &crate::settings::Settings, migrations_dir: &Path) -> Result<()> {
@@ -374,7 +375,25 @@ async fn resolve_down_steps(
     Ok(steps)
 }
 
-fn render_statuses(statuses: &[crate::migration::MigrationStatus]) {
+/// Turn a run that stopped on a failed migration into an error.
+///
+/// The executor reports a failed statement or commit as a status with
+/// [`MigrationState::Failed`] rather than as an `Err`, and stops there;
+/// without this check the command would print the table and exit 0.
+fn fail_on_failed(statuses: &[MigrationStatus]) -> Result<()> {
+    match statuses.iter().find(|s| s.state == MigrationState::Failed) {
+        Some(failed) => Err(SurqlError::MigrationExecution {
+            reason: format!(
+                "migration {} failed: {}",
+                failed.migration.version,
+                failed.error.as_deref().unwrap_or("unknown error")
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+fn render_statuses(statuses: &[MigrationStatus]) {
     let mut table = fmt::make_table();
     table.set_header(vec!["version", "state", "error"]);
     for s in statuses {
@@ -385,4 +404,52 @@ fn render_statuses(statuses: &[crate::migration::MigrationStatus]) {
         ]);
     }
     println!("{table}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migration::Migration;
+
+    fn status(version: &str, state: MigrationState, error: Option<&str>) -> MigrationStatus {
+        MigrationStatus {
+            migration: Migration {
+                version: version.into(),
+                description: String::new(),
+                path: PathBuf::new(),
+                up: vec![],
+                down: vec![],
+                checksum: None,
+                depends_on: vec![],
+            },
+            state,
+            applied_at: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn failed_status_is_an_error() {
+        let statuses = vec![
+            status("v1", MigrationState::Applied, None),
+            status(
+                "v2",
+                MigrationState::Failed,
+                Some("statement 0 failed: boom"),
+            ),
+        ];
+        let err = fail_on_failed(&statuses).unwrap_err();
+        assert!(err.to_string().contains("v2"), "{err}");
+        assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn applied_and_rolled_back_statuses_are_ok() {
+        let statuses = vec![
+            status("v1", MigrationState::Applied, None),
+            status("v2", MigrationState::Pending, None),
+        ];
+        assert!(fail_on_failed(&statuses).is_ok());
+        assert!(fail_on_failed(&[]).is_ok());
+    }
 }

@@ -18,12 +18,13 @@
 //!
 //! ## Configuration
 //!
-//! Every subcommand accepts `--config <path>` to override the
-//! automatic [`Settings`] discovery. Without
-//! the flag the standard layered lookup runs (env, `.env`,
-//! `Cargo.toml [package.metadata.surql]`).
+//! Every subcommand accepts `--config <path>` naming the `Cargo.toml`
+//! (or its directory) whose `[package.metadata.surql]` table the
+//! [`Settings`] loader should read instead of discovering one; see
+//! [`GlobalOpts::settings`]. Without the flag the standard layered lookup
+//! runs (env, `.env`, `Cargo.toml [package.metadata.surql]`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -47,8 +48,9 @@ pub const EXIT_FAILURE: u8 = 1;
 /// [`ExitCode`] as its process exit status.
 #[must_use]
 pub fn run() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    let cli = match Cli::try_parse_from(&args) {
+    // `try_parse` reads `args_os`, so an argument that is not valid UTF-8
+    // becomes a usage error instead of a panic in `std::env::args`.
+    let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
             // clap already formats errors; exit codes match its defaults
@@ -127,8 +129,9 @@ pub struct Cli {
 /// Global flags shared by every subcommand group.
 #[derive(Debug, Clone, clap::Args)]
 pub struct GlobalOpts {
-    /// Override the automatic `Settings` discovery with a `Cargo.toml`-style
-    /// settings file.
+    /// Read settings from this `Cargo.toml` (or the `Cargo.toml` in this
+    /// directory) instead of discovering one from the current directory.
+    /// Its `[package.metadata.surql]` table must exist.
     #[arg(long = "config", global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -140,25 +143,71 @@ pub struct GlobalOpts {
 impl GlobalOpts {
     /// Resolve the effective [`Settings`] for this invocation.
     ///
-    /// When `--config <path>` is supplied the file's parent directory is
-    /// used as the working directory for the settings loader, which
-    /// causes it to pick up the TOML metadata declared in that file.
-    /// Otherwise the loader walks upward from the current directory as
-    /// documented on [`Settings::load`].
+    /// When `--config <path>` is supplied, the settings loader reads that
+    /// `Cargo.toml` (a directory means the `Cargo.toml` inside it) and the
+    /// `.env` beside it, with the usual precedence: `SURQL_*` environment
+    /// variables still win over the file. The file must exist, parse, and
+    /// carry a `[package.metadata.surql]` table; anything else is an error
+    /// rather than a silent fall back to the defaults. Otherwise the loader
+    /// walks upward from the current directory as documented on
+    /// [`Settings::load`].
     ///
     /// # Errors
     ///
-    /// Propagates validation errors from [`Settings::load`].
+    /// Returns [`SurqlError::Validation`] for an unusable `--config` path
+    /// and propagates validation errors from [`Settings::load`].
     pub fn settings(&self) -> Result<Settings> {
         let mut builder = SettingsBuilder::default();
         if let Some(path) = &self.config {
-            let cwd = path
-                .parent()
-                .map_or_else(|| PathBuf::from("."), PathBuf::from);
-            builder = builder.cwd(cwd);
+            builder = builder.cwd(config_dir(path)?);
         }
         builder.load()
     }
+}
+
+/// The directory to hand the settings loader for `--config <path>`.
+///
+/// The loader reads the `Cargo.toml` of the directory it starts in before
+/// walking upward, so pointing it at the parent of the named file makes it
+/// read exactly that file. It only ever reads a file called `Cargo.toml`,
+/// and it quietly falls back to the defaults for a file that does not
+/// parse or has no `[package.metadata.surql]` table, so those cases are
+/// rejected here.
+fn config_dir(path: &Path) -> Result<PathBuf> {
+    let invalid = |why: String| SurqlError::Validation {
+        reason: format!("--config {}: {why}", path.display()),
+    };
+    let file = if path.is_dir() {
+        path.join("Cargo.toml")
+    } else {
+        path.to_path_buf()
+    };
+    if file.file_name().and_then(|n| n.to_str()) != Some("Cargo.toml") {
+        return Err(invalid(
+            "settings are read from a file named Cargo.toml (its [package.metadata.surql] table); \
+             pass that file or its directory"
+                .into(),
+        ));
+    }
+    if !file.is_file() {
+        return Err(invalid(format!("{} does not exist", file.display())));
+    }
+    let body = std::fs::read_to_string(&file)
+        .map_err(|e| invalid(format!("cannot read {}: {e}", file.display())))?;
+    let parsed: toml::Table =
+        toml::from_str(&body).map_err(|e| invalid(format!("cannot parse: {e}")))?;
+    let has_section = parsed
+        .get("package")
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("surql"))
+        .is_some();
+    if !has_section {
+        return Err(invalid("has no [package.metadata.surql] table".into()));
+    }
+    Ok(match file.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    })
 }
 
 /// Top-level subcommand selector.
@@ -203,6 +252,60 @@ mod tests {
     fn config_flag_is_accepted_before_subcommand() {
         let cli = Cli::try_parse_from(["surql", "--config", "/tmp/c.toml", "db", "info"]).unwrap();
         assert!(cli.global.config.is_some());
+    }
+
+    fn opts(config: &Path) -> GlobalOpts {
+        GlobalOpts {
+            config: Some(config.to_path_buf()),
+            verbose: false,
+        }
+    }
+
+    const SURQL_CARGO: &str = "[package]\nname = \"demo\"\nversion = \"0.0.0\"\n\n\
+        [package.metadata.surql]\napp_name = \"from-config-flag\"\n";
+
+    #[test]
+    fn config_flag_reads_the_named_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.toml");
+        std::fs::write(&file, SURQL_CARGO).unwrap();
+        assert_eq!(opts(&file).settings().unwrap().app_name, "from-config-flag");
+        assert_eq!(
+            opts(dir.path()).settings().unwrap().app_name,
+            "from-config-flag"
+        );
+    }
+
+    #[test]
+    fn config_flag_rejects_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = opts(&dir.path().join("Cargo.toml")).settings().unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn config_flag_rejects_a_file_the_loader_would_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("prod.toml");
+        std::fs::write(&file, SURQL_CARGO).unwrap();
+        let err = opts(&file).settings().unwrap_err();
+        assert!(err.to_string().contains("Cargo.toml"), "{err}");
+    }
+
+    #[test]
+    fn config_flag_rejects_a_file_without_surql_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Cargo.toml");
+        std::fs::write(&file, "[package]\nname = \"demo\"\n").unwrap();
+        let err = opts(&file).settings().unwrap_err();
+        assert!(
+            err.to_string().contains("[package.metadata.surql]"),
+            "{err}"
+        );
+
+        std::fs::write(&file, "not = [valid").unwrap();
+        let err = opts(&file).settings().unwrap_err();
+        assert!(err.to_string().contains("cannot parse"), "{err}");
     }
 
     #[test]
