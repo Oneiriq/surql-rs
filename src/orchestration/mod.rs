@@ -57,6 +57,7 @@ pub mod coordinator;
 pub mod environment;
 pub mod health;
 pub mod result;
+mod rollback;
 pub mod strategies;
 
 pub use coordinator::{

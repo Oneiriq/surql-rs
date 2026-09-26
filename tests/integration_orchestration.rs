@@ -240,8 +240,14 @@ async fn register(registry: &EnvironmentRegistry, name: &str, cfg: &ConnectionCo
 }
 
 fn coordinator(registry: &EnvironmentRegistry) -> MigrationCoordinator {
-    MigrationCoordinator::with_strategy_label(registry.clone(), StrategyKind::Sequential, 1, 10.0, 1)
-        .expect("coordinator")
+    MigrationCoordinator::with_strategy_label(
+        registry.clone(),
+        StrategyKind::Sequential,
+        1,
+        10.0,
+        1,
+    )
+    .expect("coordinator")
 }
 
 #[tokio::test]
@@ -304,4 +310,79 @@ async fn coordinator_errors_on_missing_environment() {
         .build();
     let err = coordinator.deploy(&plan).await.unwrap_err();
     assert!(err.to_string().contains("Environment not found"));
+}
+#[tokio::test]
+async fn deploy_applies_only_pending_and_rolls_back_only_this_run() {
+    let db_a = unique_db("it_orch_a");
+    let db_b = unique_db("it_orch_b");
+    let (Some(cfg_a), Some(cfg_b)) = (integration_config(&db_a), integration_config(&db_b)) else {
+        eprintln!("SURREAL_URL not set; skipping");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_migration(
+        tmp.path(),
+        "20260101_000001_one.surql",
+        &migration_file(
+            "20260101_000001",
+            "DEFINE TABLE keep_me;",
+            "REMOVE TABLE keep_me;",
+        ),
+    );
+    let v1_only = discover_migrations(tmp.path()).expect("discover");
+    write_migration(
+        tmp.path(),
+        "20260101_000002_two.surql",
+        &migration_file(
+            "20260101_000002",
+            "DEFINE TABLE clash;",
+            "REMOVE TABLE clash;",
+        ),
+    );
+    let both = discover_migrations(tmp.path()).expect("discover");
+
+    let registry = EnvironmentRegistry::new();
+    register(&registry, "env_a", &cfg_a).await;
+    register(&registry, "env_b", &cfg_b).await;
+
+    // Environment A is already at v1 and holds data in the v1 table.
+    let seed = DeploymentPlan::builder(registry.clone())
+        .environment("env_a")
+        .migrations(v1_only)
+        .verify_health(false)
+        .build();
+    let seeded = coordinator(&registry).deploy(&seed).await.expect("seed");
+    assert_eq!(seeded["env_a"].status, DeploymentStatus::Success);
+    query(&cfg_a, "CREATE keep_me:1 SET n = 1;").await;
+
+    // Environment B already has a `clash` table, so v2 fails there.
+    query(&cfg_b, "DEFINE TABLE clash;").await;
+
+    let plan = DeploymentPlan::builder(registry.clone())
+        .environments(["env_a", "env_b"])
+        .migrations(both)
+        .verify_health(false)
+        .auto_rollback(true)
+        .build();
+    let results = coordinator(&registry).deploy(&plan).await.expect("deploy");
+
+    let a = &results["env_a"];
+    assert_eq!(a.status, DeploymentStatus::RolledBack, "{a:?}");
+    assert_eq!(a.migrations_applied, 1, "A only had v2 pending: {a:?}");
+    let b = &results["env_b"];
+    assert_eq!(b.status, DeploymentStatus::Failed, "{b:?}");
+
+    // A is back where it started: v1 applied, its table and data intact.
+    assert_eq!(applied_versions(&cfg_a).await, vec!["20260101_000001"]);
+    let tables_a = table_names(&cfg_a).await;
+    assert!(tables_a.contains(&"keep_me".to_string()), "{tables_a:?}");
+    assert!(!tables_a.contains(&"clash".to_string()), "{tables_a:?}");
+    let rows = query(&cfg_a, "SELECT * FROM keep_me;").await;
+    assert_eq!(rows[0].as_array().map(Vec::len), Some(1), "{rows:?}");
+
+    // B's partial v1 was reverted; its pre-existing table was not touched.
+    assert!(applied_versions(&cfg_b).await.is_empty());
+    let tables_b = table_names(&cfg_b).await;
+    assert!(!tables_b.contains(&"keep_me".to_string()), "{tables_b:?}");
+    assert!(tables_b.contains(&"clash".to_string()), "{tables_b:?}");
 }

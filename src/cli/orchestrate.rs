@@ -12,8 +12,8 @@ use crate::cli::GlobalOpts;
 use crate::error::{Result, SurqlError};
 use crate::migration::discover_migrations;
 use crate::orchestration::{
-    configure_environments, get_registry, DeploymentPlan, DeploymentStatus, HealthCheck,
-    MigrationCoordinator, StrategyKind,
+    configure_environments, get_registry, DeploymentPlan, DeploymentResult, DeploymentStatus,
+    HealthCheck, MigrationCoordinator, StrategyKind,
 };
 
 /// Deployment strategy flag mirroring [`StrategyKind`].
@@ -120,7 +120,7 @@ async fn deploy(
     }
 
     let env_names: Vec<String> = match environments {
-        Some(raw) => raw.split(',').map(|s| s.trim().to_string()).collect(),
+        Some(raw) => parse_environment_list(raw),
         None => registry.list().await,
     };
 
@@ -135,7 +135,7 @@ async fn deploy(
         MigrationCoordinator::with_strategy_label(registry, strategy.into(), 1, 10.0, 5)?;
 
     fmt::info(format!(
-        "deploying {} migration(s) to {} environment(s) (strategy: {:?}, dry_run: {})",
+        "deploying {} migration(s) to {} environment(s); each receives the ones it has not applied (strategy: {:?}, dry_run: {})",
         migrations.len(),
         env_names.len(),
         strategy,
@@ -144,23 +144,27 @@ async fn deploy(
 
     let results = coordinator.deploy(&plan).await?;
 
+    let mut rows: Vec<&DeploymentResult> = results.values().collect();
+    rows.sort_by(|a, b| a.environment.cmp(&b.environment));
     let mut table = fmt::make_table();
     table.set_header(vec![
         "environment",
         "status",
-        "migrations",
+        "applied",
+        "rolled_back",
         "duration_ms",
         "error",
     ]);
-    let mut failures = 0;
-    for (env, result) in &results {
-        if result.status == DeploymentStatus::Failed {
-            failures += 1;
-        }
+    for result in &rows {
         table.add_row(vec![
-            env.clone(),
-            format!("{:?}", result.status),
-            format!("{}", result.migrations_applied),
+            result.environment.clone(),
+            result.status.to_string(),
+            if dry_run {
+                format!("up to {}", result.migrations_applied)
+            } else {
+                result.applied_versions.join(", ")
+            },
+            result.rolled_back_versions.join(", "),
             result
                 .execution_time_ms
                 .map_or_else(|| "-".to_string(), |d| format!("{d}")),
@@ -169,13 +173,31 @@ async fn deploy(
     }
     println!("{table}");
 
-    if failures > 0 {
+    let unsuccessful = rows
+        .iter()
+        .filter(|r| r.status != DeploymentStatus::Success)
+        .count();
+    if unsuccessful > 0 {
         return Err(SurqlError::Orchestration {
-            reason: format!("{failures} environment(s) failed"),
+            reason: format!(
+                "{unsuccessful} of {} environment(s) did not end deployed",
+                rows.len()
+            ),
         });
     }
-    fmt::success(format!("deployed to {} environment(s)", results.len()));
+    fmt::success(format!("deployed to {} environment(s)", rows.len()));
     Ok(())
+}
+
+/// Split a `--environments a,b` list, dropping blanks and repeats so no
+/// environment is deployed twice.
+fn parse_environment_list(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && seen.insert(*name))
+        .map(str::to_string)
+        .collect()
 }
 
 async fn status(plan_path: &Path) -> Result<()> {
@@ -231,9 +253,15 @@ async fn validate(plan_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// Ensure a compile-time reference to `HashMap` is not required even when
-// no orchestration results are materialised through the CLI.
-#[allow(dead_code)]
-fn _touch() -> Vec<DeploymentStatus> {
-    vec![DeploymentStatus::Success, DeploymentStatus::Failed]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_list_drops_blanks_and_repeats() {
+        assert_eq!(
+            parse_environment_list("prod, prod,,stage ,prod"),
+            vec!["prod".to_string(), "stage".to_string()]
+        );
+    }
 }

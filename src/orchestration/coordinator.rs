@@ -10,14 +10,15 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
-use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
-use crate::migration::{execute_migration, Migration, MigrationDirection, MigrationState};
-use crate::orchestration::environment::{EnvironmentConfig, EnvironmentRegistry};
+use crate::migration::Migration;
+use crate::orchestration::environment::EnvironmentRegistry;
 use crate::orchestration::health::HealthCheck;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
+use crate::orchestration::rollback::rollback_deployment;
 use crate::orchestration::strategies::{
-    CanaryStrategy, DeploymentStrategy, ParallelStrategy, RollingStrategy, SequentialStrategy,
+    resolve_plan_environments, CanaryStrategy, DeploymentStrategy, ParallelStrategy,
+    RollingStrategy, SequentialStrategy,
 };
 
 /// Raised when orchestration fails in a fatal way (wraps
@@ -120,7 +121,8 @@ pub struct DeploymentPlan {
     pub max_concurrent: usize,
     /// Verify environment health before deploying.
     pub verify_health: bool,
-    /// Auto-rollback previously successful deployments on failure.
+    /// When any environment fails, revert the migrations this deployment
+    /// applied to every environment.
     pub auto_rollback: bool,
     /// Simulate deployment without executing migrations.
     pub dry_run: bool,
@@ -292,6 +294,14 @@ impl MigrationCoordinator {
 
     /// Deploy the supplied plan.
     ///
+    /// Each environment receives only the plan migrations its history
+    /// does not already record. An environment named more than once is
+    /// deployed once. When any environment fails and
+    /// [`DeploymentPlan::auto_rollback`] is set, the migrations this call
+    /// applied are reverted (newest first) and the reverted environments
+    /// are reported as [`DeploymentStatus::RolledBack`]; migrations that
+    /// were applied before this call are never touched.
+    ///
     /// # Errors
     ///
     /// Returns [`SurqlError::Orchestration`] when environments cannot be
@@ -308,7 +318,7 @@ impl MigrationCoordinator {
         );
 
         // Resolve environments up front so missing names fail fast.
-        let envs = resolve_environments(&self.registry, &plan.environments).await?;
+        let envs = resolve_plan_environments(plan).await?;
 
         if plan.verify_health && !plan.dry_run {
             info!("verifying_environment_health");
@@ -332,32 +342,32 @@ impl MigrationCoordinator {
             }
         })?;
 
-        let map: HashMap<String, DeploymentResult> = results
-            .iter()
-            .map(|r| (r.environment.clone(), r.clone()))
-            .collect();
-
         let failed = results
             .iter()
             .filter(|r| r.status == DeploymentStatus::Failed)
             .count();
 
-        if failed > 0 && plan.auto_rollback && !plan.dry_run {
+        let results = if failed > 0 && plan.auto_rollback && !plan.dry_run {
             warn!(failed, "initiating_auto_rollback");
-            rollback_successful(&envs, &plan.migrations, &results).await;
-        }
+            rollback_deployment(&envs, plan, results).await
+        } else {
+            results
+        };
 
+        let count =
+            |status: DeploymentStatus| results.iter().filter(|r| r.status == status).count();
         info!(
             total = results.len(),
-            successful = results
-                .iter()
-                .filter(|r| r.status == DeploymentStatus::Success)
-                .count(),
-            failed,
+            successful = count(DeploymentStatus::Success),
+            rolled_back = count(DeploymentStatus::RolledBack),
+            failed = count(DeploymentStatus::Failed),
             "orchestration_completed"
         );
 
-        Ok(map)
+        Ok(results
+            .into_iter()
+            .map(|r| (r.environment.clone(), r))
+            .collect())
     }
 
     /// Return a map `env_name -> is_healthy` for the supplied environments.
@@ -376,74 +386,6 @@ impl MigrationCoordinator {
             .into_iter()
             .map(|(name, status)| (name, status.is_healthy))
             .collect())
-    }
-}
-
-async fn resolve_environments(
-    registry: &EnvironmentRegistry,
-    names: &[String],
-) -> Result<Vec<EnvironmentConfig>> {
-    let mut out = Vec::with_capacity(names.len());
-    for name in names {
-        match registry.get(name).await {
-            Some(cfg) => out.push(cfg),
-            None => {
-                return Err(SurqlError::Orchestration {
-                    reason: format!("Environment not found: {name}"),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-async fn rollback_successful(
-    environments: &[EnvironmentConfig],
-    migrations: &[Migration],
-    results: &[DeploymentResult],
-) {
-    for result in results
-        .iter()
-        .filter(|r| r.status == DeploymentStatus::Success)
-    {
-        let Some(env) = environments.iter().find(|e| e.name == result.environment) else {
-            continue;
-        };
-        info!(environment = %env.name, "rolling_back_environment");
-        let client = match DatabaseClient::new(env.connection.clone()) {
-            Ok(c) => c,
-            Err(err) => {
-                error!(environment = %env.name, error = %err, "rollback_client_failed");
-                continue;
-            }
-        };
-        if let Err(err) = client.connect().await {
-            error!(environment = %env.name, error = %err, "rollback_connect_failed");
-            continue;
-        }
-        for migration in migrations.iter().rev() {
-            let failure = match execute_migration(&client, migration, MigrationDirection::Down)
-                .await
-            {
-                Ok(status) if status.state == MigrationState::Failed => {
-                    Some(status.error.unwrap_or_default())
-                }
-                Ok(_) => None,
-                Err(err) => Some(err.to_string()),
-            };
-            if let Some(reason) = failure {
-                // Later `down` bodies assume this one ran; stop here.
-                error!(
-                    environment = %env.name,
-                    migration = %migration.version,
-                    error = %reason,
-                    "rollback_migration_failed"
-                );
-                break;
-            }
-        }
-        let _ = client.disconnect().await;
-        info!(environment = %env.name, "environment_rolled_back");
     }
 }
 
@@ -494,6 +436,7 @@ pub async fn deploy_to_environments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::environment::EnvironmentConfig;
 
     #[test]
     fn strategy_kind_parse_accepts_each_variant() {
