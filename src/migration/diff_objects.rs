@@ -6,9 +6,9 @@
 //! [`diff_named`] captures that once, so a new kind is three lines rather
 //! than a copy of the walk.
 //!
-//! Lives beside [`super::diff`] rather than inside it because that module is
-//! already well past the repository's 1000-LOC budget. Everything here is
-//! re-exported from `migration::diff`, so existing paths keep resolving.
+//! Lives beside [`super::diff`] rather than inside it, which holds the
+//! table-scoped diffs. The bucket and analyzer diffs are re-exported from
+//! `migration::diff`, so those paths keep resolving too.
 //!
 //! Buckets and analyzers predate [`diff_named`] and keep their hand-written
 //! walks: a bucket modification renders `ALTER BUCKET` (a delta, not a
@@ -18,13 +18,14 @@
 
 use std::collections::BTreeMap;
 
-use crate::migration::diff::{index_by_name, sorted_keys};
+use crate::migration::diff::index_by_name;
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::analyzer::AnalyzerDefinition;
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::function::FunctionDefinition;
 use crate::schema::param::ParamDefinition;
 use crate::schema::sequence::SequenceDefinition;
+use crate::types::escape::{quote_ident, quote_str};
 
 /// The three [`DiffOperation`] variants one kind of object uses.
 #[derive(Debug, Clone, Copy)]
@@ -81,45 +82,28 @@ pub fn diff_named<T: PartialEq>(
     overwrite: impl Fn(&T) -> String,
     remove: impl Fn(&T) -> String,
 ) -> Vec<SchemaDiff> {
-    let index = |items: &'_ [T]| -> BTreeMap<String, usize> {
-        items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| (name_of(item).to_owned(), i))
-            .collect()
-    };
-    let code_map = index(code);
-    let db_map = index(db);
+    let code_map = index_by_name(code, &name_of);
+    let db_map = index_by_name(db, &name_of);
     let mut out = Vec::new();
 
-    for (name, &i) in &code_map {
+    for (name, item) in &code_map {
         if !db_map.contains_key(name) {
-            out.push(object_diff(
-                kinds.add,
-                name,
-                define(&code[i]),
-                remove(&code[i]),
-            ));
+            out.push(object_diff(kinds.add, name, define(item), remove(item)));
         }
     }
-    for (name, &i) in &db_map {
+    for (name, item) in &db_map {
         if !code_map.contains_key(name) {
-            out.push(object_diff(
-                kinds.drop,
-                name,
-                remove(&db[i]),
-                define(&db[i]),
-            ));
+            out.push(object_diff(kinds.drop, name, remove(item), define(item)));
         }
     }
-    for (name, &i) in &code_map {
-        if let Some(&j) = db_map.get(name) {
-            if code[i] != db[j] {
+    for (name, code_item) in &code_map {
+        if let Some(db_item) = db_map.get(name) {
+            if code_item != db_item {
                 out.push(object_diff(
                     kinds.modify,
                     name,
-                    overwrite(&code[i]),
-                    overwrite(&db[j]),
+                    overwrite(code_item),
+                    overwrite(db_item),
                 ));
             }
         }
@@ -265,20 +249,19 @@ pub fn diff_buckets(code: &[BucketDefinition], db: &[BucketDefinition]) -> Vec<S
     let db_map = index_by_name(db, |b| b.name.as_str());
     let mut out: Vec<SchemaDiff> = Vec::new();
 
-    for name in sorted_keys(&code_map) {
+    for (name, bucket) in &code_map {
         if !db_map.contains_key(name) {
-            out.push(generate_add_bucket_diff(code_map[name]));
+            out.push(generate_add_bucket_diff(bucket));
         }
     }
-    for name in sorted_keys(&db_map) {
+    for (name, bucket) in &db_map {
         if !code_map.contains_key(name) {
-            out.push(generate_drop_bucket_diff(db_map[name]));
+            out.push(generate_drop_bucket_diff(bucket));
         }
     }
-    for name in sorted_keys(&code_map) {
+    for (name, code_bucket) in &code_map {
         if let Some(db_bucket) = db_map.get(name) {
-            let code_bucket = code_map[name];
-            if code_bucket != *db_bucket {
+            if code_bucket != db_bucket {
                 out.push(generate_modify_bucket_diff(code_bucket, db_bucket));
             }
         }
@@ -308,16 +291,16 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
             backward_sql: backward,
             details: BTreeMap::new(),
         };
-    for name in sorted_keys(&code_map) {
-        let analyzer = code_map[name];
+    let remove = |name: &str| format!("REMOVE ANALYZER IF EXISTS {};", quote_ident(name));
+    for (name, analyzer) in &code_map {
         match db_map.get(name) {
             None => out.push(analyzer_diff(
                 DiffOperation::AddAnalyzer,
                 name,
                 analyzer.to_surql(),
-                format!("REMOVE ANALYZER IF EXISTS {name};"),
+                remove(name),
             )),
-            Some(db_analyzer) if *db_analyzer != analyzer => out.push(analyzer_diff(
+            Some(db_analyzer) if db_analyzer != analyzer => out.push(analyzer_diff(
                 DiffOperation::ModifyAnalyzer,
                 name,
                 analyzer.to_surql_overwrite(),
@@ -326,29 +309,35 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
             Some(_) => {}
         }
     }
-    for name in sorted_keys(&db_map) {
+    for (name, analyzer) in &db_map {
         if !code_map.contains_key(name) {
             out.push(analyzer_diff(
                 DiffOperation::DropAnalyzer,
                 name,
-                format!("REMOVE ANALYZER IF EXISTS {name};"),
-                db_map[name].to_surql(),
+                remove(name),
+                analyzer.to_surql(),
             ));
         }
     }
     out
 }
 
-fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
-    // `to_surql` only fails validation; an invalid bucket still yields a
-    // best-effort render so callers can surface it via dry-run (matching the
-    // "infallible diff constructor" contract of the other generators).
-    let forward_sql = bucket.to_surql().unwrap_or_else(|_| {
+/// `DEFINE BUCKET` for `bucket`. `to_surql` only fails validation; an
+/// invalid bucket still yields a best-effort render, its name and backend
+/// quoted, so callers can surface it via dry-run (matching the "infallible
+/// diff constructor" contract of the other generators).
+fn bucket_define_sql(bucket: &BucketDefinition) -> String {
+    bucket.to_surql().unwrap_or_else(|_| {
         format!(
-            "DEFINE BUCKET {} BACKEND \"{}\";",
-            bucket.name, bucket.backend
+            "DEFINE BUCKET {} BACKEND {};",
+            quote_ident(&bucket.name),
+            quote_str(&bucket.backend)
         )
-    });
+    })
+}
+
+fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
+    let forward_sql = bucket_define_sql(bucket);
     let backward_sql = bucket.to_remove_surql();
     let mut details = BTreeMap::new();
     details.insert(
@@ -373,12 +362,7 @@ fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
 
 fn generate_drop_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
     let forward_sql = bucket.to_remove_surql();
-    let backward_sql = bucket.to_surql().unwrap_or_else(|_| {
-        format!(
-            "DEFINE BUCKET {} BACKEND \"{}\";",
-            bucket.name, bucket.backend
-        )
-    });
+    let backward_sql = bucket_define_sql(bucket);
     SchemaDiff {
         operation: DiffOperation::DropBucket,
         table: String::new(),
@@ -481,6 +465,36 @@ mod tests {
         assert_eq!(
             diffs[0].details.get("new_backend"),
             Some(&serde_json::json!("s3://x"))
+        );
+    }
+
+    /// An invalid bucket still renders, but never splices its name or
+    /// backend into the statement raw.
+    #[test]
+    fn the_fallback_bucket_statement_quotes_what_it_splices() {
+        let bad = BucketDefinition::new("my-files", "x\"; REMOVE TABLE user; --")
+            .with_permissions("bogus");
+        let diffs = diff_buckets(std::slice::from_ref(&bad), &[]);
+        assert_eq!(
+            diffs[0].forward_sql,
+            r#"DEFINE BUCKET `my-files` BACKEND 'x"; REMOVE TABLE user; --';"#
+        );
+        let dropped = diff_buckets(&[], std::slice::from_ref(&bad));
+        assert_eq!(dropped[0].backward_sql, diffs[0].forward_sql);
+    }
+
+    #[test]
+    fn analyzer_removals_quote_the_name() {
+        let code = vec![crate::schema::standard_analyzer("my-words")];
+        let added = diff_analyzers(&code, &[]);
+        assert_eq!(
+            added[0].backward_sql,
+            "REMOVE ANALYZER IF EXISTS `my-words`;"
+        );
+        let dropped = diff_analyzers(&[], &code);
+        assert_eq!(
+            dropped[0].forward_sql,
+            "REMOVE ANALYZER IF EXISTS `my-words`;"
         );
     }
 
