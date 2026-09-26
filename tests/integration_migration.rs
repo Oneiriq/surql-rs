@@ -24,8 +24,8 @@ use surql::migration::{
     create_migration_plan, create_rollback_plan, discover_migrations, ensure_migration_table,
     execute_migration, execute_migration_plan, execute_rollback, get_applied_migrations,
     get_migration_status, get_pending_migrations, is_migration_applied, migrate_down, migrate_up,
-    record_migration, MigrateUpOptions, Migration, MigrationDirection, MigrationHistory,
-    MigrationState,
+    record_migration, squash_migrations, MigrateUpOptions, Migration, MigrationDirection,
+    MigrationHistory, MigrationState, SquashOptions,
 };
 
 fn env_url() -> Option<String> {
@@ -370,6 +370,86 @@ async fn rolling_back_an_unrecorded_migration_runs_nothing() {
         .unwrap();
     assert_eq!(status.state, MigrationState::Failed, "{status:?}");
     assert!(table_names(&client).await.contains(&"keep".to_string()));
+}
+
+/// A squashed migration gets a version of its own; on a database that had
+/// applied its sources it used to be pending, and migrate_up re-ran every
+/// statement in it.
+#[tokio::test]
+async fn a_squashed_migration_is_not_reapplied() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write_migration(
+        tmp.path(),
+        "20260101_000030_seed.surql",
+        "-- @up\nCREATE seed SET n = 1;\n-- @down\nDELETE seed;\n",
+    );
+    write_migration(
+        tmp.path(),
+        "20260101_000031_other.surql",
+        "-- @up\nDEFINE TABLE other;\n-- @down\nREMOVE TABLE other;\n",
+    );
+    let first = migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+
+    squash_migrations(tmp.path(), &SquashOptions::new()).unwrap();
+    assert_eq!(discover_migrations(tmp.path()).unwrap().len(), 3);
+
+    let second = migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+    assert!(second.is_empty(), "{second:?}");
+    let raw = client
+        .query("RETURN count(SELECT * FROM seed);")
+        .await
+        .unwrap();
+    assert_eq!(raw[0], serde_json::json!(1));
+
+    let report = get_migration_status(&client, tmp.path()).await.unwrap();
+    assert_eq!(report.applied_count(), 3);
+    assert_eq!(report.pending_count(), 0);
+}
+
+/// Versions used to compare as strings, so `v10` applied before `v9` and
+/// a rollback to `v9` was "not older than" `v10`.
+#[tokio::test]
+async fn versions_order_numerically_when_applying_and_rolling_back() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    for (file, version, table) in [
+        ("20260101_000040_nine.surql", "v9", "nine"),
+        ("20260101_000041_ten.surql", "v10", "ten"),
+    ] {
+        write_migration(
+            tmp.path(),
+            file,
+            &format!(
+                "-- @metadata\n-- version: {version}\n-- description: {table}\n\
+                 -- @up\nDEFINE TABLE {table};\n-- @down\nREMOVE INDEX IF EXISTS nothing ON {table};\n"
+            ),
+        );
+    }
+    let applied = migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+    let order: Vec<&str> = applied
+        .iter()
+        .map(|s| s.migration.version.as_str())
+        .collect();
+    assert_eq!(order, vec!["v9", "v10"]);
+
+    let plan = create_rollback_plan(&client, tmp.path(), "v9")
+        .await
+        .unwrap();
+    assert_eq!(plan.from_version, "v10");
+    let planned: Vec<&str> = plan.migrations.iter().map(|m| m.version.as_str()).collect();
+    assert_eq!(planned, vec!["v10"]);
 }
 
 #[tokio::test]

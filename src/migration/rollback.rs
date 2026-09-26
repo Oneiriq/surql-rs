@@ -18,13 +18,15 @@
 //! [`RollbackSafety::Warning`] (data-loss) and
 //! [`RollbackSafety::Danger`] (unsafe) as the task brief requires.
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::discover_migrations;
+use crate::migration::discovery::{compare_versions, discover_migrations};
 use crate::migration::executor::execute_migration;
 use crate::migration::history::get_applied_migrations;
 use crate::migration::lexer::{self, existence_clause, Token};
@@ -184,7 +186,7 @@ pub async fn analyze_rollback_safety(
     let mut issues = Vec::new();
     for migration in on_disk
         .iter()
-        .filter(|m| m.version.as_str() > target_version)
+        .filter(|m| compare_versions(&m.version, target_version) == Ordering::Greater)
     {
         issues.extend(analyse_migration(migration));
     }
@@ -193,11 +195,16 @@ pub async fn analyze_rollback_safety(
 
 /// Build a rollback plan that moves the database to `target_version`.
 ///
+/// The current version is the highest applied version. Every applied
+/// migration newer than the target is rolled back, most recently applied
+/// first (the reverse of the order they were applied in).
+///
 /// # Errors
 ///
 /// Returns [`SurqlError::Validation`] if the current database has no
-/// applied migrations, if the target version is missing, or if the
-/// target is not older than the current version.
+/// applied migrations, if the target version is missing, if the target is
+/// not older than the current version, or if a migration that would have
+/// to be rolled back has no file on disk.
 pub async fn create_rollback_plan(
     client: &DatabaseClient,
     migrations_dir: &Path,
@@ -210,15 +217,20 @@ pub async fn create_rollback_plan(
         });
     }
 
+    // Ordered by `applied_at`, oldest first.
     let applied = get_applied_migrations(client).await?;
-    let Some(latest) = applied.last() else {
+    let Some(current_version) = applied
+        .iter()
+        .map(|h| h.version.as_str())
+        .max_by(|a, b| compare_versions(a, b))
+        .map(str::to_owned)
+    else {
         return Err(SurqlError::Validation {
             reason: "no migrations have been applied".to_string(),
         });
     };
-    let current_version = latest.version.clone();
 
-    if target_version >= current_version.as_str() {
+    if compare_versions(target_version, &current_version) != Ordering::Less {
         return Err(SurqlError::Validation {
             reason: format!(
                 "target version {target_version} must be older than current version {current_version}"
@@ -226,18 +238,24 @@ pub async fn create_rollback_plan(
         });
     }
 
-    // Applied versions on the database (ordered ascending already).
-    let applied_versions: std::collections::BTreeSet<String> =
-        applied.iter().map(|m| m.version.clone()).collect();
-
-    // The migrations we need to roll back are those applied on the server
-    // whose version is strictly greater than the target. Newest first.
-    let mut to_rollback: Vec<Migration> = on_disk
-        .iter()
-        .filter(|m| m.version.as_str() > target_version && applied_versions.contains(&m.version))
-        .cloned()
-        .collect();
-    to_rollback.sort_by(|a, b| b.version.cmp(&a.version));
+    let by_version: BTreeMap<&str, &Migration> =
+        on_disk.iter().map(|m| (m.version.as_str(), m)).collect();
+    let mut to_rollback: Vec<Migration> = Vec::new();
+    for history in applied.iter().rev() {
+        if compare_versions(&history.version, target_version) != Ordering::Greater {
+            continue;
+        }
+        let Some(migration) = by_version.get(history.version.as_str()) else {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "applied migration {} has no file in {}; cannot roll it back",
+                    history.version,
+                    migrations_dir.display()
+                ),
+            });
+        };
+        to_rollback.push((*migration).clone());
+    }
 
     let mut issues = Vec::new();
     let mut overall = RollbackSafety::Safe;
@@ -432,6 +450,7 @@ mod tests {
             down: down.iter().map(|s| (*s).to_string()).collect(),
             checksum: None,
             depends_on: vec![],
+            squashed_from: vec![],
         }
     }
 

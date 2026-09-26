@@ -39,6 +39,8 @@
 //!   and description fall back to the filename when absent).
 //! * A leading UTF-8 byte-order mark is ignored.
 
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -125,9 +127,88 @@ pub fn discover_migrations(directory: &Path) -> Result<Vec<Migration>> {
         migrations.push(migration);
     }
 
-    migrations.sort_by(|a, b| a.version.cmp(&b.version));
+    order_migrations(migrations)
+}
 
-    Ok(migrations)
+/// Order migrations for applying: by version, comparing digit runs as
+/// numbers (so `v9` sorts before `v10`), and then moved as little as
+/// needed for every migration to follow the ones it `depends_on`.
+/// Dependencies on versions outside `migrations` do not constrain the
+/// order ([`crate::migration::validate_migrations`] reports them).
+///
+/// # Errors
+///
+/// Returns [`SurqlError::MigrationDiscovery`] when the dependencies form a
+/// cycle.
+pub(crate) fn order_migrations(mut migrations: Vec<Migration>) -> Result<Vec<Migration>> {
+    migrations.sort_by(|a, b| compare_versions(&a.version, &b.version));
+    let mut ordered: Vec<Migration> = Vec::with_capacity(migrations.len());
+    let mut placed: BTreeSet<String> = BTreeSet::new();
+    let known: BTreeSet<String> = migrations.iter().map(|m| m.version.clone()).collect();
+    while !migrations.is_empty() {
+        // The earliest migration whose dependencies are all placed.
+        let ready = migrations.iter().position(|m| {
+            m.depends_on
+                .iter()
+                .all(|dep| placed.contains(dep) || !known.contains(dep) || *dep == m.version)
+        });
+        let Some(idx) = ready else {
+            let stuck: Vec<&str> = migrations.iter().map(|m| m.version.as_str()).collect();
+            return Err(SurqlError::MigrationDiscovery {
+                reason: format!(
+                    "migration dependencies form a cycle among: {}",
+                    stuck.join(", ")
+                ),
+            });
+        };
+        let next = migrations.remove(idx);
+        placed.insert(next.version.clone());
+        ordered.push(next);
+    }
+    Ok(ordered)
+}
+
+/// Compare migration versions, reading runs of ASCII digits as numbers:
+/// `v9` < `v10`, and `YYYYMMDD_HHMMSS` timestamps compare as they always
+/// did. Versions whose runs are numerically equal (`v01`, `v1`) fall back
+/// to plain string order, so only equal strings compare equal.
+pub(crate) fn compare_versions(a: &str, b: &str) -> Ordering {
+    let mut left = version_runs(a);
+    let mut right = version_runs(b);
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+                let order = if digits(x) && digits(y) {
+                    let (x, y) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+                    x.len().cmp(&y.len()).then_with(|| x.cmp(y))
+                } else {
+                    x.cmp(y)
+                };
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+        }
+    }
+}
+
+/// Split `s` into maximal runs of ASCII digits and of everything else.
+fn version_runs(s: &str) -> impl Iterator<Item = &str> {
+    let mut rest = s;
+    std::iter::from_fn(move || {
+        let first = rest.chars().next()?;
+        let digit = first.is_ascii_digit();
+        let len = rest
+            .find(|c: char| c.is_ascii_digit() != digit)
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(len);
+        rest = tail;
+        Some(run)
+    })
 }
 
 /// Load a single migration file.
@@ -180,10 +261,9 @@ pub fn load_migration(path: &Path) -> Result<Migration> {
 
     let (version, description) = resolve_identity(parsed.metadata.as_ref(), file_name, path)?;
 
-    let depends_on = parsed
+    let (depends_on, squashed_from) = parsed
         .metadata
-        .as_ref()
-        .map(|m| m.depends_on.clone())
+        .map(|m| (m.depends_on, m.squashed_from))
         .unwrap_or_default();
 
     let checksum = content_checksum(&content);
@@ -196,6 +276,7 @@ pub fn load_migration(path: &Path) -> Result<Migration> {
         down: parsed.down,
         checksum: Some(checksum),
         depends_on,
+        squashed_from,
     })
 }
 
@@ -213,25 +294,21 @@ pub fn load_migration(path: &Path) -> Result<Migration> {
 /// assert!(!validate_migration_name("20260102_120000_create_user.py"));
 /// ```
 pub fn validate_migration_name(filename: &str) -> bool {
-    let Some(stem) = filename.strip_suffix(".surql") else {
-        return false;
-    };
+    name_parts(filename).is_some()
+}
 
-    let parts: Vec<&str> = stem.split('_').collect();
-    if parts.len() < 3 {
-        return false;
-    }
-
-    if parts[0].len() != 8 || !parts[0].chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-
-    if parts[1].len() != 6 || !parts[1].chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-
-    // Description part must be non-empty.
-    !parts[2..].iter().all(|p| p.is_empty())
+/// The `(date, time, description)` parts of a valid migration filename.
+fn name_parts(filename: &str) -> Option<(&str, &str, &str)> {
+    let stem = filename.strip_suffix(".surql")?;
+    let mut parts = stem.splitn(3, '_');
+    let (date, time, description) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
+    // The description must hold something other than separators.
+    (digits(date, 8) && digits(time, 6) && description.contains(|c| c != '_')).then_some((
+        date,
+        time,
+        description,
+    ))
 }
 
 /// Extract version from a migration filename.
@@ -250,12 +327,7 @@ pub fn validate_migration_name(filename: &str) -> bool {
 /// assert_eq!(get_version_from_filename("invalid.surql"), None);
 /// ```
 pub fn get_version_from_filename(filename: &str) -> Option<String> {
-    if !validate_migration_name(filename) {
-        return None;
-    }
-    let stem = filename.strip_suffix(".surql")?;
-    let parts: Vec<&str> = stem.split('_').collect();
-    Some(format!("{}_{}", parts[0], parts[1]))
+    name_parts(filename).map(|(date, time, _)| format!("{date}_{time}"))
 }
 
 /// Extract the description portion from a migration filename.
@@ -274,12 +346,7 @@ pub fn get_version_from_filename(filename: &str) -> Option<String> {
 /// assert_eq!(get_description_from_filename("invalid.surql"), None);
 /// ```
 pub fn get_description_from_filename(filename: &str) -> Option<String> {
-    if !validate_migration_name(filename) {
-        return None;
-    }
-    let stem = filename.strip_suffix(".surql")?;
-    let parts: Vec<&str> = stem.split('_').collect();
-    Some(parts[2..].join("_"))
+    name_parts(filename).map(|(_, _, description)| description.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +377,7 @@ fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration
     let mut metadata_description: Option<String> = None;
     let mut metadata_author: Option<String> = None;
     let mut metadata_depends_on: Vec<String> = Vec::new();
+    let mut metadata_squashed_from: Vec<String> = Vec::new();
     let mut saw_metadata = false;
 
     let mut up_lines: Vec<String> = Vec::new();
@@ -343,13 +411,9 @@ fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration
                         "version" => metadata_version = Some(value),
                         "description" => metadata_description = Some(value),
                         "author" => metadata_author = Some(value),
-                        "depends_on" => {
-                            metadata_depends_on = value
-                                .trim_matches(|c| c == '[' || c == ']')
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect();
+                        "depends_on" => metadata_depends_on = parse_version_list(&value),
+                        "squashed-from" | "squashed_from" => {
+                            metadata_squashed_from = parse_version_list(&value);
                         }
                         _ => {}
                     }
@@ -392,6 +456,7 @@ fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration
             description,
             author: metadata_author.unwrap_or_else(MigrationMetadata::default_author),
             depends_on: metadata_depends_on,
+            squashed_from: metadata_squashed_from,
         })
     } else {
         None
@@ -410,6 +475,16 @@ fn parse_section_marker(line: &str) -> Option<Section> {
         "down" => Some(Section::Down),
         _ => None,
     }
+}
+
+/// `a, b` or `[a, b]` as a list of versions.
+fn parse_version_list(value: &str) -> Vec<String> {
+    value
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn parse_metadata_line(line: &str) -> Option<(String, String)> {
@@ -471,7 +546,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -480,7 +555,7 @@ mod tests {
         let nanos: u128 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let n = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         let dir = std::env::temp_dir().join(format!("surql-mig-{tag}-{pid}-{nanos}-{n}"));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -668,6 +743,96 @@ mod tests {
 
         let m = load_migration(&path).unwrap();
         assert_eq!(m.description, "with bom");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compare_versions_reads_digit_runs_as_numbers() {
+        assert_eq!(compare_versions("v9", "v10"), Ordering::Less);
+        assert_eq!(compare_versions("v10", "v9"), Ordering::Greater);
+        assert_eq!(
+            compare_versions("20260101_000000", "20260102_000000"),
+            Ordering::Less
+        );
+        assert_eq!(compare_versions("1.2.10", "1.10.2"), Ordering::Less);
+        assert_eq!(compare_versions("v1", "v1"), Ordering::Equal);
+        assert_ne!(compare_versions("v01", "v1"), Ordering::Equal);
+        assert_eq!(compare_versions("v1", "v1a"), Ordering::Less);
+    }
+
+    fn bare(version: &str, depends_on: &[&str]) -> Migration {
+        Migration {
+            version: version.to_string(),
+            description: String::new(),
+            path: PathBuf::new(),
+            up: vec![],
+            down: vec![],
+            checksum: None,
+            depends_on: depends_on.iter().map(|d| (*d).to_string()).collect(),
+            squashed_from: vec![],
+        }
+    }
+
+    fn versions(migrations: &[Migration]) -> Vec<&str> {
+        migrations.iter().map(|m| m.version.as_str()).collect()
+    }
+
+    #[test]
+    fn order_migrations_puts_dependencies_first() {
+        let ordered = order_migrations(vec![
+            bare("v10", &[]),
+            bare("v2", &["v3"]),
+            bare("v3", &["unknown"]),
+            bare("v9", &[]),
+        ])
+        .unwrap();
+        assert_eq!(versions(&ordered), vec!["v3", "v2", "v9", "v10"]);
+    }
+
+    #[test]
+    fn order_migrations_rejects_a_cycle() {
+        let err = order_migrations(vec![bare("a", &["b"]), bare("b", &["a"]), bare("c", &[])])
+            .unwrap_err();
+        assert!(matches!(err, SurqlError::MigrationDiscovery { .. }));
+        assert!(err.to_string().contains("a, b"), "{err}");
+    }
+
+    #[test]
+    fn discover_orders_versions_numerically() {
+        let dir = unique_temp_dir("disc-natural");
+        for (file, version) in [
+            ("20260101_000000_a.surql", "v10"),
+            ("20260101_000001_b.surql", "v9"),
+        ] {
+            let text = format!(
+                "-- @metadata\n-- version: {version}\n-- description: d\n\
+                 -- @up\nSELECT 1;\n-- @down\nSELECT 2;\n"
+            );
+            fs::write(dir.join(file), text).unwrap();
+        }
+        let migrations = discover_migrations(&dir).unwrap();
+        assert_eq!(versions(&migrations), vec!["v9", "v10"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_migration_reads_squashed_from() {
+        let dir = unique_temp_dir("load-squashed");
+        let path = dir.join("20260105_000000_squashed.surql");
+        let text = "-- @metadata\n\
+             -- version: 20260105_000000\n\
+             -- description: squashed\n\
+             -- squashed-from: 20260101_000000,20260102_000000\n\
+             -- @up\n\
+             SELECT 1;\n\
+             -- @down\n";
+        fs::write(&path, text).unwrap();
+
+        let m = load_migration(&path).unwrap();
+        assert_eq!(m.squashed_from, vec!["20260101_000000", "20260102_000000"]);
+        assert!(m.down.is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }

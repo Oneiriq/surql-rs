@@ -33,6 +33,7 @@
 //! assert!(result.original_count >= 2);
 //! ```
 
+use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::{discover_migrations, sha256_hex};
+use crate::migration::discovery::{compare_versions, discover_migrations, sha256_hex};
 use crate::migration::lexer::{self, existence_clause, Clause, Token};
 use crate::migration::models::Migration;
 
@@ -672,9 +673,9 @@ fn persist_squashed_migration(output_path: &Path, content: &str, version: &str) 
 /// range.
 ///
 /// Either bound may be `None`. `from` bound is compared with `>=`; `to`
-/// bound is compared with `<=`. Versions are compared lexicographically,
-/// which matches Python and works correctly for the `YYYYMMDD_HHMMSS`
-/// format used throughout `surql`.
+/// bound is compared with `<=`. Versions are compared with runs of digits
+/// read as numbers (so `v9` < `v10`), which for the `YYYYMMDD_HHMMSS`
+/// format used throughout `surql` is plain string order.
 #[must_use]
 pub fn filter_migrations_by_version(
     migrations: &[Migration],
@@ -684,17 +685,8 @@ pub fn filter_migrations_by_version(
     migrations
         .iter()
         .filter(|m| {
-            if let Some(from) = from_version {
-                if m.version.as_str() < from {
-                    return false;
-                }
-            }
-            if let Some(to) = to_version {
-                if m.version.as_str() > to {
-                    return false;
-                }
-            }
-            true
+            from_version.is_none_or(|from| compare_versions(&m.version, from) != Ordering::Less)
+                && to_version.is_none_or(|to| compare_versions(&m.version, to) != Ordering::Greater)
         })
         .cloned()
         .collect()
@@ -1052,6 +1044,7 @@ mod tests {
             down: Vec::new(),
             checksum: Some("abc".to_string()),
             depends_on: Vec::new(),
+            squashed_from: Vec::new(),
         }
     }
 

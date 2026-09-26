@@ -272,6 +272,7 @@ pub struct VersionNode {
 ///     down: vec![],
 ///     checksum: None,
 ///     depends_on: vec![],
+///     squashed_from: vec![],
 /// };
 /// graph.add_version(m, None, None);
 /// assert_eq!(graph.len(), 1);
@@ -745,6 +746,7 @@ mod tests {
             down: vec!["REMOVE TABLE t;".into()],
             checksum: Some("abc".into()),
             depends_on: vec![],
+            squashed_from: vec![],
         }
     }
 
