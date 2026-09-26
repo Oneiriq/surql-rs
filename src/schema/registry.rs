@@ -35,6 +35,22 @@ use std::sync::{OnceLock, RwLock};
 use super::bucket::BucketDefinition;
 use super::edge::EdgeDefinition;
 use super::table::TableDefinition;
+use crate::error::{Result, SurqlError};
+
+fn poisoned() -> SurqlError {
+    SurqlError::Registry {
+        reason: "schema registry lock poisoned".into(),
+    }
+}
+
+fn name_taken(name: &str, kind: &str) -> SurqlError {
+    SurqlError::Registry {
+        reason: format!(
+            "{name:?} is already registered as {kind}; tables and edges share one \
+             namespace in SurrealDB"
+        ),
+    }
+}
 
 /// Global registry for code-defined table and edge schemas.
 ///
@@ -58,20 +74,58 @@ impl SchemaRegistry {
         Self::default()
     }
 
-    /// Register a table schema (replaces any existing entry with the same name).
+    /// Register a table schema, replacing any table with the same name.
+    ///
+    /// Tables and edges share one namespace in SurrealDB, so a name already
+    /// registered as an edge is refused (both would render a `DEFINE TABLE`
+    /// for the same table): the refusal is logged and the registry is left
+    /// unchanged. Use [`Self::try_register_table`] to handle it instead.
     pub fn register_table(&self, table: TableDefinition) {
-        let name = table.name.clone();
-        if let Ok(mut guard) = self.tables.write() {
-            guard.insert(name, table);
+        if let Err(err) = self.try_register_table(table) {
+            tracing::warn!(target: "surql::schema::registry", %err, "register_table_refused");
         }
     }
 
-    /// Register an edge schema (replaces any existing entry with the same name).
+    /// Register an edge schema, replacing any edge with the same name.
+    ///
+    /// A name already registered as a table is refused and logged, as for
+    /// [`Self::register_table`]; use [`Self::try_register_edge`] to handle
+    /// it instead.
     pub fn register_edge(&self, edge: EdgeDefinition) {
-        let name = edge.name.clone();
-        if let Ok(mut guard) = self.edges.write() {
-            guard.insert(name, edge);
+        if let Err(err) = self.try_register_edge(edge) {
+            tracing::warn!(target: "surql::schema::registry", %err, "register_edge_refused");
         }
+    }
+
+    /// Register a table schema, replacing any table with the same name.
+    ///
+    /// Returns [`SurqlError::Registry`] when the name is already registered
+    /// as an edge (tables and edges share one namespace), or when the
+    /// registry lock is poisoned.
+    pub fn try_register_table(&self, table: TableDefinition) -> Result<()> {
+        // Lock order everywhere both maps are held: tables, then edges.
+        let mut tables = self.tables.write().map_err(|_| poisoned())?;
+        let edges = self.edges.read().map_err(|_| poisoned())?;
+        if edges.contains_key(&table.name) {
+            return Err(name_taken(&table.name, "an edge"));
+        }
+        tables.insert(table.name.clone(), table);
+        Ok(())
+    }
+
+    /// Register an edge schema, replacing any edge with the same name.
+    ///
+    /// Returns [`SurqlError::Registry`] when the name is already registered
+    /// as a table (tables and edges share one namespace), or when the
+    /// registry lock is poisoned.
+    pub fn try_register_edge(&self, edge: EdgeDefinition) -> Result<()> {
+        let tables = self.tables.read().map_err(|_| poisoned())?;
+        let mut edges = self.edges.write().map_err(|_| poisoned())?;
+        if tables.contains_key(&edge.name) {
+            return Err(name_taken(&edge.name, "a table"));
+        }
+        edges.insert(edge.name.clone(), edge);
+        Ok(())
     }
 
     /// Register a bucket schema (replaces any existing entry with the same
@@ -218,7 +272,9 @@ pub fn get_registry() -> &'static SchemaRegistry {
 /// Register a table schema with the global registry and return it.
 ///
 /// Convenience wrapper around [`SchemaRegistry::register_table`] that
-/// returns the table for inline usage (`let t = register_table(...)`).
+/// returns the table for inline usage (`let t = register_table(...)`). A
+/// name already registered as an edge is refused and logged; see
+/// [`try_register_table`].
 pub fn register_table(table: TableDefinition) -> TableDefinition {
     get_registry().register_table(table.clone());
     table
@@ -227,10 +283,29 @@ pub fn register_table(table: TableDefinition) -> TableDefinition {
 /// Register an edge schema with the global registry and return it.
 ///
 /// Convenience wrapper around [`SchemaRegistry::register_edge`] that
-/// returns the edge for inline usage.
+/// returns the edge for inline usage. A name already registered as a table
+/// is refused and logged; see [`try_register_edge`].
 pub fn register_edge(edge: EdgeDefinition) -> EdgeDefinition {
     get_registry().register_edge(edge.clone());
     edge
+}
+
+/// Register a table schema with the global registry and return it, or
+/// [`SurqlError::Registry`] when the name is already registered as an edge.
+///
+/// Fallible counterpart of [`register_table`], which logs the refusal.
+pub fn try_register_table(table: TableDefinition) -> Result<TableDefinition> {
+    get_registry().try_register_table(table.clone())?;
+    Ok(table)
+}
+
+/// Register an edge schema with the global registry and return it, or
+/// [`SurqlError::Registry`] when the name is already registered as a table.
+///
+/// Fallible counterpart of [`register_edge`], which logs the refusal.
+pub fn try_register_edge(edge: EdgeDefinition) -> Result<EdgeDefinition> {
+    get_registry().try_register_edge(edge.clone())?;
+    Ok(edge)
 }
 
 /// Register a bucket schema with the global registry and return it.
@@ -314,6 +389,54 @@ mod tests {
         r.register_edge(e.clone());
         assert_eq!(r.get_edge("likes"), Some(e));
         assert_eq!(r.edge_count(), 1);
+    }
+
+    #[test]
+    fn local_edge_named_like_a_table_is_refused() {
+        let r = SchemaRegistry::new();
+        r.register_table(table_schema("likes"));
+        let err = r
+            .try_register_edge(typed_edge("likes", "user", "post"))
+            .unwrap_err();
+        assert!(matches!(err, crate::error::SurqlError::Registry { .. }));
+        assert!(err.to_string().contains("likes"));
+        r.register_edge(typed_edge("likes", "user", "post"));
+        assert_eq!(r.edge_count(), 0);
+        assert_eq!(r.table_count(), 1);
+    }
+
+    #[test]
+    fn local_table_named_like_an_edge_is_refused() {
+        let r = SchemaRegistry::new();
+        r.register_edge(typed_edge("likes", "user", "post"));
+        assert!(r.try_register_table(table_schema("likes")).is_err());
+        r.register_table(table_schema("likes"));
+        assert_eq!(r.table_count(), 0);
+        assert_eq!(r.edge_count(), 1);
+    }
+
+    #[test]
+    fn local_try_register_same_kind_replaces() {
+        let r = SchemaRegistry::new();
+        r.try_register_table(table_schema("user")).unwrap();
+        r.try_register_table(
+            table_schema("user").with_mode(crate::schema::table::TableMode::Schemaless),
+        )
+        .unwrap();
+        assert_eq!(r.table_count(), 1);
+        r.try_register_edge(typed_edge("e", "a", "b")).unwrap();
+        r.try_register_edge(typed_edge("e", "a", "c")).unwrap();
+        assert_eq!(r.get_edge("e").unwrap().to_table.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn global_try_register_rejects_collision() {
+        with_clean_global(|| {
+            let t = try_register_table(table_schema("x")).unwrap();
+            assert_eq!(t.name, "x");
+            assert!(try_register_edge(typed_edge("x", "a", "b")).is_err());
+            assert!(get_registered_edges().is_empty());
+        });
     }
 
     #[test]
