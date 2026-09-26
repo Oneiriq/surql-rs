@@ -10,6 +10,8 @@
 //! `` `…` `` and `⟨…⟩` identifiers run to their closing delimiter, and inside
 //! quotes a `\` escapes the character after it.
 
+use crate::types::escape::{quote_ident, unescape};
+
 /// What a [`Segment`] of text is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -161,6 +163,25 @@ pub(crate) fn split_statements(text: &str) -> Vec<String> {
     statements
 }
 
+/// `stmt` without the whitespace and comments in front of its first token.
+pub(crate) fn strip_leading_comments(stmt: &str) -> &str {
+    let mut offset = 0usize;
+    for segment in segments(stmt) {
+        match segment.kind {
+            Kind::LineComment | Kind::BlockComment => offset += segment.text.len(),
+            Kind::Code => {
+                let code = segment.text.trim_start();
+                offset += segment.text.len() - code.len();
+                if !code.is_empty() {
+                    break;
+                }
+            }
+            Kind::Quoted(_) => break,
+        }
+    }
+    stmt.get(offset..).unwrap_or_default()
+}
+
 /// `stmt` with a statement terminator after it, unless it already ends in
 /// one. A statement ending in a line comment gets its `;` on a line of its
 /// own, where the comment cannot swallow it.
@@ -170,6 +191,108 @@ pub(crate) fn terminate_statement(stmt: &str) -> String {
         Some(last) if last.kind == Kind::LineComment => format!("{trimmed}\n;"),
         Some(last) if last.kind == Kind::Code && last.text.ends_with(';') => trimmed.to_owned(),
         _ => format!("{trimmed};"),
+    }
+}
+
+/// A lexical token of a statement's code. Comments are skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Token<'a> {
+    /// A run of letters, digits and `_`: a keyword or a bare name.
+    Word(&'a str),
+    /// A `` `…` `` or `⟨…⟩` quoted identifier, escapes resolved.
+    Ident(String),
+    /// A string literal.
+    Str,
+    /// Any other single character of code.
+    Punct(char),
+}
+
+impl Token<'_> {
+    /// `true` when this token is the keyword `kw` (compared ASCII
+    /// case-insensitively; keywords are never quoted).
+    pub(crate) fn is_keyword(&self, kw: &str) -> bool {
+        matches!(self, Token::Word(w) if w.eq_ignore_ascii_case(kw))
+    }
+
+    /// The name this token spells, rendered the way the engine prints it,
+    /// so `` `user` `` and `user` compare equal. `None` for a string
+    /// literal or punctuation.
+    pub(crate) fn name(&self) -> Option<String> {
+        match self {
+            Token::Word(w) => Some((*w).to_owned()),
+            Token::Ident(s) => Some(quote_ident(s)),
+            Token::Str | Token::Punct(_) => None,
+        }
+    }
+}
+
+/// The code tokens of `stmt`, in order.
+pub(crate) fn tokens(stmt: &str) -> Vec<Token<'_>> {
+    let mut out: Vec<Token<'_>> = Vec::new();
+    for segment in segments(stmt) {
+        match segment.kind {
+            Kind::Code => code_tokens(segment.text, &mut out),
+            Kind::Quoted(open @ ('`' | '⟨')) => {
+                let mut body = segment.text.chars();
+                body.next();
+                let inner = body.as_str();
+                let close = if open == '`' { '`' } else { '⟩' };
+                let inner = inner.strip_suffix(close).unwrap_or(inner);
+                out.push(Token::Ident(unescape(inner)));
+            }
+            Kind::Quoted(_) => out.push(Token::Str),
+            Kind::LineComment | Kind::BlockComment => {}
+        }
+    }
+    out
+}
+
+fn code_tokens<'a>(code: &'a str, out: &mut Vec<Token<'a>>) {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut rest = code;
+    while let Some(c) = rest.chars().next() {
+        if c.is_whitespace() {
+            rest = rest.trim_start();
+        } else if is_word(c) {
+            let len = rest.find(|c: char| !is_word(c)).unwrap_or(rest.len());
+            let (word, tail) = rest.split_at(len);
+            out.push(Token::Word(word));
+            rest = tail;
+        } else {
+            out.push(Token::Punct(c));
+            rest = rest.get(c.len_utf8()..).unwrap_or_default();
+        }
+    }
+}
+
+/// The optional clause between a `DEFINE` / `REMOVE` kind keyword and the
+/// object name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Clause {
+    /// No clause: a `DEFINE` fails when the object exists, a `REMOVE` when
+    /// it does not.
+    Plain,
+    /// `IF NOT EXISTS`: a `DEFINE` that is a no-op when the object exists.
+    IfNotExists,
+    /// `OVERWRITE`: a `DEFINE` that replaces an existing object.
+    Overwrite,
+    /// `IF EXISTS`: a `REMOVE` that is a no-op when the object is absent.
+    IfExists,
+}
+
+/// Split the optional existence clause off the front of `toks`.
+pub(crate) fn existence_clause<'t, 'a>(toks: &'t [Token<'a>]) -> (Clause, &'t [Token<'a>]) {
+    match toks {
+        [a, b, c, rest @ ..]
+            if a.is_keyword("IF") && b.is_keyword("NOT") && c.is_keyword("EXISTS") =>
+        {
+            (Clause::IfNotExists, rest)
+        }
+        [a, b, rest @ ..] if a.is_keyword("IF") && b.is_keyword("EXISTS") => {
+            (Clause::IfExists, rest)
+        }
+        [a, rest @ ..] if a.is_keyword("OVERWRITE") => (Clause::Overwrite, rest),
+        _ => (Clause::Plain, toks),
     }
 }
 
@@ -263,6 +386,20 @@ mod tests {
     }
 
     #[test]
+    fn strip_leading_comments_finds_the_first_token() {
+        assert_eq!(
+            strip_leading_comments("-- purge\nDELETE FROM user"),
+            "DELETE FROM user"
+        );
+        assert_eq!(
+            strip_leading_comments("  /* a */ # b\n  REMOVE TABLE t"),
+            "REMOVE TABLE t"
+        );
+        assert_eq!(strip_leading_comments("-- only"), "");
+        assert_eq!(strip_leading_comments("'lit'"), "'lit'");
+    }
+
+    #[test]
     fn terminate_statement_keeps_the_terminator_out_of_comments() {
         assert_eq!(terminate_statement("SELECT 1"), "SELECT 1;");
         assert_eq!(terminate_statement("SELECT 1;"), "SELECT 1;");
@@ -275,5 +412,49 @@ mod tests {
             "SELECT 1 -- note;\n;"
         );
         assert_eq!(terminate_statement("SELECT 1 /* x */"), "SELECT 1 /* x */;");
+    }
+
+    #[test]
+    fn tokens_skip_comments_and_resolve_quoted_names() {
+        let toks = tokens("-- c\nDEFINE FIELD `first name` ON ⟨my table⟩ TYPE string; /* x */");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("DEFINE"),
+                Token::Word("FIELD"),
+                Token::Ident("first name".to_owned()),
+                Token::Word("ON"),
+                Token::Ident("my table".to_owned()),
+                Token::Word("TYPE"),
+                Token::Word("string"),
+                Token::Punct(';'),
+            ]
+        );
+        assert_eq!(tokens("a = 'b'")[2], Token::Str);
+    }
+
+    #[test]
+    fn token_names_normalise_needless_quoting() {
+        assert_eq!(Token::Ident("user".into()).name().as_deref(), Some("user"));
+        assert_eq!(Token::Word("user").name().as_deref(), Some("user"));
+        assert_eq!(
+            Token::Ident("my-table".into()).name().as_deref(),
+            Some("`my-table`")
+        );
+        assert_eq!(Token::Str.name(), None);
+    }
+
+    #[test]
+    fn existence_clause_recognises_all_three_forms() {
+        let toks = tokens("IF NOT EXISTS user");
+        assert_eq!(existence_clause(&toks).0, Clause::IfNotExists);
+        let toks = tokens("if exists user");
+        assert_eq!(existence_clause(&toks).0, Clause::IfExists);
+        let toks = tokens("OVERWRITE user");
+        let (clause, rest) = existence_clause(&toks);
+        assert_eq!(clause, Clause::Overwrite);
+        assert_eq!(rest, &[Token::Word("user")]);
+        let toks = tokens("user");
+        assert_eq!(existence_clause(&toks).0, Clause::Plain);
     }
 }

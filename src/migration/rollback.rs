@@ -27,6 +27,7 @@ use crate::error::{Result, SurqlError};
 use crate::migration::discovery::discover_migrations;
 use crate::migration::executor::execute_migration;
 use crate::migration::history::get_applied_migrations;
+use crate::migration::lexer::{self, existence_clause, Token};
 use crate::migration::models::{Migration, MigrationDirection, MigrationStatus};
 
 /// Safety tier of a rollback operation.
@@ -321,19 +322,20 @@ fn analyse_migration(migration: &Migration) -> Vec<RollbackIssue> {
         return issues;
     }
     for statement in &migration.down {
-        let upper = statement.to_ascii_uppercase();
-        let trimmed = upper.trim();
+        // Classify by the leading keywords of the statement's code
+        // ("REMOVE TABLE …", "REMOVE FIELD …", "ALTER FIELD … TYPE …",
+        // "DELETE …"); comments in front of it do not count.
+        let toks = lexer::tokens(statement);
+        let (verb, object) = match toks.as_slice() {
+            [verb, object, ..] => (Some(verb), Some(object)),
+            [verb] => (Some(verb), None),
+            [] => (None, None),
+        };
+        let is = |tok: Option<&Token<'_>>, kw: &str| tok.is_some_and(|t| t.is_keyword(kw));
+        let is_remove_or_drop = is(verb, "REMOVE") || is(verb, "DROP");
 
-        // Classify by looking at the first two significant tokens of the
-        // statement ("REMOVE TABLE …", "REMOVE FIELD …", "REMOVE INDEX …",
-        // "ALTER FIELD … TYPE …", etc.).
-        let head = leading_tokens(trimmed, 2);
-        let verb = head.first().map_or("", String::as_str);
-        let object = head.get(1).map_or("", String::as_str);
-        let is_remove_or_drop = matches!(verb, "REMOVE" | "DROP");
-
-        if is_remove_or_drop && object == "TABLE" {
-            let table = extract_after(statement, "TABLE").unwrap_or_else(|| "unknown".into());
+        if is_remove_or_drop && is(object, "TABLE") {
+            let table = object_name(toks.get(2..).unwrap_or_default());
             issues.push(RollbackIssue {
                 safety: RollbackSafety::Danger,
                 migration: migration.version.clone(),
@@ -341,8 +343,8 @@ fn analyse_migration(migration: &Migration) -> Vec<RollbackIssue> {
                 affected_data: Some(format!("all records in table {table}")),
                 recommendation: Some("export table data before rollback".into()),
             });
-        } else if is_remove_or_drop && object == "FIELD" {
-            let field = extract_after(statement, "FIELD").unwrap_or_else(|| "unknown".into());
+        } else if is_remove_or_drop && is(object, "FIELD") {
+            let field = object_name(toks.get(2..).unwrap_or_default());
             issues.push(RollbackIssue {
                 safety: RollbackSafety::Warning,
                 migration: migration.version.clone(),
@@ -350,7 +352,10 @@ fn analyse_migration(migration: &Migration) -> Vec<RollbackIssue> {
                 affected_data: Some(format!("field data in {field}")),
                 recommendation: Some("back up affected field data".into()),
             });
-        } else if verb == "ALTER" && object == "FIELD" && trimmed.contains("TYPE") {
+        } else if is(verb, "ALTER")
+            && is(object, "FIELD")
+            && toks.iter().any(|t| t.is_keyword("TYPE"))
+        {
             issues.push(RollbackIssue {
                 safety: RollbackSafety::Warning,
                 migration: migration.version.clone(),
@@ -358,34 +363,32 @@ fn analyse_migration(migration: &Migration) -> Vec<RollbackIssue> {
                 affected_data: None,
                 recommendation: Some("review data compatibility before rollback".into()),
             });
+        } else if is(verb, "DELETE") {
+            let target = object_name(toks.get(1..).unwrap_or_default());
+            issues.push(RollbackIssue {
+                safety: RollbackSafety::Danger,
+                migration: migration.version.clone(),
+                description: format!("deleting records: {target}"),
+                affected_data: Some(format!("records deleted from {target}")),
+                recommendation: Some("export the records before rollback".into()),
+            });
         }
         // Index / event drops and other operations are treated as safe.
     }
     issues
 }
 
-fn leading_tokens(upper: &str, n: usize) -> Vec<String> {
-    upper
-        .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
-        .filter(|s| !s.is_empty())
-        .take(n)
-        .map(str::to_string)
-        .collect()
-}
-
-fn extract_after(statement: &str, anchor: &str) -> Option<String> {
-    let upper = statement.to_ascii_uppercase();
-    let anchor_upper = anchor.to_ascii_uppercase();
-    let idx = upper.find(&anchor_upper)?;
-    let after = &statement[idx + anchor.len()..];
-    let token = after
-        .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
-        .find(|s| !s.is_empty())?;
-    Some(
-        token
-            .trim_matches(|c: char| c == ';' || c == ',')
-            .to_string(),
-    )
+/// The name after a kind keyword, past any `IF EXISTS` (or `FROM`, for a
+/// `DELETE`); `unknown` when there is none.
+fn object_name(toks: &[Token<'_>]) -> String {
+    let (_, rest) = existence_clause(toks);
+    let rest = match rest {
+        [from, rest @ ..] if from.is_keyword("FROM") || from.is_keyword("ONLY") => rest,
+        _ => rest,
+    };
+    rest.first()
+        .and_then(Token::name)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]
@@ -481,15 +484,32 @@ mod tests {
     }
 
     #[test]
-    fn extract_after_returns_table_name() {
-        assert_eq!(
-            extract_after("REMOVE TABLE user;", "TABLE"),
-            Some("user".to_string())
-        );
-        assert_eq!(
-            extract_after("remove table user;", "TABLE"),
-            Some("user".to_string())
-        );
+    fn object_name_skips_if_exists() {
+        let name = |s: &str| object_name(&lexer::tokens(s));
+        assert_eq!(name("user;"), "user");
+        assert_eq!(name("IF EXISTS user;"), "user");
+        assert_eq!(name("if exists `my-table`"), "`my-table`");
+        assert_eq!(name(";"), "unknown");
+    }
+
+    /// A comment in front of a destructive statement used to make its
+    /// first "token" `--`, so the plan came out Safe and needed no approval.
+    #[test]
+    fn a_leading_comment_does_not_hide_a_table_drop() {
+        let mig = m("v6", &["-- drop\nREMOVE TABLE IF EXISTS user"]);
+        let issues = analyse_migration(&mig);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].safety, RollbackSafety::Danger);
+        assert_eq!(issues[0].description, "dropping table: user");
+    }
+
+    #[test]
+    fn delete_in_down_is_danger() {
+        let mig = m("v7", &["/* reset */ DELETE FROM user WHERE seeded = true"]);
+        let issues = analyse_migration(&mig);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].safety, RollbackSafety::Danger);
+        assert!(issues[0].description.contains("user"));
     }
 
     #[tokio::test]

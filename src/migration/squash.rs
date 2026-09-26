@@ -33,7 +33,6 @@
 //! assert!(result.original_count >= 2);
 //! ```
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,7 +41,7 @@ use chrono::Utc;
 
 use crate::error::{Result, SurqlError};
 use crate::migration::discovery::{discover_migrations, sha256_hex};
-use crate::migration::lexer;
+use crate::migration::lexer::{self, existence_clause, Clause, Token};
 use crate::migration::models::Migration;
 
 /// Error raised by the squash subsystem.
@@ -186,18 +185,14 @@ impl SquashOptions {
 // Parsed statements (statement-level optimiser)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Define,
     Remove,
-    Insert,
-    Update,
-    Delete,
-    Create,
-    Unknown,
+    Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ObjectType {
     Table,
     Field,
@@ -205,129 +200,119 @@ enum ObjectType {
     Event,
 }
 
+/// The schema object a `DEFINE` / `REMOVE` statement names. Names are
+/// rendered the way the engine prints them, so `` `user` `` and `user`
+/// are the same object; a table's `name` is the table itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObjectKey {
+    kind: ObjectType,
+    table: String,
+    name: String,
+}
+
 #[derive(Debug, Clone)]
 struct ParsedStatement {
-    statement: String,
     operation: Operation,
-    object_type: Option<ObjectType>,
-    table_name: Option<String>,
-    field_name: Option<String>,
-    index_name: Option<String>,
-}
-
-/// Composite key used to deduplicate repeated `DEFINE` statements.
-type DefineKey = (
-    Option<ObjectType>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
-fn tokens(upper: &str) -> Vec<&str> {
-    upper.split_whitespace().collect()
-}
-
-fn strip_trailing_punct(s: &str) -> &str {
-    s.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+    clause: Clause,
+    /// `None` for anything the optimiser does not understand: data
+    /// statements, other kinds of definition, and names it cannot read.
+    /// Such a statement is never removed, and nothing is moved across it.
+    object: Option<ObjectKey>,
 }
 
 fn parse_statement(statement: &str) -> ParsedStatement {
-    let original = statement.trim().to_string();
-    let upper = original.to_ascii_uppercase();
-
-    let op = if upper.starts_with("DEFINE") {
-        Operation::Define
-    } else if upper.starts_with("REMOVE") {
-        Operation::Remove
-    } else if upper.starts_with("INSERT") {
-        Operation::Insert
-    } else if upper.starts_with("UPDATE") {
-        Operation::Update
-    } else if upper.starts_with("DELETE") {
-        Operation::Delete
-    } else if upper.starts_with("CREATE") {
-        Operation::Create
-    } else {
-        return ParsedStatement {
-            statement: original,
-            operation: Operation::Unknown,
-            object_type: None,
-            table_name: None,
-            field_name: None,
-            index_name: None,
-        };
+    let toks = lexer::tokens(statement);
+    let operation = match toks.first() {
+        Some(t) if t.is_keyword("DEFINE") => Operation::Define,
+        Some(t) if t.is_keyword("REMOVE") => Operation::Remove,
+        _ => Operation::Other,
     };
-
-    let mut object_type: Option<ObjectType> = None;
-    let mut table_name: Option<String> = None;
-    let mut field_name: Option<String> = None;
-    let mut index_name: Option<String> = None;
-
-    // Tokenise the uppercased form for simple pattern matching. Python
-    // uses regexes with `IGNORECASE`; we use case-folded token walking
-    // which is easier to audit and avoids adding regex deps here.
-    let toks = tokens(&upper);
-    if matches!(op, Operation::Define | Operation::Remove) && toks.len() >= 3 {
-        // DEFINE/REMOVE <KIND> <NAME> [ON TABLE <table>]
-        match toks[1] {
-            "TABLE" => {
-                object_type = Some(ObjectType::Table);
-                table_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-            }
-            "FIELD" => {
-                object_type = Some(ObjectType::Field);
-                field_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-                if let Some(table) = extract_on_table(&toks) {
-                    table_name = Some(table);
-                }
-            }
-            "INDEX" => {
-                object_type = Some(ObjectType::Index);
-                index_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-                if let Some(table) = extract_on_table(&toks) {
-                    table_name = Some(table);
-                }
-            }
-            "EVENT" => {
-                object_type = Some(ObjectType::Event);
-                // Events reuse index_name for the identifier slot, matching py.
-                index_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-                if let Some(table) = extract_on_table(&toks) {
-                    table_name = Some(table);
-                }
-            }
-            _ => {}
-        }
-    }
-
+    let (clause, object) = match (operation, toks.split_first()) {
+        (Operation::Define | Operation::Remove, Some((_, rest))) => parse_object(rest),
+        _ => (Clause::Plain, None),
+    };
     ParsedStatement {
-        statement: original,
-        operation: op,
-        object_type,
-        table_name,
-        field_name,
-        index_name,
+        operation,
+        clause,
+        object,
     }
 }
 
-fn extract_on_table(toks: &[&str]) -> Option<String> {
-    for (i, tok) in toks.iter().enumerate() {
-        if *tok == "ON" && i + 2 < toks.len() && toks[i + 1] == "TABLE" && !toks[i + 2].is_empty() {
-            return Some(strip_trailing_punct(toks[i + 2]).to_ascii_lowercase());
-        }
-    }
-    None
+/// Parse `<KIND> [IF NOT EXISTS | IF EXISTS | OVERWRITE] <name> [ON [TABLE] <table>]`.
+fn parse_object(toks: &[Token<'_>]) -> (Clause, Option<ObjectKey>) {
+    let Some((kind_tok, rest)) = toks.split_first() else {
+        return (Clause::Plain, None);
+    };
+    let kind = if kind_tok.is_keyword("TABLE") {
+        ObjectType::Table
+    } else if kind_tok.is_keyword("FIELD") {
+        ObjectType::Field
+    } else if kind_tok.is_keyword("INDEX") {
+        ObjectType::Index
+    } else if kind_tok.is_keyword("EVENT") {
+        ObjectType::Event
+    } else {
+        return (Clause::Plain, None);
+    };
+    let (clause, rest) = existence_clause(rest);
+    let object = if kind == ObjectType::Table {
+        rest.first().and_then(Token::name).map(|table| ObjectKey {
+            kind,
+            name: table.clone(),
+            table,
+        })
+    } else {
+        parse_table_scoped(kind, rest)
+    };
+    (clause, object)
+}
+
+/// `<name> ON [TABLE] <table>`, where a field name may be a path such as
+/// `address.city` or `tags[*]`.
+fn parse_table_scoped(kind: ObjectType, toks: &[Token<'_>]) -> Option<ObjectKey> {
+    let on = toks.iter().position(|t| t.is_keyword("ON"))?;
+    let (name_toks, after_on) = toks.split_at(on);
+    let name = name_toks
+        .iter()
+        .map(|t| match t {
+            Token::Punct(c @ ('.' | '[' | ']' | '*')) => Some(c.to_string()),
+            other => other.name(),
+        })
+        .collect::<Option<String>>()
+        .filter(|name| !name.is_empty())?;
+    let after_on = after_on.get(1..)?;
+    let table_tok = match after_on {
+        [t, table, ..] if t.is_keyword("TABLE") && table.name().is_some() => table,
+        [table, ..] => table,
+        [] => return None,
+    };
+    Some(ObjectKey {
+        kind,
+        table: table_tok.name()?,
+        name,
+    })
 }
 
 /// Remove redundant SurrealQL statements from a list.
 ///
-/// Applies three passes:
+/// Understands `DEFINE` / `REMOVE` of tables, fields, indexes and events
+/// (with or without `IF NOT EXISTS`, `IF EXISTS`, `OVERWRITE`, and with
+/// `ON t` or `ON TABLE t`) and applies two rewrites:
 ///
-/// 1. Drop `DEFINE` + matching `REMOVE` pairs for the same object.
-/// 2. When the same object is defined more than once, drop all earlier
-///    definitions and keep the last (mirrors Python behaviour).
-/// 3. Drop `UPDATE` statements that reference a field whose `DEFINE` and
-///    `REMOVE` have both been dropped in pass 1 (orphaned data migrations).
+/// 1. A plain `DEFINE` (which fails when the object already exists) that
+///    is later removed again with nothing in between that could observe
+///    the object is dropped together with its `REMOVE`. A `DEFINE … IF NOT
+///    EXISTS` or `OVERWRITE` is kept: the object may have existed before,
+///    and then the `REMOVE` still has work to do.
+/// 2. Of two definitions of the same object with nothing observing it in
+///    between, the earlier is dropped when the later one `OVERWRITE`s it,
+///    and a later `IF NOT EXISTS` (a no-op at that point) is dropped.
+///
+/// "Could observe" is judged conservatively: any statement the optimiser
+/// does not understand (data statements included), any statement on the
+/// same table (other than a definition of an unrelated field of it), and
+/// any change to the table itself blocks a rewrite. Data statements are
+/// never removed.
 ///
 /// Returns the optimised list and the count of individual statements
 /// that were elided.
@@ -338,120 +323,92 @@ pub fn optimize_statements(statements: &[String]) -> (Vec<String>, usize) {
         .map(|s| parse_statement(s.as_str()))
         .collect();
 
-    let mut to_remove: HashSet<usize> = HashSet::new();
-    let mut optimisations: usize = 0;
-
-    pass_drop_define_remove_pairs(&parsed, &mut to_remove, &mut optimisations);
-    pass_drop_duplicate_defines(&parsed, &mut to_remove, &mut optimisations);
-    pass_drop_orphaned_updates(&parsed, &mut to_remove, &mut optimisations);
+    let mut removed = vec![false; parsed.len()];
+    drop_define_remove_pairs(&parsed, &mut removed);
+    drop_superseded_defines(&parsed, &mut removed);
 
     let optimised: Vec<String> = statements
         .iter()
-        .enumerate()
-        .filter_map(|(i, s)| {
-            if to_remove.contains(&i) {
-                None
-            } else {
-                Some(s.clone())
-            }
-        })
+        .zip(&removed)
+        .filter(|(_, gone)| !**gone)
+        .map(|(s, _)| s.clone())
         .collect();
-    (optimised, optimisations)
+    let count = removed.iter().filter(|gone| **gone).count();
+    (optimised, count)
 }
 
-fn object_pair_matches(a: &ParsedStatement, b: &ParsedStatement) -> bool {
-    if a.object_type != b.object_type || a.table_name != b.table_name {
+/// The next live statement after `i` that names the same object, provided
+/// nothing between the two could observe or depend on that object.
+fn next_same_object(parsed: &[ParsedStatement], removed: &[bool], i: usize) -> Option<usize> {
+    let key = parsed.get(i)?.object.as_ref()?;
+    for (j, stmt) in parsed.iter().enumerate().skip(i + 1) {
+        if removed.get(j).copied().unwrap_or(false) {
+            continue;
+        }
+        if stmt.object.as_ref() == Some(key) {
+            return Some(j);
+        }
+        if interferes(key, stmt) {
+            return None;
+        }
+    }
+    None
+}
+
+/// `true` when `stmt` may observe or depend on the object `key` names, so
+/// a rewrite may not move `key`'s definition across it.
+fn interferes(key: &ObjectKey, stmt: &ParsedStatement) -> bool {
+    let Some(other) = &stmt.object else {
+        return true;
+    };
+    if other.table != key.table {
         return false;
     }
-    match &a.object_type {
-        Some(ObjectType::Table) => true,
-        Some(ObjectType::Field) => a.field_name == b.field_name,
-        Some(ObjectType::Index | ObjectType::Event) => a.index_name == b.index_name,
-        None => false,
+    match (key.kind, other.kind) {
+        (ObjectType::Field, ObjectType::Field) => field_root(&key.name) == field_root(&other.name),
+        _ => true,
     }
 }
 
-fn pass_drop_define_remove_pairs(
-    parsed: &[ParsedStatement],
-    to_remove: &mut HashSet<usize>,
-    optimisations: &mut usize,
-) {
-    for i in 0..parsed.len() {
-        if to_remove.contains(&i) || parsed[i].operation != Operation::Define {
-            continue;
-        }
-        for j in (i + 1)..parsed.len() {
-            if to_remove.contains(&j) || parsed[j].operation != Operation::Remove {
-                continue;
-            }
-            if object_pair_matches(&parsed[i], &parsed[j]) {
-                to_remove.insert(i);
-                to_remove.insert(j);
-                *optimisations += 2;
-                break;
-            }
-        }
-    }
+/// The top-level field a field path belongs to (`address` for
+/// `address.city`, `tags` for `tags[*]`).
+fn field_root(path: &str) -> &str {
+    path.split(['.', '[']).next().unwrap_or(path)
 }
 
-fn pass_drop_duplicate_defines(
-    parsed: &[ParsedStatement],
-    to_remove: &mut HashSet<usize>,
-    optimisations: &mut usize,
-) {
-    let mut last_define_idx: std::collections::HashMap<DefineKey, usize> =
-        std::collections::HashMap::new();
-
+fn drop_define_remove_pairs(parsed: &[ParsedStatement], removed: &mut [bool]) {
     for (i, stmt) in parsed.iter().enumerate() {
-        if to_remove.contains(&i) || stmt.operation != Operation::Define {
+        if removed[i] || stmt.operation != Operation::Define || stmt.clause != Clause::Plain {
             continue;
         }
-        let key: DefineKey = (
-            stmt.object_type.clone(),
-            stmt.table_name.clone(),
-            stmt.field_name.clone(),
-            stmt.index_name.clone(),
-        );
-        if let Some(&earlier) = last_define_idx.get(&key) {
-            if !to_remove.contains(&earlier) {
-                to_remove.insert(earlier);
-                *optimisations += 1;
+        if let Some(j) = next_same_object(parsed, removed, i) {
+            if parsed[j].operation == Operation::Remove {
+                removed[i] = true;
+                removed[j] = true;
             }
         }
-        last_define_idx.insert(key, i);
     }
 }
 
-fn pass_drop_orphaned_updates(
-    parsed: &[ParsedStatement],
-    to_remove: &mut HashSet<usize>,
-    optimisations: &mut usize,
-) {
-    let mut removed_fields: HashSet<(Option<String>, Option<String>)> = HashSet::new();
-    for i in to_remove.iter() {
-        let s = &parsed[*i];
-        if matches!(s.object_type, Some(ObjectType::Field)) {
-            removed_fields.insert((s.table_name.clone(), s.field_name.clone()));
-        }
-    }
-
-    for (i, stmt) in parsed.iter().enumerate() {
-        if to_remove.contains(&i) || stmt.operation != Operation::Update {
-            continue;
-        }
-        let upper = stmt.statement.to_ascii_uppercase();
-        for (table, field) in &removed_fields {
-            let (Some(table), Some(field)) = (table.as_ref(), field.as_ref()) else {
-                continue;
-            };
-            let set_token = format!("SET {}", field.to_ascii_uppercase());
-            let tab_token = format!("UPDATE {}", table.to_ascii_uppercase());
-            if upper.contains(&set_token) && upper.contains(&tab_token) {
-                to_remove.insert(i);
-                *optimisations += 1;
-                break;
+fn drop_superseded_defines(parsed: &[ParsedStatement], removed: &mut [bool]) {
+    let mut i = 0;
+    while i < parsed.len() {
+        if !removed[i] && parsed[i].operation == Operation::Define {
+            if let Some(j) = next_same_object(parsed, removed, i) {
+                if parsed[j].operation == Operation::Define {
+                    match parsed[j].clause {
+                        Clause::Overwrite => removed[i] = true,
+                        Clause::IfNotExists => {
+                            // Look past the no-op for another definition.
+                            removed[j] = true;
+                            continue;
+                        }
+                        Clause::Plain | Clause::IfExists => {}
+                    }
+                }
             }
         }
+        i += 1;
     }
 }
 
@@ -462,6 +419,9 @@ fn pass_drop_orphaned_updates(
 /// Inspect `migrations` and return a list of warnings about
 /// data-manipulation statements, ordering issues, and other known
 /// squash hazards.
+///
+/// Statements are classified by their first keyword after any leading
+/// comments, so a `-- purge` line above a `DELETE` does not hide it.
 #[must_use]
 pub fn validate_squash_safety(migrations: &[Migration]) -> Vec<SquashWarning> {
     let mut warnings: Vec<SquashWarning> = Vec::new();
@@ -469,38 +429,38 @@ pub fn validate_squash_safety(migrations: &[Migration]) -> Vec<SquashWarning> {
     for migration in migrations {
         let version = &migration.version;
         for stmt in &migration.up {
-            let upper = stmt.to_ascii_uppercase();
-            let preview = preview_statement(stmt);
+            let code = lexer::strip_leading_comments(stmt);
+            let toks = lexer::tokens(code);
+            let has = |kw: &str| toks.iter().any(|t| t.is_keyword(kw));
+            let is_backfill = toks
+                .windows(2)
+                .any(|w| w[0].is_keyword("IS") && w[1].is_keyword("NONE"));
+            let preview = preview_statement(code);
+            let verb = toks.first();
 
-            if upper.trim_start().starts_with("INSERT") {
-                warnings.push(SquashWarning {
-                    migration: version.clone(),
-                    message: format!("Contains INSERT statement: {preview}..."),
-                    severity: SquashSeverity::Medium,
-                });
-            } else if upper.trim_start().starts_with("UPDATE") && upper.contains(" SET ") {
-                if !upper.contains(" IS NONE") {
-                    warnings.push(SquashWarning {
-                        migration: version.clone(),
-                        message: format!("Contains UPDATE statement: {preview}..."),
-                        severity: SquashSeverity::Medium,
-                    });
+            let warning = match verb {
+                Some(t) if t.is_keyword("INSERT") => Some(("INSERT", SquashSeverity::Medium)),
+                Some(t) if t.is_keyword("UPDATE") && has("SET") && !is_backfill => {
+                    Some(("UPDATE", SquashSeverity::Medium))
                 }
-            } else if upper.trim_start().starts_with("DELETE") {
+                Some(t) if t.is_keyword("DELETE") => Some(("DELETE", SquashSeverity::High)),
+                Some(t)
+                    if t.is_keyword("CREATE")
+                        && !toks.get(1).is_some_and(|t| t.is_keyword("TABLE")) =>
+                {
+                    Some(("CREATE", SquashSeverity::Low))
+                }
+                _ => None,
+            };
+            if let Some((kind, severity)) = warning {
                 warnings.push(SquashWarning {
                     migration: version.clone(),
-                    message: format!("Contains DELETE statement: {preview}..."),
-                    severity: SquashSeverity::High,
-                });
-            } else if upper.trim_start().starts_with("CREATE") && !upper.contains("CREATE TABLE") {
-                warnings.push(SquashWarning {
-                    migration: version.clone(),
-                    message: format!("Contains CREATE statement: {preview}..."),
-                    severity: SquashSeverity::Low,
+                    message: format!("Contains {kind} statement: {preview}..."),
+                    severity,
                 });
             }
 
-            if upper.contains("RECORD") && upper.contains("TYPE") {
+            if has("RECORD") && has("TYPE") {
                 warnings.push(SquashWarning {
                     migration: version.clone(),
                     message: "Contains record reference - verify table order".to_string(),
@@ -513,13 +473,9 @@ pub fn validate_squash_safety(migrations: &[Migration]) -> Vec<SquashWarning> {
     warnings
 }
 
+/// The first 50 characters of a statement (never cut inside a character).
 fn preview_statement(stmt: &str) -> String {
-    let trimmed = stmt.trim();
-    if trimmed.len() > 50 {
-        trimmed[..50].to_string()
-    } else {
-        trimmed.to_string()
-    }
+    stmt.trim().chars().take(50).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -795,37 +751,40 @@ mod tests {
 
     // --- parse_statement --------------------------------------------------
 
+    fn key(kind: ObjectType, table: &str, name: &str) -> ObjectKey {
+        ObjectKey {
+            kind,
+            table: table.to_string(),
+            name: name.to_string(),
+        }
+    }
+
     #[test]
     fn parse_define_table() {
         let p = parse_statement("DEFINE TABLE user SCHEMAFULL;");
         assert_eq!(p.operation, Operation::Define);
-        assert_eq!(p.object_type, Some(ObjectType::Table));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
+        assert_eq!(p.clause, Clause::Plain);
+        assert_eq!(p.object, Some(key(ObjectType::Table, "user", "user")));
     }
 
     #[test]
     fn parse_remove_table() {
         let p = parse_statement("REMOVE TABLE user;");
         assert_eq!(p.operation, Operation::Remove);
-        assert_eq!(p.object_type, Some(ObjectType::Table));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
+        assert_eq!(p.object, Some(key(ObjectType::Table, "user", "user")));
     }
 
     #[test]
     fn parse_define_field() {
         let p = parse_statement("DEFINE FIELD email ON TABLE user TYPE string;");
         assert_eq!(p.operation, Operation::Define);
-        assert_eq!(p.object_type, Some(ObjectType::Field));
-        assert_eq!(p.field_name.as_deref(), Some("email"));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
+        assert_eq!(p.object, Some(key(ObjectType::Field, "user", "email")));
     }
 
     #[test]
     fn parse_define_index() {
         let p = parse_statement("DEFINE INDEX email_idx ON TABLE user COLUMNS email UNIQUE;");
-        assert_eq!(p.object_type, Some(ObjectType::Index));
-        assert_eq!(p.index_name.as_deref(), Some("email_idx"));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
+        assert_eq!(p.object, Some(key(ObjectType::Index, "user", "email_idx")));
     }
 
     #[test]
@@ -833,18 +792,77 @@ mod tests {
         let p = parse_statement(
             "DEFINE EVENT user_created ON TABLE user WHEN $event = \"CREATE\" THEN {};",
         );
-        assert_eq!(p.object_type, Some(ObjectType::Event));
-        assert_eq!(p.index_name.as_deref(), Some("user_created"));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
+        assert_eq!(
+            p.object,
+            Some(key(ObjectType::Event, "user", "user_created"))
+        );
     }
 
     #[test]
     fn parse_unknown_statement() {
         let p = parse_statement("SELECT * FROM user;");
-        assert_eq!(p.operation, Operation::Unknown);
+        assert_eq!(p.operation, Operation::Other);
+        assert_eq!(p.object, None);
+    }
+
+    /// The name used to be read from the third token, which is `IF` or
+    /// `OVERWRITE` in these forms, and the table only after `ON TABLE`.
+    #[test]
+    fn parse_skips_existence_clauses_and_accepts_bare_on() {
+        let p = parse_statement("DEFINE TABLE IF NOT EXISTS user SCHEMAFULL;");
+        assert_eq!(p.clause, Clause::IfNotExists);
+        assert_eq!(p.object, Some(key(ObjectType::Table, "user", "user")));
+
+        let p = parse_statement("DEFINE FIELD OVERWRITE f ON TABLE t TYPE int;");
+        assert_eq!(p.clause, Clause::Overwrite);
+        assert_eq!(p.object, Some(key(ObjectType::Field, "t", "f")));
+
+        let p = parse_statement("REMOVE FIELD IF EXISTS email ON user;");
+        assert_eq!(p.clause, Clause::IfExists);
+        assert_eq!(p.object, Some(key(ObjectType::Field, "user", "email")));
+
+        let p = parse_statement("define index i on post fields a;");
+        assert_eq!(p.object, Some(key(ObjectType::Index, "post", "i")));
+    }
+
+    #[test]
+    fn parse_resolves_quoted_names_and_field_paths() {
+        let p = parse_statement("DEFINE TABLE `user` SCHEMAFULL;");
+        assert_eq!(p.object, Some(key(ObjectType::Table, "user", "user")));
+        let p = parse_statement("DEFINE FIELD `first-name` ON ⟨my-table⟩ TYPE string;");
+        assert_eq!(
+            p.object,
+            Some(key(ObjectType::Field, "`my-table`", "`first-name`"))
+        );
+        let p = parse_statement("DEFINE FIELD address.city ON user TYPE string;");
+        assert_eq!(
+            p.object,
+            Some(key(ObjectType::Field, "user", "address.city"))
+        );
+        let p = parse_statement("DEFINE FIELD tags[*] ON user TYPE string;");
+        assert_eq!(p.object, Some(key(ObjectType::Field, "user", "tags[*]")));
+        let p = parse_statement("-- note\nDEFINE TABLE post;");
+        assert_eq!(p.object, Some(key(ObjectType::Table, "post", "post")));
+    }
+
+    #[test]
+    fn parse_leaves_unreadable_definitions_unkeyed() {
+        for stmt in [
+            "DEFINE FUNCTION fn::a() { RETURN 1; };",
+            "DEFINE PARAM $x VALUE 1;",
+            "DEFINE FIELD ON user;",
+            "DEFINE FIELD 'str' ON user;",
+            "DEFINE FIELD f;",
+        ] {
+            assert_eq!(parse_statement(stmt).object, None, "{stmt}");
+        }
     }
 
     // --- optimize_statements ---------------------------------------------
+
+    fn strings(stmts: &[&str]) -> Vec<String> {
+        stmts.iter().map(|s| (*s).to_string()).collect()
+    }
 
     #[test]
     fn optimise_empty_list() {
@@ -891,15 +909,26 @@ mod tests {
     }
 
     #[test]
-    fn optimise_removes_duplicate_defines_keeping_last() {
-        let stmts = vec![
-            "DEFINE FIELD email ON TABLE user TYPE string;".into(),
-            "DEFINE FIELD age ON TABLE user TYPE int;".into(),
-            "DEFINE FIELD email ON TABLE user TYPE string ASSERT string::is::email($value);".into(),
-        ];
+    fn optimise_drops_a_definition_its_overwrite_replaces() {
+        let stmts = strings(&[
+            "DEFINE FIELD email ON TABLE user TYPE string;",
+            "DEFINE FIELD age ON TABLE user TYPE int;",
+            "DEFINE FIELD OVERWRITE email ON TABLE user TYPE string ASSERT string::is::email($value);",
+        ]);
         let (out, count) = optimize_statements(&stmts);
         assert_eq!(count, 1);
-        assert!(out.iter().any(|s| s.contains("ASSERT")));
+        assert_eq!(out, stmts[1..].to_vec());
+    }
+
+    #[test]
+    fn optimise_drops_a_redundant_if_not_exists_and_keeps_the_first() {
+        let stmts = strings(&[
+            "DEFINE FIELD email ON user TYPE string ASSERT $value != NONE;",
+            "DEFINE FIELD IF NOT EXISTS email ON user TYPE string;",
+        ]);
+        let (out, count) = optimize_statements(&stmts);
+        assert_eq!(count, 1);
+        assert_eq!(out, stmts[..1].to_vec());
     }
 
     #[test]
@@ -914,17 +943,102 @@ mod tests {
         assert_eq!(out.len(), 3);
     }
 
+    /// `generate_initial_migration` writes every definition with `IF NOT
+    /// EXISTS`; they all used to key as the table `if` and all but the last
+    /// were dropped as duplicates.
     #[test]
-    fn optimise_removes_orphaned_updates() {
-        let stmts = vec![
-            "DEFINE FIELD temp ON TABLE user TYPE string;".into(),
-            "UPDATE user SET temp = \"value\" WHERE temp IS NONE;".into(),
-            "REMOVE FIELD temp ON TABLE user;".into(),
-        ];
+    fn optimise_keeps_every_if_not_exists_table() {
+        let stmts = strings(&[
+            "DEFINE TABLE IF NOT EXISTS user SCHEMAFULL;",
+            "DEFINE FIELD IF NOT EXISTS email ON TABLE user TYPE string;",
+            "DEFINE TABLE IF NOT EXISTS post SCHEMAFULL;",
+            "DEFINE FIELD IF NOT EXISTS email ON TABLE post TYPE string;",
+            "DEFINE TABLE IF NOT EXISTS comment SCHEMAFULL;",
+        ]);
         let (out, count) = optimize_statements(&stmts);
-        // DEFINE + REMOVE pair drops 2, orphaned UPDATE drops 1.
-        assert!(out.is_empty(), "got {out:?}");
-        assert!(count >= 3, "got count {count}");
+        assert_eq!(count, 0, "{out:#?}");
+        assert_eq!(out, stmts);
+    }
+
+    #[test]
+    fn optimise_keys_fields_by_their_table_under_bare_on() {
+        let stmts = strings(&[
+            "DEFINE FIELD email ON user TYPE string;",
+            "DEFINE FIELD email ON post TYPE string;",
+            "REMOVE FIELD email ON post;",
+        ]);
+        let (out, _) = optimize_statements(&stmts);
+        assert_eq!(out, stmts[..1].to_vec());
+
+        let stmts = strings(&["DEFINE TABLE user;", "REMOVE TABLE post;"]);
+        assert_eq!(optimize_statements(&stmts).0, stmts);
+    }
+
+    #[test]
+    fn optimise_never_pairs_a_conditional_define_with_a_remove() {
+        // The object may predate the squashed range; then the REMOVE is
+        // what deletes it.
+        for define in [
+            "DEFINE TABLE IF NOT EXISTS legacy;",
+            "DEFINE TABLE OVERWRITE legacy;",
+        ] {
+            let stmts = strings(&[define, "REMOVE TABLE legacy;"]);
+            assert_eq!(optimize_statements(&stmts).0, stmts, "{define}");
+        }
+    }
+
+    #[test]
+    fn optimise_never_removes_unreadable_definitions() {
+        let stmts = strings(&[
+            "DEFINE FUNCTION fn::a() { RETURN 1; };",
+            "DEFINE FUNCTION fn::b() { RETURN 2; };",
+            "DEFINE ANALYZER one TOKENIZERS blank;",
+            "DEFINE ANALYZER two TOKENIZERS blank;",
+        ]);
+        assert_eq!(optimize_statements(&stmts), (stmts, 0));
+    }
+
+    /// Copy-through-temp-column: the fill step and the copy-back both read
+    /// or write `temp`, so neither the pair nor the UPDATEs may go.
+    #[test]
+    fn optimise_keeps_everything_around_a_data_statement() {
+        let stmts = strings(&[
+            "DEFINE FIELD temp ON TABLE user TYPE string;",
+            "UPDATE user SET temp = <string> age;",
+            "REMOVE FIELD age ON TABLE user;",
+            "DEFINE FIELD age ON TABLE user TYPE string;",
+            "UPDATE user SET age = temp;",
+            "REMOVE FIELD temp ON TABLE user;",
+        ]);
+        assert_eq!(optimize_statements(&stmts), (stmts, 0));
+    }
+
+    #[test]
+    fn optimise_keeps_a_table_pair_with_children_in_between() {
+        let stmts = strings(&[
+            "DEFINE TABLE scratch;",
+            "DEFINE FIELD x ON scratch TYPE int;",
+            "REMOVE TABLE scratch;",
+        ]);
+        assert_eq!(optimize_statements(&stmts), (stmts, 0));
+    }
+
+    #[test]
+    fn optimise_moves_nothing_across_a_statement_on_the_same_field_root() {
+        let stmts = strings(&[
+            "DEFINE FIELD address ON user TYPE object;",
+            "DEFINE FIELD address.city ON user TYPE string;",
+            "REMOVE FIELD address ON user;",
+        ]);
+        assert_eq!(optimize_statements(&stmts), (stmts, 0));
+
+        // An unrelated field of the same table does not block.
+        let stmts = strings(&[
+            "DEFINE FIELD temp ON user TYPE int;",
+            "DEFINE FIELD other ON user TYPE int;",
+            "REMOVE FIELD temp ON user;",
+        ]);
+        assert_eq!(optimize_statements(&stmts), (stmts[1..2].to_vec(), 2));
     }
 
     // --- validate_squash_safety ------------------------------------------
@@ -989,6 +1103,41 @@ mod tests {
         );
         let w = validate_squash_safety(&[m]);
         assert!(w.is_empty(), "got {w:?}");
+    }
+
+    #[test]
+    fn a_leading_comment_does_not_hide_a_delete() {
+        let m = mock_migration(
+            "v1",
+            &["-- purge\nDELETE FROM user", "/* x */ INSERT INTO t {};"],
+        );
+        let w = validate_squash_safety(&[m]);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(w[0].severity, SquashSeverity::High);
+        assert!(
+            w[0].message.contains("DELETE FROM user"),
+            "{}",
+            w[0].message
+        );
+        assert_eq!(w[1].severity, SquashSeverity::Medium);
+    }
+
+    #[test]
+    fn update_with_set_on_its_own_line_warns() {
+        let m = mock_migration("v1", &["UPDATE user\nSET name = 'x';"]);
+        assert_eq!(validate_squash_safety(&[m]).len(), 1);
+    }
+
+    /// The preview was cut at byte 50, which panics inside a multi-byte
+    /// character.
+    #[test]
+    fn preview_never_splits_a_character() {
+        let stmt = "CREATE tt SET c = 'éééééééééééééééééééééééééééééé';";
+        let m = mock_migration("v1", &[stmt]);
+        let w = validate_squash_safety(&[m]);
+        assert_eq!(w.len(), 1);
+        assert_eq!(preview_statement(stmt).chars().count(), 50);
+        assert_eq!(preview_statement("short"), "short");
     }
 
     #[test]
@@ -1340,6 +1489,34 @@ mod tests {
         assert!(r
             .original_migrations
             .contains(&"20260103_000000".to_string()));
+    }
+
+    #[test]
+    fn squash_keeps_every_table_of_an_initial_migration() {
+        use crate::migration::generator::generate_initial_migration;
+        use crate::schema::fields::{FieldDefinition, FieldType};
+        use crate::schema::registry::SchemaRegistry;
+        use crate::schema::table::table_schema;
+
+        let dir = unique_temp_dir("initial");
+        let registry = SchemaRegistry::new();
+        for name in ["user", "post", "comment"] {
+            registry.register_table(
+                table_schema(name).with_fields([FieldDefinition::new("email", FieldType::String)]),
+            );
+        }
+        let initial = generate_initial_migration(&registry, &dir).unwrap();
+        write_migration(
+            &dir,
+            "29990101_000000",
+            "later",
+            &["DEFINE TABLE tag SCHEMAFULL;"],
+            &[],
+        );
+
+        let r = squash_migrations(&dir, &SquashOptions::new().dry_run(true)).unwrap();
+        assert_eq!(r.optimizations_applied, 0);
+        assert_eq!(r.statement_count, initial.up.len() + 1);
     }
 
     #[test]
