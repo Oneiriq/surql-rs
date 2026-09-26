@@ -30,7 +30,8 @@ pub enum DbCommand {
     },
     /// Remove every table from the configured database.
     Reset {
-        /// Skip the interactive confirmation prompt.
+        /// Skip the confirmation prompt (required when stdin is not a
+        /// terminal).
         #[arg(long = "yes", short = 'y')]
         yes: bool,
     },
@@ -142,15 +143,14 @@ fn info(settings: &crate::settings::Settings, as_json: bool) -> Result<()> {
 }
 
 async fn reset(settings: &crate::settings::Settings, yes: bool) -> Result<()> {
-    fmt::warn(format!(
-        "this will DROP all tables in {}/{}",
-        settings.database().namespace(),
-        settings.database().database()
-    ));
-    if !yes {
-        fmt::warn("re-run with --yes to confirm");
-        return Ok(());
-    }
+    fmt::confirm(
+        &format!(
+            "remove every table in {}/{}",
+            settings.database().namespace(),
+            settings.database().database()
+        ),
+        yes,
+    )?;
     let client = connected_client(settings).await?;
     let info_value = client.query("INFO FOR DB;").await?;
     let mut tables: Vec<String> = Vec::new();

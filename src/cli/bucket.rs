@@ -51,6 +51,10 @@ pub enum BucketCommand {
     Rm {
         /// Bucket name.
         name: String,
+        /// Skip the confirmation prompt (required when stdin is not a
+        /// terminal).
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
     },
     /// Write a file into a bucket.
     Put {
@@ -85,6 +89,10 @@ pub enum BucketCommand {
         bucket: String,
         /// File key.
         key: String,
+        /// Skip the confirmation prompt (required when stdin is not a
+        /// terminal).
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
     },
     /// Report whether a file exists in a bucket (exit-style boolean print).
     Exists {
@@ -126,7 +134,10 @@ pub async fn run(cmd: BucketCommand, global: &GlobalOpts) -> Result<()> {
             .await
         }
         BucketCommand::List => list(&settings).await,
-        BucketCommand::Rm { name } => rm(&settings, &name).await,
+        BucketCommand::Rm { name, yes } => {
+            fmt::confirm(&format!("remove bucket {name} and every file in it"), yes)?;
+            rm(&settings, &name).await
+        }
         BucketCommand::Put {
             bucket,
             key,
@@ -149,7 +160,10 @@ pub async fn run(cmd: BucketCommand, global: &GlobalOpts) -> Result<()> {
             key,
             output,
         } => get(&settings, &bucket, &key, output.as_deref()).await,
-        BucketCommand::Delete { bucket, key } => delete(&settings, &bucket, &key).await,
+        BucketCommand::Delete { bucket, key, yes } => {
+            fmt::confirm(&format!("delete {bucket}:/{key}"), yes)?;
+            delete(&settings, &bucket, &key).await
+        }
         BucketCommand::Exists { bucket, key } => exists(&settings, &bucket, &key).await,
         BucketCommand::Files { bucket } => files(&settings, &bucket).await,
     }

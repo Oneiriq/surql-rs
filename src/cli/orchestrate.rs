@@ -12,8 +12,8 @@ use crate::cli::GlobalOpts;
 use crate::error::{Result, SurqlError};
 use crate::migration::discover_migrations;
 use crate::orchestration::{
-    configure_environments, get_registry, DeploymentPlan, DeploymentResult, DeploymentStatus,
-    HealthCheck, MigrationCoordinator, StrategyKind,
+    configure_environments, deploy_to_environments, get_registry, DeploymentPlan, DeploymentResult,
+    DeploymentStatus, HealthCheck, StrategyKind,
 };
 
 /// Deployment strategy flag mirroring [`StrategyKind`].
@@ -41,6 +41,8 @@ impl From<StrategyArg> for StrategyKind {
 }
 
 /// Flags of `surql orchestrate deploy`.
+// Each bool is an independent command-line switch.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, clap::Args)]
 pub struct DeployArgs {
     /// Path to the environments JSON file.
@@ -59,6 +61,14 @@ pub struct DeployArgs {
     /// it the deploy is refused before anything runs.
     #[arg(long)]
     pub approve: bool,
+    /// Skip the confirmation prompt (required when stdin is not a
+    /// terminal).
+    #[arg(long = "yes", short = 'y')]
+    pub yes: bool,
+    /// Leave successful environments deployed when another one fails
+    /// (by default what this run applied is rolled back everywhere).
+    #[arg(long)]
+    pub no_auto_rollback: bool,
 }
 
 /// `surql orchestrate <subcommand>` commands.
@@ -111,6 +121,8 @@ async fn deploy(settings: &crate::settings::Settings, args: &DeployArgs) -> Resu
         environments,
         dry_run,
         approve,
+        yes,
+        no_auto_rollback,
     } = args.clone();
     load_plan(&plan_path).await?;
     let registry = get_registry();
@@ -128,16 +140,26 @@ async fn deploy(settings: &crate::settings::Settings, args: &DeployArgs) -> Resu
         None => registry.list().await,
     };
 
-    let plan = DeploymentPlan::builder(registry.clone())
+    if !dry_run {
+        fmt::confirm(
+            &format!(
+                "deploy up to {} migration(s) to {} (auto-rollback {})",
+                migrations.len(),
+                env_names.join(", "),
+                if no_auto_rollback { "off" } else { "on" }
+            ),
+            yes,
+        )?;
+    }
+
+    let plan = DeploymentPlan::builder(registry)
         .environments(env_names.clone())
         .migrations(migrations.clone())
         .strategy(strategy.into())
         .dry_run(dry_run)
         .approved(approve)
+        .auto_rollback(!no_auto_rollback)
         .build();
-
-    let coordinator =
-        MigrationCoordinator::with_strategy_label(registry, strategy.into(), 1, 10.0, 5)?;
 
     fmt::info(format!(
         "deploying {} migration(s) to {} environment(s); each receives the ones it has not applied (strategy: {:?}, dry_run: {})",
@@ -147,7 +169,7 @@ async fn deploy(settings: &crate::settings::Settings, args: &DeployArgs) -> Resu
         dry_run
     ));
 
-    let results = coordinator.deploy(&plan).await?;
+    let results = deploy_to_environments(&plan).await?;
 
     let mut rows: Vec<&DeploymentResult> = results.values().collect();
     rows.sort_by(|a, b| a.environment.cmp(&b.environment));
