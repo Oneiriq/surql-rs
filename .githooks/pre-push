@@ -41,6 +41,9 @@ if cargo tree --no-default-features --features client-rustls --prefix none \
   exit 1
 fi
 
+echo "[pre-push] cargo check --lib --no-default-features"
+RUSTFLAGS="-D warnings" cargo check --lib --no-default-features
+
 if command -v cargo-audit >/dev/null 2>&1; then
   echo "[pre-push] cargo audit"
   cargo audit

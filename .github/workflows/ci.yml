@@ -137,6 +137,12 @@ jobs:
       - name: cargo check (client-rustls only)
         run: cargo check --no-default-features --features client-rustls --all-targets
 
+      # The schema / query / migration toolkit with no client at all is a
+      # supported build; code whose only callers are client-gated shows up
+      # here as dead code.
+      - name: cargo check (no features)
+        run: cargo check --lib --no-default-features
+
       - name: Assert openssl-sys / native-tls absent from dep graph
         run: |
           if cargo tree --no-default-features --features client-rustls --prefix none \
