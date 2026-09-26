@@ -5,12 +5,17 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::escape::quote_str;
 use super::record_id::RecordIdValue;
+use crate::query::expressions::Expression;
 
 /// Reference to a SurrealDB record via `type::record()`.
 ///
-/// When this value is embedded in a query body (rather than as a parameter)
-/// it renders verbatim rather than being quoted as a string.
+/// Converted into an [`Expression`] (`.into()`, or through
+/// [`eq_expr`](super::operators::eq_expr) and `Query::set_expr`) it renders
+/// as the `type::record(...)` call. Serialised into a `serde_json::Value`
+/// it is plain data: the query renderers never treat a JSON object as
+/// SurrealQL, whatever its shape.
 ///
 /// ## Examples
 ///
@@ -33,14 +38,13 @@ pub struct RecordRef {
 }
 
 impl RecordRef {
-    /// Render as a `type::record()` SurrealQL call.
+    /// Render as a `type::record()` SurrealQL call. The table and a string
+    /// id are both rendered as escaped string literals.
     pub fn to_surql(&self) -> String {
+        let table = quote_str(&self.table);
         match &self.record_id {
-            RecordIdValue::Int(n) => format!("type::record('{}', {})", self.table, n),
-            RecordIdValue::String(s) => {
-                let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
-                format!("type::record('{}', '{escaped}')", self.table)
-            }
+            RecordIdValue::Int(n) => format!("type::record({table}, {n})"),
+            RecordIdValue::String(s) => format!("type::record({table}, {})", quote_str(s)),
         }
     }
 }
@@ -48,6 +52,12 @@ impl RecordRef {
 impl std::fmt::Display for RecordRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.to_surql())
+    }
+}
+
+impl From<RecordRef> for Expression {
+    fn from(r: RecordRef) -> Self {
+        Expression::function(r.to_surql())
     }
 }
 

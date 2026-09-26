@@ -6,9 +6,9 @@
 
 use serde_json::Value;
 
+use super::escape::{is_identifier, quote_str};
 use super::record_id::RecordIdValue;
-use super::record_ref::{record_ref, RecordRef};
-use super::surreal_fn::SurrealFn;
+use super::record_ref::record_ref;
 
 use crate::query::expressions::Expression;
 
@@ -59,6 +59,15 @@ pub enum Operator {
     Or(Or),
     /// `NOT (operand)`
     Not(Not),
+    /// A condition built from typed expressions, such as a comparison
+    /// against a function call or a record reference (see [`eq_expr`]).
+    Expr(Expression),
+}
+
+impl From<Expression> for Operator {
+    fn from(expr: Expression) -> Self {
+        Self::Expr(expr)
+    }
 }
 
 impl OperatorExpr for Operator {
@@ -83,6 +92,7 @@ impl OperatorExpr for Operator {
             Self::And(x) => x.to_surql(),
             Self::Or(x) => x.to_surql(),
             Self::Not(x) => x.to_surql(),
+            Self::Expr(x) => x.to_surql(),
         }
     }
 }
@@ -456,6 +466,76 @@ pub fn not_(operand: Operator) -> Operator {
 }
 
 // ---------------------------------------------------------------------------
+// Expression-valued comparisons
+// ---------------------------------------------------------------------------
+
+macro_rules! expr_comparison {
+    ($(#[$meta:meta])* $name:ident, $sql:literal) => {
+        $(#[$meta])*
+        pub fn $name(field: impl Into<String>, rhs: impl Into<Expression>) -> Operator {
+            Operator::Expr(Expression::raw(format!(
+                "{} {} {}",
+                field.into(),
+                $sql,
+                rhs.into().to_surql()
+            )))
+        }
+    };
+}
+
+expr_comparison!(
+    /// `field = <expression>`: compare against a typed expression (a
+    /// function call, a record reference, another field) instead of a JSON
+    /// literal.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::types::operators::{eq_expr, OperatorExpr};
+    /// use surql::types::record_ref;
+    ///
+    /// let op = eq_expr("author", record_ref("user", "alice"));
+    /// assert_eq!(op.to_surql(), "author = type::record('user', 'alice')");
+    /// ```
+    eq_expr,
+    "="
+);
+expr_comparison!(
+    /// `field != <expression>` (see [`eq_expr`]).
+    ne_expr,
+    "!="
+);
+expr_comparison!(
+    /// `field > <expression>` (see [`eq_expr`]).
+    gt_expr,
+    ">"
+);
+expr_comparison!(
+    /// `field >= <expression>` (see [`eq_expr`]).
+    gte_expr,
+    ">="
+);
+expr_comparison!(
+    /// `field < <expression>` (see [`eq_expr`]).
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::query::expressions::time_now;
+    /// use surql::types::operators::{lt_expr, OperatorExpr};
+    ///
+    /// assert_eq!(lt_expr("expires_at", time_now()).to_surql(), "expires_at < time::now()");
+    /// ```
+    lt_expr,
+    "<"
+);
+expr_comparison!(
+    /// `field <= <expression>` (see [`eq_expr`]).
+    lte_expr,
+    "<="
+);
+
+// ---------------------------------------------------------------------------
 // Value quoting (mirrors Python's `_quote_value`).
 // ---------------------------------------------------------------------------
 
@@ -470,30 +550,29 @@ pub fn quote_value_public(value: &Value) -> String {
 /// - `null` becomes `NULL`.
 /// - bool becomes `true`/`false`.
 /// - numbers stringify directly.
-/// - strings are single-quoted and escape `\` and `'`.
-/// - [`SurrealFn`] and [`RecordRef`] encoded as JSON objects (via
-///   `serde_json::to_value`) render their raw `to_surql()` expression.
+/// - strings are single-quoted and escaped.
+/// - arrays and objects render as literals, at any depth, with object keys
+///   quoted by [`quote_object_key`].
+///
+/// A `Value` is always data: no shape of JSON renders as raw SurrealQL.
+/// Function calls and record references reach a query only through typed
+/// channels ([`SurrealFn`](super::SurrealFn) and
+/// [`RecordRef`](super::RecordRef) converted into an [`Expression`], the
+/// `*_expr` comparisons, `Query::set_expr`).
 pub(crate) fn quote_value(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Number(n) => n.to_string(),
-        Value::String(s) => {
-            let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
-            format!("'{escaped}'")
-        }
+        Value::String(s) => quote_str(s),
         Value::Array(arr) => {
             let inner = arr.iter().map(quote_value).collect::<Vec<_>>().join(", ");
             format!("[{inner}]")
         }
         Value::Object(obj) => {
-            // Detect `SurrealFn` / `RecordRef` shapes.
-            if let Some(raw) = try_wrapped_raw(obj) {
-                return raw;
-            }
             let inner = obj
                 .iter()
-                .map(|(k, v)| format!("{}: {}", quote_key(k), quote_value(v)))
+                .map(|(k, v)| format!("{}: {}", quote_object_key(k), quote_value(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{{ {inner} }}")
@@ -501,12 +580,17 @@ pub(crate) fn quote_value(value: &Value) -> String {
     }
 }
 
-fn quote_key(key: &str) -> String {
-    if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+/// Render `key` as the key of a SurrealQL object literal.
+///
+/// Bare when identifier-shaped (the engine's own object-key rule, which also
+/// quotes `NaN` and `Infinity`), a single-quoted string otherwise. The
+/// parser accepts any string literal as an object key, so no key can end the
+/// literal early.
+pub(crate) fn quote_object_key(key: &str) -> String {
+    if is_identifier(key) && key != "NaN" && key != "Infinity" {
         key.to_owned()
     } else {
-        let escaped = key.replace('\\', "\\\\").replace('\'', "\\'");
-        format!("'{escaped}'")
+        quote_str(key)
     }
 }
 
@@ -538,12 +622,12 @@ pub fn type_record(table: impl Into<String>, record_id: impl Into<RecordIdValue>
     Expression::function(record_ref(table, record_id).to_surql())
 }
 
-/// Build a `type::thing('<table>', <id>)` expression.
+/// Alias of [`type_record`], kept for parity with the sibling ports.
 ///
-/// `type::thing` is the SurrealDB alias for `type::record`. This helper is
-/// provided for parity with the SurrealQL function set; the rendered SurrealQL
-/// uses `type::thing(...)` verbatim so query plans that expect the literal
-/// `thing` function call continue to match.
+/// SurrealDB 2 accepted `type::thing(...)`; SurrealDB 3 removed it and
+/// rejects the statement at parse time ("did you maybe mean
+/// `type::record`"). This helper therefore renders `type::record(...)`, the
+/// same as [`type_record`].
 ///
 /// ## Examples
 ///
@@ -551,30 +635,13 @@ pub fn type_record(table: impl Into<String>, record_id: impl Into<RecordIdValue>
 /// use surql::types::operators::type_thing;
 ///
 /// let target = type_thing("user", "alice");
-/// assert_eq!(target.to_surql(), "type::thing('user', 'alice')");
+/// assert_eq!(target.to_surql(), "type::record('user', 'alice')");
 ///
 /// let numeric = type_thing("post", 123_i64);
-/// assert_eq!(numeric.to_surql(), "type::thing('post', 123)");
+/// assert_eq!(numeric.to_surql(), "type::record('post', 123)");
 /// ```
 pub fn type_thing(table: impl Into<String>, record_id: impl Into<RecordIdValue>) -> Expression {
-    let rendered = match record_id.into() {
-        RecordIdValue::Int(n) => format!("type::thing('{}', {n})", table.into()),
-        RecordIdValue::String(s) => {
-            let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
-            format!("type::thing('{}', '{escaped}')", table.into())
-        }
-    };
-    Expression::function(rendered)
-}
-
-fn try_wrapped_raw(obj: &serde_json::Map<String, Value>) -> Option<String> {
-    if let Ok(fnv) = serde_json::from_value::<SurrealFn>(Value::Object(obj.clone())) {
-        return Some(fnv.to_surql());
-    }
-    if let Ok(rr) = serde_json::from_value::<RecordRef>(Value::Object(obj.clone())) {
-        return Some(rr.to_surql());
-    }
-    None
+    type_record(table, record_id)
 }
 
 #[cfg(test)]
@@ -711,20 +778,86 @@ mod tests {
     }
 
     #[test]
-    fn surrealfn_value_renders_raw() {
-        let fnv =
-            serde_json::to_value(super::super::surreal_fn::surql_fn("time::now", &[])).unwrap();
-        assert_eq!(eq("created_at", fnv).to_surql(), "created_at = time::now()");
+    fn expression_shaped_data_renders_as_an_object_literal() {
+        let hostile = json!({"body": {"expression": "1}; DELETE user; --"}});
+        assert_eq!(
+            quote_value(&hostile),
+            "{ body: { expression: '1}; DELETE user; --' } }"
+        );
+        let harmless = json!({"expression": "1+1", "result": 2});
+        assert_eq!(quote_value(&harmless), "{ expression: '1+1', result: 2 }");
     }
 
     #[test]
-    fn record_ref_value_renders_raw() {
-        let rr =
-            serde_json::to_value(super::super::record_ref::record_ref("user", "alice")).unwrap();
+    fn record_ref_shaped_data_renders_as_an_object_literal() {
+        let shaped = json!({"table": "user", "record_id": "alice"});
         assert_eq!(
-            eq("author", rr).to_surql(),
+            quote_value(&shaped),
+            "{ record_id: 'alice', table: 'user' }"
+        );
+    }
+
+    #[test]
+    fn object_keys_are_quoted_when_not_identifiers() {
+        assert_eq!(quote_value(&json!({"": 1})), "{ '': 1 }");
+        assert_eq!(
+            quote_value(&json!({"x: 1}; DELETE user; --": 1})),
+            "{ 'x: 1}; DELETE user; --': 1 }"
+        );
+        assert_eq!(quote_value(&json!({"1a": 1})), "{ '1a': 1 }");
+    }
+
+    #[test]
+    fn record_ref_escapes_the_table() {
+        assert_eq!(
+            record_ref("user', 'x'); DELETE user; --", "a").to_surql(),
+            r"type::record('user\', \'x\'); DELETE user; --', 'a')"
+        );
+        assert_eq!(
+            type_record("a'b", "c").to_surql(),
+            r"type::record('a\'b', 'c')"
+        );
+    }
+
+    #[test]
+    fn surrealfn_renders_raw_only_through_the_typed_channel() {
+        let now = super::super::surreal_fn::surql_fn("time::now", &[]);
+        // Serialised into JSON it is data like any other object ...
+        let as_json = serde_json::to_value(&now).unwrap();
+        assert_eq!(
+            eq("created_at", as_json).to_surql(),
+            "created_at = { expression: 'time::now()' }"
+        );
+        // ... and only the typed comparison renders the call.
+        assert_eq!(
+            lt_expr("created_at", now).to_surql(),
+            "created_at < time::now()"
+        );
+    }
+
+    #[test]
+    fn record_ref_renders_raw_only_through_the_typed_channel() {
+        let rr = record_ref("user", "alice");
+        let as_json = serde_json::to_value(&rr).unwrap();
+        assert_eq!(
+            eq("author", as_json).to_surql(),
+            "author = { record_id: 'alice', table: 'user' }"
+        );
+        assert_eq!(
+            eq_expr("author", rr).to_surql(),
             "author = type::record('user', 'alice')"
         );
+    }
+
+    #[test]
+    fn expr_comparisons_compose_with_logical_operators() {
+        use crate::query::expressions::{field, time_now};
+
+        let op = and_(ne_expr("owner", field("author")), gte_expr("n", 1));
+        assert_eq!(op.to_surql(), "(owner != author) AND (n >= 1)");
+        assert_eq!(gt_expr("t", time_now()).to_surql(), "t > time::now()");
+        assert_eq!(lte_expr("t", time_now()).to_surql(), "t <= time::now()");
+        assert_eq!(Operator::from(Expression::raw("a = b")).to_surql(), "a = b");
     }
 
     #[test]
@@ -761,18 +894,15 @@ mod tests {
     }
 
     #[test]
-    fn type_thing_string_id_renders() {
+    fn type_thing_renders_the_v3_function() {
+        // SurrealDB 3 rejects `type::thing(...)` at parse time.
         assert_eq!(
             type_thing("user", "alice").to_surql(),
-            "type::thing('user', 'alice')"
+            "type::record('user', 'alice')"
         );
-    }
-
-    #[test]
-    fn type_thing_int_id_renders() {
         assert_eq!(
             type_thing("post", 123_i64).to_surql(),
-            "type::thing('post', 123)"
+            "type::record('post', 123)"
         );
     }
 
@@ -780,7 +910,7 @@ mod tests {
     fn type_thing_escapes_backslash() {
         assert_eq!(
             type_thing("path", "a\\b").to_surql(),
-            "type::thing('path', 'a\\\\b')"
+            "type::record('path', 'a\\\\b')"
         );
     }
 
