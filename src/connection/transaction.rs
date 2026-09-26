@@ -13,6 +13,8 @@
 //! SurrealDB does **not** support nested transactions; begin one at a
 //! time.
 
+use std::future::{ready, Ready};
+
 use serde_json::Value;
 
 use crate::connection::client::DatabaseClient;
@@ -45,21 +47,23 @@ pub struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     /// Begin a new transaction bound to `client`.
-    // Kept `async` although nothing is awaited: the method is public API
-    // that callers `.await`, and dropping the `async` would break every one.
-    #[allow(clippy::unused_async)]
-    pub async fn begin(client: &'a DatabaseClient) -> Result<Transaction<'a>> {
+    ///
+    /// Nothing is sent to the server yet, so the returned future is already
+    /// complete; it is a future so that callers `.await` it like the other
+    /// client calls.
+    pub fn begin(client: &'a DatabaseClient) -> Ready<Result<Transaction<'a>>> {
         // Surface an early error if the client is not connected, so the
         // caller learns about it before issuing `execute` calls.
-        if !client.is_connected() {
-            return Err(SurqlError::Transaction {
+        ready(if client.is_connected() {
+            Ok(Self {
+                client,
+                statements: Vec::new(),
+                state: TransactionState::Active,
+            })
+        } else {
+            Err(SurqlError::Transaction {
                 reason: "cannot begin transaction: client is not connected".into(),
-            });
-        }
-        Ok(Self {
-            client,
-            statements: Vec::new(),
-            state: TransactionState::Active,
+            })
         })
     }
 
@@ -80,17 +84,17 @@ impl<'a> Transaction<'a> {
     /// aside), with or without a trailing `;`. Returns
     /// [`serde_json::Value::Null`] on success; the actual result becomes
     /// available in `commit`'s response.
-    // Kept `async` although it only buffers: the method is public API that
-    // callers `.await`, and dropping the `async` would break every one.
-    #[allow(clippy::unused_async)]
-    pub async fn execute(&mut self, surql: &str) -> Result<Value> {
+    ///
+    /// The statement is queued when this is called; the returned future is
+    /// already complete.
+    pub fn execute(&mut self, surql: &str) -> Ready<Result<Value>> {
         if !self.is_active() {
-            return Err(SurqlError::Transaction {
+            return ready(Err(SurqlError::Transaction {
                 reason: format!("transaction is not active (state = {:?})", self.state),
-            });
+            }));
         }
         self.statements.push(surql.trim().to_owned());
-        Ok(Value::Null)
+        ready(Ok(Value::Null))
     }
 
     /// Commit the transaction.
@@ -125,19 +129,17 @@ impl<'a> Transaction<'a> {
     ///
     /// Since queued statements are buffered client-side until commit,
     /// there is nothing to undo server-side; this simply discards the
-    /// buffer and marks the transaction as terminated.
-    // Kept `async` although nothing is awaited: the method is public API
-    // that callers `.await`, and dropping the `async` would break every one.
-    #[allow(clippy::unused_async)]
-    pub async fn rollback(mut self) -> Result<()> {
+    /// buffer and marks the transaction as terminated. The returned future
+    /// is already complete.
+    pub fn rollback(mut self) -> Ready<Result<()>> {
         if !self.is_active() {
-            return Err(SurqlError::Transaction {
+            return ready(Err(SurqlError::Transaction {
                 reason: format!("cannot rollback in state {:?}", self.state),
-            });
+            }));
         }
         self.statements.clear();
         self.state = TransactionState::RolledBack;
-        Ok(())
+        ready(Ok(()))
     }
 }
 
