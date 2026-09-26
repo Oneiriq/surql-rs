@@ -16,17 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
 use crate::types::check_reserved_word;
+use crate::types::escape::is_identifier;
 
 pub use super::field_type::FieldType;
 
 use super::reference::{
     render_reference_clause, validate_computed, validate_reference_target, ReferenceAction,
 };
-
-fn field_name_part_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").expect("valid regex"))
-}
 
 /// Regex matching the canonical `type::record("<table>", $value)` coercion.
 fn type_record_coercion_regex() -> &'static Regex {
@@ -358,14 +354,13 @@ pub fn validate_field_name(name: &str) -> Result<()> {
             reason: "Field name cannot be empty".into(),
         });
     }
-    let regex = field_name_part_regex();
     for part in name.split('.') {
         if part.is_empty() {
             return Err(SurqlError::Validation {
                 reason: format!("Invalid field name {name:?}: empty segment"),
             });
         }
-        if !regex.is_match(part) {
+        if !is_identifier(part) {
             return Err(SurqlError::Validation {
                 reason: format!(
                     "Invalid field name {name:?}: segment {part:?} must contain only \

@@ -23,13 +23,10 @@
 //! );
 //! ```
 
-use std::sync::OnceLock;
-
-use regex::Regex;
-
 use serde_json::Value;
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::is_identifier;
 use crate::types::operators::{quote_value_public, Operator, OperatorExpr};
 
 use super::expressions::Expression;
@@ -260,11 +257,6 @@ pub struct Query {
     pub hints: Vec<QueryHint>,
 }
 
-fn identifier_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid regex"))
-}
-
 pub(crate) fn validate_identifier(name: &str, context: &str) -> Result<()> {
     if name.is_empty() {
         let capitalized = capitalize(context);
@@ -272,7 +264,7 @@ pub(crate) fn validate_identifier(name: &str, context: &str) -> Result<()> {
             reason: format!("{capitalized} cannot be empty"),
         });
     }
-    if !identifier_pattern().is_match(name) {
+    if !is_identifier(name) {
         return Err(SurqlError::Validation {
             reason: format!(
                 "Invalid {context}: {name:?}. Must contain only alphanumeric \

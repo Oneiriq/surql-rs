@@ -5,11 +5,10 @@
 
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::OnceLock;
 
-use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::escape::{is_identifier, quote_record_key, unescape};
 use crate::error::{Result, SurqlError};
 
 /// Value held by a [`RecordID`].
@@ -89,9 +88,12 @@ impl From<i32> for RecordIdValue {
 /// let leading_digit = RecordID::<()>::new("chunk", "1abc").unwrap();
 /// assert_eq!(leading_digit.to_string(), "chunk:⟨1abc⟩");
 ///
-/// // Pure-digit ids still emit unbracketed (v3 parses them as integers).
-/// let pure_digit = RecordID::<()>::new("post", "123").unwrap();
-/// assert_eq!(pure_digit.to_string(), "post:123");
+/// // A digit-only string id is bracketed so it keeps naming the string
+/// // key; the integer id renders bare.
+/// let digit_string = RecordID::<()>::new("post", "123").unwrap();
+/// assert_eq!(digit_string.to_string(), "post:⟨123⟩");
+/// let integer = RecordID::<()>::new("post", 123_i64).unwrap();
+/// assert_eq!(integer.to_string(), "post:123");
 ///
 /// let parsed = RecordID::<()>::parse("post:123").unwrap();
 /// assert_eq!(parsed.table(), "post");
@@ -103,29 +105,9 @@ pub struct RecordID<T = ()> {
     _phantom: PhantomData<fn() -> T>,
 }
 
-fn table_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid regex"))
-}
-
-/// Bare-identifier shape — `[A-Za-z_][A-Za-z0-9_]*`. SurrealDB v3 parses an
-/// id matching this rule verbatim; anything else has to be wrapped in
-/// unicode angle brackets `⟨ … ⟩` so the v3 lexer treats the id as an
-/// opaque key instead of tokenising it as `<number> <ident>` and rejecting
-/// the record with `Unexpected token`. Pre-0.2.5 this regex was
-/// `[A-Za-z0-9_]+` — strictly looser, so `1abc` slipped through bare and
-/// the resulting `chunk:1abc` literal blew up on v3.
-fn identifier_id_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid regex"))
-}
-
-/// Pure-digit shape — `[0-9]+`. SurrealDB v3 happily parses a bare string of
-/// digits as the integer-key shape and round-trips it, so brackets are not
-/// required even though the string is not identifier-shaped.
-fn pure_digit_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[0-9]+$").expect("valid regex"))
+/// The text between `open` and `close` when `s` is exactly wrapped by them.
+fn delimited(s: &str, open: char, close: char) -> Option<&str> {
+    s.strip_prefix(open)?.strip_suffix(close)
 }
 
 /// Strip SurrealDB v3 wire-format angle brackets from a record-id-shaped
@@ -199,7 +181,7 @@ impl<T> RecordID<T> {
                 reason: "Table name cannot be empty".into(),
             });
         }
-        if !table_pattern().is_match(name) {
+        if !is_identifier(name) {
             return Err(SurqlError::Validation {
                 reason: format!(
                     "Invalid table name: {name:?}. Must contain only alphanumeric \
@@ -210,11 +192,13 @@ impl<T> RecordID<T> {
         Ok(())
     }
 
-    /// Parse a string of the form `table:id` or `table:<id>`.
+    /// Parse a string of the form `table:id`, `table:⟨id⟩`, or `` table:`id` ``.
     ///
-    /// Integer-looking ids are parsed into [`RecordIdValue::Int`]; everything
-    /// else stays a [`RecordIdValue::String`]. Angle brackets around the id
-    /// (used for complex identifiers in SurrealQL) are stripped on parse.
+    /// A bare integer-looking id is parsed into [`RecordIdValue::Int`], as the
+    /// engine does. A quoted id always stays a [`RecordIdValue::String`], so
+    /// `post:⟨123⟩` names the string key `"123"`, not the integer key `123`;
+    /// escapes inside the quotes (`\\`, `` \` ``) are reversed. The legacy
+    /// ASCII `table:<id>` form is accepted and taken literally.
     pub fn parse(input: &str) -> Result<Self> {
         let Some((table, id_str)) = input.split_once(':') else {
             return Err(SurqlError::Validation {
@@ -236,22 +220,21 @@ impl<T> RecordID<T> {
             });
         }
 
-        // Strip angle brackets if present — accept both unicode `⟨ … ⟩`
-        // (the v3 escape syntax emitted by `Display`) and the legacy
-        // ASCII `< … >` form (older serialisers, surql-py < 1.5.11).
-        let stripped = if id_str.starts_with('<') && id_str.ends_with('>') && id_str.len() >= 2 {
-            &id_str[1..id_str.len() - 1]
-        } else if id_str.starts_with('⟨') && id_str.ends_with('⟩') {
-            // Each unicode bracket is a 3-byte UTF-8 char.
-            &id_str['⟨'.len_utf8()..id_str.len() - '⟩'.len_utf8()]
+        // The unicode `⟨ … ⟩` and backtick forms are what `Display` and the
+        // engine emit; ASCII `< … >` comes from older serialisers
+        // (surql-py < 1.5.11) and never carried escapes.
+        let id = if let Some(inner) =
+            delimited(id_str, '⟨', '⟩').or_else(|| delimited(id_str, '`', '`'))
+        {
+            RecordIdValue::String(unescape(inner))
+        } else if let Some(inner) = delimited(id_str, '<', '>') {
+            RecordIdValue::String(inner.to_owned())
         } else {
-            id_str
+            id_str.parse::<i64>().map_or_else(
+                |_| RecordIdValue::String(id_str.to_owned()),
+                RecordIdValue::Int,
+            )
         };
-
-        let id = stripped.parse::<i64>().map_or_else(
-            |_| RecordIdValue::String(stripped.to_owned()),
-            RecordIdValue::Int,
-        );
 
         Self::new(table, id)
     }
@@ -270,36 +253,20 @@ impl<T> RecordID<T> {
     pub fn to_surql(&self) -> String {
         self.to_string()
     }
-
-    /// `true` when the id needs to be wrapped in unicode angle brackets
-    /// (`⟨ … ⟩`) on output. Integer ids never bracket; strings bracket
-    /// unless they are identifier-shaped or a pure-digit literal.
-    fn needs_angle_brackets(&self) -> bool {
-        match &self.id {
-            RecordIdValue::Int(_) => false,
-            RecordIdValue::String(s) => {
-                if s.is_empty() {
-                    return true;
-                }
-                !(identifier_id_pattern().is_match(s) || pure_digit_pattern().is_match(s))
-            }
-        }
-    }
 }
 
 impl<T> fmt::Display for RecordID<T> {
     /// Render the record id in SurrealQL `table:id` form.
     ///
-    /// Ids that contain anything other than identifier characters or pure
-    /// digits are wrapped in **unicode** angle brackets (U+27E8 / U+27E9)
-    /// — the SurrealDB v3 record-id escape syntax. ASCII `<` / `>` is
-    /// rejected by the v3 parser with
-    /// `Unexpected token '<', expected a record-id key`.
+    /// Integer ids render bare. String ids render through
+    /// [`quote_record_key`](super::escape::quote_record_key): bare when
+    /// identifier-shaped, wrapped in unicode angle brackets (U+27E8 / U+27E9)
+    /// otherwise, and backtick-quoted when the id itself contains `⟩`. A
+    /// digit-only string id is bracketed so it keeps naming the string key.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.needs_angle_brackets() {
-            write!(f, "{}:⟨{}⟩", self.table, self.id)
-        } else {
-            write!(f, "{}:{}", self.table, self.id)
+        match &self.id {
+            RecordIdValue::Int(n) => write!(f, "{}:{n}", self.table),
+            RecordIdValue::String(s) => write!(f, "{}:{}", self.table, quote_record_key(s)),
         }
     }
 }
@@ -354,13 +321,54 @@ mod tests {
     }
 
     #[test]
-    fn pure_digit_string_id_renders_unbracketed() {
-        // SurrealDB v3 parses pure-digit string ids as the integer-key
-        // shape, so `post:'123'` round-trips as `post:123`. The
-        // pure_digit_pattern allow-list keeps these bare even though
-        // they fail the bare-identifier rule.
+    fn pure_digit_string_id_stays_a_string_key() {
+        // `post:123` is the integer key 123 and `post:⟨123⟩` the string key
+        // "123": two different records. A string id must keep naming the
+        // string key, and `post:007` would even name the integer 7.
         let id = RecordID::<()>::new("post", "123").unwrap();
-        assert_eq!(id.to_string(), "post:123");
+        assert_eq!(id.to_string(), "post:⟨123⟩");
+        let id = RecordID::<()>::new("post", "007").unwrap();
+        assert_eq!(id.to_string(), "post:⟨007⟩");
+    }
+
+    #[test]
+    fn closing_bracket_in_id_cannot_end_the_key() {
+        let id = RecordID::<()>::new("user", "x⟩; DELETE user; --").unwrap();
+        assert_eq!(id.to_string(), "user:`x⟩; DELETE user; --`");
+    }
+
+    #[test]
+    fn backslash_in_id_is_escaped() {
+        let id = RecordID::<()>::new("user", r"a\b").unwrap();
+        assert_eq!(id.to_string(), r"user:⟨a\\b⟩");
+    }
+
+    #[test]
+    fn parse_bracketed_digits_keeps_the_string_key() {
+        let id = RecordID::<()>::parse("post:⟨123⟩").unwrap();
+        assert!(matches!(id.id(), RecordIdValue::String(s) if s == "123"));
+        let id = RecordID::<()>::parse("post:`123`").unwrap();
+        assert!(matches!(id.id(), RecordIdValue::String(s) if s == "123"));
+    }
+
+    #[test]
+    fn parse_reverses_escapes() {
+        let id = RecordID::<()>::parse(r"user:`x⟩\`y\\z`").unwrap();
+        assert!(matches!(id.id(), RecordIdValue::String(s) if s == r"x⟩`y\z"));
+    }
+
+    #[test]
+    fn display_then_parse_round_trips() {
+        let ids = [
+            "alice", "123", "-5", "007", "a-b", "a:b", "x⟩y", r"a\b", "a`b", "é", " ", "⟨",
+        ];
+        for raw in ids {
+            let id = RecordID::<()>::new("t", raw).unwrap();
+            let back = RecordID::<()>::parse(&id.to_string()).unwrap();
+            assert_eq!(back, id, "{id}");
+        }
+        let id = RecordID::<()>::new("t", -5_i64).unwrap();
+        assert_eq!(RecordID::<()>::parse(&id.to_string()).unwrap(), id);
     }
 
     #[test]
