@@ -54,7 +54,9 @@ use super::edge::EdgeDefinition;
 use super::fields::FieldType;
 use super::registry::get_registry;
 use super::table::{IndexType, TableDefinition};
-use super::themes::{modern_color_scheme, ASCIITheme, GraphVizTheme, MermaidTheme};
+use super::themes::{
+    color_scheme_by_name, modern_color_scheme, ASCIITheme, ColorScheme, GraphVizTheme, MermaidTheme,
+};
 use super::utils::display_width;
 
 // ---------------------------------------------------------------------------
@@ -191,7 +193,7 @@ pub fn generate_mermaid<S: BuildHasher>(
     let mut lines: Vec<String> = Vec::new();
 
     if let Some(theme) = theme {
-        lines.push(format!("%%{{init: {{'theme':'{}'}}}}%%", theme.theme_name));
+        lines.push(mermaid_init_directive(theme));
     }
 
     lines.push("erDiagram".to_string());
@@ -253,6 +255,41 @@ pub fn generate_mermaid<S: BuildHasher>(
     }
 
     lines.join("\n")
+}
+
+/// `true` for a value safe to splice into the single-quoted JSON-ish init
+/// directive: a `#hex` colour or a plain word.
+fn is_plain_theme_value(value: &str) -> bool {
+    let body = value.strip_prefix('#').unwrap_or(value);
+    !body.is_empty() && body.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The `%%{init: ...}%%` directive for a theme. With `use_custom_css` the
+/// primary / secondary colours ride along as `themeVariables`. A theme
+/// name or colour that is not a plain word / `#hex` value is left out
+/// rather than allowed to end the directive early.
+fn mermaid_init_directive(theme: &MermaidTheme) -> String {
+    let name = if is_plain_theme_value(theme.theme_name) && !theme.theme_name.starts_with('#') {
+        theme.theme_name
+    } else {
+        "default"
+    };
+    let variables: Vec<String> = [
+        ("primaryColor", theme.primary_color),
+        ("secondaryColor", theme.secondary_color),
+    ]
+    .into_iter()
+    .filter(|(_, value)| theme.use_custom_css && is_plain_theme_value(value))
+    .map(|(key, value)| format!("'{key}':'{value}'"))
+    .collect();
+    if variables.is_empty() {
+        format!("%%{{init: {{'theme':'{name}'}}}}%%")
+    } else {
+        format!(
+            "%%{{init: {{'theme':'{name}', 'themeVariables': {{{}}}}}}}%%",
+            variables.join(", ")
+        )
+    }
 }
 
 fn infer_mermaid_cardinality(edge: &EdgeDefinition) -> &'static str {
@@ -376,17 +413,36 @@ pub fn generate_graphviz<S: BuildHasher>(
     lines.push(String::new());
 
     // Table nodes (sorted).
-    for (table_name, table) in sorted_by_key(tables) {
-        let label =
-            build_graphviz_table_label(table_name, table, include_fields, record_shape, theme);
-        lines.push(format!("    {} [label={label}];", dot_quoted(table_name)));
-    }
+    let table_nodes: Vec<String> = sorted_by_key(tables)
+        .into_iter()
+        .map(|(table_name, table)| {
+            let label =
+                build_graphviz_table_label(table_name, table, include_fields, record_shape, theme);
+            format!("{} [label={label}];", dot_quoted(table_name))
+        })
+        .collect();
 
     // Edge nodes (only if they have fields and include_fields).
-    for (edge_name, edge) in sorted_by_key(edges) {
-        if include_fields && !edge.fields.is_empty() {
+    let edge_nodes: Vec<String> = sorted_by_key(edges)
+        .into_iter()
+        .filter(|(_, edge)| include_fields && !edge.fields.is_empty())
+        .map(|(edge_name, edge)| {
             let label = build_graphviz_edge_label(edge_name, edge, theme);
-            lines.push(format!("    {} [label={label}];", dot_quoted(edge_name)));
+            format!("{} [label={label}];", dot_quoted(edge_name))
+        })
+        .collect();
+
+    for (cluster, title, nodes) in [
+        ("cluster_tables", "Tables", table_nodes),
+        ("cluster_edges", "Edges", edge_nodes),
+    ] {
+        if theme.use_clusters && !nodes.is_empty() {
+            lines.push(format!("    subgraph {cluster} {{"));
+            lines.push(format!("        label={};", dot_quoted(title)));
+            lines.extend(nodes.iter().map(|node| format!("        {node}")));
+            lines.push("    }".to_string());
+        } else {
+            lines.extend(nodes.iter().map(|node| format!("    {node}")));
         }
     }
 
@@ -442,7 +498,7 @@ fn build_graphviz_table_label(
     }
 
     if theme.use_gradients {
-        return build_graphviz_html_label(table_name, table);
+        return build_graphviz_html_label(table_name, table, theme);
     }
 
     // Plain record label: "{name|id : string (PK)\\l|field : ty\\l|...}"
@@ -475,12 +531,16 @@ fn html_label(header_bg: &str, title: &str, rows: &[String]) -> String {
     )
 }
 
-fn build_graphviz_html_label(table_name: &str, table: &TableDefinition) -> String {
-    let palette = modern_color_scheme();
+fn build_graphviz_html_label(
+    table_name: &str,
+    table: &TableDefinition,
+    theme: &GraphVizTheme,
+) -> String {
+    let palette = &theme.palette;
     let mut rows = vec![format!(
         "<TR><TD ALIGN=\"LEFT\">id</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{muted}\">string</FONT> <FONT COLOR=\"{err}\">PK</FONT></TD></TR>",
-        muted = palette.muted,
-        err = palette.error,
+        muted = html_text(palette.muted),
+        err = html_text(palette.error),
     )];
     rows.extend(table.fields.iter().map(|field| {
         let constraint = get_field_constraint(&field.name, table);
@@ -489,17 +549,17 @@ fn build_graphviz_html_label(table_name: &str, table: &TableDefinition) -> Strin
         } else {
             format!(
                 " <FONT COLOR=\"{cc}\">{constraint}</FONT>",
-                cc = constraint_color(constraint),
+                cc = html_text(constraint_color(constraint, palette)),
             )
         };
         format!(
             "<TR><TD ALIGN=\"LEFT\">{name}</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{tc}\">{ty}</FONT>{key}</TD></TR>",
             name = html_text(&field.name),
-            tc = field_type_color(field.field_type),
+            tc = html_text(field_type_color(field.field_type, palette)),
             ty = field.field_type.as_str(),
         )
     }));
-    html_label(palette.primary, table_name, &rows)
+    html_label(theme.node_color, table_name, &rows)
 }
 
 fn build_graphviz_edge_label(
@@ -515,7 +575,7 @@ fn build_graphviz_edge_label(
                 format!(
                     "<TR><TD ALIGN=\"LEFT\">{name}</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{tc}\">{ty}</FONT></TD></TR>",
                     name = html_text(&field.name),
-                    tc = field_type_color(field.field_type),
+                    tc = html_text(field_type_color(field.field_type, &theme.palette)),
                     ty = field.field_type.as_str(),
                 )
             })
@@ -542,8 +602,10 @@ fn graphviz_edge_style(edge: &EdgeDefinition, theme: &GraphVizTheme) -> String {
     if let (Some(from), Some(to)) = (&edge.from_table, &edge.to_table) {
         if from == to {
             if theme.use_gradients {
-                let secondary = modern_color_scheme().secondary;
-                return format!(", style=dashed, color={}", dot_quoted(secondary));
+                return format!(
+                    ", style=dashed, color={}",
+                    dot_quoted(theme.palette.secondary)
+                );
             }
             return ", style=dashed".to_string();
         }
@@ -551,26 +613,24 @@ fn graphviz_edge_style(edge: &EdgeDefinition, theme: &GraphVizTheme) -> String {
     String::new()
 }
 
-fn field_type_color(ty: FieldType) -> &'static str {
-    let cs = modern_color_scheme();
+fn field_type_color(ty: FieldType, palette: &ColorScheme) -> &'static str {
     match ty {
-        FieldType::String => cs.success,
-        FieldType::Int | FieldType::Float => cs.warning,
-        FieldType::Bool => cs.accent,
-        FieldType::Datetime => cs.secondary,
-        FieldType::Record => cs.primary,
-        FieldType::Object | FieldType::Array => cs.muted,
-        _ => cs.text,
+        FieldType::String => palette.success,
+        FieldType::Int | FieldType::Float => palette.warning,
+        FieldType::Bool => palette.accent,
+        FieldType::Datetime => palette.secondary,
+        FieldType::Record => palette.primary,
+        FieldType::Object | FieldType::Array => palette.muted,
+        _ => palette.text,
     }
 }
 
-fn constraint_color(constraint: &str) -> &'static str {
-    let cs = modern_color_scheme();
+fn constraint_color(constraint: &str, palette: &ColorScheme) -> &'static str {
     match constraint {
-        "PK" => cs.error,
-        "FK" => cs.primary,
-        "UK" => cs.accent,
-        _ => cs.text,
+        "PK" => palette.error,
+        "FK" => palette.primary,
+        "UK" => palette.accent,
+        _ => palette.text,
     }
 }
 
@@ -711,23 +771,37 @@ fn select_box_chars(theme: Option<&ASCIITheme>) -> &'static BoxChars {
     }
 }
 
+/// 24-bit ANSI foreground escape for a `#rrggbb` colour.
+fn ansi_foreground(hex: &str) -> Option<String> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |range: std::ops::Range<usize>| u8::from_str_radix(hex.get(range)?, 16).ok();
+    Some(format!(
+        "\u{1b}[38;2;{};{};{}m",
+        channel(0..2)?,
+        channel(2..4)?,
+        channel(4..6)?
+    ))
+}
+
+/// Wrap `text` in the theme's colour for `color_type`: PK / FK / UK markers
+/// take the error / primary / accent colour of the theme's colour scheme
+/// (16-colour codes when a colour is not `#rrggbb`), the header is bold.
 fn colorize(text: &str, color_type: &str, theme: Option<&ASCIITheme>) -> String {
-    let Some(theme) = theme else {
+    let Some(theme) = theme.filter(|t| t.use_colors) else {
         return text.to_string();
     };
-    if !theme.use_colors {
-        return text.to_string();
-    }
-    let code = match color_type {
-        "pk" => "\u{1b}[91m",
-        "fk" => "\u{1b}[94m",
-        "uk" => "\u{1b}[95m",
-        "header" => "\u{1b}[1m",
-        _ => "",
+    let palette = color_scheme_by_name(theme.color_scheme).unwrap_or_else(modern_color_scheme);
+    let (hex, fallback) = match color_type {
+        "pk" => (palette.error, "\u{1b}[91m"),
+        "fk" => (palette.primary, "\u{1b}[94m"),
+        "uk" => (palette.accent, "\u{1b}[95m"),
+        "header" => return format!("\u{1b}[1m{text}\u{1b}[0m"),
+        _ => return text.to_string(),
     };
-    if code.is_empty() {
-        return text.to_string();
-    }
+    let code = ansi_foreground(hex).unwrap_or_else(|| fallback.to_string());
     format!("{code}{text}\u{1b}[0m")
 }
 
@@ -1049,7 +1123,116 @@ mod tests {
     fn mermaid_theme_emits_init_directive() {
         let t = MermaidTheme::default();
         let out = generate_mermaid(&minimal_tables(), &HashMap::new(), true, true, Some(&t));
-        assert!(out.starts_with("%%{init: {'theme':'default'}}%%\nerDiagram"));
+        assert!(out.starts_with(
+            "%%{init: {'theme':'default', 'themeVariables': \
+             {'primaryColor':'#6366f1', 'secondaryColor':'#ec4899'}}}%%\nerDiagram"
+        ));
+    }
+
+    #[test]
+    fn mermaid_theme_without_custom_css_emits_the_name_only() {
+        let t = MermaidTheme {
+            use_custom_css: false,
+            ..dark_theme().mermaid
+        };
+        let out = generate_mermaid(&minimal_tables(), &HashMap::new(), true, true, Some(&t));
+        assert!(
+            out.starts_with("%%{init: {'theme':'dark'}}%%\nerDiagram"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn mermaid_theme_values_cannot_break_the_directive() {
+        let t = MermaidTheme {
+            theme_name: "dark'}}%%\nerDiagram",
+            primary_color: "red'}",
+            secondary_color: "#abcdef",
+            use_custom_css: true,
+        };
+        let out = generate_mermaid(&minimal_tables(), &HashMap::new(), true, true, Some(&t));
+        assert!(
+            out.starts_with(
+                "%%{init: {'theme':'default', 'themeVariables': \
+                 {'secondaryColor':'#abcdef'}}}%%\nerDiagram"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn graphviz_rich_labels_use_the_theme_palette() {
+        let theme = dark_theme().graphviz;
+        let mut edges = HashMap::new();
+        edges.insert("knows".to_string(), knows_edge_self());
+        let out = generate_graphviz(&two_tables(), &edges, true, true, Some(&theme));
+        let dark = dark_theme().color_scheme;
+        assert!(
+            out.contains(&format!("BGCOLOR=\"{}\"", theme.node_color)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("<FONT COLOR=\"{}\">string", dark.success)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("<FONT COLOR=\"{}\">PK", dark.error)),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("color=\"{}\"", dark.secondary)),
+            "{out}"
+        );
+        let modern = modern_theme().color_scheme;
+        assert!(!out.contains(modern.success), "{out}");
+    }
+
+    #[test]
+    fn graphviz_clusters_group_tables_and_edges() {
+        let theme = GraphVizTheme {
+            use_clusters: true,
+            ..modern_theme().graphviz
+        };
+        let mut edges = HashMap::new();
+        edges.insert("likes".to_string(), likes_edge());
+        let out = generate_graphviz(&two_tables(), &edges, true, true, Some(&theme));
+        assert!(out.contains("    subgraph cluster_tables {\n        label=\"Tables\";\n        \"post\" [label="), "{out}");
+        assert!(
+            out.contains(
+                "    subgraph cluster_edges {\n        label=\"Edges\";\n        \"likes\" [label="
+            ),
+            "{out}"
+        );
+        let plain = generate_graphviz(
+            &two_tables(),
+            &edges,
+            true,
+            true,
+            Some(&modern_theme().graphviz),
+        );
+        assert!(!plain.contains("subgraph"), "{plain}");
+    }
+
+    #[test]
+    fn ascii_colours_follow_the_theme_color_scheme() {
+        let modern = generate_ascii(
+            &two_tables(),
+            &HashMap::new(),
+            true,
+            true,
+            Some(&modern_theme().ascii),
+        );
+        let dark = generate_ascii(
+            &two_tables(),
+            &HashMap::new(),
+            true,
+            true,
+            Some(&dark_theme().ascii),
+        );
+        // PK markers take the scheme's error colour: #ef4444 vs #f87171.
+        assert!(modern.contains("\u{1b}[38;2;239;68;68m"), "{modern:?}");
+        assert!(dark.contains("\u{1b}[38;2;248;113;113m"), "{dark:?}");
+        assert_ne!(modern, dark);
     }
 
     #[test]
@@ -1062,7 +1245,7 @@ mod tests {
             true,
             Some(&th.mermaid),
         );
-        assert!(out.contains("%%{init: {'theme':'dark'}}%%"));
+        assert!(out.contains("%%{init: {'theme':'dark', 'themeVariables': {'primaryColor':'#8b5cf6', 'secondaryColor':'#d946ef'}}}%%"));
     }
 
     #[test]
@@ -1075,7 +1258,7 @@ mod tests {
             true,
             Some(&th.mermaid),
         );
-        assert!(out.contains("%%{init: {'theme':'forest'}}%%"));
+        assert!(out.contains("%%{init: {'theme':'forest', 'themeVariables': {'primaryColor':'#10b981', 'secondaryColor':'#14b8a6'}}}%%"));
     }
 
     #[test]
@@ -1088,7 +1271,7 @@ mod tests {
             true,
             Some(&th.mermaid),
         );
-        assert!(out.contains("%%{init: {'theme':'neutral'}}%%"));
+        assert!(out.contains("%%{init: {'theme':'neutral', 'themeVariables': {'primaryColor':'#6b7280', 'secondaryColor':'#64748b'}}}%%"));
     }
 
     #[test]
@@ -1425,7 +1608,7 @@ mod tests {
             Some(&theme),
         )
         .unwrap();
-        assert!(out.contains("%%{init: {'theme':'dark'}}%%"));
+        assert!(out.contains("%%{init: {'theme':'dark', 'themeVariables'"));
     }
 
     #[test]

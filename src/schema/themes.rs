@@ -66,7 +66,7 @@ impl Default for ColorScheme {
 /// edge styling, layout, and advanced features like gradients and clustering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GraphVizTheme {
-    /// Node border color.
+    /// Node accent colour: the header background of HTML (gradient) labels.
     pub node_color: &'static str,
     /// Edge line color.
     pub edge_color: &'static str,
@@ -82,8 +82,12 @@ pub struct GraphVizTheme {
     pub edge_style: &'static str,
     /// Enable gradient fills for nodes.
     pub use_gradients: bool,
-    /// Enable table clustering / grouping.
+    /// Group table nodes and edge nodes into two labelled clusters
+    /// (`cluster_tables`, `cluster_edges`).
     pub use_clusters: bool,
+    /// Palette for the rich (gradient) rendering: field-type and key colours
+    /// in HTML labels and the colour of a self-referencing edge.
+    pub palette: ColorScheme,
 }
 
 impl GraphVizTheme {
@@ -100,6 +104,7 @@ impl GraphVizTheme {
             edge_style: "solid",
             use_gradients: true,
             use_clusters: false,
+            palette: ColorScheme::default_const(),
         }
     }
 
@@ -133,11 +138,14 @@ impl Default for GraphVizTheme {
 pub struct MermaidTheme {
     /// Built-in Mermaid theme (`"default"`, `"dark"`, `"forest"`, `"neutral"`, `"base"`).
     pub theme_name: &'static str,
-    /// Primary entity color.
+    /// Primary colour, emitted as `themeVariables.primaryColor` when
+    /// [`Self::use_custom_css`] is set.
     pub primary_color: &'static str,
-    /// Secondary UI color.
+    /// Secondary colour, emitted as `themeVariables.secondaryColor` when
+    /// [`Self::use_custom_css`] is set.
     pub secondary_color: &'static str,
-    /// Enable custom CSS variable injection.
+    /// Emit the two colours as Mermaid `themeVariables` in the `%%{init}%%`
+    /// directive (Mermaid honours them fully on the `base` theme).
     pub use_custom_css: bool,
 }
 
@@ -174,7 +182,10 @@ pub struct ASCIITheme {
     pub use_colors: bool,
     /// Show Unicode / emoji icons for constraints.
     pub use_icons: bool,
-    /// Color scheme name for ANSI colors.
+    /// Preset palette (`default` / `modern`, `dark`, `forest`, `minimal`)
+    /// whose error / primary / accent colours tint the PK / FK / UK markers
+    /// as 24-bit ANSI colours when [`Self::use_colors`] is set. An unknown
+    /// name falls back to the modern palette.
     pub color_scheme: &'static str,
 }
 
@@ -251,6 +262,7 @@ pub const fn modern_graphviz() -> GraphVizTheme {
         edge_style: "solid",
         use_gradients: true,
         use_clusters: false,
+        palette: modern_color_scheme(),
     }
 }
 
@@ -323,6 +335,7 @@ pub const fn dark_graphviz() -> GraphVizTheme {
         edge_style: "solid",
         use_gradients: true,
         use_clusters: false,
+        palette: dark_color_scheme(),
     }
 }
 
@@ -395,6 +408,7 @@ pub const fn forest_graphviz() -> GraphVizTheme {
         edge_style: "solid",
         use_gradients: true,
         use_clusters: false,
+        palette: forest_color_scheme(),
     }
 }
 
@@ -467,6 +481,7 @@ pub const fn minimal_graphviz() -> GraphVizTheme {
         edge_style: "solid",
         use_gradients: false,
         use_clusters: false,
+        palette: minimal_color_scheme(),
     }
 }
 
@@ -535,6 +550,29 @@ pub fn get_theme(name: &str) -> Result<Theme> {
                 "Unknown theme: {other:?}. Available themes: dark, forest, minimal, modern"
             ),
         }),
+    }
+}
+
+/// Resolve a colour-scheme name (as carried by [`ASCIITheme::color_scheme`])
+/// to its palette: `"default"` / `"modern"`, `"dark"`, `"forest"`, or
+/// `"minimal"`. Returns `None` for any other name.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::schema::themes::{color_scheme_by_name, dark_color_scheme};
+///
+/// assert_eq!(color_scheme_by_name("dark"), Some(dark_color_scheme()));
+/// assert_eq!(color_scheme_by_name("neon"), None);
+/// ```
+#[must_use]
+pub fn color_scheme_by_name(name: &str) -> Option<ColorScheme> {
+    match name {
+        "default" | "modern" => Some(modern_color_scheme()),
+        "dark" => Some(dark_color_scheme()),
+        "forest" => Some(forest_color_scheme()),
+        "minimal" => Some(minimal_color_scheme()),
+        _ => None,
     }
 }
 
@@ -672,6 +710,37 @@ mod tests {
     fn list_themes_is_sorted() {
         let names = list_themes();
         assert_eq!(names, vec!["dark", "forest", "minimal", "modern"]);
+    }
+
+    #[test]
+    fn graphviz_presets_carry_their_theme_palette() {
+        for theme in [
+            modern_theme(),
+            dark_theme(),
+            forest_theme(),
+            minimal_theme(),
+        ] {
+            assert_eq!(theme.graphviz.palette, theme.color_scheme, "{}", theme.name);
+        }
+    }
+
+    #[test]
+    fn ascii_scheme_names_resolve_to_palettes() {
+        for theme in [
+            modern_theme(),
+            dark_theme(),
+            forest_theme(),
+            minimal_theme(),
+        ] {
+            assert_eq!(
+                color_scheme_by_name(theme.ascii.color_scheme),
+                Some(theme.color_scheme.clone()),
+                "{}",
+                theme.name
+            );
+        }
+        assert_eq!(color_scheme_by_name("default"), Some(modern_color_scheme()));
+        assert!(color_scheme_by_name("neon").is_none());
     }
 
     #[test]
