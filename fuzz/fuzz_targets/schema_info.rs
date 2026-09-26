@@ -11,8 +11,20 @@ use serde_json::{json, Value};
 use surql::schema::parser;
 
 const DB_KEYS: &[&str] = &[
-    "tb", "tables", "ac", "accesses", "bu", "buckets", "az", "analyzers", "fc", "functions",
-    "pa", "params", "sq", "sequences",
+    "tb",
+    "tables",
+    "ac",
+    "accesses",
+    "bu",
+    "buckets",
+    "az",
+    "analyzers",
+    "fc",
+    "functions",
+    "pa",
+    "params",
+    "sq",
+    "sequences",
 ];
 const TABLE_KEYS: &[&str] = &["fd", "fields", "ix", "indexes", "ev", "events"];
 
@@ -34,11 +46,14 @@ fuzz_target!(|input: (String, String)| {
     let _ = parser::parse_view(&definition);
 
     let entry = || json!({ name.clone(): definition.clone() });
-    let db: serde_json::Map<String, Value> = DB_KEYS.iter().map(|k| ((*k).to_owned(), entry())).collect();
+    let db: serde_json::Map<String, Value> =
+        DB_KEYS.iter().map(|k| ((*k).to_owned(), entry())).collect();
     let _ = parser::parse_db_info(&Value::Object(db));
 
-    let table: serde_json::Map<String, Value> =
-        TABLE_KEYS.iter().map(|k| ((*k).to_owned(), entry())).collect();
+    let table: serde_json::Map<String, Value> = TABLE_KEYS
+        .iter()
+        .map(|k| ((*k).to_owned(), entry()))
+        .collect();
     let table = Value::Object(table);
     let _ = parser::parse_table_info(&name, &table, Some(&definition));
     let _ = parser::parse_edge_info(&name, &table, Some(&definition));

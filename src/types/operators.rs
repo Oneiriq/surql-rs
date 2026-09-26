@@ -549,7 +549,9 @@ pub fn quote_value_public(value: &Value) -> String {
 ///
 /// - `null` becomes `NULL`.
 /// - bool becomes `true`/`false`.
-/// - numbers stringify directly.
+/// - numbers stringify directly, except an integer above `i64::MAX`, which
+///   the engine's integer literal cannot hold: it renders as an exact
+///   decimal (`18446744073709551615dec`).
 /// - strings are single-quoted and escaped.
 /// - arrays and objects render as literals, at any depth, with object keys
 ///   quoted by [`quote_object_key`].
@@ -563,6 +565,7 @@ pub(crate) fn quote_value(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::Number(n) if n.is_u64() && !n.is_i64() => format!("{n}dec"),
         Value::Number(n) => n.to_string(),
         Value::String(s) => quote_str(s),
         Value::Array(arr) => {
@@ -775,6 +778,13 @@ mod tests {
     #[test]
     fn string_escapes_backslash() {
         assert_eq!(eq("path", "a\\b").to_surql(), "path = 'a\\\\b'");
+    }
+
+    #[test]
+    fn integers_beyond_i64_render_as_exact_decimals() {
+        assert_eq!(quote_value(&json!(u64::MAX)), "18446744073709551615dec");
+        assert_eq!(quote_value(&json!(i64::MAX)), "9223372036854775807");
+        assert_eq!(quote_value(&json!(-5)), "-5");
     }
 
     #[test]

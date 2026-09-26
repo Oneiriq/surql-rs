@@ -19,8 +19,7 @@ fuzz_target!(|input: (String, String)| {
     };
     let text = rid.to_string();
 
-    let parsed = syn::record_id(&text)
-        .unwrap_or_else(|e| panic!("engine rejected {text:?}: {e}"));
+    let parsed = syn::record_id(&text).unwrap_or_else(|e| panic!("engine rejected {text:?}: {e}"));
     assert_eq!(parsed.table.as_str(), table, "table of {text:?}");
     match &parsed.key {
         RecordIdKey::String(k) => assert_eq!(k, &key, "key of {text:?}"),
@@ -28,8 +27,8 @@ fuzz_target!(|input: (String, String)| {
     }
 
     let statement = format!("SELECT * FROM {text};");
-    let ast = syn::parse(&statement)
-        .unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
+    let ast =
+        syn::parse(&statement).unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
     assert_eq!(ast.num_statements(), 1, "{statement:?}");
 
     let back = RecordID::<()>::parse(&text)

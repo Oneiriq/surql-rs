@@ -47,13 +47,17 @@ fn to_json(node: &Node, depth: usize) -> Value {
 }
 
 /// Structural equality with numbers compared by value, since the engine may
-/// read a float literal back through a different numeric kind.
+/// read a float literal back through a different numeric kind, and an
+/// integer above `i64::MAX` comes back as a decimal (JSON text).
 fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        (Value::Number(x), Value::String(y)) if x.is_u64() && !x.is_i64() => x.to_string() == *y,
         (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
             (Some(x), Some(y)) => x == y,
             _ => match (x.as_f64(), y.as_f64()) {
-                (Some(x), Some(y)) => x == y || (x - y).abs() <= f64::EPSILON * x.abs().max(y.abs()),
+                (Some(x), Some(y)) => {
+                    x == y || (x - y).abs() <= f64::EPSILON * x.abs().max(y.abs())
+                }
                 _ => false,
             },
         },
@@ -72,11 +76,14 @@ fuzz_target!(|node: Node| {
     let text = quote_value_public(&value);
 
     let statement = format!("RETURN {text};");
-    let ast = syn::parse(&statement)
-        .unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
+    let ast =
+        syn::parse(&statement).unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
     assert_eq!(ast.num_statements(), 1, "{statement:?}");
 
     let parsed = syn::value(&text).unwrap_or_else(|e| panic!("engine rejected {text:?}: {e}"));
     let back = parsed.into_json_value();
-    assert!(same(&value, &back), "{value} rendered as {text} read back as {back}");
+    assert!(
+        same(&value, &back),
+        "{value} rendered as {text} read back as {back}"
+    );
 });

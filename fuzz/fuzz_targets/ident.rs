@@ -16,8 +16,8 @@ fuzz_target!(|s: String| {
     let table = syn::table(&ident).unwrap_or_else(|e| panic!("engine rejected {ident:?}: {e}"));
     assert_eq!(table.as_str(), s, "{ident:?}");
     let statement = format!("SELECT * FROM {ident};");
-    let ast = syn::parse(&statement)
-        .unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
+    let ast =
+        syn::parse(&statement).unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
     assert_eq!(ast.num_statements(), 1, "{statement:?}");
 
     let literal = quote_str(&s);
@@ -26,8 +26,8 @@ fuzz_target!(|s: String| {
         other => panic!("{literal:?} parsed as {other:?}"),
     }
     let statement = format!("RETURN {literal};");
-    let ast = syn::parse(&statement)
-        .unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
+    let ast =
+        syn::parse(&statement).unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
     assert_eq!(ast.num_statements(), 1, "{statement:?}");
     assert_eq!(unquote_str(&literal).as_deref(), Some(s.as_str()));
 });
