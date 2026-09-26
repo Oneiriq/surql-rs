@@ -14,6 +14,13 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::{quote_ident, quote_str};
+
+/// The JWT algorithms `DEFINE ACCESS ... ALGORITHM` accepts.
+const ALGORITHMS: &[&str] = &[
+    "EDDSA", "ES256", "ES384", "ES512", "HS256", "HS384", "HS512", "PS256", "PS384", "PS512",
+    "RS256", "RS384", "RS512",
+];
 
 /// Access type used in `DEFINE ACCESS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,18 +49,58 @@ impl std::fmt::Display for AccessType {
 }
 
 /// Immutable JWT access configuration for `DEFINE ACCESS ... TYPE JWT`.
+///
+/// Mirrors the engine's grammar: tokens are verified either with a key
+/// (`ALGORITHM <alg> KEY '<key>'`) or with keys fetched from a JWKS endpoint
+/// (`URL '<url>'`), never both, and the engine can optionally issue tokens
+/// of its own (`WITH ISSUER KEY '<key>'`).
+///
+/// ## Examples
+///
+/// ```
+/// use surql::schema::{jwt_access, JwtConfig};
+///
+/// let verify_only = jwt_access("api", JwtConfig::new("RS256").with_key("<public key>"));
+/// assert_eq!(
+///     verify_only.to_surql().unwrap(),
+///     "DEFINE ACCESS api ON DATABASE TYPE JWT ALGORITHM RS256 KEY '<public key>';"
+/// );
+///
+/// let jwks = jwt_access(
+///     "sso",
+///     JwtConfig::new("RS256")
+///         .with_url("https://auth.example.com/jwks")
+///         .with_issuer("<private key>"),
+/// );
+/// assert_eq!(
+///     jwks.to_surql().unwrap(),
+///     "DEFINE ACCESS sso ON DATABASE TYPE JWT URL 'https://auth.example.com/jwks' \
+///      WITH ISSUER ALGORITHM RS256 KEY '<private key>';"
+/// );
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JwtConfig {
-    /// JWT signing algorithm (e.g. `HS256`, `RS256`).
+    /// JWT signing algorithm (e.g. `HS256`, `RS256`). With a JWKS [`url`]
+    /// the engine takes the verification algorithm from the key set, so this
+    /// only applies to the [`issuer`] key.
+    ///
+    /// [`url`]: Self::url
+    /// [`issuer`]: Self::issuer
     #[serde(default = "JwtConfig::default_algorithm")]
     pub algorithm: String,
-    /// Symmetric key for HMAC algorithms.
+    /// Verification key: the shared secret for an HMAC algorithm, the public
+    /// key for an asymmetric one. Mutually exclusive with [`url`](Self::url).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub key: Option<String>,
-    /// JWKS endpoint URL for key discovery.
+    /// JWKS endpoint the engine fetches verification keys from. Mutually
+    /// exclusive with [`key`](Self::key).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub url: Option<String>,
-    /// Expected token issuer claim.
+    /// Issuer signing key (`WITH ISSUER KEY`): the key the engine signs the
+    /// tokens it issues with. For an HMAC algorithm the verification key
+    /// already serves, so leave this unset; for an asymmetric one it is the
+    /// private key paired with the public [`key`](Self::key). Without it a
+    /// JWT access method only verifies externally issued tokens.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub issuer: Option<String>,
 }
@@ -83,7 +130,7 @@ impl JwtConfig {
         }
     }
 
-    /// Set the symmetric key.
+    /// Set the verification key.
     pub fn with_key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
         self
@@ -95,11 +142,69 @@ impl JwtConfig {
         self
     }
 
-    /// Set the expected issuer.
+    /// Set the issuer signing key (`WITH ISSUER KEY`).
     pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
         self.issuer = Some(issuer.into());
         self
     }
+
+    /// Validate the configuration against the engine's grammar.
+    ///
+    /// Returns [`SurqlError::Validation`] for an unknown algorithm, or when
+    /// the configuration names neither or both of [`key`](Self::key) and
+    /// [`url`](Self::url).
+    pub fn validate(&self) -> Result<()> {
+        if !ALGORITHMS
+            .iter()
+            .any(|alg| alg.eq_ignore_ascii_case(&self.algorithm))
+        {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Unknown JWT algorithm {:?}; expected one of {}",
+                    self.algorithm,
+                    ALGORITHMS.join(", ")
+                ),
+            });
+        }
+        match (&self.key, &self.url) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            (None, None) => Err(SurqlError::Validation {
+                reason: "JWT access needs a verification key or a JWKS url".into(),
+            }),
+            (Some(_), Some(_)) => Err(SurqlError::Validation {
+                reason: "JWT access takes a verification key or a JWKS url, not both".into(),
+            }),
+        }
+    }
+
+    /// Render `ALGORITHM <alg> KEY '<key>'` or `URL '<url>'`, then the
+    /// optional `WITH ISSUER` clause. The engine names the issuer algorithm
+    /// only when the verifier (a JWKS url) does not already fix it.
+    fn to_clause(&self) -> String {
+        let algorithm = self.algorithm.to_ascii_uppercase();
+        let mut sql = match (&self.key, &self.url) {
+            (Some(key), _) => format!("ALGORITHM {algorithm} KEY {}", quote_str(key)),
+            (None, Some(url)) => format!("URL {}", quote_str(url)),
+            (None, None) => format!("ALGORITHM {algorithm}"),
+        };
+        if let Some(issuer) = &self.issuer {
+            if self.key.is_some() {
+                let _ = write!(sql, " WITH ISSUER KEY {}", quote_str(issuer));
+            } else {
+                let _ = write!(
+                    sql,
+                    " WITH ISSUER ALGORITHM {algorithm} KEY {}",
+                    quote_str(issuer)
+                );
+            }
+        }
+        sql
+    }
+}
+
+/// `true` for a SurrealQL duration literal (`24h`, `1h30m`) or `NONE`.
+fn is_duration(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || c == 'µ')
 }
 
 impl Default for JwtConfig {
@@ -219,22 +324,44 @@ impl AccessDefinition {
     /// Returns [`SurqlError::Validation`] when:
     /// - the name is empty;
     /// - the access type is `Jwt` and no [`JwtConfig`] is set;
-    /// - the access type is `Record` and no [`RecordAccessConfig`] is set.
+    /// - the access type is `Record` and no [`RecordAccessConfig`] is set;
+    /// - a [`JwtConfig`] fails [`JwtConfig::validate`];
+    /// - a duration is not a SurrealQL duration literal.
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(SurqlError::Validation {
                 reason: "Access name cannot be empty".into(),
             });
         }
-        match self.access_type {
-            AccessType::Jwt if self.jwt.is_none() => Err(SurqlError::Validation {
-                reason: "JWT access type requires jwt config".into(),
-            }),
-            AccessType::Record if self.record.is_none() => Err(SurqlError::Validation {
-                reason: "RECORD access type requires record config".into(),
-            }),
-            _ => Ok(()),
+        match (self.access_type, &self.jwt, &self.record) {
+            (AccessType::Jwt, None, _) => {
+                return Err(SurqlError::Validation {
+                    reason: "JWT access type requires jwt config".into(),
+                });
+            }
+            (AccessType::Jwt, Some(jwt), _) => jwt.validate()?,
+            (AccessType::Record, _, None) => {
+                return Err(SurqlError::Validation {
+                    reason: "RECORD access type requires record config".into(),
+                });
+            }
+            (AccessType::Record, _, Some(record)) => {
+                if let Some(jwt) = &record.jwt {
+                    jwt.validate()?;
+                }
+            }
         }
+        for duration in [&self.duration_session, &self.duration_token]
+            .into_iter()
+            .flatten()
+        {
+            if !is_duration(duration) {
+                return Err(SurqlError::Validation {
+                    reason: format!("Access {:?}: {duration:?} is not a duration", self.name),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Render the `DEFINE ACCESS` statement.
@@ -263,51 +390,36 @@ impl AccessDefinition {
         let mut sql = format!(
             "DEFINE ACCESS {ine}{name} ON DATABASE TYPE {ty}",
             ine = ine,
-            name = self.name,
+            name = quote_ident(&self.name),
             ty = self.access_type.as_str(),
         );
 
         if let (AccessType::Jwt, Some(jwt)) = (self.access_type, &self.jwt) {
-            write!(sql, " ALGORITHM {}", jwt.algorithm).expect("writing to String cannot fail");
-            if let Some(key) = &jwt.key {
-                write!(sql, " KEY '{}'", key).expect("writing to String cannot fail");
-            }
-            if let Some(url) = &jwt.url {
-                write!(sql, " URL '{}'", url).expect("writing to String cannot fail");
-            }
-            if let Some(iss) = &jwt.issuer {
-                write!(sql, " WITH ISSUER '{}'", iss).expect("writing to String cannot fail");
-            }
+            sql.push(' ');
+            sql.push_str(&jwt.to_clause());
         }
 
         if let (AccessType::Record, Some(record)) = (self.access_type, &self.record) {
             if let Some(signup) = &record.signup {
-                write!(sql, " SIGNUP ({})", signup).expect("writing to String cannot fail");
+                let _ = write!(sql, " SIGNUP ({signup})");
             }
             if let Some(signin) = &record.signin {
-                write!(sql, " SIGNIN ({})", signin).expect("writing to String cannot fail");
+                let _ = write!(sql, " SIGNIN ({signin})");
             }
             if let Some(jwt) = &record.jwt {
-                write!(sql, " WITH JWT ALGORITHM {}", jwt.algorithm)
-                    .expect("writing to String cannot fail");
-                if let Some(key) = &jwt.key {
-                    write!(sql, " KEY '{}'", key).expect("writing to String cannot fail");
-                }
-                if let Some(url) = &jwt.url {
-                    write!(sql, " URL '{}'", url).expect("writing to String cannot fail");
-                }
+                let _ = write!(sql, " WITH JWT {}", jwt.to_clause());
             }
         }
 
         if self.duration_session.is_some() || self.duration_token.is_some() {
             let mut parts: Vec<String> = Vec::new();
             if let Some(session) = &self.duration_session {
-                parts.push(format!("FOR SESSION {}", session));
+                parts.push(format!("FOR SESSION {session}"));
             }
             if let Some(token) = &self.duration_token {
-                parts.push(format!("FOR TOKEN {}", token));
+                parts.push(format!("FOR TOKEN {token}"));
             }
-            write!(sql, " DURATION {}", parts.join(", ")).expect("writing to String cannot fail");
+            let _ = write!(sql, " DURATION {}", parts.join(", "));
         }
 
         sql.push(';');
@@ -451,10 +563,10 @@ mod tests {
     fn jwt_config_setters() {
         let cfg = JwtConfig::new("RS256")
             .with_url("https://auth.example.com/jwks")
-            .with_issuer("example");
+            .with_issuer("private-key");
         assert_eq!(cfg.algorithm, "RS256");
         assert_eq!(cfg.url.as_deref(), Some("https://auth.example.com/jwks"));
-        assert_eq!(cfg.issuer.as_deref(), Some("example"));
+        assert_eq!(cfg.issuer.as_deref(), Some("private-key"));
     }
 
     #[test]
@@ -476,16 +588,68 @@ mod tests {
     }
 
     #[test]
-    fn jwt_access_with_url_and_issuer() {
+    fn jwt_access_with_url_and_issuer_follows_the_engine_grammar() {
+        // `URL` replaces `ALGORITHM ... KEY`, and the issuer clause names a
+        // key, not an issuer claim; the old `ALGORITHM RS256 URL ...
+        // WITH ISSUER '...'` form was a parse error.
         let a = jwt_access(
             "api",
             JwtConfig::new("RS256")
                 .with_url("https://auth.example.com/jwks")
-                .with_issuer("https://auth.example.com"),
+                .with_issuer("private-key"),
         );
-        let sql = a.to_surql().unwrap();
-        assert!(sql.contains("URL 'https://auth.example.com/jwks'"));
-        assert!(sql.contains("WITH ISSUER 'https://auth.example.com'"));
+        assert_eq!(
+            a.to_surql().unwrap(),
+            "DEFINE ACCESS api ON DATABASE TYPE JWT URL 'https://auth.example.com/jwks' \
+             WITH ISSUER ALGORITHM RS256 KEY 'private-key';"
+        );
+        let a = jwt_access(
+            "api",
+            JwtConfig::new("RS256")
+                .with_key("public-key")
+                .with_issuer("private-key"),
+        );
+        assert_eq!(
+            a.to_surql().unwrap(),
+            "DEFINE ACCESS api ON DATABASE TYPE JWT ALGORITHM RS256 KEY 'public-key' \
+             WITH ISSUER KEY 'private-key';"
+        );
+    }
+
+    #[test]
+    fn jwt_config_needs_exactly_one_verifier_and_a_known_algorithm() {
+        assert!(jwt_access("api", JwtConfig::new("RS256"))
+            .to_surql()
+            .is_err());
+        assert!(jwt_access(
+            "api",
+            JwtConfig::new("RS256").with_key("k").with_url("https://x")
+        )
+        .to_surql()
+        .is_err());
+        assert!(jwt_access(
+            "api",
+            JwtConfig::new("RS256; REMOVE TABLE user").with_key("k")
+        )
+        .to_surql()
+        .is_err());
+        assert!(record_access(
+            "r",
+            RecordAccessConfig::new().with_jwt(JwtConfig::new("HS256"))
+        )
+        .to_surql()
+        .is_err());
+    }
+
+    #[test]
+    fn keys_and_names_are_escaped() {
+        let a = jwt_access("my-api", JwtConfig::hs256(r"it's \ secret"));
+        assert_eq!(
+            a.to_surql().unwrap(),
+            r"DEFINE ACCESS `my-api` ON DATABASE TYPE JWT ALGORITHM HS256 KEY 'it\'s \\ secret';"
+        );
+        let bad = jwt_access("api", JwtConfig::hs256("k")).with_session("1h; REMOVE TABLE x");
+        assert!(bad.to_surql().is_err());
     }
 
     #[test]

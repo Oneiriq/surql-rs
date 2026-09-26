@@ -84,6 +84,7 @@ pub mod index;
 pub mod index_vector;
 pub mod param;
 pub mod parser;
+pub(crate) mod permissions;
 pub mod reference;
 pub mod registry;
 pub mod sequence;

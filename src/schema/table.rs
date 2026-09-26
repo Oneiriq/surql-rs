@@ -12,9 +12,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::quote_ident;
 
 use super::changefeed::ChangeFeed;
 use super::fields::FieldDefinition;
+use super::permissions::{render_permissions_clause, validate_permissions, TABLE_ACTIONS};
 use super::view::ViewDefinition;
 
 pub use super::index::{
@@ -59,7 +61,8 @@ pub struct EventDefinition {
     pub name: String,
     /// SurrealQL `WHEN` condition expression.
     pub condition: String,
-    /// SurrealQL `THEN` action.
+    /// SurrealQL `THEN` action: one statement or several separated by `;`,
+    /// rendered inside a `{ … }` block.
     pub action: String,
 }
 
@@ -114,16 +117,60 @@ impl EventDefinition {
         self.render_guard(table, " OVERWRITE")
     }
 
+    /// The action always renders as a `{ … }` block. Unbraced, a
+    /// multi-statement action (`UPDATE s SET n += 1; DELETE tmp`) would end
+    /// the `DEFINE EVENT` at its first `;` and run the rest immediately, at
+    /// apply time, instead of on the event.
     fn render_guard(&self, table: &str, ine: &str) -> String {
+        let action = self.action.trim().trim_end_matches(';').trim_end();
+        let block = if is_block(action) {
+            action.to_string()
+        } else {
+            format!("{{ {action} }}")
+        };
         format!(
-            "DEFINE EVENT{ine} {name} ON TABLE {table} WHEN {cond} THEN {act};",
+            "DEFINE EVENT{ine} {name} ON TABLE {table} WHEN {cond} THEN {block};",
             ine = ine,
-            name = self.name,
-            table = table,
+            name = quote_ident(&self.name),
+            table = quote_ident(table),
             cond = self.condition,
-            act = self.action,
         )
     }
+}
+
+/// `true` when `action` is already one `{ … }` block, braces in strings
+/// aside.
+fn is_block(action: &str) -> bool {
+    if !action.starts_with('{') {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in action.char_indices() {
+        if let Some(close) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == close {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at + 1 == action.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Immutable table schema.
@@ -143,7 +190,11 @@ pub struct TableDefinition {
     /// Event definitions.
     #[serde(default)]
     pub events: Vec<EventDefinition>,
-    /// Per-action permissions map.
+    /// Per-action permissions map (`select` / `create` / `update` /
+    /// `delete`, or a comma-joined group), rendered inline as `PERMISSIONS
+    /// FOR <action> WHERE <rule>`. A rule of `"NONE"` or `"FULL"` renders
+    /// that posture instead of a `WHERE`. Actions left out keep the engine's
+    /// table default, `NONE`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub permissions: Option<BTreeMap<String, String>>,
     /// Whether this table is marked for deletion.
@@ -254,6 +305,11 @@ impl TableDefinition {
                 reason: "Table name cannot be empty".into(),
             });
         }
+        validate_permissions(
+            &format!("Table {:?}", self.name),
+            self.permissions.as_ref(),
+            TABLE_ACTIONS,
+        )?;
         for field in &self.fields {
             field.validate()?;
         }
@@ -271,7 +327,8 @@ impl TableDefinition {
             if !self.fields.is_empty() {
                 return Err(SurqlError::Validation {
                     reason: format!(
-                        "Table {:?} is a view: its fields come from the AS SELECT                          projection, so none may be declared",
+                        "Table {:?} is a view: its fields come from the AS SELECT \
+                         projection, so none may be declared",
                         self.name
                     ),
                 });
@@ -302,16 +359,7 @@ impl TableDefinition {
     }
 
     fn render_guard(&self, ine: &str) -> String {
-        let perms = match &self.permissions {
-            Some(perms) if !perms.is_empty() => {
-                let clauses: Vec<String> = perms
-                    .iter()
-                    .map(|(action, rule)| format!("FOR {action} WHERE {rule}"))
-                    .collect();
-                format!(" PERMISSIONS {}", clauses.join(" "))
-            }
-            _ => String::new(),
-        };
+        let perms = render_permissions_clause(self.permissions.as_ref());
         // SurrealQL order: TYPE, mode, AS SELECT, CHANGEFEED, PERMISSIONS.
         // A view carries the explicit `TYPE NORMAL` the engine echoes back.
         let (kind, view) = match &self.view {
@@ -326,7 +374,7 @@ impl TableDefinition {
         format!(
             "DEFINE TABLE{ine} {name} {kind}{mode}{view}{changefeed}{perms};",
             ine = ine,
-            name = self.name,
+            name = quote_ident(&self.name),
             kind = kind,
             mode = self.mode.as_str(),
             view = view,
@@ -337,8 +385,9 @@ impl TableDefinition {
 
     /// Render every statement required to create this table.
     ///
-    /// Returns the `DEFINE TABLE` line followed by each contained field,
-    /// index, event, and permission statement.
+    /// Returns the `DEFINE TABLE` line (which carries the table-level
+    /// `PERMISSIONS` inline) followed by each contained field, index, and
+    /// event statement.
     pub fn to_surql_all(&self) -> Vec<String> {
         self.to_surql_all_with_options(false)
     }
@@ -486,8 +535,55 @@ mod tests {
         assert_eq!(
             ev.to_surql("user"),
             "DEFINE EVENT email_changed ON TABLE user WHEN $before.email != $after.email \
-             THEN CREATE audit_log SET user = $value.id;"
+             THEN { CREATE audit_log SET user = $value.id };"
         );
+    }
+
+    #[test]
+    fn a_multi_statement_action_stays_inside_the_event() {
+        // Unbraced, `DELETE tmp` became its own statement and ran at apply
+        // time. The parser strips the braces the engine echoes, so this is
+        // also the shape a parsed event re-renders in.
+        let ev = event("n", "true", "UPDATE s SET n += 1; DELETE tmp");
+        assert_eq!(
+            ev.to_surql("t"),
+            "DEFINE EVENT n ON TABLE t WHEN true THEN { UPDATE s SET n += 1; DELETE tmp };"
+        );
+        assert_eq!(
+            ev.to_surql_overwrite("t"),
+            "DEFINE EVENT OVERWRITE n ON TABLE t WHEN true THEN { UPDATE s SET n += 1; DELETE tmp };"
+        );
+        let braced = event("n", "true", "{ CREATE log; }");
+        assert_eq!(
+            braced.to_surql("t"),
+            "DEFINE EVENT n ON TABLE t WHEN true THEN { CREATE log; };"
+        );
+        let quoted = event("n", "true", "{ CREATE log SET x = '}' } ; DELETE tmp");
+        assert!(quoted
+            .to_surql("t")
+            .ends_with("THEN { { CREATE log SET x = '}' } ; DELETE tmp };"));
+    }
+
+    #[test]
+    fn table_permissions_render_fixed_postures() {
+        let t = table_schema("doc").with_permissions([("select", "FULL"), ("delete", "none")]);
+        assert_eq!(
+            t.to_surql(),
+            "DEFINE TABLE doc SCHEMAFULL PERMISSIONS FOR delete NONE FOR select FULL;"
+        );
+        let bad = table_schema("doc").with_permissions([("drop", "true")]);
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn table_and_event_names_are_quoted() {
+        assert_eq!(
+            table_schema("select").to_surql(),
+            "DEFINE TABLE `select` SCHEMAFULL;"
+        );
+        assert!(event("my-event", "true", "CREATE x")
+            .to_surql("user-log")
+            .starts_with("DEFINE EVENT `my-event` ON TABLE `user-log` WHEN"));
     }
 
     #[test]

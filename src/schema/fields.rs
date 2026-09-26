@@ -8,40 +8,78 @@
 //! [`FieldDefinition::to_surql`].
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::sync::OnceLock;
 
-use regex::Regex;
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
 use crate::types::check_reserved_word;
-use crate::types::escape::is_identifier;
+use crate::types::escape::{is_identifier, quote_ident};
 
 pub use super::field_type::FieldType;
 
+use super::permissions::{render_permissions_clause, validate_permissions, FIELD_ACTIONS};
 use super::reference::{
     render_reference_clause, validate_computed, validate_reference_target, ReferenceAction,
 };
-
-/// Regex matching the canonical `type::record("<table>", $value)` coercion.
-fn type_record_coercion_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"^type::record\s*\(\s*["']([a-zA-Z_][a-zA-Z0-9_]*)["']\s*,\s*\$value\s*\)\s*\z"#,
-        )
-        .expect("valid regex")
-    })
-}
 
 /// If `value` is the canonical record coercion expression, return the target
 /// table. `type::record("plan", $value)` yields `Some("plan")`. Returns `None`
 /// for anything else, including more complex VALUE expressions.
 fn detect_target_table_from_value(value: &str) -> Option<String> {
-    type_record_coercion_regex()
-        .captures(value.trim())
-        .map(|caps| caps[1].to_string())
+    let rest = value
+        .trim()
+        .strip_prefix("type::record")?
+        .trim_start()
+        .strip_prefix('(')?
+        .trim_start()
+        .strip_prefix(['"', '\''])?;
+    let end = rest.find(['"', '\''])?;
+    let table = rest.get(..end)?;
+    let tail = rest
+        .get(end + 1..)?
+        .trim_start()
+        .strip_prefix(',')?
+        .trim_start()
+        .strip_prefix("$value")?
+        .trim_start()
+        .strip_prefix(')')?;
+    (is_identifier(table) && tail.trim().is_empty()).then(|| table.to_string())
+}
+
+/// Render a field path (`address.city`, `tags.*`, `tags[*]`) for a
+/// statement, backtick-quoting any name segment the engine would not read
+/// as a plain name (a reserved word, a name with a `-`).
+///
+/// A segment carrying brackets or an expression is left as written.
+pub(crate) fn render_field_path(path: &str) -> String {
+    path.split('.')
+        .map(|segment| {
+            let (base, suffix) = segment
+                .find('[')
+                .and_then(|at| Some((segment.get(..at)?, segment.get(at..)?)))
+                .unwrap_or((segment, ""));
+            let plain = !base.is_empty()
+                && base != "*"
+                && !base.contains(['(', ')', '`', '\'', '"', '$', ' ', '⟨']);
+            if plain {
+                format!("{}{suffix}", quote_ident(base))
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Render the tables of a `record<a | b>` link, each quoted as a name.
+pub(crate) fn render_table_list(tables: &str) -> String {
+    tables
+        .split('|')
+        .map(|table| quote_ident(table.trim()))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Immutable field definition for table schemas.
@@ -73,7 +111,11 @@ pub struct FieldDefinition {
     /// Optional computed-value expression.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub value: Option<String>,
-    /// Optional per-action permission rules keyed by action name.
+    /// Optional per-action permission rules keyed by action (`select`,
+    /// `create`, `update`; fields have no `delete`), rendered as the field's
+    /// `PERMISSIONS FOR <action> WHERE <rule>` clause. A rule of `"NONE"` or
+    /// `"FULL"` renders that posture instead of a `WHERE`. Actions left out
+    /// keep the engine's field default, `FULL`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub permissions: Option<BTreeMap<String, String>>,
     /// Whether the field is read-only after creation.
@@ -202,12 +244,19 @@ impl FieldDefinition {
     }
 
     /// Validate the field definition against SurrealDB identifier rules,
-    /// plus the `REFERENCE` and `COMPUTED` restrictions the engine enforces.
+    /// plus the `REFERENCE`, `COMPUTED`, and `PERMISSIONS` restrictions the
+    /// engine enforces.
     ///
     /// Returns [`SurqlError::Validation`] for an empty name, empty segments,
-    /// or segments that contain invalid characters.
+    /// segments that contain invalid characters, or a permission naming an
+    /// action other than `select`, `create`, or `update`.
     pub fn validate(&self) -> Result<()> {
         validate_field_name(&self.name)?;
+        validate_permissions(
+            &format!("Field {:?}", self.name),
+            self.permissions.as_ref(),
+            FIELD_ACTIONS,
+        )?;
         if self.reference.is_some() {
             validate_reference_target(&self.name, self.field_type, self.target_table.as_deref())?;
         }
@@ -262,11 +311,11 @@ impl FieldDefinition {
         let mut sql = format!(
             "DEFINE FIELD{ine} {name} ON TABLE {table}",
             ine = ine,
-            name = self.name,
-            table = table,
+            name = render_field_path(&self.name),
+            table = quote_ident(table),
         );
         if !self.omits_type_clause() {
-            write!(sql, " TYPE {type_clause}").expect("writing to String cannot fail");
+            let _ = write!(sql, " TYPE {type_clause}");
         }
         // SurrealDB v3 requires FLEXIBLE immediately after the TYPE
         // clause; rendering it after READONLY (this crate's previous
@@ -279,22 +328,25 @@ impl FieldDefinition {
             sql.push_str(&render_reference_clause(action));
         }
         if let Some(computed) = &self.computed {
-            write!(sql, " COMPUTED {computed}").expect("writing to String cannot fail");
+            let _ = write!(sql, " COMPUTED {computed}");
         }
         if let Some(assertion) = &self.assertion {
-            write!(sql, " ASSERT {}", assertion).expect("writing to String cannot fail");
+            let _ = write!(sql, " ASSERT {assertion}");
         }
         if let Some(default) = &self.default {
-            write!(sql, " DEFAULT {}", default).expect("writing to String cannot fail");
+            let _ = write!(sql, " DEFAULT {default}");
         }
         if let Some(value) = &self.value {
             if !drop_value {
-                write!(sql, " VALUE {}", value).expect("writing to String cannot fail");
+                let _ = write!(sql, " VALUE {value}");
             }
         }
         if self.readonly {
             sql.push_str(" READONLY");
         }
+        // Field permissions: without this clause the field would get the
+        // engine default, FULL, whatever the definition declares.
+        sql.push_str(&render_permissions_clause(self.permissions.as_ref()));
         sql.push(';');
         sql
     }
@@ -317,6 +369,7 @@ impl FieldDefinition {
         let Some(target) = self.target_table.as_deref() else {
             return (self.field_type.as_str().to_string(), false);
         };
+        let targets = render_table_list(target);
         match self.field_type {
             FieldType::Record => {
                 let drop_value = self
@@ -325,9 +378,9 @@ impl FieldDefinition {
                     .and_then(detect_target_table_from_value)
                     .as_deref()
                     == Some(target);
-                (format!("record<{target}>"), drop_value)
+                (format!("record<{targets}>"), drop_value)
             }
-            FieldType::Array => (format!("array<record<{target}>>"), false),
+            FieldType::Array => (format!("array<record<{targets}>>"), false),
             _ => (self.field_type.as_str().to_string(), false),
         }
     }
@@ -423,7 +476,22 @@ impl FieldBuilder {
         self
     }
 
-    /// Attach per-action permissions.
+    /// Attach per-action permissions, rendered as the field's `PERMISSIONS`
+    /// clause (see [`FieldDefinition::permissions`]).
+    ///
+    /// ```
+    /// use surql::schema::string_field;
+    ///
+    /// let (ssn, _) = string_field("ssn")
+    ///     .permissions([("select", "$auth.admin = true")])
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     ssn.to_surql("user"),
+    ///     "DEFINE FIELD ssn ON TABLE user TYPE string \
+    ///      PERMISSIONS FOR select WHERE $auth.admin = true;",
+    /// );
+    /// ```
     pub fn permissions<I, K, V>(mut self, permissions: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -752,8 +820,8 @@ mod tests {
     fn to_surql_with_default() {
         let f = FieldDefinition::new("created_at", FieldType::Datetime).with_default("time::now()");
         assert_eq!(
-            f.to_surql("event"),
-            "DEFINE FIELD created_at ON TABLE event TYPE datetime DEFAULT time::now();"
+            f.to_surql("audit"),
+            "DEFINE FIELD created_at ON TABLE audit TYPE datetime DEFAULT time::now();"
         );
     }
 
@@ -965,6 +1033,65 @@ mod tests {
                 .get("select")
                 .map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[test]
+    fn field_permissions_render_in_the_statement() {
+        // Regression: the permissions used to be dropped, leaving the field
+        // at the engine default, FULL.
+        let (f, _) = string_field("ssn")
+            .permissions([("select", "$auth.admin"), ("update", "NONE")])
+            .build()
+            .unwrap();
+        assert_eq!(
+            f.to_surql("user"),
+            "DEFINE FIELD ssn ON TABLE user TYPE string \
+             PERMISSIONS FOR select WHERE $auth.admin FOR update NONE;"
+        );
+        assert!(f
+            .to_surql_overwrite("user")
+            .ends_with("PERMISSIONS FOR select WHERE $auth.admin FOR update NONE;"));
+    }
+
+    #[test]
+    fn field_permissions_refuse_delete_and_unknown_actions() {
+        assert!(string_field("x")
+            .permissions([("delete", "true")])
+            .build()
+            .is_err());
+        assert!(string_field("x")
+            .permissions([("select WHERE true FOR create", "true")])
+            .build()
+            .is_err());
+    }
+
+    #[test]
+    fn reserved_and_odd_names_are_quoted() {
+        let f = FieldDefinition::new("value", FieldType::Int);
+        assert_eq!(
+            f.to_surql("select"),
+            "DEFINE FIELD `value` ON TABLE `select` TYPE int;"
+        );
+        let f = FieldDefinition::new("meta.type", FieldType::String);
+        assert_eq!(
+            f.to_surql("my-table"),
+            "DEFINE FIELD meta.`type` ON TABLE `my-table` TYPE string;"
+        );
+        let f = FieldDefinition::new("tags[*]", FieldType::String);
+        assert_eq!(
+            f.to_surql("t"),
+            "DEFINE FIELD tags[*] ON TABLE t TYPE string;"
+        );
+        let f = FieldDefinition::new("tags.*", FieldType::String);
+        assert_eq!(
+            f.to_surql("t"),
+            "DEFINE FIELD tags.* ON TABLE t TYPE string;"
+        );
+        let f = FieldDefinition::new("link", FieldType::Record).with_target_table("user | order");
+        assert_eq!(
+            f.to_surql("t"),
+            "DEFINE FIELD link ON TABLE t TYPE record<user | `order`>;"
         );
     }
 
