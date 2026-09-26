@@ -31,28 +31,26 @@
 //! The DDL string generation here is independent of that switch; only live
 //! execution needs it.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::{quote_ident, quote_str};
 
-/// Render a per-action `PERMISSIONS` clause body shared by tables and buckets.
-///
-/// Produces `FOR <action> WHERE <rule> ...` (space-joined), the only valid
-/// inline placement. Returns an empty string when `permissions` is `None` or
-/// empty so callers can append it unconditionally.
-fn render_permissions_clause(permissions: Option<&BTreeMap<String, String>>) -> String {
-    match permissions {
-        Some(perms) if !perms.is_empty() => {
-            let clauses: Vec<String> = perms
-                .iter()
-                .map(|(action, rule)| format!("FOR {action} WHERE {rule}"))
-                .collect();
-            format!(" PERMISSIONS {}", clauses.join(" "))
-        }
-        _ => String::new(),
+/// The engine's permission posture for a bucket defined without one.
+pub const DEFAULT_BUCKET_PERMISSIONS: &str = "FULL";
+
+/// Render a string literal: double-quoted as this module has always
+/// rendered it when the text needs no escaping, the escaped single-quoted
+/// form from [`quote_str`] otherwise, so a `"`, `\`, or newline in a backend
+/// path or comment can never end the literal early.
+fn quote_literal(text: &str) -> String {
+    let plain = !text.contains(['"', '\\', '\0', '\r', '\t', '\n', '\x08', '\x0C']);
+    if plain {
+        format!("\"{text}\"")
+    } else {
+        quote_str(text)
     }
 }
 
@@ -82,11 +80,13 @@ pub struct BucketDefinition {
     /// Whether the bucket rejects writes (`READONLY`).
     #[serde(default)]
     pub readonly: bool,
-    /// Per-action permission rules keyed by action name, rendered inline as a
-    /// `PERMISSIONS FOR <action> WHERE <rule>` clause — the same shape as
-    /// [`TableDefinition::permissions`](crate::schema::TableDefinition).
+    /// The `PERMISSIONS` clause body: `NONE`, `FULL`, or `WHERE <expr>`.
+    ///
+    /// A bucket has one permission covering every file operation, not the
+    /// per-action map a table has; `FOR select WHERE ...` is a parse error.
+    /// `None` is the engine default, [`DEFAULT_BUCKET_PERMISSIONS`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub permissions: Option<BTreeMap<String, String>>,
+    pub permissions: Option<String>,
     /// Optional human-readable comment.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub comment: Option<String>,
@@ -110,19 +110,10 @@ impl BucketDefinition {
         self
     }
 
-    /// Attach per-action permissions.
-    pub fn with_permissions<I, K, V>(mut self, permissions: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.permissions = Some(
-            permissions
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
-        );
+    /// Set the `PERMISSIONS` clause body: `NONE`, `FULL`, or
+    /// `WHERE <expr>`.
+    pub fn with_permissions(mut self, permissions: impl Into<String>) -> Self {
+        self.permissions = Some(permissions.into());
         self
     }
 
@@ -134,7 +125,8 @@ impl BucketDefinition {
 
     /// Validate the bucket definition.
     ///
-    /// Returns [`SurqlError::Validation`] when the name or backend is empty.
+    /// Returns [`SurqlError::Validation`] when the name or backend is empty,
+    /// or when the permissions are not `NONE`, `FULL`, or `WHERE <expr>`.
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(SurqlError::Validation {
@@ -146,7 +138,29 @@ impl BucketDefinition {
                 reason: format!("Bucket {:?} must have a backend", self.name),
             });
         }
+        if let Some(permissions) = &self.permissions {
+            let body = permissions.trim();
+            let keyword = body.split_whitespace().next().unwrap_or("");
+            let fixed = body.eq_ignore_ascii_case("NONE") || body.eq_ignore_ascii_case("FULL");
+            let rule = keyword.eq_ignore_ascii_case("WHERE") && body.len() > keyword.len();
+            if !fixed && !rule {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "Bucket {:?}: permissions must be NONE, FULL, or WHERE <expr>, got {body:?}",
+                        self.name
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// The rendered ` PERMISSIONS <body>` clause, or an empty string.
+    fn permissions_clause(&self) -> String {
+        self.permissions
+            .as_deref()
+            .map(|p| format!(" PERMISSIONS {}", p.trim()))
+            .unwrap_or_default()
     }
 
     /// Render the `DEFINE BUCKET` statement.
@@ -171,17 +185,17 @@ impl BucketDefinition {
             ""
         };
         let mut sql = format!(
-            "DEFINE BUCKET {guard}{name} BACKEND \"{backend}\"",
+            "DEFINE BUCKET {guard}{name} BACKEND {backend}",
             guard = guard,
-            name = self.name,
-            backend = self.backend,
+            name = quote_ident(&self.name),
+            backend = quote_literal(&self.backend),
         );
         if self.readonly {
             sql.push_str(" READONLY");
         }
-        sql.push_str(&render_permissions_clause(self.permissions.as_ref()));
+        sql.push_str(&self.permissions_clause());
         if let Some(comment) = &self.comment {
-            write!(sql, " COMMENT \"{comment}\"").expect("writing to String cannot fail");
+            let _ = write!(sql, " COMMENT {}", quote_literal(comment));
         }
         sql.push(';');
         Ok(sql)
@@ -194,7 +208,7 @@ impl BucketDefinition {
 
     /// Render a `REMOVE BUCKET` statement for a bucket by name.
     pub fn remove_surql(name: &str) -> String {
-        format!("REMOVE BUCKET {name};")
+        format!("REMOVE BUCKET {};", quote_ident(name))
     }
 
     /// Render an `ALTER BUCKET` statement that turns `from` into `self`.
@@ -203,9 +217,9 @@ impl BucketDefinition {
     /// but absent on `self` is impossible (backend is required), so the
     /// `DROP BACKEND` clause is never produced here; a `None` comment on
     /// `self` paired with a `Some` comment on `from` renders `DROP COMMENT`.
-    /// Read-only transitions render `READONLY` / `DROP READONLY`. Permission
-    /// changes re-emit the full `PERMISSIONS` clause (SurrealQL replaces the
-    /// whole posture).
+    /// Read-only transitions render `READONLY` / `DROP READONLY`. A
+    /// permission change re-emits the `PERMISSIONS` clause; clearing it
+    /// restores the engine default, [`DEFAULT_BUCKET_PERMISSIONS`].
     ///
     /// `if_exists` adds the `IF EXISTS` guard for idempotent re-application.
     pub fn to_alter_surql(&self, from: &BucketDefinition, if_exists: bool) -> String {
@@ -213,7 +227,7 @@ impl BucketDefinition {
         let mut sql = format!(
             "ALTER BUCKET {guard}{name}",
             guard = guard,
-            name = self.name
+            name = quote_ident(&self.name)
         );
 
         if self.readonly != from.readonly {
@@ -225,15 +239,13 @@ impl BucketDefinition {
         }
 
         if self.backend != from.backend {
-            write!(sql, " BACKEND \"{}\"", self.backend).expect("writing to String cannot fail");
+            let _ = write!(sql, " BACKEND {}", quote_literal(&self.backend));
         }
 
         if self.permissions != from.permissions {
-            let clause = render_permissions_clause(self.permissions.as_ref());
+            let clause = self.permissions_clause();
             if clause.is_empty() {
-                // Clearing all per-action rules: re-assert the default-deny
-                // posture explicitly so the ALTER is not a no-op.
-                sql.push_str(" PERMISSIONS NONE");
+                let _ = write!(sql, " PERMISSIONS {DEFAULT_BUCKET_PERMISSIONS}");
             } else {
                 sql.push_str(&clause);
             }
@@ -242,7 +254,7 @@ impl BucketDefinition {
         if self.comment != from.comment {
             match &self.comment {
                 Some(comment) => {
-                    write!(sql, " COMMENT \"{comment}\"").expect("writing to String cannot fail");
+                    let _ = write!(sql, " COMMENT {}", quote_literal(comment));
                 }
                 None => sql.push_str(" DROP COMMENT"),
             }
@@ -269,19 +281,10 @@ impl BucketSchemaBuilder {
         self
     }
 
-    /// Attach per-action permissions.
-    pub fn permissions<I, K, V>(mut self, permissions: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
-    {
-        self.inner.permissions = Some(
-            permissions
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
-        );
+    /// Set the `PERMISSIONS` clause body: `NONE`, `FULL`, or
+    /// `WHERE <expr>`.
+    pub fn permissions(mut self, permissions: impl Into<String>) -> Self {
+        self.inner.permissions = Some(permissions.into());
         self
     }
 
@@ -400,15 +403,48 @@ mod tests {
     }
 
     #[test]
-    fn permissions_render_inline() {
+    fn permissions_render_as_one_posture() {
+        // A bucket has a single permission; the per-action `FOR select`
+        // form this used to render is a parse error.
         let b = bucket_schema("p", "memory")
-            .permissions([("select", "$auth.id != NONE"), ("create", "$auth.admin")])
+            .permissions("WHERE $auth.id != NONE")
             .build()
             .unwrap();
-        let sql = b.to_surql().unwrap();
-        assert!(sql.contains("PERMISSIONS FOR"));
-        assert!(sql.contains("FOR select WHERE $auth.id != NONE"));
-        assert!(sql.contains("FOR create WHERE $auth.admin"));
+        assert_eq!(
+            b.to_surql().unwrap(),
+            "DEFINE BUCKET p BACKEND \"memory\" PERMISSIONS WHERE $auth.id != NONE;"
+        );
+        assert!(bucket_schema("p", "memory")
+            .permissions("FOR select WHERE true")
+            .build()
+            .is_err());
+        assert!(bucket_schema("p", "memory")
+            .permissions("NONE")
+            .build()
+            .is_ok());
+    }
+
+    #[test]
+    fn literals_that_need_escaping_cannot_break_out() {
+        let b = memory_bucket("c").with_comment("x\"; REMOVE TABLE user; --");
+        assert_eq!(
+            b.to_surql().unwrap(),
+            r#"DEFINE BUCKET c BACKEND "memory" COMMENT 'x"; REMOVE TABLE user; --';"#
+        );
+        let b = file_bucket("d", r"C:\data");
+        assert_eq!(
+            b.to_surql().unwrap(),
+            r"DEFINE BUCKET d BACKEND 'file:C:\\data';"
+        );
+        let b = memory_bucket("it's").with_comment("user's files");
+        assert_eq!(
+            b.to_surql().unwrap(),
+            "DEFINE BUCKET `it's` BACKEND \"memory\" COMMENT \"user's files\";"
+        );
+        assert_eq!(
+            BucketDefinition::remove_surql("a-b"),
+            "REMOVE BUCKET `a-b`;"
+        );
     }
 
     #[test]
@@ -510,17 +546,17 @@ mod tests {
     #[test]
     fn alter_replaces_permissions() {
         let from = memory_bucket("b");
-        let to = memory_bucket("b").with_permissions([("select", "true")]);
+        let to = memory_bucket("b").with_permissions("WHERE true");
         let sql = to.to_alter_surql(&from, false);
-        assert!(sql.contains("PERMISSIONS FOR select WHERE true"));
+        assert!(sql.contains("PERMISSIONS WHERE true"));
     }
 
     #[test]
-    fn alter_clears_permissions_to_none() {
-        let from = memory_bucket("b").with_permissions([("select", "true")]);
+    fn alter_clears_permissions_to_the_default() {
+        let from = memory_bucket("b").with_permissions("WHERE true");
         let to = memory_bucket("b");
         let sql = to.to_alter_surql(&from, false);
-        assert!(sql.contains("PERMISSIONS NONE"));
+        assert!(sql.contains("PERMISSIONS FULL"));
     }
 
     #[test]
@@ -552,7 +588,7 @@ mod tests {
     fn serde_roundtrip() {
         let b = bucket_schema("p", "memory")
             .readonly(true)
-            .permissions([("select", "true")])
+            .permissions("WHERE true")
             .comment("c")
             .build()
             .unwrap();

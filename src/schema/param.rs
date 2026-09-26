@@ -14,8 +14,9 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::quote_str;
 
-use super::function::DEFAULT_PERMISSIONS;
+use super::function::{render_param_name, DEFAULT_PERMISSIONS};
 use super::sequence::guard_keyword;
 
 /// Immutable `DEFINE PARAM` schema definition.
@@ -115,16 +116,16 @@ impl ParamDefinition {
     pub fn to_surql_with_options(&self, if_not_exists: bool, overwrite: bool) -> Result<String> {
         self.validate()?;
         let mut sql = format!(
-            "DEFINE PARAM {guard}${name} VALUE {value}",
+            "DEFINE PARAM {guard}{name} VALUE {value}",
             guard = guard_keyword(if_not_exists, overwrite),
-            name = self.name,
+            name = render_param_name(&self.name),
             value = self.value.trim(),
         );
         if let Some(comment) = &self.comment {
-            write!(sql, " COMMENT '{comment}'").expect("writing to String cannot fail");
+            let _ = write!(sql, " COMMENT {}", quote_str(comment));
         }
         if let Some(permissions) = &self.permissions {
-            write!(sql, " PERMISSIONS {permissions}").expect("writing to String cannot fail");
+            let _ = write!(sql, " PERMISSIONS {permissions}");
         }
         sql.push(';');
         Ok(sql)
@@ -143,7 +144,7 @@ impl ParamDefinition {
     /// Render a `REMOVE PARAM` statement for a param by name (with or without
     /// the leading `$`).
     pub fn remove_surql(name: &str) -> String {
-        format!("REMOVE PARAM IF EXISTS ${};", name.trim_start_matches('$'))
+        format!("REMOVE PARAM IF EXISTS {};", render_param_name(name))
     }
 }
 
@@ -208,6 +209,21 @@ mod tests {
             p.to_surql().unwrap(),
             "DEFINE PARAM $APP VALUE 'oneiriq' COMMENT 'display name' PERMISSIONS WHERE $auth;"
         );
+    }
+
+    #[test]
+    fn a_comment_is_escaped_and_round_trips() {
+        let p = param_schema("P", "1")
+            .comment("x'; REMOVE TABLE user; --")
+            .build()
+            .unwrap();
+        let sql = p.to_surql().unwrap();
+        assert_eq!(
+            sql,
+            r"DEFINE PARAM $P VALUE 1 COMMENT 'x\'; REMOVE TABLE user; --';"
+        );
+        let parsed = crate::schema::parser::parse_param("P", &sql).unwrap();
+        assert_eq!(parsed.comment, p.comment);
     }
 
     #[test]

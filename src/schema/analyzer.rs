@@ -32,6 +32,7 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::quote_ident;
 
 /// Tokenizer that splits text into terms before the filter chain runs.
 ///
@@ -216,7 +217,7 @@ impl AnalyzerDefinition {
     }
 
     fn render_guard(&self, ine: &str) -> String {
-        let mut sql = format!("DEFINE ANALYZER {ine}{name}", name = self.name);
+        let mut sql = format!("DEFINE ANALYZER {ine}{}", quote_ident(&self.name));
         if !self.tokenizers.is_empty() {
             let toks = self
                 .tokenizers
@@ -224,7 +225,7 @@ impl AnalyzerDefinition {
                 .map(|t| t.as_str())
                 .collect::<Vec<_>>()
                 .join(",");
-            write!(sql, " TOKENIZERS {toks}").expect("writing to String cannot fail");
+            let _ = write!(sql, " TOKENIZERS {toks}");
         }
         if !self.filters.is_empty() {
             let filters = self
@@ -233,7 +234,7 @@ impl AnalyzerDefinition {
                 .map(TokenFilter::to_surql)
                 .collect::<Vec<_>>()
                 .join(",");
-            write!(sql, " FILTERS {filters}").expect("writing to String cannot fail");
+            let _ = write!(sql, " FILTERS {filters}");
         }
         sql.push(';');
         sql

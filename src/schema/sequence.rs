@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::{quote_ident, quote_str};
 
 /// The engine's default batch size, and what it echoes for a sequence
 /// defined without one.
@@ -106,6 +107,20 @@ impl SequenceDefinition {
                 reason: format!("Sequence {:?} must have a batch of at least 1", self.name),
             });
         }
+        if let Some(timeout) = &self.timeout {
+            if timeout.is_empty()
+                || !timeout
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == 'µ')
+            {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "Sequence {:?}: timeout {timeout:?} is not a duration",
+                        self.name
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -122,12 +137,12 @@ impl SequenceDefinition {
         let mut sql = format!(
             "DEFINE SEQUENCE {guard}{name} BATCH {batch} START {start}",
             guard = guard,
-            name = self.name,
+            name = quote_ident(&self.name),
             batch = self.batch,
             start = self.start,
         );
         if let Some(timeout) = &self.timeout {
-            write!(sql, " TIMEOUT {timeout}").expect("writing to String cannot fail");
+            let _ = write!(sql, " TIMEOUT {timeout}");
         }
         sql.push(';');
         Ok(sql)
@@ -145,13 +160,13 @@ impl SequenceDefinition {
 
     /// Render a `REMOVE SEQUENCE` statement for a sequence by name.
     pub fn remove_surql(name: &str) -> String {
-        format!("REMOVE SEQUENCE IF EXISTS {name};")
+        format!("REMOVE SEQUENCE IF EXISTS {};", quote_ident(name))
     }
 
-    /// Render `sequence::nextval("<name>")`, the call that draws the next
+    /// Render `sequence::nextval('<name>')`, the call that draws the next
     /// value.
     pub fn nextval_surql(name: &str) -> String {
-        format!("sequence::nextval(\"{name}\")")
+        format!("sequence::nextval({})", quote_str(name))
     }
 }
 
@@ -279,8 +294,24 @@ mod tests {
         );
         assert_eq!(
             SequenceDefinition::nextval_surql("s"),
-            "sequence::nextval(\"s\")"
+            "sequence::nextval('s')"
         );
+        assert_eq!(
+            SequenceDefinition::nextval_surql("a'b"),
+            r"sequence::nextval('a\'b')"
+        );
+        assert_eq!(
+            SequenceDefinition::remove_surql("my-seq"),
+            "REMOVE SEQUENCE IF EXISTS `my-seq`;"
+        );
+    }
+
+    #[test]
+    fn a_timeout_must_be_a_duration() {
+        assert!(SequenceDefinition::new("s")
+            .with_timeout("5s; REMOVE TABLE user")
+            .validate()
+            .is_err());
     }
 
     #[test]

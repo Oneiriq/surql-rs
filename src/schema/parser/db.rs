@@ -48,13 +48,10 @@ fn collect<T>(
     keys: &[&str],
     parse: impl Fn(&str, &str) -> Option<T>,
 ) -> std::collections::BTreeMap<String, T> {
-    let Some(value) = pick_map(obj, keys) else {
+    let Some(map) = pick_map(obj, keys) else {
         return std::collections::BTreeMap::new();
     };
-    value
-        .as_object()
-        .expect("checked by pick_map")
-        .iter()
+    map.iter()
         .filter_map(|(name, def)| {
             let parsed = parse(name, def.as_str()?)?;
             Some((name.clone(), parsed))
@@ -94,8 +91,8 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
 
     let mut out = DatabaseInfo::default();
 
-    if let Some(tb_value) = pick_map(obj, &["tb", "tables"]) {
-        for (name, def_value) in tb_value.as_object().expect("checked by pick_map") {
+    if let Some(tables) = pick_map(obj, &["tb", "tables"]) {
+        for (name, def_value) in tables {
             let Some(def) = def_value.as_str() else {
                 continue;
             };
