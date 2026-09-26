@@ -40,24 +40,32 @@ impl From<StrategyArg> for StrategyKind {
     }
 }
 
+/// Flags of `surql orchestrate deploy`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeployArgs {
+    /// Path to the environments JSON file.
+    #[arg(long, value_name = "PATH", default_value = "environments.json")]
+    pub plan: PathBuf,
+    /// Deployment strategy.
+    #[arg(long, value_enum, default_value_t = StrategyArg::Sequential)]
+    pub strategy: StrategyArg,
+    /// Comma-separated environment names (defaults to every registered env).
+    #[arg(long, value_name = "LIST")]
+    pub environments: Option<String>,
+    /// Dry-run: plan but do not apply.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Approve changes to environments marked `require_approval`; without
+    /// it the deploy is refused before anything runs.
+    #[arg(long)]
+    pub approve: bool,
+}
+
 /// `surql orchestrate <subcommand>` commands.
 #[derive(Debug, Subcommand)]
 pub enum OrchestrateCommand {
     /// Deploy migrations across the environments declared by `--plan`.
-    Deploy {
-        /// Path to the environments JSON file.
-        #[arg(long, value_name = "PATH", default_value = "environments.json")]
-        plan: PathBuf,
-        /// Deployment strategy.
-        #[arg(long, value_enum, default_value_t = StrategyArg::Sequential)]
-        strategy: StrategyArg,
-        /// Comma-separated environment names (defaults to every registered env).
-        #[arg(long, value_name = "LIST")]
-        environments: Option<String>,
-        /// Dry-run: plan but do not apply.
-        #[arg(long)]
-        dry_run: bool,
-    },
+    Deploy(DeployArgs),
     /// Show the health of each registered environment.
     Status {
         /// Path to the environments JSON file.
@@ -80,12 +88,7 @@ pub enum OrchestrateCommand {
 pub async fn run(cmd: OrchestrateCommand, global: &GlobalOpts) -> Result<()> {
     let settings = global.settings()?;
     match cmd {
-        OrchestrateCommand::Deploy {
-            plan,
-            strategy,
-            environments,
-            dry_run,
-        } => deploy(&settings, &plan, strategy, environments.as_deref(), dry_run).await,
+        OrchestrateCommand::Deploy(args) => deploy(&settings, &args).await,
         OrchestrateCommand::Status { plan } => status(&plan).await,
         OrchestrateCommand::Validate { plan } => validate(&plan).await,
     }
@@ -101,14 +104,15 @@ async fn load_plan(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn deploy(
-    settings: &crate::settings::Settings,
-    plan_path: &Path,
-    strategy: StrategyArg,
-    environments: Option<&str>,
-    dry_run: bool,
-) -> Result<()> {
-    load_plan(plan_path).await?;
+async fn deploy(settings: &crate::settings::Settings, args: &DeployArgs) -> Result<()> {
+    let DeployArgs {
+        plan: plan_path,
+        strategy,
+        environments,
+        dry_run,
+        approve,
+    } = args.clone();
+    load_plan(&plan_path).await?;
     let registry = get_registry();
 
     let migrations = discover_migrations(&settings.migration_path)?;
@@ -119,7 +123,7 @@ async fn deploy(
         ));
     }
 
-    let env_names: Vec<String> = match environments {
+    let env_names: Vec<String> = match environments.as_deref() {
         Some(raw) => parse_environment_list(raw),
         None => registry.list().await,
     };
@@ -129,6 +133,7 @@ async fn deploy(
         .migrations(migrations.clone())
         .strategy(strategy.into())
         .dry_run(dry_run)
+        .approved(approve)
         .build();
 
     let coordinator =

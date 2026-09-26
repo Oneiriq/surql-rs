@@ -386,3 +386,139 @@ async fn deploy_applies_only_pending_and_rolls_back_only_this_run() {
     assert!(!tables_b.contains(&"keep_me".to_string()), "{tables_b:?}");
     assert!(tables_b.contains(&"clash".to_string()), "{tables_b:?}");
 }
+#[tokio::test]
+async fn require_approval_refuses_unapproved_deploy() {
+    let database = unique_db("it_orch_appr");
+    let Some(cfg) = integration_config(&database) else {
+        eprintln!("SURREAL_URL not set; skipping");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    seed_migrations(tmp.path(), "needs_ok");
+    let migrations = discover_migrations(tmp.path()).expect("discover");
+
+    let registry = EnvironmentRegistry::new();
+    let env = EnvironmentConfig::builder("prod", cfg.clone())
+        .require_approval(true)
+        .build()
+        .expect("env");
+    registry.register(env).await;
+    let plan = DeploymentPlan::builder(registry.clone())
+        .environment("prod")
+        .migrations(migrations)
+        .verify_health(false)
+        .build();
+    let outcome = coordinator(&registry).deploy(&plan).await;
+    assert!(
+        outcome.is_err(),
+        "unapproved deploy must be refused: {outcome:?}"
+    );
+    assert!(!table_names(&cfg).await.contains(&"needs_ok".to_string()));
+
+    let approved = DeploymentPlan {
+        approved: true,
+        ..plan
+    };
+    let results = coordinator(&registry)
+        .deploy(&approved)
+        .await
+        .expect("approved deploy");
+    assert_eq!(results["prod"].status, DeploymentStatus::Success);
+    assert!(table_names(&cfg).await.contains(&"needs_ok".to_string()));
+}
+
+#[tokio::test]
+async fn allow_destructive_false_refuses_a_destructive_auto_rollback() {
+    let db_a = unique_db("it_orch_keep");
+    let db_b = unique_db("it_orch_break");
+    let (Some(cfg_a), Some(cfg_b)) = (integration_config(&db_a), integration_config(&db_b)) else {
+        eprintln!("SURREAL_URL not set; skipping");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_migration(
+        tmp.path(),
+        "20260101_000001_one.surql",
+        &migration_file(
+            "20260101_000001",
+            "DEFINE TABLE ledger;",
+            "REMOVE TABLE ledger;",
+        ),
+    );
+    let migrations = discover_migrations(tmp.path()).expect("discover");
+    // B already has the table, so the migration fails there.
+    query(&cfg_b, "DEFINE TABLE ledger;").await;
+
+    let registry = EnvironmentRegistry::new();
+    let guarded = EnvironmentConfig::builder("guarded", cfg_a.clone())
+        .allow_destructive(false)
+        .build()
+        .expect("env");
+    registry.register(guarded).await;
+    register(&registry, "breaks", &cfg_b).await;
+    let plan = DeploymentPlan::builder(registry.clone())
+        .environments(["guarded", "breaks"])
+        .migrations(migrations)
+        .verify_health(false)
+        .build();
+    let results = coordinator(&registry).deploy(&plan).await.expect("deploy");
+
+    let guarded = &results["guarded"];
+    assert_eq!(guarded.status, DeploymentStatus::Success, "{guarded:?}");
+    assert!(guarded.rolled_back_versions.is_empty());
+    assert!(
+        guarded
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("allow_destructive"),
+        "{guarded:?}"
+    );
+    assert!(table_names(&cfg_a).await.contains(&"ledger".to_string()));
+    assert_eq!(results["breaks"].status, DeploymentStatus::Failed);
+}
+
+#[tokio::test]
+async fn allow_destructive_false_refuses_destructive_migration() {
+    let database = unique_db("it_orch_destr");
+    let Some(cfg) = integration_config(&database) else {
+        eprintln!("SURREAL_URL not set; skipping");
+        return;
+    };
+    query(&cfg, "DEFINE TABLE precious; CREATE precious:1;").await;
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_migration(
+        tmp.path(),
+        "20260101_000001_drop.surql",
+        &migration_file(
+            "20260101_000001",
+            "REMOVE TABLE precious;",
+            "DEFINE TABLE precious;",
+        ),
+    );
+    let migrations = discover_migrations(tmp.path()).expect("discover");
+
+    let registry = EnvironmentRegistry::new();
+    let env = EnvironmentConfig::builder("prod", cfg.clone())
+        .allow_destructive(false)
+        .build()
+        .expect("env");
+    registry.register(env).await;
+    let plan = DeploymentPlan::builder(registry.clone())
+        .environment("prod")
+        .migrations(migrations)
+        .verify_health(false)
+        .build();
+    let results = coordinator(&registry).deploy(&plan).await.expect("deploy");
+    let result = &results["prod"];
+    assert_eq!(result.status, DeploymentStatus::Failed, "{result:?}");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("destructive"),
+        "{result:?}"
+    );
+    assert!(table_names(&cfg).await.contains(&"precious".to_string()));
+}

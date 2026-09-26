@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub use canary::CanaryStrategy;
 pub use parallel::ParallelStrategy;
@@ -35,6 +35,7 @@ use crate::migration::{
 use crate::orchestration::coordinator::DeploymentPlan;
 use crate::orchestration::environment::EnvironmentConfig;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
+use crate::orchestration::safety::{destructive_statements, needs_approval};
 
 /// Strategy for rolling migrations out to a plan's environments.
 ///
@@ -56,6 +57,12 @@ pub trait DeploymentStrategy: std::fmt::Debug + Send + Sync {
 /// environment that is partway through the plan is brought up to date
 /// rather than having its earlier migrations re-run. The versions applied
 /// are listed in [`DeploymentResult::applied_versions`].
+///
+/// Nothing is applied, and the result is a failure, when the environment
+/// has `require_approval` and [`DeploymentPlan::approved`] is not set, or
+/// when it has `allow_destructive = false` and a pending migration's `up`
+/// statements are destructive (drop a table or field, change a field
+/// type, delete records, ...).
 ///
 /// A dry run does not connect: it reports every plan migration as the
 /// upper bound of what would be applied.
@@ -85,6 +92,14 @@ pub async fn deploy_to_environment(
             .build();
     }
 
+    if needs_approval(env, plan) {
+        warn!(environment = %env.name, "deployment_requires_approval");
+        return failed(
+            "environment requires approval and the plan is not approved".into(),
+            Vec::new(),
+        );
+    }
+
     let client = match DatabaseClient::new(env.connection.clone()) {
         Ok(client) => client,
         Err(err) => {
@@ -105,6 +120,21 @@ pub async fn deploy_to_environment(
             return failed(format!("cannot read migration history: {err}"), Vec::new());
         }
     };
+    if !env.allow_destructive {
+        let destructive = destructive_statements(&pending, MigrationDirection::Up);
+        if !destructive.is_empty() {
+            warn!(environment = %env.name, "deployment_refused_destructive");
+            let _ = client.disconnect().await;
+            return failed(
+                format!(
+                    "refusing destructive migration(s) on an environment with \
+                     allow_destructive = false: {}",
+                    destructive.join(", ")
+                ),
+                Vec::new(),
+            );
+        }
+    }
     info!(
         environment = %env.name,
         pending = pending.len(),

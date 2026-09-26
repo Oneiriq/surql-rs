@@ -16,6 +16,7 @@ use crate::orchestration::environment::EnvironmentRegistry;
 use crate::orchestration::health::HealthCheck;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
 use crate::orchestration::rollback::rollback_deployment;
+use crate::orchestration::safety::needs_approval;
 use crate::orchestration::strategies::{
     resolve_plan_environments, CanaryStrategy, DeploymentStrategy, ParallelStrategy,
     RollingStrategy, SequentialStrategy,
@@ -126,6 +127,10 @@ pub struct DeploymentPlan {
     pub auto_rollback: bool,
     /// Simulate deployment without executing migrations.
     pub dry_run: bool,
+    /// The operator's approval to change environments marked
+    /// [`require_approval`](crate::orchestration::EnvironmentConfig::require_approval).
+    /// Without it such an environment is neither deployed nor rolled back.
+    pub approved: bool,
 }
 
 impl DeploymentPlan {
@@ -142,6 +147,7 @@ impl DeploymentPlan {
             verify_health: true,
             auto_rollback: true,
             dry_run: false,
+            approved: false,
         }
     }
 }
@@ -159,6 +165,7 @@ pub struct DeploymentPlanBuilder {
     verify_health: bool,
     auto_rollback: bool,
     dry_run: bool,
+    approved: bool,
 }
 
 impl DeploymentPlanBuilder {
@@ -226,6 +233,12 @@ impl DeploymentPlanBuilder {
         self
     }
 
+    /// Record the operator's approval for environments that require it.
+    pub fn approved(mut self, value: bool) -> Self {
+        self.approved = value;
+        self
+    }
+
     /// Finalise into a [`DeploymentPlan`].
     pub fn build(self) -> DeploymentPlan {
         DeploymentPlan {
@@ -239,6 +252,7 @@ impl DeploymentPlanBuilder {
             verify_health: self.verify_health,
             auto_rollback: self.auto_rollback,
             dry_run: self.dry_run,
+            approved: self.approved,
         }
     }
 }
@@ -302,12 +316,19 @@ impl MigrationCoordinator {
     /// are reported as [`DeploymentStatus::RolledBack`]; migrations that
     /// were applied before this call are never touched.
     ///
+    /// Environment guards: nothing runs unless every environment with
+    /// `require_approval` is covered by [`DeploymentPlan::approved`]. An
+    /// environment with `allow_destructive = false` refuses (as a failed
+    /// result) a deployment whose pending `up` statements are destructive,
+    /// and its auto-rollback refuses destructive `down` statements.
+    ///
     /// # Errors
     ///
     /// Returns [`SurqlError::Orchestration`] when environments cannot be
-    /// resolved, pre-flight health checks fail, or the strategy raises
-    /// a fatal error. Per-environment failures are reported through the
-    /// returned map (status = [`DeploymentStatus::Failed`]).
+    /// resolved, an environment requires an approval the plan lacks,
+    /// pre-flight health checks fail, or the strategy raises a fatal
+    /// error. Per-environment failures are reported through the returned
+    /// map (status = [`DeploymentStatus::Failed`]).
     pub async fn deploy(&self, plan: &DeploymentPlan) -> Result<HashMap<String, DeploymentResult>> {
         info!(
             environments = plan.environments.len(),
@@ -319,6 +340,22 @@ impl MigrationCoordinator {
 
         // Resolve environments up front so missing names fail fast.
         let envs = resolve_plan_environments(plan).await?;
+
+        if !plan.dry_run {
+            let unapproved: Vec<&str> = envs
+                .iter()
+                .filter(|env| needs_approval(env, plan))
+                .map(|env| env.name.as_str())
+                .collect();
+            if !unapproved.is_empty() {
+                return Err(SurqlError::Orchestration {
+                    reason: format!(
+                        "environment(s) {} require approval; approve the plan to deploy",
+                        unapproved.join(", ")
+                    ),
+                });
+            }
+        }
 
         if plan.verify_health && !plan.dry_run {
             info!("verifying_environment_health");

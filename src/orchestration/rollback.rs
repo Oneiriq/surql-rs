@@ -5,7 +5,10 @@
 //! to [`rollback_deployment`]. Only the migrations the deployment itself
 //! applied (its [`DeploymentResult::applied_versions`]) are reverted,
 //! newest first; whatever an environment held before the deployment is
-//! left alone.
+//! left alone. The environment guards apply here as well: a rollback does
+//! not start on an environment that requires an approval the plan lacks,
+//! or on one with `allow_destructive = false` when the `down` statements
+//! to run are destructive.
 //!
 //! The status afterwards describes where the environment ended up:
 //!
@@ -26,6 +29,7 @@ use crate::migration::{execute_migration, Migration, MigrationDirection};
 use crate::orchestration::coordinator::DeploymentPlan;
 use crate::orchestration::environment::EnvironmentConfig;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
+use crate::orchestration::safety::{destructive_statements, needs_approval};
 use crate::orchestration::strategies::migration_failure;
 
 /// Revert what the deployment applied to each environment in `results`.
@@ -56,6 +60,22 @@ async fn rollback_environment(
         Ok(migrations) => migrations,
         Err(reason) => return not_started(result, &reason),
     };
+    if needs_approval(env, plan) {
+        return not_started(result, "environment requires approval");
+    }
+    if !env.allow_destructive {
+        let destructive = destructive_statements(&to_revert, MigrationDirection::Down);
+        if !destructive.is_empty() {
+            return not_started(
+                result,
+                &format!(
+                    "destructive down statement(s) on an environment with \
+                     allow_destructive = false: {}",
+                    destructive.join(", ")
+                ),
+            );
+        }
+    }
 
     info!(environment = %env.name, count = to_revert.len(), "rolling_back_environment");
     let client = match DatabaseClient::new(env.connection.clone()) {
