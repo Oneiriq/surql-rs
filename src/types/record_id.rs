@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::escape::{is_identifier, quote_ident, quote_record_key, unescape};
 use crate::error::{Result, SurqlError};
+use crate::query::expressions::Expression;
 
 /// Value held by a [`RecordID`].
 ///
@@ -276,6 +277,14 @@ impl<T> fmt::Display for RecordID<T> {
     }
 }
 
+/// A record id as a SurrealQL expression (its `table:key` literal), for the
+/// typed comparisons such as [`eq_expr`](super::operators::eq_expr).
+impl<T> From<RecordID<T>> for Expression {
+    fn from(id: RecordID<T>) -> Self {
+        Expression::raw(id.to_string())
+    }
+}
+
 impl<T> Serialize for RecordID<T> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -386,6 +395,12 @@ mod tests {
         }
         let id = RecordID::<()>::new("t", -5_i64).unwrap();
         assert_eq!(RecordID::<()>::parse(&id.to_string()).unwrap(), id);
+    }
+
+    #[test]
+    fn converts_into_an_escaped_expression() {
+        let id = RecordID::<()>::new("user", "x⟩; DELETE user").unwrap();
+        assert_eq!(Expression::from(id).to_surql(), "user:`x⟩; DELETE user`");
     }
 
     #[test]

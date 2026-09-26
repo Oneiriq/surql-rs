@@ -15,9 +15,18 @@
 //!     .limit(10).unwrap()
 //!     .to_surql().unwrap();
 //! assert_eq!(sql, "SELECT * FROM user:alice->follows LIMIT 10");
+//!
+//! // Two hops out, landing on `user` records.
+//! let sql = GraphQuery::new("user:alice")
+//!     .out("follows", Some(2))
+//!     .to("user")
+//!     .to_surql().unwrap();
+//! assert_eq!(sql, "SELECT * FROM user:alice->follows->?->follows->user");
 //! ```
 
 use crate::error::{Result, SurqlError};
+
+use super::validate::{render_target, validate_depth, validate_field_path, validate_identifier};
 
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 use serde::de::DeserializeOwned;
@@ -29,22 +38,33 @@ use crate::connection::DatabaseClient;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 use crate::query::executor::{extract_rows, flatten_rows};
 
+/// One traversal step: an arrow, an edge table, and an optional depth.
+#[derive(Debug, Clone, PartialEq)]
+struct Hop {
+    arrow: &'static str,
+    edge: String,
+    depth: Option<u32>,
+}
+
 /// Immutable fluent builder for graph traversal queries.
 ///
-/// The builder accumulates arrow segments (`->edge[depth]` / `<-edge[depth]`
-/// / `<->edge[depth]`), an optional target table, `WHERE` fragments,
-/// projected fields, `FETCH` clauses, and a `LIMIT`. Call
-/// [`GraphQuery::to_surql`] to render the SurrealQL, or
-/// [`GraphQuery::execute`] / [`GraphQuery::fetch_typed`] /
+/// The builder accumulates traversal steps (`out` / `in` / `both`), an
+/// optional target table, `WHERE` fragments, projected fields, `FETCH`
+/// clauses, and a `LIMIT`. Call [`GraphQuery::to_surql`] to render the
+/// SurrealQL, or [`GraphQuery::execute`] / [`GraphQuery::fetch_typed`] /
 /// [`GraphQuery::count`] / [`GraphQuery::exists`] to dispatch against a
 /// [`DatabaseClient`].
+///
+/// Names are checked when the query is rendered: the start must be a table
+/// or record id, edges and the target table identifiers, and projected and
+/// fetched fields field paths (or `*`). `WHERE` fragments are raw SurrealQL.
 ///
 /// All chain methods take `self` by value; use `.clone()` to fork a
 /// partially-built query.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GraphQuery {
     start: String,
-    path: Vec<String>,
+    path: Vec<Hop>,
     conditions: Vec<String>,
     fields: Vec<String>,
     fetch: Vec<String>,
@@ -66,46 +86,59 @@ impl GraphQuery {
         }
     }
 
-    /// Append an outgoing arrow (`->edge[depth]`).
-    pub fn out(mut self, edge: impl AsRef<str>, depth: Option<u32>) -> Self {
-        let depth_str = depth.map_or(String::new(), |d| d.to_string());
-        self.path.push(format!("->{}{depth_str}", edge.as_ref()));
+    fn hop(mut self, arrow: &'static str, edge: &str, depth: Option<u32>) -> Self {
+        self.path.push(Hop {
+            arrow,
+            edge: edge.to_owned(),
+            depth,
+        });
         self
     }
 
-    /// Append an incoming arrow (`<-edge[depth]`).
+    /// Append an outgoing step through `edge`.
+    ///
+    /// Without a depth this is the single hop `->edge`, which selects the
+    /// edge records. With `Some(n)` it is exactly `n` hops through `edge`
+    /// to the records at the far end, spelled out as `->edge->?` per hop
+    /// (the form SurrealDB 3 accepts, as in the sibling ports); `n` must be
+    /// in `1..=32`.
+    pub fn out(self, edge: impl AsRef<str>, depth: Option<u32>) -> Self {
+        self.hop("->", edge.as_ref(), depth)
+    }
+
+    /// Append an incoming step (`<-edge`, see [`GraphQuery::out`] for the
+    /// depth).
     ///
     /// Renamed from Python's `in_` to use Rust's raw-identifier syntax;
     /// semantics match `GraphQuery.in_` exactly.
-    pub fn r#in(mut self, edge: impl AsRef<str>, depth: Option<u32>) -> Self {
-        let depth_str = depth.map_or(String::new(), |d| d.to_string());
-        self.path.push(format!("<-{}{depth_str}", edge.as_ref()));
-        self
+    pub fn r#in(self, edge: impl AsRef<str>, depth: Option<u32>) -> Self {
+        self.hop("<-", edge.as_ref(), depth)
     }
 
-    /// Append a bidirectional arrow (`<->edge[depth]`).
-    pub fn both(mut self, edge: impl AsRef<str>, depth: Option<u32>) -> Self {
-        let depth_str = depth.map_or(String::new(), |d| d.to_string());
-        self.path.push(format!("<->{}{depth_str}", edge.as_ref()));
-        self
+    /// Append a bidirectional step (`<->edge`, see [`GraphQuery::out`] for
+    /// the depth).
+    pub fn both(self, edge: impl AsRef<str>, depth: Option<u32>) -> Self {
+        self.hop("<->", edge.as_ref(), depth)
     }
 
-    /// Narrow the tail of the traversal to a specific target table. The
-    /// corresponding SurrealQL is `->target_table` appended after the last
-    /// edge hop.
+    /// Narrow the tail of the traversal to a specific target table: the
+    /// records at the far end of the last step, reached in that step's
+    /// direction (`.r#in("follows", None).to("user")` renders
+    /// `<-follows<-user`).
     pub fn to(mut self, target: impl Into<String>) -> Self {
         self.target_table = Some(target.into());
         self
     }
 
-    /// Append a `WHERE` condition. Multiple calls are combined with `AND`.
+    /// Append a `WHERE` condition (raw SurrealQL). Multiple calls are
+    /// combined with `AND`.
     pub fn r#where(mut self, condition: impl Into<String>) -> Self {
         self.conditions.push(condition.into());
         self
     }
 
-    /// Project the given fields (`SELECT <fields> FROM ...`). Repeated
-    /// calls extend the projection list.
+    /// Project the given fields (`SELECT <fields> FROM ...`). Each must be a
+    /// field path or `*`. Repeated calls extend the projection list.
     pub fn select<I, S>(mut self, fields: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -126,7 +159,7 @@ impl GraphQuery {
         Ok(self)
     }
 
-    /// Append records to the `FETCH` clause (e.g. `FETCH author, tags`).
+    /// Append field paths to the `FETCH` clause (e.g. `FETCH author, tags`).
     pub fn fetch<I, S>(mut self, refs: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -136,78 +169,100 @@ impl GraphQuery {
         self
     }
 
-    /// Render the built query to SurrealQL.
-    ///
-    /// Returns a validation error when no traversal step has been added.
-    pub fn to_surql(&self) -> Result<String> {
-        if self.path.is_empty() {
+    /// Render `<start><steps>[<target>]`, checking every name.
+    fn render_source(&self) -> Result<String> {
+        let Some(last) = self.path.last() else {
             return Err(SurqlError::Validation {
                 reason: "At least one traversal step (out, in, both) is required".to_string(),
             });
-        }
-
-        let fields_str = if self.fields.is_empty() {
-            "*".to_string()
-        } else {
-            self.fields.join(", ")
         };
-
-        let mut path_str = self.path.join("");
-        if let Some(target) = &self.target_table {
-            path_str.push_str("->");
-            path_str.push_str(target);
+        let mut source = render_target(&self.start)?;
+        for hop in &self.path {
+            validate_identifier(&hop.edge, "edge table name")?;
+            let Hop { arrow, edge, depth } = hop;
+            match *depth {
+                None => {
+                    source.push_str(arrow);
+                    source.push_str(edge);
+                }
+                Some(depth) => {
+                    validate_depth(depth)?;
+                    let step = format!("{arrow}{edge}{arrow}?");
+                    for _ in 0..depth {
+                        source.push_str(&step);
+                    }
+                }
+            }
         }
+        if let Some(target) = &self.target_table {
+            validate_identifier(target, "target table name")?;
+            // A depth step already ends on its records (`->?`): the target
+            // replaces the wildcard. A single hop ends on the edge, so the
+            // target is one more arrow in the same direction.
+            if last.depth.is_some() {
+                source.pop();
+            } else {
+                source.push_str(last.arrow);
+            }
+            source.push_str(target);
+        }
+        Ok(source)
+    }
 
-        let mut parts = vec![format!("SELECT {fields_str} FROM {}{path_str}", self.start)];
-
-        if !self.conditions.is_empty() {
+    fn render_where(&self) -> Option<String> {
+        (!self.conditions.is_empty()).then(|| {
             let joined = self
                 .conditions
                 .iter()
                 .map(|c| format!("({c})"))
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            parts.push(format!("WHERE {joined}"));
+            format!("WHERE {joined}")
+        })
+    }
+
+    /// Render the built query to SurrealQL.
+    ///
+    /// Returns a validation error when no traversal step has been added, or
+    /// when a name or depth is not acceptable.
+    pub fn to_surql(&self) -> Result<String> {
+        let source = self.render_source()?;
+
+        let fields_str = if self.fields.is_empty() {
+            "*".to_string()
+        } else {
+            for field in self.fields.iter().filter(|f| f.as_str() != "*") {
+                validate_field_path(field, "projected field")?;
+            }
+            self.fields.join(", ")
+        };
+
+        let mut parts = vec![format!("SELECT {fields_str} FROM {source}")];
+        parts.extend(self.render_where());
+
+        // SurrealQL takes LIMIT before FETCH; the reverse is a parse error.
+        if let Some(n) = self.limit_value {
+            parts.push(format!("LIMIT {n}"));
         }
 
         if !self.fetch.is_empty() {
+            for field in &self.fetch {
+                validate_field_path(field, "fetch field")?;
+            }
             parts.push(format!("FETCH {}", self.fetch.join(", ")));
-        }
-
-        if let Some(n) = self.limit_value {
-            parts.push(format!("LIMIT {n}"));
         }
 
         Ok(parts.join(" "))
     }
 
     /// Render a matching `SELECT count() FROM ... GROUP ALL` query.
+    #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
     fn to_count_surql(&self) -> Result<String> {
-        if self.path.is_empty() {
-            return Err(SurqlError::Validation {
-                reason: "At least one traversal step (out, in, both) is required".to_string(),
-            });
-        }
-
-        let mut path_str = self.path.join("");
-        if let Some(target) = &self.target_table {
-            path_str.push_str("->");
-            path_str.push_str(target);
-        }
-
-        let mut sql = format!("SELECT count() FROM {}{path_str}", self.start);
-        if !self.conditions.is_empty() {
-            let joined = self
-                .conditions
-                .iter()
-                .map(|c| format!("({c})"))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            sql.push_str(" WHERE ");
-            sql.push_str(&joined);
-        }
-        sql.push_str(" GROUP ALL");
-        Ok(sql)
+        let source = self.render_source()?;
+        let mut parts = vec![format!("SELECT count() FROM {source}")];
+        parts.extend(self.render_where());
+        parts.push("GROUP ALL".to_owned());
+        Ok(parts.join(" "))
     }
 
     /// Execute the rendered query and return raw JSON rows.
@@ -273,7 +328,7 @@ mod tests {
             .r#in("follows", Some(2))
             .to_surql()
             .unwrap();
-        assert_eq!(sql, "SELECT * FROM user:alice<-follows2");
+        assert_eq!(sql, "SELECT * FROM user:alice<-follows<-?<-follows<-?");
     }
 
     #[test]
@@ -283,6 +338,78 @@ mod tests {
             .to_surql()
             .unwrap();
         assert_eq!(sql, "SELECT * FROM user:alice<->knows");
+    }
+
+    #[test]
+    fn depth_unrolls_into_repeated_hops() {
+        let sql = GraphQuery::new("user:alice")
+            .out("follows", Some(2))
+            .to_surql()
+            .unwrap();
+        assert_eq!(sql, "SELECT * FROM user:alice->follows->?->follows->?");
+        let sql = GraphQuery::new("user:alice")
+            .out("follows", Some(2))
+            .to("user")
+            .to_surql()
+            .unwrap();
+        assert_eq!(sql, "SELECT * FROM user:alice->follows->?->follows->user");
+        assert!(GraphQuery::new("user:alice")
+            .out("follows", Some(0))
+            .to_surql()
+            .is_err());
+    }
+
+    #[test]
+    fn to_follows_the_direction_of_the_last_hop() {
+        let sql = GraphQuery::new("user:alice")
+            .r#in("follows", None)
+            .to("user")
+            .to_surql()
+            .unwrap();
+        assert_eq!(sql, "SELECT * FROM user:alice<-follows<-user");
+    }
+
+    #[test]
+    fn limit_renders_before_fetch() {
+        let sql = GraphQuery::new("user:alice")
+            .out("likes", None)
+            .fetch(["out"])
+            .limit(1)
+            .unwrap()
+            .to_surql()
+            .unwrap();
+        assert_eq!(sql, "SELECT * FROM user:alice->likes LIMIT 1 FETCH out");
+    }
+
+    #[test]
+    fn names_are_validated() {
+        let hostile = "follows; DELETE user; --";
+        assert!(GraphQuery::new("user:alice")
+            .out(hostile, None)
+            .to_surql()
+            .is_err());
+        assert!(GraphQuery::new("user:alice")
+            .out("follows", None)
+            .to(hostile)
+            .to_surql()
+            .is_err());
+        assert!(GraphQuery::new("user:alice")
+            .out("follows", None)
+            .select([hostile])
+            .to_surql()
+            .is_err());
+        assert!(GraphQuery::new("user:alice")
+            .out("follows", None)
+            .fetch([hostile])
+            .to_surql()
+            .is_err());
+        assert_eq!(
+            GraphQuery::new("user:a; DELETE user")
+                .out("follows", None)
+                .to_surql()
+                .unwrap(),
+            "SELECT * FROM user:⟨a; DELETE user⟩->follows"
+        );
     }
 
     #[test]
@@ -349,6 +476,30 @@ mod tests {
     }
 
     #[test]
+    fn depth_is_bounded() {
+        assert!(GraphQuery::new("user:alice")
+            .out("follows", Some(32))
+            .to_surql()
+            .is_ok());
+        assert!(GraphQuery::new("user:alice")
+            .out("follows", Some(33))
+            .to_surql()
+            .is_err());
+    }
+
+    #[test]
+    fn mixed_steps_render_in_order() {
+        let sql = GraphQuery::new("user:alice")
+            .out("wrote", None)
+            .both("tagged", Some(1))
+            .to("topic")
+            .to_surql()
+            .unwrap();
+        assert_eq!(sql, "SELECT * FROM user:alice->wrote<->tagged<->topic");
+    }
+
+    #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
+    #[test]
     fn count_surql_includes_group_all() {
         let sql = GraphQuery::new("user:alice")
             .out("follows", None)
@@ -357,6 +508,7 @@ mod tests {
         assert_eq!(sql, "SELECT count() FROM user:alice->follows GROUP ALL");
     }
 
+    #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
     #[test]
     fn count_surql_with_where() {
         let sql = GraphQuery::new("user:alice")

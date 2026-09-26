@@ -39,8 +39,10 @@ let target = type_record("task", id).to_surql();
 update_record_target(&client, &target, data).await?;
 ```
 
-`type_thing(...)` emits the SurrealDB v2-compatible alias verbatim -
-use it when a query plan relies on the literal function name matching.
+`type_thing(...)` is kept as an alias for the sibling ports and renders
+`type::record(...)` too: SurrealDB 3 removed `type::thing` and rejects
+it at parse time. The table and a string id are rendered as escaped
+string literals.
 
 Numeric ids are accepted directly:
 
@@ -48,6 +50,36 @@ Numeric ids are accepted directly:
 let num = type_record("post", 42_i64);
 assert_eq!(num.to_surql(), "type::record('post', 42)");
 ```
+
+### Raw values go through typed channels
+
+A `serde_json::Value` is always data. Serialising a `RecordRef` or
+`SurrealFn` into JSON and passing it as a value renders an object literal
+(`{ table: 'task', record_id: 'abc' }`), never the function call: the
+renderer cannot tell such an object from untrusted input of the same
+shape. To use one as SurrealQL, convert it into an `Expression`:
+
+```rust
+use surql::query::builder::Query;
+use surql::query::expressions::time_now;
+use surql::types::operators::eq_expr;
+use surql::types::record_ref;
+
+// In a WHERE clause: the `*_expr` comparisons take any Expression.
+let q = Query::new()
+    .select(None)
+    .from_table("post")?
+    .where_(eq_expr("author", record_ref("user", "alice")));
+
+// In CREATE / UPSERT / RELATE content, or an UPDATE SET: `set_expr`.
+let q = Query::new()
+    .insert("post", data)?
+    .set_expr("created_at", time_now())?
+    .set_expr("author", record_ref("user", "alice").into())?;
+```
+
+`SurrealFn`, `RecordRef`, and `RecordID` all convert into an
+`Expression` with `.into()`.
 
 ## `extract_many` / `has_result`
 
@@ -78,10 +110,16 @@ let values = extract_many(&raw);
 if !has_result(&raw) { return Ok(None); }
 ```
 
-Both handle the two common response shapes:
+Both handle the common response shapes, decided per statement:
 
+- The Rust client's one-array-per-statement shape: `[[{...}, {...}]]`
 - Flat arrays: `[{...}, {...}]`
 - Nested `result` wrappers: `[{"result": [...]}]`
+
+Each statement's rows are spread by exactly one level, so a row that is
+itself an array (`SELECT VALUE tags`) stays one row, and a row with a
+`result` field is kept whole. Rows that are not objects
+(`SELECT VALUE name`) come back wrapped as `{"value": ...}`.
 
 ## `SurrealQL` function factories (snake_case)
 
@@ -208,8 +246,9 @@ let rows = aggregate_records(
 ```
 
 Each row is a JSON object keyed by the aliases in
-`AggregateOpts::select`. Pair with [`extract_scalar`] to pull a single
-field out of the single-row `GROUP ALL` case:
+`AggregateOpts::select`. Aliases and `group_by` entries must be field
+paths (`total`, `meta.count`). Pair with [`extract_scalar`] to pull a
+single field out of the single-row `GROUP ALL` case:
 
 ```rust
 use surql::extract_scalar;

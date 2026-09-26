@@ -376,12 +376,11 @@ async fn type_record_target_round_trip_with_update() {
     .expect("upsert via type::record target");
     assert_eq!(upserted["status"], "archived");
 
-    // type_thing renders the SurrealQL `type::thing(...)` form deterministically;
-    // v3.0.5 only honours it in some positions so we assert the shape
-    // rather than executing it here.
+    // SurrealDB 3 rejects `type::thing(...)` at parse time, so `type_thing`
+    // renders the `type::record(...)` it was an alias of.
     assert_eq!(
         type_thing("task", "abc").to_surql(),
-        "type::thing('task', 'abc')",
+        "type::record('task', 'abc')",
     );
 
     client.disconnect().await.unwrap();

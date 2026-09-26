@@ -1,11 +1,22 @@
 //! Query optimization hints.
 //!
-//! Port of `surql/query/hints.py`. Each hint renders to a SurrealQL comment
-//! that the query planner interprets (e.g. `/* USE INDEX user.email_idx */`).
+//! Port of `surql/query/hints.py`. Each hint renders to a `/* ... */`
+//! comment prefixed to the statement (e.g. `/* USE INDEX user.email_idx */`).
+//!
+//! SurrealDB discards comments when it parses a statement, so a hint does
+//! not change how the query runs: it is an annotation carried in the
+//! statement text, visible in logs, slow-query captures, and any tooling
+//! that reads the SurrealQL. To change execution, use the SurrealQL clause
+//! itself (`WITH INDEX`, `TIMEOUT`, `PARALLEL`, `EXPLAIN`, `FETCH`).
+//!
+//! A hint's text can never end its comment early: any `*/` inside it is
+//! broken up when rendered, and `Query::to_surql` refuses index hints whose
+//! table or index is not an identifier.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::is_identifier;
 
 /// Category of a query hint; used to deduplicate when [`merge_hints`]
 /// collapses overlapping hints.
@@ -115,7 +126,7 @@ impl IndexHint {
 impl HintExpr for IndexHint {
     fn to_surql(&self) -> String {
         let prefix = if self.force { "FORCE" } else { "USE" };
-        format!("/* {prefix} INDEX {}.{} */", self.table, self.index)
+        comment(&format!("{prefix} INDEX {}.{}", self.table, self.index))
     }
     fn hint_type(&self) -> HintType {
         HintType::Index
@@ -189,9 +200,10 @@ pub struct TimeoutHint {
 }
 
 impl TimeoutHint {
-    /// Build a timeout hint. Returns [`SurqlError::Validation`] when `seconds <= 0`.
+    /// Build a timeout hint. Returns [`SurqlError::Validation`] when `seconds`
+    /// is not a finite number above zero.
     pub fn new(seconds: f64) -> Result<Self> {
-        if seconds.is_nan() || seconds <= 0.0 {
+        if !seconds.is_finite() || seconds <= 0.0 {
             return Err(SurqlError::Validation {
                 reason: format!("TimeoutHint seconds must be > 0, got {seconds}"),
             });
@@ -327,34 +339,60 @@ impl HintExpr for ExplainHint {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Render `body` as a block comment. `*/` inside the body is broken up so
+/// the comment always ends where it was meant to (SurrealQL comments do not
+/// nest, so an embedded `/*` is harmless).
+fn comment(body: &str) -> String {
+    format!("/* {} */", body.replace("*/", "* /"))
+}
+
 /// Validate a hint against the query's target table. Returns a list of
 /// human-readable problems (empty on success).
+///
+/// An index hint's table and index must be identifiers, and its table must
+/// match `table` when one is given.
 pub fn validate_hint(hint: &QueryHint, table: Option<&str>) -> Vec<String> {
     let mut errors = Vec::new();
-    if let (QueryHint::Index(h), Some(tbl)) = (hint, table) {
-        if h.table != tbl {
-            errors.push(format!(
-                "Index hint table {:?} does not match query table {:?}",
-                h.table, tbl
-            ));
+    if let QueryHint::Index(h) = hint {
+        for (what, name) in [("table", &h.table), ("index", &h.index)] {
+            if !is_identifier(name) {
+                errors.push(format!("Index hint {what} {name:?} is not an identifier"));
+            }
+        }
+        if let Some(tbl) = table {
+            if h.table != tbl {
+                errors.push(format!(
+                    "Index hint table {:?} does not match query table {:?}",
+                    h.table, tbl
+                ));
+            }
         }
     }
     errors
 }
 
+/// Refuse hints that cannot render as intended: an index hint naming a
+/// non-identifier, or a batch fetch hint without a size.
+pub(crate) fn check_hints(hints: &[QueryHint]) -> Result<()> {
+    hints.iter().try_for_each(|hint| match hint {
+        QueryHint::Fetch(h) => h.validate(),
+        QueryHint::Index(_) => match validate_hint(hint, None).into_iter().next() {
+            Some(reason) => Err(SurqlError::Validation { reason }),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    })
+}
+
 /// Collapse duplicate hints: later hints of the same [`HintType`] replace
 /// earlier ones (preserving insertion order of the kept entries).
 pub fn merge_hints(hints: impl IntoIterator<Item = QueryHint>) -> Vec<QueryHint> {
-    use std::collections::HashMap;
-    let mut map: HashMap<HintType, usize> = HashMap::new();
     let mut out: Vec<QueryHint> = Vec::new();
     for hint in hints {
         let ty = hint.hint_type();
-        if let Some(idx) = map.get(&ty) {
-            out[*idx] = hint;
-        } else {
-            map.insert(ty, out.len());
-            out.push(hint);
+        match out.iter_mut().find(|kept| kept.hint_type() == ty) {
+            Some(kept) => *kept = hint,
+            None => out.push(hint),
         }
     }
     out
@@ -399,6 +437,16 @@ mod tests {
             IndexHint::new("user", "email_idx").force(true).to_surql(),
             "/* FORCE INDEX user.email_idx */"
         );
+    }
+
+    #[test]
+    fn index_hint_cannot_close_the_comment() {
+        let hint = IndexHint::new("user", "x */ REMOVE TABLE user; /*");
+        let rendered = hint.to_surql();
+        assert!(rendered.starts_with("/* ") && rendered.ends_with(" */"));
+        let body = &rendered[3..rendered.len() - 3];
+        assert!(!body.contains("*/"), "{rendered}");
+        assert!(!validate_hint(&QueryHint::Index(hint), None).is_empty());
     }
 
     #[test]
