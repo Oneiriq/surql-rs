@@ -18,9 +18,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use surql::connection::{ConnectionConfig, DatabaseClient};
-use surql::migration::diff::diff_edges;
-use surql::migration::SchemaDiff;
+use surql::migration::diff::{diff_edges, diff_fields};
+use surql::migration::{DiffOperation, SchemaDiff};
 use surql::schema::edge::typed_edge;
+use surql::schema::parser::parse_table_full;
+use surql::schema::{
+    record_field, string_field, FieldDefinition, ReferenceAction, TableDefinition,
+};
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -91,6 +95,21 @@ async fn table_echo(client: &DatabaseClient, table: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+async fn table_info(client: &DatabaseClient, table: &str) -> Value {
+    first(
+        &client
+            .query(&format!("INFO FOR TABLE {table};"))
+            .await
+            .expect("INFO FOR TABLE"),
+    )
+}
+
+/// Read one table back through both `INFO` levels.
+async fn read_table(client: &DatabaseClient, table: &str) -> TableDefinition {
+    let define = table_echo(client, table).await.expect("table exists");
+    parse_table_full(table, &define, &table_info(client, table).await).expect("parse table")
+}
+
 /// Adding an edge that carries permissions is one statement the engine
 /// accepts; it used to be a bare `DEFINE TABLE e PERMISSIONS ...` after the
 /// `DEFINE TABLE e TYPE RELATION ...`, which the engine refuses because the
@@ -121,4 +140,75 @@ async fn an_added_edge_with_permissions_applies_and_rolls_back() {
 
     apply(&client, &backward(&diffs)).await;
     assert!(table_echo(&client, "likes").await.is_none());
+}
+
+/// Walk one field change through the engine: define `old`, apply the diff's
+/// forward, check the stored field now diffs clean against `new`, apply the
+/// backward, and check it diffs clean against `old` again.
+async fn field_change_round_trips(old: FieldDefinition, new: FieldDefinition) {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE user SCHEMAFULL;".into(),
+            "DEFINE TABLE post SCHEMAFULL;".into(),
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            old.to_surql("doc"),
+        ],
+    )
+    .await;
+
+    let diffs = diff_fields(
+        "doc",
+        std::slice::from_ref(&new),
+        std::slice::from_ref(&old),
+    );
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    assert_eq!(diffs[0].operation, DiffOperation::ModifyField);
+
+    apply(&client, &forward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&new), &stored.fields);
+    assert!(residual.is_empty(), "forward left drift: {residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&old), &stored.fields);
+    assert!(residual.is_empty(), "rollback left drift: {residual:#?}");
+}
+
+#[tokio::test]
+async fn a_field_losing_option_is_migrated_both_ways() {
+    let old = string_field("title")
+        .nullable(true)
+        .build_unchecked()
+        .unwrap();
+    let new = string_field("title").build_unchecked().unwrap();
+    field_change_round_trips(old, new).await;
+}
+
+#[tokio::test]
+async fn a_record_link_changing_target_is_migrated_both_ways() {
+    let old = record_field("owner", Some("user"))
+        .build_unchecked()
+        .unwrap();
+    let new = record_field("owner", Some("post"))
+        .build_unchecked()
+        .unwrap();
+    field_change_round_trips(old, new).await;
+}
+
+#[tokio::test]
+async fn a_reference_action_change_is_migrated_both_ways() {
+    let old = record_field("owner", Some("user"))
+        .reference(ReferenceAction::Cascade)
+        .build_unchecked()
+        .unwrap();
+    let new = record_field("owner", Some("user"))
+        .reference(ReferenceAction::Reject)
+        .build_unchecked()
+        .unwrap();
+    field_change_round_trips(old, new).await;
 }

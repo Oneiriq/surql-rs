@@ -48,7 +48,7 @@ use crate::migration::diff_objects::{diff_functions, diff_params, diff_sequences
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
-use crate::schema::fields::FieldDefinition;
+use crate::schema::fields::{FieldDefinition, FieldType};
 use crate::schema::function::FunctionDefinition;
 use crate::schema::param::ParamDefinition;
 use crate::schema::sequence::SequenceDefinition;
@@ -273,7 +273,21 @@ pub fn normalize_expression(expr: &str) -> String {
     folded
 }
 
-fn expr_eq(a: Option<&str>, b: Option<&str>) -> bool {
+/// Whether two optional expressions are the same once normalised with
+/// [`normalize_expression`]. Two absent expressions are equal; an absent and
+/// a present one are not.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff::expr_eq;
+///
+/// assert!(expr_eq(Some("(a  >  1)"), Some("a > 1")));
+/// assert!(expr_eq(None, None));
+/// assert!(!expr_eq(Some("a > 1"), None));
+/// ```
+#[must_use]
+pub fn expr_eq(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => normalize_expression(x) == normalize_expression(y),
@@ -1052,9 +1066,34 @@ fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
     field.to_surql(table)
 }
 
-fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
+/// Whether two field definitions render the same stored field.
+///
+/// Every clause [`FieldDefinition::to_surql`] renders is compared: the type
+/// with its `option<...>` wrapper and record target, `FLEXIBLE`, `READONLY`,
+/// `REFERENCE`, the `ASSERT` / `DEFAULT` / `VALUE` / `COMPUTED` expressions
+/// (through [`normalize_expression`]), and the permissions. What the engine
+/// is free to spell differently compares equal: a record target on a type
+/// that never renders one, and field permission rules that say `FULL`, the
+/// field default the engine writes out for every action a rule set leaves
+/// unnamed.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff::fields_equal;
+/// use surql::schema::{FieldDefinition, FieldType};
+///
+/// let text = FieldDefinition::new("title", FieldType::String);
+/// let code = text.clone().with_assertion("$value  !=  NONE");
+/// assert!(fields_equal(&code, &text.clone().with_assertion("$value != NONE")));
+/// assert!(!fields_equal(&text, &text.clone().with_nullable(true)));
+/// ```
+#[must_use]
+pub fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
     a.name == b.name
         && a.field_type == b.field_type
+        && a.nullable == b.nullable
+        && rendered_target(a) == rendered_target(b)
         && a.readonly == b.readonly
         && a.flexible == b.flexible
         && a.reference == b.reference
@@ -1062,6 +1101,29 @@ fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
         && expr_eq(a.default.as_deref(), b.default.as_deref())
         && expr_eq(a.value.as_deref(), b.value.as_deref())
         && expr_eq(a.computed.as_deref(), b.computed.as_deref())
+        && permissions_equal(
+            field_permissions(a.permissions.as_ref()).as_ref(),
+            field_permissions(b.permissions.as_ref()).as_ref(),
+        )
+}
+
+/// The record target a field actually renders: only `record<...>` and
+/// `array<record<...>>` carry one.
+fn rendered_target(field: &FieldDefinition) -> Option<&str> {
+    match field.field_type {
+        FieldType::Record | FieldType::Array => field.target_table.as_deref(),
+        _ => None,
+    }
+}
+
+/// A field's permission rules without the ones that restate the field
+/// default, `FULL`.
+fn field_permissions(perms: Option<&BTreeMap<String, String>>) -> Option<BTreeMap<String, String>> {
+    let kept: BTreeMap<String, String> = expand_actions(perms?)
+        .into_iter()
+        .filter(|(_, rule)| !rule.trim().eq_ignore_ascii_case("FULL"))
+        .collect();
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// Expand comma-grouped action keys (`"select, create"`) into one
@@ -1077,7 +1139,28 @@ fn expand_actions(map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     out
 }
 
-fn permissions_equal(
+/// Whether two per-action permission maps grant the same thing.
+///
+/// Comma-grouped keys (`"select, create"`) are split into one entry per
+/// action, the shape the engine echoes, and each rule compares through
+/// [`normalize_expression`]. An absent map equals an empty one.
+///
+/// ## Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use surql::migration::diff::permissions_equal;
+///
+/// let grouped = BTreeMap::from([("select, create".to_owned(), "$auth.id = id".to_owned())]);
+/// let split = BTreeMap::from([
+///     ("select".to_owned(), "$auth.id  =  id".to_owned()),
+///     ("create".to_owned(), "$auth.id = id".to_owned()),
+/// ]);
+/// assert!(permissions_equal(Some(&grouped), Some(&split)));
+/// assert!(permissions_equal(None, Some(&BTreeMap::new())));
+/// ```
+#[must_use]
+pub fn permissions_equal(
     a: Option<&BTreeMap<String, String>>,
     b: Option<&BTreeMap<String, String>>,
 ) -> bool {
@@ -1422,6 +1505,69 @@ mod tests {
         assert_eq!(added.len(), 1);
         assert_eq!(added[0].operation, DiffOperation::AddField);
         assert!(added[0].reference_backfill_sql().is_none());
+    }
+
+    /// Every clause the field renders is a clause a change can land in.
+    #[test]
+    fn every_rendered_field_clause_is_compared() {
+        let base = f("owner", FieldType::Record).with_target_table("user");
+        let changes = [
+            ("nullable", base.clone().with_nullable(true)),
+            ("target", base.clone().with_target_table("post")),
+            (
+                "reference",
+                base.clone()
+                    .with_reference(crate::schema::ReferenceAction::Reject),
+            ),
+            ("computed", base.clone().with_computed("<~post")),
+            (
+                "permissions",
+                base.clone().with_permissions([("update", "$auth.admin")]),
+            ),
+        ];
+        for (what, changed) in changes {
+            let diffs = diff_fields(
+                "t",
+                std::slice::from_ref(&changed),
+                std::slice::from_ref(&base),
+            );
+            assert_eq!(diffs.len(), 1, "a {what} change went unnoticed");
+            assert_eq!(diffs[0].operation, DiffOperation::ModifyField);
+            assert_eq!(
+                diffs[0].forward_sql,
+                changed.to_surql_overwrite("t"),
+                "{what}"
+            );
+            assert_eq!(
+                diffs[0].backward_sql,
+                base.to_surql_overwrite("t"),
+                "{what}"
+            );
+        }
+    }
+
+    /// A target table only renders on a record or array field, so on any
+    /// other type it is not a difference.
+    #[test]
+    fn a_target_table_the_type_ignores_is_not_a_change() {
+        let code = f("name", FieldType::String).with_target_table("user");
+        let db = f("name", FieldType::String);
+        assert!(diff_fields("t", &[code], &[db]).is_empty());
+    }
+
+    /// The engine spells out `FULL` for every action a field's rules leave
+    /// out, which is the field default; it is not a change.
+    #[test]
+    fn default_field_permissions_are_not_a_change() {
+        let code = f("x", FieldType::Int).with_permissions([("select", "$auth.id = id")]);
+        let db = f("x", FieldType::Int).with_permissions([
+            ("select", "$auth.id = id"),
+            ("create", "FULL"),
+            ("update", "FULL"),
+        ]);
+        assert!(diff_fields("t", &[code], &[db]).is_empty());
+        let full = f("x", FieldType::Int).with_permissions([("select, create, update", "FULL")]);
+        assert!(diff_fields("t", &[f("x", FieldType::Int)], &[full]).is_empty());
     }
 
     #[test]
