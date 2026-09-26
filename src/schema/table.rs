@@ -371,11 +371,19 @@ impl TableDefinition {
             .as_ref()
             .map(ChangeFeed::to_clause)
             .unwrap_or_default();
+        // The engine prints `DROP` between the table type and the schema
+        // mode; `TableMode::Drop` already renders it on its own.
+        let drop = if self.drop && self.mode != TableMode::Drop {
+            "DROP "
+        } else {
+            ""
+        };
         format!(
-            "DEFINE TABLE{ine} {name} {kind}{mode}{view}{changefeed}{perms};",
+            "DEFINE TABLE{ine} {name} {kind}{drop}{mode}{view}{changefeed}{perms};",
             ine = ine,
             name = quote_ident(&self.name),
             kind = kind,
+            drop = drop,
             mode = self.mode.as_str(),
             view = view,
             changefeed = changefeed,
@@ -573,6 +581,16 @@ mod tests {
         );
         let bad = table_schema("doc").with_permissions([("drop", "true")]);
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn the_drop_flag_renders_before_the_schema_mode() {
+        let t = table_schema("audit").with_drop(true);
+        assert_eq!(t.to_surql(), "DEFINE TABLE audit DROP SCHEMAFULL;");
+        let t = table_schema("audit")
+            .with_mode(TableMode::Drop)
+            .with_drop(true);
+        assert_eq!(t.to_surql(), "DEFINE TABLE audit DROP;");
     }
 
     #[test]

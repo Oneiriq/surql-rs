@@ -123,7 +123,8 @@ pub use parser::{
 pub use reference::{reference_backfill_sql, ReferenceAction};
 pub use registry::{
     clear_registry, get_registered_buckets, get_registered_edges, get_registered_tables,
-    get_registry, register_bucket, register_edge, register_table, SchemaRegistry,
+    get_registry, register_bucket, register_edge, register_table, try_register_edge,
+    try_register_table, SchemaRegistry,
 };
 pub use sequence::{sequence_schema, SequenceDefinition, SequenceSchemaBuilder};
 pub use sql::{
@@ -140,11 +141,11 @@ pub use table::{
     IndexType, MTreeDistanceType, MTreeVectorType, TableDefinition, TableMode,
 };
 pub use themes::{
-    dark_ascii, dark_color_scheme, dark_graphviz, dark_mermaid, dark_theme, forest_ascii,
-    forest_color_scheme, forest_graphviz, forest_mermaid, forest_theme, get_theme, list_themes,
-    minimal_ascii, minimal_color_scheme, minimal_graphviz, minimal_mermaid, minimal_theme,
-    modern_ascii, modern_color_scheme, modern_graphviz, modern_mermaid, modern_theme, ASCIITheme,
-    ColorScheme, GraphVizTheme, MermaidTheme, Theme,
+    color_scheme_by_name, dark_ascii, dark_color_scheme, dark_graphviz, dark_mermaid, dark_theme,
+    forest_ascii, forest_color_scheme, forest_graphviz, forest_mermaid, forest_theme, get_theme,
+    list_themes, minimal_ascii, minimal_color_scheme, minimal_graphviz, minimal_mermaid,
+    minimal_theme, modern_ascii, modern_color_scheme, modern_graphviz, modern_mermaid,
+    modern_theme, ASCIITheme, ColorScheme, GraphVizTheme, MermaidTheme, Theme,
 };
 pub use utils::{char_display_width, display_width, strip_ansi};
 pub use validator::{
