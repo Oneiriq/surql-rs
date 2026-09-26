@@ -14,9 +14,13 @@
 //! * Outside any scope, [`get_db`] and [`has_db`] return
 //!   [`SurqlError::Context`] / `false` respectively.
 //! * [`connection_scope`] and [`connection_override`] push a new value
-//!   for the duration of the wrapped future; callers inside that future
-//!   (including spawned `tokio::spawn` tasks that inherit the task-local
-//!   via `TaskLocalFuture`) will see the overridden value.
+//!   for the duration of the wrapped future; code awaited inside that
+//!   future sees the overridden value.
+//! * A task started with `tokio::spawn` does **not** inherit it: a
+//!   task-local belongs to the future it wraps, and a spawned future runs
+//!   outside that future. To carry the client into a spawned task, wrap
+//!   the task's future in its own scope, e.g.
+//!   `tokio::spawn(connection_scope(get_db()?, fut))`.
 //! * [`set_db`] / [`clear_db`] mutate the **current** scope's slot. They
 //!   fail outside a scope because `task_local!` values cannot be set
 //!   without an enclosing `.scope(...)`.
@@ -224,6 +228,22 @@ mod tests {
             clear_db().expect("clear in scope");
             assert!(!has_db());
             assert!(matches!(get_db().unwrap_err(), SurqlError::Context { .. }));
+        })
+        .await;
+    }
+
+    /// The module docs used to promise that spawned tasks inherit the
+    /// scope; they do not, and the documented way to carry it works.
+    #[tokio::test]
+    async fn spawned_tasks_need_their_own_scope() {
+        let client = make_client();
+        connection_scope(client.clone(), async {
+            let inherited = tokio::spawn(async { has_db() }).await.unwrap();
+            assert!(!inherited, "tokio::spawn does not inherit the scope");
+            let carried = tokio::spawn(connection_scope(get_db().unwrap(), async { has_db() }))
+                .await
+                .unwrap();
+            assert!(carried);
         })
         .await;
     }

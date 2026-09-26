@@ -229,10 +229,10 @@ impl std::fmt::Display for SubscriptionId {
 ///
 /// 1. Starts a new `LIVE SELECT` against `target`.
 /// 2. Spawns a tokio task that polls the stream and dispatches every
-///    notification to the supplied callback (sync or `async` via
-///    `async move` closure).
+///    notification to the supplied (synchronous) callback.
 /// 3. Stores the task's [`JoinHandle`] against a fresh
-///    [`SubscriptionId`].
+///    [`SubscriptionId`], until the subscription is killed or its
+///    stream ends.
 ///
 /// Dropping the manager aborts every spawned task; the
 /// [`LiveQuery`] stored inside each task is dropped as part of the
@@ -347,35 +347,46 @@ impl StreamingManager {
             }
         });
 
-        self.inner.tasks.lock().await.insert(id, handle);
+        let mut tasks = self.inner.tasks.lock().await;
+        prune_ended(&mut tasks);
+        tasks.insert(id, handle);
         Ok(id)
     }
 
     /// Kill a single subscription by id.
     ///
-    /// Returns `true` when a matching subscription was found; `false`
-    /// otherwise (unknown id or already-drained).
+    /// Returns `true` when a matching subscription was still running and
+    /// has been stopped; `false` otherwise (unknown id, already killed or
+    /// drained, or a subscription whose stream had already ended).
     pub async fn kill(&self, id: SubscriptionId) -> bool {
-        if let Some(handle) = self.inner.tasks.lock().await.remove(&id) {
-            handle.abort();
-            // Wait for the abort to settle so the SDK's KILL flush
-            // happens before we return; ignore the JoinError (AbortError
-            // variant is expected).
-            let _ = handle.await;
-            true
-        } else {
-            false
+        let handle = self.inner.tasks.lock().await.remove(&id);
+        match handle {
+            Some(handle) if !handle.is_finished() => {
+                handle.abort();
+                // Wait for the abort to settle so the SDK's KILL flush
+                // happens before we return; ignore the JoinError
+                // (AbortError variant is expected).
+                let _ = handle.await;
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Number of live subscriptions currently managed.
+    /// Number of live subscriptions currently managed. A subscription
+    /// whose stream has ended (the server closed it, or the callback
+    /// panicked) is no longer counted.
     pub async fn count(&self) -> usize {
-        self.inner.tasks.lock().await.len()
+        let mut tasks = self.inner.tasks.lock().await;
+        prune_ended(&mut tasks);
+        tasks.len()
     }
 
-    /// Return the set of known subscription ids (snapshot).
+    /// Return the ids of the live subscriptions (snapshot).
     pub async fn ids(&self) -> Vec<SubscriptionId> {
-        self.inner.tasks.lock().await.keys().copied().collect()
+        let mut tasks = self.inner.tasks.lock().await;
+        prune_ended(&mut tasks);
+        tasks.keys().copied().collect()
     }
 
     /// Abort every managed subscription and clear the pool.
@@ -389,6 +400,12 @@ impl StreamingManager {
             let _ = h.await;
         }
     }
+}
+
+/// Forget the subscriptions whose task has finished: their stream ended,
+/// so there is nothing left to count or kill.
+fn prune_ended(tasks: &mut HashMap<SubscriptionId, JoinHandle<()>>) {
+    tasks.retain(|_, handle| !handle.is_finished());
 }
 
 impl Drop for StreamingManager {
@@ -448,6 +465,28 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SurqlError::Streaming { .. }));
         assert_eq!(m.count().await, 0);
+    }
+
+    /// Regression: a subscription whose stream had ended stayed in the
+    /// pool, so `count` kept counting it and `kill` reported stopping it.
+    #[tokio::test]
+    async fn ended_subscriptions_are_neither_counted_nor_killed() {
+        let m = StreamingManager::new();
+        let ended = || async {
+            let handle = tokio::spawn(async {});
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            handle
+        };
+        let a = SubscriptionId::new();
+        m.inner.tasks.lock().await.insert(a, ended().await);
+        assert!(!m.kill(a).await, "an ended subscription is not killed");
+
+        let b = SubscriptionId::new();
+        m.inner.tasks.lock().await.insert(b, ended().await);
+        assert_eq!(m.count().await, 0);
+        assert!(m.ids().await.is_empty());
     }
 
     #[tokio::test]

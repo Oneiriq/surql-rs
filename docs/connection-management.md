@@ -36,9 +36,18 @@ connection_scope(client.clone(), async {
 - `set_db` / `clear_db` mutate the current scope's slot and fail
   outside a scope.
 
-Spawned `tokio::spawn` tasks inherit the task-local automatically via
-`TaskLocalFuture` provided you pass the future through one of the
-`connection::context` helpers.
+A task started with `tokio::spawn` does not inherit the scope: a
+task-local belongs to the future it wraps, and the spawned future runs
+outside it, so `get_db` fails there. Carry the client across by giving
+the spawned future its own scope:
+
+```rust
+let db = get_db()?;
+tokio::spawn(connection_scope(db, async move {
+    get_db()?.query("RETURN 1;").await?;
+    Ok::<_, surql::SurqlError>(())
+}));
+```
 
 ## Connection registry
 
@@ -59,6 +68,11 @@ set_registry(registry)?;
 let registry = get_registry();
 let dev = registry.get("dev").await?;
 ```
+
+`set_registry` installs the process-wide registry once: it fails if the
+global is already set, including by an earlier `get_registry` call,
+which initialises an empty one on first use. Call it at startup, before
+anything reads the registry; there is no swapping it later.
 
 The registry is cheap to clone because it stores `Arc<DatabaseClient>`
 values internally. `register` returns the `Arc<DatabaseClient>` it
@@ -146,11 +160,14 @@ while let Some(event) = live.next().await {
 // Or hand off to the manager so the subscription can outlive the
 // caller frame and be cancelled by id later.
 let manager = StreamingManager::new();
-let id = manager.spawn::<User, _>(&client, "user", |event| async move {
+let id = manager.spawn::<User, _>(&client, "user", |event| {
     handle_change(event);
 }).await?;
 manager.kill(id).await;
 ```
+
+The callback is a plain `FnMut(Notification<T>)` run on the spawned
+task; hand work that needs to await to a channel or another task.
 
 The target is a table name or a `table:id` record id, never SurrealQL,
 under the same rules as the typed CRUD methods (`select`, `create`,
@@ -162,7 +179,10 @@ ranges belong in a hand-written query with bound variables.
 
 `manager.count`, `manager.ids`, and `manager.drain_all` give you the
 operational surface needed to enumerate or tear down every active
-subscription on a graceful exit.
+subscription on a graceful exit. A subscription whose stream has ended
+(the server closed it, or the callback panicked) is dropped from the
+pool: `count` and `ids` no longer include it, and `kill` on its id
+returns `false`.
 
 ## Transactions
 
