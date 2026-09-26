@@ -3,16 +3,31 @@
 //!
 //! Port of `surql/schema/validator.py`. This module performs cross-schema
 //! validation and produces a list of [`ValidationResult`] entries describing
-//! every difference between the two sides. Each result carries a
+//! the differences between the two sides. Each result carries a
 //! [`ValidationSeverity`] (`ERROR` / `WARNING` / `INFO`), the table (and
 //! optionally field) it applies to, a human-readable message, and the
 //! conflicting values on each side.
 //!
+//! Every attribute a definition can render is compared: table mode, `DROP`,
+//! view body, change feed and permissions; field type, nullability, record
+//! target, `REFERENCE`, `COMPUTED`, `ASSERT` / `DEFAULT` / `VALUE`,
+//! `READONLY` / `FLEXIBLE` and permissions; index kind, columns (in order)
+//! and the per-kind options; event `WHEN` / `THEN` bodies; and for edges the
+//! mode, `FROM` / `TO` endpoints, permissions, fields, indexes and events.
+//! Differences the engine introduces on its own are folded away before
+//! comparing: expression reformatting (see [`normalize_expression`]),
+//! implicit defaults (field permissions `FULL`, table permissions `NONE`,
+//! HNSW `EFC 150 M 12`, the DISKANN tuning defaults, the `ascii` full-text
+//! analyzer) and the `<array>.*` child fields the engine defines beside a
+//! typed array.
+//!
 //! Unlike the Python source, async database fetching lives outside of the
 //! pure-schema layer: [`validate_schema`] takes both code and database
 //! table/edge maps as arguments. Callers are expected to produce the `db_*`
-//! maps — typically by querying `INFO FOR DB` / `INFO FOR TABLE` and parsing
-//! the results via the schema parser.
+//! maps by querying `INFO FOR DB` and then `INFO FOR TABLE` for every table
+//! (`INFO FOR DB` alone carries no fields, indexes or events), parsing the
+//! results with [`parse_table_full`](crate::schema::parser::parse_table_full)
+//! and [`parse_edge_info`](crate::schema::parser::parse_edge_info).
 //!
 //! ## Examples
 //!
@@ -32,13 +47,32 @@
 //! assert_eq!(results[0].severity, ValidationSeverity::Error);
 //! ```
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::BuildHasher;
 
 use serde::{Deserialize, Serialize};
 
 use super::edge::{EdgeDefinition, EdgeMode};
-use super::fields::FieldDefinition;
-use super::table::{IndexDefinition, IndexType, TableDefinition};
+use super::fields::{FieldDefinition, FieldType};
+use super::index::{DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE, DISKANN_DEFAULT_L_BUILD};
+use super::table::{
+    DiskAnnDistanceType, EventDefinition, HnswDistanceType, IndexDefinition, IndexType,
+    MTreeDistanceType, MTreeVectorType, TableDefinition, TableMode,
+};
+use super::view::ViewDefinition;
+
+/// HNSW `EFC` the engine stores when a definition leaves it out (verified
+/// against the v3.0.5 `INFO FOR TABLE` echo).
+const HNSW_DEFAULT_EFC: u32 = 150;
+/// HNSW `M` the engine stores when a definition leaves it out.
+const HNSW_DEFAULT_M: u32 = 12;
+/// Analyzer a full-text index renders when none is set.
+const FULLTEXT_DEFAULT_ANALYZER: &str = "ascii";
+
+/// Actions a table (or edge) `PERMISSIONS` clause governs.
+const TABLE_ACTIONS: &[&str] = &["select", "create", "update", "delete"];
+/// Actions a field `PERMISSIONS` clause governs.
+const FIELD_ACTIONS: &[&str] = &["select", "create", "update"];
 
 /// Severity classification for a [`ValidationResult`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -138,6 +172,35 @@ impl std::fmt::Display for ValidationResult {
     }
 }
 
+/// Shorthand for the "defined here, missing there" pair every presence
+/// check reports.
+fn presence(
+    severity: ValidationSeverity,
+    table: &str,
+    field: Option<String>,
+    message: &str,
+    in_code: bool,
+) -> ValidationResult {
+    let (code, db) = if in_code {
+        ("exists", "missing")
+    } else {
+        ("missing", "exists")
+    };
+    ValidationResult::new(
+        severity,
+        table,
+        field,
+        message,
+        Some(code.into()),
+        Some(db.into()),
+    )
+}
+
+/// Borrow a name-keyed map in name order, whatever its hasher.
+fn by_name<T, S: BuildHasher>(map: &HashMap<String, T, S>) -> BTreeMap<&str, &T> {
+    map.iter().map(|(k, v)| (k.as_str(), v)).collect()
+}
+
 // -----------------------------------------------------------------------------
 // Main validation entry point
 // -----------------------------------------------------------------------------
@@ -146,27 +209,54 @@ impl std::fmt::Display for ValidationResult {
 /// schemas.
 ///
 /// Callers are expected to have fetched the `db_tables` / `db_edges` maps up
-/// front — this function is pure and synchronous.
+/// front — this function is pure and synchronous. Each map must hold the
+/// complete definitions (fields, indexes, events) that `INFO FOR TABLE`
+/// reports; the fieldless tables `INFO FOR DB` alone yields would make every
+/// code-side field look missing.
 ///
-/// Returns the aggregated list of [`ValidationResult`] entries. An empty
-/// vector means the schemas match.
-#[allow(clippy::implicit_hasher)]
-pub fn validate_schema(
-    code_tables: &HashMap<String, TableDefinition>,
-    db_tables: &HashMap<String, TableDefinition>,
-    code_edges: Option<&HashMap<String, EdgeDefinition>>,
-    db_edges: Option<&HashMap<String, TableDefinition>>,
+/// Edges are validated only when both `code_edges` and `db_edges` are
+/// `Some`: `None` means "not supplied", never "the database has no edges".
+/// Tables and edges share one namespace in SurrealDB, so a name defined as a
+/// table on one side and as an edge on the other is reported once, under the
+/// side that owns it, rather than as a missing table plus an extra edge. A
+/// code edge the database holds as a plain table (as `INFO FOR DB` reports a
+/// non-`RELATION` edge) is compared as an edge. The edge maps take the same
+/// hasher as the table maps on their side, which keeps a bare `None`
+/// inferable.
+///
+/// Returns the aggregated list of [`ValidationResult`] entries in a
+/// deterministic (name-sorted) order. An empty vector means no difference
+/// was found in any compared attribute.
+pub fn validate_schema<S1: BuildHasher, S2: BuildHasher>(
+    code_tables: &HashMap<String, TableDefinition, S1>,
+    db_tables: &HashMap<String, TableDefinition, S2>,
+    code_edges: Option<&HashMap<String, EdgeDefinition, S1>>,
+    db_edges: Option<&HashMap<String, EdgeDefinition, S2>>,
 ) -> Vec<ValidationResult> {
-    let mut results = Vec::new();
+    let code_tables = by_name(code_tables);
+    let db_tables = by_name(db_tables);
+    let code_edges = code_edges.map(by_name);
+    let db_edges = db_edges.map(by_name);
 
-    results.extend(validate_tables(code_tables, db_tables));
+    let code_edge_names: BTreeSet<&str> = code_edges
+        .as_ref()
+        .map(|m| m.keys().copied().collect())
+        .unwrap_or_default();
+    let db_edge_names: BTreeSet<&str> = db_edges
+        .as_ref()
+        .map(|m| m.keys().copied().collect())
+        .unwrap_or_default();
 
-    if let Some(code_edges) = code_edges {
-        let empty_edges: HashMap<String, TableDefinition> = HashMap::new();
-        let db_edges = db_edges.unwrap_or(&empty_edges);
-        results.extend(validate_edges(code_edges, db_edges));
+    let mut results = compare_tables(&code_tables, &db_tables, &code_edge_names, &db_edge_names);
+    if let (Some(code_edges), Some(db_edges)) = (code_edges, db_edges) {
+        let code_table_names: BTreeSet<&str> = code_tables.keys().copied().collect();
+        results.extend(compare_edges(
+            &code_edges,
+            &db_edges,
+            &code_table_names,
+            &db_tables,
+        ));
     }
-
     results
 }
 
@@ -175,547 +265,755 @@ pub fn validate_schema(
 // -----------------------------------------------------------------------------
 
 /// Validate every table across the two maps (missing, extra, and matching).
-#[allow(clippy::implicit_hasher)]
-pub fn validate_tables(
-    code_tables: &HashMap<String, TableDefinition>,
-    db_tables: &HashMap<String, TableDefinition>,
+pub fn validate_tables<S1: BuildHasher, S2: BuildHasher>(
+    code_tables: &HashMap<String, TableDefinition, S1>,
+    db_tables: &HashMap<String, TableDefinition, S2>,
+) -> Vec<ValidationResult> {
+    compare_tables(
+        &by_name(code_tables),
+        &by_name(db_tables),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+}
+
+fn compare_tables(
+    code: &BTreeMap<&str, &TableDefinition>,
+    db: &BTreeMap<&str, &TableDefinition>,
+    code_edge_names: &BTreeSet<&str>,
+    db_edge_names: &BTreeSet<&str>,
 ) -> Vec<ValidationResult> {
     let mut results = Vec::new();
 
-    let code_names: BTreeSet<&String> = code_tables.keys().collect();
-    let db_names: BTreeSet<&String> = db_tables.keys().collect();
-
-    // Missing tables — in code but not in DB.
-    for name in code_names.difference(&db_names) {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            (*name).clone(),
-            None,
-            "Table defined in code but missing from database",
-            Some("exists".into()),
-            Some("missing".into()),
-        ));
+    for name in code.keys().filter(|n| !db.contains_key(*n)) {
+        if db_edge_names.contains(name) {
+            results.push(ValidationResult::new(
+                ValidationSeverity::Error,
+                *name,
+                None,
+                "Table defined in code but the database defines it as an edge (TYPE RELATION)",
+                Some("table".into()),
+                Some("edge".into()),
+            ));
+        } else {
+            results.push(presence(
+                ValidationSeverity::Error,
+                name,
+                None,
+                "Table defined in code but missing from database",
+                true,
+            ));
+        }
     }
 
-    // Extra tables — in DB but not in code.
-    for name in db_names.difference(&code_names) {
-        results.push(ValidationResult::new(
+    // A database table named like a code edge is compared as that edge.
+    for name in db
+        .keys()
+        .filter(|n| !code.contains_key(*n) && !code_edge_names.contains(*n))
+    {
+        results.push(presence(
             ValidationSeverity::Warning,
-            (*name).clone(),
+            name,
             None,
             "Table exists in database but not defined in code",
-            Some("missing".into()),
-            Some("exists".into()),
+            false,
         ));
     }
 
-    // Matching tables.
-    for name in code_names.intersection(&db_names) {
-        let code_table = &code_tables[*name];
-        let db_table = &db_tables[*name];
-        results.extend(validate_table(code_table, db_table));
+    for (name, code_table) in code {
+        if let Some(db_table) = db.get(name) {
+            results.extend(validate_table(code_table, db_table));
+        }
     }
 
     results
 }
 
-/// Validate a single table (mode, fields, indexes, events).
+/// Validate a single table: mode, `DROP` flag, view body, change feed,
+/// permissions, fields, indexes, and events.
 pub fn validate_table(
     code_table: &TableDefinition,
     db_table: &TableDefinition,
 ) -> Vec<ValidationResult> {
+    let table = code_table.name.as_str();
     let mut results = Vec::new();
-    results.extend(validate_table_mode(code_table, db_table));
-    results.extend(validate_fields(code_table, db_table));
-    results.extend(validate_indexes(code_table, db_table));
-    results.extend(validate_events(code_table, db_table));
-    results
-}
 
-fn validate_table_mode(
-    code_table: &TableDefinition,
-    db_table: &TableDefinition,
-) -> Vec<ValidationResult> {
-    if code_table.mode == db_table.mode {
-        return Vec::new();
+    if code_table.mode != db_table.mode {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Error,
+            table,
+            None,
+            "Table mode mismatch",
+            Some(code_table.mode.as_str().to_string()),
+            Some(db_table.mode.as_str().to_string()),
+        ));
     }
-    vec![ValidationResult::new(
-        ValidationSeverity::Error,
-        &code_table.name,
+
+    if code_table.drop != db_table.drop {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Error,
+            table,
+            None,
+            "Table DROP flag mismatch",
+            Some(code_table.drop.to_string()),
+            Some(db_table.drop.to_string()),
+        ));
+    }
+
+    let code_view = code_table.view.as_ref().map(ViewDefinition::to_clause);
+    let db_view = db_table.view.as_ref().map(ViewDefinition::to_clause);
+    if !expr_eq(code_view.as_deref(), db_view.as_deref()) {
+        results.push(ValidationResult::new(
+            ValidationSeverity::Error,
+            table,
+            None,
+            "Table view (AS SELECT) mismatch",
+            code_view.map(|v| v.trim().to_string()),
+            db_view.map(|v| v.trim().to_string()),
+        ));
+    }
+
+    if code_table.changefeed != db_table.changefeed {
+        let clause = |t: &TableDefinition| {
+            t.changefeed
+                .as_ref()
+                .map(|cf| cf.to_clause().trim().to_string())
+        };
+        results.push(ValidationResult::new(
+            ValidationSeverity::Warning,
+            table,
+            None,
+            "Table change feed mismatch",
+            clause(code_table),
+            clause(db_table),
+        ));
+    }
+
+    results.extend(compare_permissions(
+        table,
         None,
-        "Table mode mismatch",
-        Some(code_table.mode.as_str().to_string()),
-        Some(db_table.mode.as_str().to_string()),
-    )]
+        "Table permissions mismatch",
+        code_table.permissions.as_ref(),
+        db_table.permissions.as_ref(),
+        &TABLE_PERMISSIONS,
+    ));
+    results.extend(compare_fields(table, &code_table.fields, &db_table.fields));
+    results.extend(compare_indexes(
+        table,
+        &code_table.indexes,
+        &db_table.indexes,
+    ));
+    results.extend(compare_events(table, &code_table.events, &db_table.events));
+    results
 }
 
 // -----------------------------------------------------------------------------
 // Field validation
 // -----------------------------------------------------------------------------
 
-fn field_map(fields: &[FieldDefinition]) -> HashMap<&str, &FieldDefinition> {
-    fields.iter().map(|f| (f.name.as_str(), f)).collect()
+/// `true` for the `<parent>.*` (or `<parent>[*]`) child the engine defines on
+/// its own beside a typed array `parent`.
+fn is_engine_array_child(
+    name: &str,
+    code: &BTreeMap<&str, &FieldDefinition>,
+    db: &BTreeMap<&str, &FieldDefinition>,
+) -> bool {
+    name.strip_suffix(".*")
+        .or_else(|| name.strip_suffix("[*]"))
+        .is_some_and(|parent| code.contains_key(parent) || db.contains_key(parent))
 }
 
-fn validate_fields(
-    code_table: &TableDefinition,
-    db_table: &TableDefinition,
+fn compare_fields(
+    table: &str,
+    code_fields: &[FieldDefinition],
+    db_fields: &[FieldDefinition],
 ) -> Vec<ValidationResult> {
+    let code: BTreeMap<&str, &FieldDefinition> =
+        code_fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    let db: BTreeMap<&str, &FieldDefinition> =
+        db_fields.iter().map(|f| (f.name.as_str(), f)).collect();
     let mut results = Vec::new();
-    let table_name = &code_table.name;
 
-    let code_fields = field_map(&code_table.fields);
-    let db_fields = field_map(&db_table.fields);
-
-    let code_names: BTreeSet<&str> = code_fields.keys().copied().collect();
-    let db_names: BTreeSet<&str> = db_fields.keys().copied().collect();
-
-    for name in code_names.difference(&db_names) {
-        results.push(ValidationResult::new(
+    for name in code.keys().filter(|n| !db.contains_key(*n)) {
+        results.push(presence(
             ValidationSeverity::Error,
-            table_name,
+            table,
             Some((*name).to_string()),
             "Field defined in code but missing from database",
-            Some("exists".into()),
-            Some("missing".into()),
+            true,
         ));
     }
 
-    for name in db_names.difference(&code_names) {
-        results.push(ValidationResult::new(
+    for name in db
+        .keys()
+        .filter(|n| !code.contains_key(*n) && !is_engine_array_child(n, &code, &db))
+    {
+        results.push(presence(
             ValidationSeverity::Warning,
-            table_name,
+            table,
             Some((*name).to_string()),
             "Field exists in database but not defined in code",
-            Some("missing".into()),
-            Some("exists".into()),
+            false,
         ));
     }
 
-    for name in code_names.intersection(&db_names) {
-        let code_field = code_fields[name];
-        let db_field = db_fields[name];
-        results.extend(validate_field(table_name, code_field, db_field));
+    for (name, code_field) in &code {
+        if let Some(db_field) = db.get(name) {
+            results.extend(validate_field(table, code_field, db_field));
+        }
     }
 
     results
 }
 
+/// The record target a field's `TYPE` clause actually carries: the renderer
+/// only honours `target_table` on `record` and `array` fields.
+fn effective_target(field: &FieldDefinition) -> Option<&str> {
+    match field.field_type {
+        FieldType::Record | FieldType::Array => field.target_table.as_deref(),
+        _ => None,
+    }
+}
+
+/// The `TYPE` clause a field renders, for reporting.
+fn type_label(field: &FieldDefinition) -> String {
+    let base = match (field.field_type, effective_target(field)) {
+        (FieldType::Record, Some(target)) => format!("record<{target}>"),
+        (FieldType::Array, Some(target)) => format!("array<record<{target}>>"),
+        (ty, _) => ty.as_str().to_string(),
+    };
+    if field.nullable {
+        format!("option<{base}>")
+    } else {
+        base
+    }
+}
+
+fn reference_label(field: &FieldDefinition) -> String {
+    field.reference.map_or_else(
+        || "none".to_string(),
+        |action| format!("REFERENCE ON DELETE {}", action.as_str()),
+    )
+}
+
 /// Validate a single field across code and database definitions.
+///
+/// Compares the type, nullability (`option<...>`), record target,
+/// `REFERENCE` action, `COMPUTED` / `ASSERT` / `DEFAULT` / `VALUE`
+/// expressions, `READONLY` / `FLEXIBLE` flags and permissions. Missing
+/// permission actions count as the engine default for fields, `FULL`.
 pub fn validate_field(
     table_name: &str,
     code_field: &FieldDefinition,
     db_field: &FieldDefinition,
 ) -> Vec<ValidationResult> {
-    let mut results = Vec::new();
-
-    if code_field.field_type != db_field.field_type {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            table_name,
-            Some(code_field.name.clone()),
-            "Field type mismatch",
-            Some(code_field.field_type.as_str().to_string()),
-            Some(db_field.field_type.as_str().to_string()),
-        ));
-    }
-
-    if normalize_expression(code_field.assertion.as_deref())
-        != normalize_expression(db_field.assertion.as_deref())
-    {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(code_field.name.clone()),
-            "Field assertion mismatch",
-            code_field.assertion.clone(),
-            db_field.assertion.clone(),
-        ));
-    }
-
-    if normalize_expression(code_field.default.as_deref())
-        != normalize_expression(db_field.default.as_deref())
-    {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(code_field.name.clone()),
-            "Field default value mismatch",
-            code_field.default.clone(),
-            db_field.default.clone(),
-        ));
-    }
-
-    if normalize_expression(code_field.value.as_deref())
-        != normalize_expression(db_field.value.as_deref())
-    {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(code_field.name.clone()),
-            "Field computed value mismatch",
-            code_field.value.clone(),
-            db_field.value.clone(),
-        ));
-    }
-
-    if code_field.readonly != db_field.readonly {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Info,
-            table_name,
-            Some(code_field.name.clone()),
-            "Field readonly flag mismatch",
-            Some(code_field.readonly.to_string()),
-            Some(db_field.readonly.to_string()),
-        ));
-    }
-
-    if code_field.flexible != db_field.flexible {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Info,
-            table_name,
-            Some(code_field.name.clone()),
-            "Field flexible flag mismatch",
-            Some(code_field.flexible.to_string()),
-            Some(db_field.flexible.to_string()),
-        ));
-    }
-
+    let mut results: Vec<ValidationResult> = field_checks(code_field, db_field)
+        .into_iter()
+        .filter(|check| check.differs)
+        .map(|check| {
+            ValidationResult::new(
+                check.severity,
+                table_name,
+                Some(code_field.name.clone()),
+                check.message,
+                check.code,
+                check.db,
+            )
+        })
+        .collect();
+    results.extend(compare_permissions(
+        table_name,
+        Some(code_field.name.clone()),
+        "Field permissions mismatch",
+        code_field.permissions.as_ref(),
+        db_field.permissions.as_ref(),
+        &FIELD_PERMISSIONS,
+    ));
     results
+}
+
+/// One attribute comparison: whether the two sides differ, and how to
+/// report it when they do.
+struct Check {
+    severity: ValidationSeverity,
+    message: &'static str,
+    differs: bool,
+    code: Option<String>,
+    db: Option<String>,
+}
+
+fn field_checks(code: &FieldDefinition, db: &FieldDefinition) -> Vec<Check> {
+    let flag = |b: bool| Some(b.to_string());
+    let mut checks = vec![
+        Check {
+            severity: ValidationSeverity::Error,
+            message: "Field type mismatch",
+            differs: code.field_type != db.field_type,
+            code: Some(code.field_type.as_str().to_string()),
+            db: Some(db.field_type.as_str().to_string()),
+        },
+        Check {
+            severity: ValidationSeverity::Error,
+            message: "Field nullability (option<...>) mismatch",
+            differs: code.nullable != db.nullable,
+            code: Some(type_label(code)),
+            db: Some(type_label(db)),
+        },
+        Check {
+            severity: ValidationSeverity::Error,
+            message: "Field record target mismatch",
+            differs: effective_target(code) != effective_target(db),
+            code: Some(type_label(code)),
+            db: Some(type_label(db)),
+        },
+        Check {
+            severity: ValidationSeverity::Error,
+            message: "Field REFERENCE mismatch",
+            differs: code.reference != db.reference,
+            code: Some(reference_label(code)),
+            db: Some(reference_label(db)),
+        },
+    ];
+    let expressions = [
+        (
+            "Field COMPUTED expression mismatch",
+            &code.computed,
+            &db.computed,
+        ),
+        ("Field assertion mismatch", &code.assertion, &db.assertion),
+        ("Field default value mismatch", &code.default, &db.default),
+        ("Field computed value mismatch", &code.value, &db.value),
+    ];
+    checks.extend(expressions.into_iter().map(|(message, c, d)| Check {
+        severity: ValidationSeverity::Warning,
+        message,
+        differs: !expr_eq(c.as_deref(), d.as_deref()),
+        code: c.clone(),
+        db: d.clone(),
+    }));
+    checks.extend([
+        Check {
+            severity: ValidationSeverity::Info,
+            message: "Field readonly flag mismatch",
+            differs: code.readonly != db.readonly,
+            code: flag(code.readonly),
+            db: flag(db.readonly),
+        },
+        Check {
+            severity: ValidationSeverity::Info,
+            message: "Field flexible flag mismatch",
+            differs: code.flexible != db.flexible,
+            code: flag(code.flexible),
+            db: flag(db.flexible),
+        },
+    ]);
+    checks
+}
+
+// -----------------------------------------------------------------------------
+// Permission validation
+// -----------------------------------------------------------------------------
+
+/// Which actions a `PERMISSIONS` clause covers and what an action it leaves
+/// out defaults to.
+struct PermissionScope {
+    actions: &'static [&'static str],
+    default: &'static str,
+}
+
+/// Tables and edges deny what their clause leaves out.
+const TABLE_PERMISSIONS: PermissionScope = PermissionScope {
+    actions: TABLE_ACTIONS,
+    default: "NONE",
+};
+
+/// Fields allow what their clause leaves out.
+const FIELD_PERMISSIONS: PermissionScope = PermissionScope {
+    actions: FIELD_ACTIONS,
+    default: "FULL",
+};
+
+/// Canonical form of one permission rule: `FULL` / `NONE` postures (also
+/// spelled `WHERE true` / `WHERE false`) collapse to the keyword, anything
+/// else is a normalised `WHERE` expression.
+fn canonical_rule(rule: &str) -> String {
+    let rule = rule.trim();
+    let body = match rule.get(..6) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("WHERE ") => rule.get(6..).unwrap_or(""),
+        _ => rule,
+    }
+    .trim();
+    if body.eq_ignore_ascii_case("FULL") || body.eq_ignore_ascii_case("true") {
+        "FULL".to_string()
+    } else if body.eq_ignore_ascii_case("NONE") || body.eq_ignore_ascii_case("false") {
+        "NONE".to_string()
+    } else {
+        canonical_expr(body)
+    }
+}
+
+/// Resolve a permission map into one canonical rule per action: grouped keys
+/// (`"select, update"`) are split, and every action the map leaves out takes
+/// the scope's default.
+fn effective_permissions(
+    map: Option<&BTreeMap<String, String>>,
+    scope: &PermissionScope,
+) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = scope
+        .actions
+        .iter()
+        .map(|action| ((*action).to_string(), scope.default.to_string()))
+        .collect();
+    for (key, rule) in map.into_iter().flatten() {
+        let rule = canonical_rule(rule);
+        for action in key.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            out.insert(action.to_ascii_lowercase(), rule.clone());
+        }
+    }
+    out
+}
+
+fn render_permissions(effective: &BTreeMap<String, String>) -> String {
+    effective
+        .iter()
+        .map(|(action, rule)| match rule.as_str() {
+            "FULL" | "NONE" => format!("FOR {action} {rule}"),
+            _ => format!("FOR {action} WHERE {rule}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn compare_permissions(
+    table: &str,
+    field: Option<String>,
+    message: &str,
+    code: Option<&BTreeMap<String, String>>,
+    db: Option<&BTreeMap<String, String>>,
+    scope: &PermissionScope,
+) -> Option<ValidationResult> {
+    let code = effective_permissions(code, scope);
+    let db = effective_permissions(db, scope);
+    (code != db).then(|| {
+        ValidationResult::new(
+            ValidationSeverity::Error,
+            table,
+            field,
+            message,
+            Some(render_permissions(&code)),
+            Some(render_permissions(&db)),
+        )
+    })
 }
 
 // -----------------------------------------------------------------------------
 // Index validation
 // -----------------------------------------------------------------------------
 
-fn index_map(indexes: &[IndexDefinition]) -> HashMap<&str, &IndexDefinition> {
-    indexes.iter().map(|i| (i.name.as_str(), i)).collect()
-}
-
-fn validate_indexes(
-    code_table: &TableDefinition,
-    db_table: &TableDefinition,
+fn compare_indexes(
+    table: &str,
+    code_indexes: &[IndexDefinition],
+    db_indexes: &[IndexDefinition],
 ) -> Vec<ValidationResult> {
+    let code: BTreeMap<&str, &IndexDefinition> =
+        code_indexes.iter().map(|i| (i.name.as_str(), i)).collect();
+    let db: BTreeMap<&str, &IndexDefinition> =
+        db_indexes.iter().map(|i| (i.name.as_str(), i)).collect();
     let mut results = Vec::new();
-    let table_name = &code_table.name;
 
-    let code_indexes = index_map(&code_table.indexes);
-    let db_indexes = index_map(&db_table.indexes);
-
-    let code_names: BTreeSet<&str> = code_indexes.keys().copied().collect();
-    let db_names: BTreeSet<&str> = db_indexes.keys().copied().collect();
-
-    for name in code_names.difference(&db_names) {
-        results.push(ValidationResult::new(
+    for name in code.keys().filter(|n| !db.contains_key(*n)) {
+        results.push(presence(
             ValidationSeverity::Error,
-            table_name,
-            Some(format!("index:{}", name)),
+            table,
+            Some(format!("index:{name}")),
             "Index defined in code but missing from database",
-            Some("exists".into()),
-            Some("missing".into()),
+            true,
         ));
     }
 
-    for name in db_names.difference(&code_names) {
-        results.push(ValidationResult::new(
+    for name in db.keys().filter(|n| !code.contains_key(*n)) {
+        results.push(presence(
             ValidationSeverity::Warning,
-            table_name,
-            Some(format!("index:{}", name)),
+            table,
+            Some(format!("index:{name}")),
             "Index exists in database but not defined in code",
-            Some("missing".into()),
-            Some("exists".into()),
+            false,
         ));
     }
 
-    for name in code_names.intersection(&db_names) {
-        let code_index = code_indexes[name];
-        let db_index = db_indexes[name];
-        results.extend(validate_index(table_name, code_index, db_index));
+    for (name, code_index) in &code {
+        if let Some(db_index) = db.get(name) {
+            results.extend(validate_index(table, code_index, db_index));
+        }
     }
 
     results
 }
 
+/// Collects index findings under one `index:<name>` pseudo-field.
+struct IndexReport<'a> {
+    table: &'a str,
+    field: String,
+    results: Vec<ValidationResult>,
+}
+
+impl IndexReport<'_> {
+    fn check<T: PartialEq>(
+        &mut self,
+        severity: ValidationSeverity,
+        message: &str,
+        code: T,
+        db: T,
+        render: impl Fn(T) -> Option<String>,
+    ) {
+        if code != db {
+            self.results.push(ValidationResult::new(
+                severity,
+                self.table,
+                Some(self.field.clone()),
+                message,
+                render(code),
+                render(db),
+            ));
+        }
+    }
+}
+
 /// Validate a single index across code and database definitions.
+///
+/// Compares the kind, the columns in order (a composite index on `a, b` is
+/// not the index on `b, a`), and the options of each kind: vector
+/// dimension, distance, element type and tuning (with the engine defaults
+/// filled in for options the code leaves unset), and the full-text
+/// analyzer, `BM25` and `HIGHLIGHTS`.
 pub fn validate_index(
     table_name: &str,
     code_index: &IndexDefinition,
     db_index: &IndexDefinition,
 ) -> Vec<ValidationResult> {
-    let mut results = Vec::new();
-    let index_field = format!("index:{}", code_index.name);
+    let mut report = IndexReport {
+        table: table_name,
+        field: format!("index:{}", code_index.name),
+        results: Vec::new(),
+    };
+    let text = |s: &str| Some(s.to_string());
+    let num = |n: Option<u32>| n.map(|n| n.to_string());
 
-    if code_index.index_type != db_index.index_type {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            table_name,
-            Some(index_field.clone()),
-            "Index type mismatch",
-            Some(code_index.index_type.as_str().to_string()),
-            Some(db_index.index_type.as_str().to_string()),
-        ));
-    }
+    report.check(
+        ValidationSeverity::Error,
+        "Index type mismatch",
+        code_index.index_type.as_str(),
+        db_index.index_type.as_str(),
+        text,
+    );
+    report.check(
+        ValidationSeverity::Error,
+        "Index columns mismatch",
+        code_index.columns.join(","),
+        db_index.columns.join(","),
+        Some,
+    );
 
-    let mut code_cols = code_index.columns.clone();
-    code_cols.sort();
-    let mut db_cols = db_index.columns.clone();
-    db_cols.sort();
-    if code_cols != db_cols {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            table_name,
-            Some(index_field.clone()),
-            "Index columns mismatch",
-            Some(code_index.columns.join(",")),
-            Some(db_index.columns.join(",")),
-        ));
-    }
+    let kind = match code_index.index_type {
+        IndexType::Mtree => "MTREE",
+        IndexType::Hnsw => "HNSW",
+        IndexType::Diskann => "DISKANN",
+        IndexType::Search => {
+            check_fulltext(&mut report, code_index, db_index);
+            return report.results;
+        }
+        IndexType::Unique | IndexType::Standard => return report.results,
+    };
 
-    if code_index.index_type == IndexType::Mtree {
-        results.extend(validate_mtree_index(table_name, code_index, db_index));
-    }
-    if code_index.index_type == IndexType::Hnsw {
-        results.extend(validate_hnsw_index(table_name, code_index, db_index));
-    }
-    if code_index.index_type == IndexType::Diskann {
-        results.extend(validate_diskann_index(table_name, code_index, db_index));
-    }
+    report.check(
+        ValidationSeverity::Error,
+        &format!("{kind} index dimension mismatch"),
+        code_index.dimension,
+        db_index.dimension,
+        num,
+    );
+    report.check(
+        ValidationSeverity::Warning,
+        &format!("{kind} index vector type mismatch"),
+        code_index.vector_type.map(MTreeVectorType::as_str),
+        db_index.vector_type.map(MTreeVectorType::as_str),
+        |v| v.map(str::to_string),
+    );
 
-    results
-}
-
-fn validate_mtree_index(
-    table_name: &str,
-    code_index: &IndexDefinition,
-    db_index: &IndexDefinition,
-) -> Vec<ValidationResult> {
-    let mut results = Vec::new();
-    let index_field = format!("index:{}", code_index.name);
-
-    if code_index.dimension != db_index.dimension {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            table_name,
-            Some(index_field.clone()),
-            "MTREE index dimension mismatch",
-            code_index.dimension.map(|d| d.to_string()),
-            db_index.dimension.map(|d| d.to_string()),
-        ));
-    }
-
-    if code_index.distance != db_index.distance {
-        results.push(ValidationResult::new(
+    match code_index.index_type {
+        IndexType::Mtree => report.check(
             ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
             "MTREE index distance metric mismatch",
-            code_index.distance.map(|d| d.as_str().to_string()),
-            db_index.distance.map(|d| d.as_str().to_string()),
-        ));
+            code_index.distance.map(MTreeDistanceType::as_str),
+            db_index.distance.map(MTreeDistanceType::as_str),
+            |v| v.map(str::to_string),
+        ),
+        IndexType::Hnsw => check_hnsw(&mut report, code_index, db_index),
+        IndexType::Diskann => check_diskann(&mut report, code_index, db_index),
+        _ => {}
     }
 
-    if code_index.vector_type != db_index.vector_type {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field),
-            "MTREE index vector type mismatch",
-            code_index.vector_type.map(|v| v.as_str().to_string()),
-            db_index.vector_type.map(|v| v.as_str().to_string()),
-        ));
-    }
-
-    results
+    report.results
 }
 
-fn validate_hnsw_index(
-    table_name: &str,
-    code_index: &IndexDefinition,
-    db_index: &IndexDefinition,
-) -> Vec<ValidationResult> {
-    let mut results = Vec::new();
-    let index_field = format!("index:{}", code_index.name);
-
-    if code_index.dimension != db_index.dimension {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            table_name,
-            Some(index_field.clone()),
-            "HNSW index dimension mismatch",
-            code_index.dimension.map(|d| d.to_string()),
-            db_index.dimension.map(|d| d.to_string()),
-        ));
-    }
-
-    if code_index.hnsw_distance != db_index.hnsw_distance {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "HNSW index distance metric mismatch",
-            code_index.hnsw_distance.map(|d| d.as_str().to_string()),
-            db_index.hnsw_distance.map(|d| d.as_str().to_string()),
-        ));
-    }
-
-    if code_index.vector_type != db_index.vector_type {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "HNSW index vector type mismatch",
-            code_index.vector_type.map(|v| v.as_str().to_string()),
-            db_index.vector_type.map(|v| v.as_str().to_string()),
-        ));
-    }
-
-    if code_index.efc != db_index.efc {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "HNSW index EFC mismatch",
-            code_index.efc.map(|e| e.to_string()),
-            db_index.efc.map(|e| e.to_string()),
-        ));
-    }
-
-    if code_index.m != db_index.m {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field),
-            "HNSW index M mismatch",
-            code_index.m.map(|m| m.to_string()),
-            db_index.m.map(|m| m.to_string()),
-        ));
-    }
-
-    results
+fn check_hnsw(report: &mut IndexReport<'_>, code: &IndexDefinition, db: &IndexDefinition) {
+    let num = |n: u32| Some(n.to_string());
+    report.check(
+        ValidationSeverity::Warning,
+        "HNSW index distance metric mismatch",
+        code.hnsw_distance.map(HnswDistanceType::as_str),
+        db.hnsw_distance.map(HnswDistanceType::as_str),
+        |v| v.map(str::to_string),
+    );
+    report.check(
+        ValidationSeverity::Warning,
+        "HNSW index EFC mismatch",
+        code.efc.unwrap_or(HNSW_DEFAULT_EFC),
+        db.efc.unwrap_or(HNSW_DEFAULT_EFC),
+        num,
+    );
+    report.check(
+        ValidationSeverity::Warning,
+        "HNSW index M mismatch",
+        code.m.unwrap_or(HNSW_DEFAULT_M),
+        db.m.unwrap_or(HNSW_DEFAULT_M),
+        num,
+    );
 }
 
-fn validate_diskann_index(
-    table_name: &str,
-    code_index: &IndexDefinition,
-    db_index: &IndexDefinition,
-) -> Vec<ValidationResult> {
-    let mut results = Vec::new();
-    let index_field = format!("index:{}", code_index.name);
+fn check_diskann(report: &mut IndexReport<'_>, code: &IndexDefinition, db: &IndexDefinition) {
+    let num = |n: u32| Some(n.to_string());
+    report.check(
+        ValidationSeverity::Warning,
+        "DISKANN index distance metric mismatch",
+        code.diskann_distance.map(DiskAnnDistanceType::as_str),
+        db.diskann_distance.map(DiskAnnDistanceType::as_str),
+        |v| v.map(str::to_string),
+    );
+    report.check(
+        ValidationSeverity::Warning,
+        "DISKANN index DEGREE mismatch",
+        code.degree.unwrap_or(DISKANN_DEFAULT_DEGREE),
+        db.degree.unwrap_or(DISKANN_DEFAULT_DEGREE),
+        num,
+    );
+    report.check(
+        ValidationSeverity::Warning,
+        "DISKANN index L_BUILD mismatch",
+        code.l_build.unwrap_or(DISKANN_DEFAULT_L_BUILD),
+        db.l_build.unwrap_or(DISKANN_DEFAULT_L_BUILD),
+        num,
+    );
+    report.check(
+        ValidationSeverity::Warning,
+        "DISKANN index ALPHA mismatch",
+        code.alpha.as_deref().unwrap_or(DISKANN_DEFAULT_ALPHA),
+        db.alpha.as_deref().unwrap_or(DISKANN_DEFAULT_ALPHA),
+        |a| Some(a.to_string()),
+    );
+    report.check(
+        ValidationSeverity::Warning,
+        "DISKANN index HASHED_VECTOR mismatch",
+        code.hashed_vector,
+        db.hashed_vector,
+        |b| Some(b.to_string()),
+    );
+}
 
-    if code_index.dimension != db_index.dimension {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            table_name,
-            Some(index_field.clone()),
-            "DISKANN index dimension mismatch",
-            code_index.dimension.map(|d| d.to_string()),
-            db_index.dimension.map(|d| d.to_string()),
-        ));
-    }
-
-    if code_index.diskann_distance != db_index.diskann_distance {
-        results.push(ValidationResult::new(
+fn check_fulltext(report: &mut IndexReport<'_>, code: &IndexDefinition, db: &IndexDefinition) {
+    report.check(
+        ValidationSeverity::Warning,
+        "FULLTEXT index analyzer mismatch",
+        code.analyzer
+            .as_deref()
+            .unwrap_or(FULLTEXT_DEFAULT_ANALYZER),
+        db.analyzer.as_deref().unwrap_or(FULLTEXT_DEFAULT_ANALYZER),
+        |a| Some(a.to_string()),
+    );
+    // v3 scores every full-text index with BM25 and echoes the clause even
+    // when the definition left it out, so only a BM25 the code asks for and
+    // the database lacks is a difference.
+    if code.bm25 && !db.bm25 {
+        report.check(
             ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "DISKANN index distance metric mismatch",
-            code_index.diskann_distance.map(|d| d.as_str().to_string()),
-            db_index.diskann_distance.map(|d| d.as_str().to_string()),
-        ));
+            "FULLTEXT index BM25 mismatch",
+            code.bm25,
+            db.bm25,
+            |b| Some(b.to_string()),
+        );
     }
-
-    if code_index.vector_type != db_index.vector_type {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "DISKANN index vector type mismatch",
-            code_index.vector_type.map(|v| v.as_str().to_string()),
-            db_index.vector_type.map(|v| v.as_str().to_string()),
-        ));
-    }
-
-    if code_index.degree != db_index.degree {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "DISKANN index DEGREE mismatch",
-            code_index.degree.map(|d| d.to_string()),
-            db_index.degree.map(|d| d.to_string()),
-        ));
-    }
-
-    if code_index.l_build != db_index.l_build {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "DISKANN index L_BUILD mismatch",
-            code_index.l_build.map(|l| l.to_string()),
-            db_index.l_build.map(|l| l.to_string()),
-        ));
-    }
-
-    if code_index.alpha != db_index.alpha {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field.clone()),
-            "DISKANN index ALPHA mismatch",
-            code_index.alpha.clone(),
-            db_index.alpha.clone(),
-        ));
-    }
-
-    if code_index.hashed_vector != db_index.hashed_vector {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Warning,
-            table_name,
-            Some(index_field),
-            "DISKANN index HASHED_VECTOR mismatch",
-            Some(code_index.hashed_vector.to_string()),
-            Some(db_index.hashed_vector.to_string()),
-        ));
-    }
-
-    results
+    report.check(
+        ValidationSeverity::Warning,
+        "FULLTEXT index HIGHLIGHTS mismatch",
+        code.highlights,
+        db.highlights,
+        |b| Some(b.to_string()),
+    );
 }
 
 // -----------------------------------------------------------------------------
 // Event validation
 // -----------------------------------------------------------------------------
 
-fn validate_events(
-    code_table: &TableDefinition,
-    db_table: &TableDefinition,
+fn compare_events(
+    table: &str,
+    code_events: &[EventDefinition],
+    db_events: &[EventDefinition],
 ) -> Vec<ValidationResult> {
+    let code: BTreeMap<&str, &EventDefinition> =
+        code_events.iter().map(|e| (e.name.as_str(), e)).collect();
+    let db: BTreeMap<&str, &EventDefinition> =
+        db_events.iter().map(|e| (e.name.as_str(), e)).collect();
     let mut results = Vec::new();
-    let table_name = &code_table.name;
 
-    let code_events: BTreeSet<&str> = code_table.events.iter().map(|e| e.name.as_str()).collect();
-    let db_events: BTreeSet<&str> = db_table.events.iter().map(|e| e.name.as_str()).collect();
-
-    for name in code_events.difference(&db_events) {
-        results.push(ValidationResult::new(
+    for name in code.keys().filter(|n| !db.contains_key(*n)) {
+        results.push(presence(
             ValidationSeverity::Error,
-            table_name,
-            Some(format!("event:{}", name)),
+            table,
+            Some(format!("event:{name}")),
             "Event defined in code but missing from database",
-            Some("exists".into()),
-            Some("missing".into()),
+            true,
         ));
     }
 
-    for name in db_events.difference(&code_events) {
-        results.push(ValidationResult::new(
+    for name in db.keys().filter(|n| !code.contains_key(*n)) {
+        results.push(presence(
             ValidationSeverity::Warning,
-            table_name,
-            Some(format!("event:{}", name)),
+            table,
+            Some(format!("event:{name}")),
             "Event exists in database but not defined in code",
-            Some("missing".into()),
-            Some("exists".into()),
+            false,
         ));
+    }
+
+    for (name, code_event) in &code {
+        let Some(db_event) = db.get(name) else {
+            continue;
+        };
+        let pairs = [
+            (
+                "Event condition (WHEN) mismatch",
+                &code_event.condition,
+                &db_event.condition,
+            ),
+            (
+                "Event action (THEN) mismatch",
+                &code_event.action,
+                &db_event.action,
+            ),
+        ];
+        for (message, code_body, db_body) in pairs {
+            if canonical_event_body(code_body) != canonical_event_body(db_body) {
+                results.push(ValidationResult::new(
+                    ValidationSeverity::Warning,
+                    table,
+                    Some(format!("event:{name}")),
+                    message,
+                    Some(code_body.clone()),
+                    Some(db_body.clone()),
+                ));
+            }
+        }
     }
 
     results
@@ -725,112 +1023,279 @@ fn validate_events(
 // Edge validation
 // -----------------------------------------------------------------------------
 
-/// Validate every edge definition against its corresponding database table.
-#[allow(clippy::implicit_hasher)]
-pub fn validate_edges(
-    code_edges: &HashMap<String, EdgeDefinition>,
-    db_edges: &HashMap<String, TableDefinition>,
+/// Validate every edge definition against its database counterpart.
+///
+/// `db_edges` holds the edges as the parser produces them
+/// ([`parse_edge_info`](crate::schema::parser::parse_edge_info)). Edges on
+/// either side only are reported (missing as `ERROR`, extra as `WARNING`),
+/// edges on both sides are compared with [`validate_edge`].
+pub fn validate_edges<S1: BuildHasher, S2: BuildHasher>(
+    code_edges: &HashMap<String, EdgeDefinition, S1>,
+    db_edges: &HashMap<String, EdgeDefinition, S2>,
+) -> Vec<ValidationResult> {
+    compare_edges(
+        &by_name(code_edges),
+        &by_name(db_edges),
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+    )
+}
+
+/// The edge a plain table stands for, used when the database holds a code
+/// edge as an ordinary (non-`RELATION`) table.
+fn edge_from_table(table: &TableDefinition) -> EdgeDefinition {
+    EdgeDefinition {
+        name: table.name.clone(),
+        mode: match table.mode {
+            TableMode::Schemafull => EdgeMode::Schemafull,
+            TableMode::Schemaless | TableMode::Drop => EdgeMode::Schemaless,
+        },
+        from_table: None,
+        to_table: None,
+        fields: table.fields.clone(),
+        indexes: table.indexes.clone(),
+        events: table.events.clone(),
+        permissions: table.permissions.clone(),
+    }
+}
+
+fn compare_edges(
+    code: &BTreeMap<&str, &EdgeDefinition>,
+    db: &BTreeMap<&str, &EdgeDefinition>,
+    code_table_names: &BTreeSet<&str>,
+    db_tables: &BTreeMap<&str, &TableDefinition>,
 ) -> Vec<ValidationResult> {
     let mut results = Vec::new();
 
-    let code_names: BTreeSet<&String> = code_edges.keys().collect();
-    let db_names: BTreeSet<&String> = db_edges.keys().collect();
+    for (name, code_edge) in code.iter().filter(|(n, _)| !db.contains_key(*n)) {
+        match db_tables.get(name) {
+            Some(db_table) => results.extend(validate_edge(code_edge, &edge_from_table(db_table))),
+            None => results.push(presence(
+                ValidationSeverity::Error,
+                name,
+                None,
+                "Edge defined in code but missing from database",
+                true,
+            )),
+        }
+    }
 
-    for name in code_names.difference(&db_names) {
-        results.push(ValidationResult::new(
-            ValidationSeverity::Error,
-            (*name).clone(),
+    // A database edge named like a code table was reported with the tables.
+    for name in db
+        .keys()
+        .filter(|n| !code.contains_key(*n) && !code_table_names.contains(*n))
+    {
+        results.push(presence(
+            ValidationSeverity::Warning,
+            name,
             None,
-            "Edge defined in code but missing from database",
-            Some("exists".into()),
-            Some("missing".into()),
+            "Edge exists in database but not defined in code",
+            false,
         ));
     }
 
-    for name in code_names.intersection(&db_names) {
-        let code_edge = &code_edges[*name];
-        let db_edge = &db_edges[*name];
-        results.extend(validate_edge(code_edge, db_edge));
+    for (name, code_edge) in code {
+        if let Some(db_edge) = db.get(name) {
+            results.extend(validate_edge(code_edge, db_edge));
+        }
     }
 
     results
 }
 
-/// Validate a single edge definition against its database table representation.
+fn compare_endpoint(
+    edge: &str,
+    clause: &str,
+    code: Option<&str>,
+    db: Option<&str>,
+) -> Option<ValidationResult> {
+    // Differing tables are drift; a constraint on one side only is reported
+    // softer, since an unconstrained relation still accepts the code's links.
+    let severity = match (code, db) {
+        (Some(c), Some(d)) if c != d => ValidationSeverity::Error,
+        (Some(_), None) | (None, Some(_)) => ValidationSeverity::Warning,
+        _ => return None,
+    };
+    Some(ValidationResult::new(
+        severity,
+        edge,
+        None,
+        format!("Edge {clause} table mismatch"),
+        code.map(str::to_string),
+        db.map(str::to_string),
+    ))
+}
+
+/// Validate a single edge definition against its database counterpart.
+///
+/// Mirrors [`validate_table`] for edges: mode, the `FROM` / `TO` endpoints
+/// of a `RELATION` edge, permissions, fields, indexes, and events. Only
+/// differences are reported; an edge that matches yields an empty vector.
 pub fn validate_edge(
     code_edge: &EdgeDefinition,
-    db_edge: &TableDefinition,
+    db_edge: &EdgeDefinition,
 ) -> Vec<ValidationResult> {
+    let edge = code_edge.name.as_str();
     let mut results = Vec::new();
-    let edge_name = &code_edge.name;
 
-    if code_edge.mode == EdgeMode::Relation {
+    if code_edge.mode != db_edge.mode {
         results.push(ValidationResult::new(
-            ValidationSeverity::Info,
-            edge_name,
+            ValidationSeverity::Error,
+            edge,
             None,
-            format!("Edge mode: {}", code_edge.mode.as_str()),
+            "Edge mode mismatch",
             Some(code_edge.mode.as_str().to_string()),
             Some(db_edge.mode.as_str().to_string()),
         ));
     }
 
-    let code_fields = field_map(&code_edge.fields);
-    let db_fields = field_map(&db_edge.fields);
-
-    for (name, code_field) in &code_fields {
-        if let Some(db_field) = db_fields.get(name) {
-            results.extend(validate_field(edge_name, code_field, db_field));
-        } else {
-            results.push(ValidationResult::new(
-                ValidationSeverity::Error,
-                edge_name,
-                Some((*name).to_string()),
-                "Edge field missing from database",
-                Some("exists".into()),
-                Some("missing".into()),
-            ));
-        }
+    if code_edge.mode == EdgeMode::Relation || db_edge.mode == EdgeMode::Relation {
+        results.extend(compare_endpoint(
+            edge,
+            "FROM",
+            code_edge.from_table.as_deref(),
+            db_edge.from_table.as_deref(),
+        ));
+        results.extend(compare_endpoint(
+            edge,
+            "TO",
+            code_edge.to_table.as_deref(),
+            db_edge.to_table.as_deref(),
+        ));
     }
 
-    let code_indexes = index_map(&code_edge.indexes);
-    let db_indexes = index_map(&db_edge.indexes);
-
-    for (name, code_index) in &code_indexes {
-        if let Some(db_index) = db_indexes.get(name) {
-            results.extend(validate_index(edge_name, code_index, db_index));
-        } else {
-            results.push(ValidationResult::new(
-                ValidationSeverity::Error,
-                edge_name,
-                Some(format!("index:{}", name)),
-                "Edge index missing from database",
-                Some("exists".into()),
-                Some("missing".into()),
-            ));
-        }
-    }
-
+    results.extend(compare_permissions(
+        edge,
+        None,
+        "Edge permissions mismatch",
+        code_edge.permissions.as_ref(),
+        db_edge.permissions.as_ref(),
+        &TABLE_PERMISSIONS,
+    ));
+    results.extend(compare_fields(edge, &code_edge.fields, &db_edge.fields));
+    results.extend(compare_indexes(edge, &code_edge.indexes, &db_edge.indexes));
+    results.extend(compare_events(edge, &code_edge.events, &db_edge.events));
     results
 }
 
 // -----------------------------------------------------------------------------
-// Utility
+// Expression normalisation
 // -----------------------------------------------------------------------------
 
 /// Normalize a SurrealQL expression for comparison purposes.
 ///
-/// Collapses consecutive whitespace to a single space and trims the result.
-/// Returns `None` for `None` inputs or expressions that become empty after
-/// normalization.
+/// Delegates to [`crate::migration::diff::normalize_expression`], so schema
+/// validation and migration diffing agree on what counts as the same
+/// expression (whitespace runs, one level of wrapping parentheses, `IS NONE`
+/// and cast spacing as the engine echoes them). On top of that a
+/// double-quoted string literal is rewritten single-quoted, the form the
+/// engine prints it in. Returns `None` for `None` inputs or expressions
+/// that become empty after normalization.
 pub fn normalize_expression(expr: Option<&str>) -> Option<String> {
-    let expr = expr?;
-    let normalized = expr.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
+    let normalized = canonical_expr(expr?);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn canonical_expr(expr: &str) -> String {
+    fold_string_quotes(&crate::migration::diff::normalize_expression(expr))
+}
+
+fn expr_eq(code: Option<&str>, db: Option<&str>) -> bool {
+    normalize_expression(code) == normalize_expression(db)
+}
+
+/// Rewrite every `"..."` string literal as `'...'` when its text holds no
+/// quote or escape, the spelling the engine echoes. Single-quoted literals
+/// are copied through untouched.
+fn fold_string_quotes(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.chars();
+    while let Some(c) = chars.next() {
+        if c != '\'' && c != '"' {
+            out.push(c);
+            continue;
+        }
+        let mut body = String::new();
+        let mut escaped = false;
+        let mut closed = false;
+        for inner in chars.by_ref() {
+            if !escaped && inner == c {
+                closed = true;
+                break;
+            }
+            escaped = !escaped && inner == '\\';
+            body.push(inner);
+        }
+        let quote = if c == '"' && closed && !body.contains(['\'', '\\']) {
+            '\''
+        } else {
+            c
+        };
+        out.push(quote);
+        out.push_str(&body);
+        if closed {
+            out.push(quote);
+        }
     }
+    out
+}
+
+/// `true` when `text` is `open ... close` with the opening delimiter
+/// matched by the final character (quoted text is skipped).
+fn wraps_whole(text: &str, open: char, close: char) -> bool {
+    if !text.starts_with(open) || !text.ends_with(close) {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let last = text.chars().count().saturating_sub(1);
+    for (i, c) in text.chars().enumerate() {
+        if let Some(q) = quote {
+            if !escaped && c == q {
+                quote = None;
+            }
+            escaped = !escaped && c == '\\';
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            _ if c == open => depth += 1,
+            _ if c == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && i != last {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// Canonical form of an event `WHEN` / `THEN` body. On top of
+/// [`normalize_expression`], the wrapping the engine adds or drops on echo is
+/// peeled: a `{ ... }` block, one level of parentheses, and trailing `;`.
+fn canonical_event_body(body: &str) -> String {
+    let mut current = canonical_expr(body);
+    // Each round strictly shortens the text, so this terminates; the bound
+    // only caps pathological nesting.
+    for _ in 0..16 {
+        let trimmed = current.trim().trim_end_matches(';').trim_end();
+        let peeled = if wraps_whole(trimmed, '{', '}') || wraps_whole(trimmed, '(', ')') {
+            trimmed
+                .get(1..trimmed.len().saturating_sub(1))
+                .unwrap_or(trimmed)
+        } else {
+            trimmed
+        };
+        let next = canonical_expr(peeled);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
 }
 
 #[cfg(test)]
@@ -1269,24 +1734,6 @@ mod tests {
     }
 
     #[test]
-    fn index_columns_order_insensitive() {
-        let code_table =
-            table_schema("user").with_indexes([IndexDefinition::new("composite", ["a", "b"])]);
-        let db_table =
-            table_schema("user").with_indexes([IndexDefinition::new("composite", ["b", "a"])]);
-
-        let mut code = HashMap::new();
-        code.insert("user".into(), code_table);
-        let mut db = HashMap::new();
-        db.insert("user".into(), db_table);
-
-        let results = validate_schema(&code, &db, None, None);
-        assert!(!results
-            .iter()
-            .any(|r| r.message.contains("columns mismatch")));
-    }
-
-    #[test]
     fn mtree_index_dimension_mismatch() {
         let code_table = table_schema("document").with_indexes([mtree_index(
             "vec_idx",
@@ -1524,7 +1971,7 @@ mod tests {
 
         let mut code_edges = HashMap::new();
         code_edges.insert("likes".into(), typed_edge("likes", "user", "post"));
-        let db_edges: HashMap<String, TableDefinition> = HashMap::new();
+        let db_edges: HashMap<String, EdgeDefinition> = HashMap::new();
 
         let results = validate_schema(
             &HashMap::new(),
@@ -1546,7 +1993,7 @@ mod tests {
 
         let code_edge = typed_edge("likes", "user", "post")
             .with_fields([FieldDefinition::new("weight", FieldType::Int)]);
-        let db_edge = table_schema("likes").with_mode(TableMode::Schemafull);
+        let db_edge = typed_edge("likes", "user", "post");
 
         let mut code_edges = HashMap::new();
         code_edges.insert("likes".into(), code_edge);
@@ -1572,7 +2019,8 @@ mod tests {
 
         let code_edge = typed_edge("r", "user", "post")
             .with_fields([FieldDefinition::new("w", FieldType::Int)]);
-        let db_edge = table_schema("r").with_fields([FieldDefinition::new("w", FieldType::String)]);
+        let db_edge = typed_edge("r", "user", "post")
+            .with_fields([FieldDefinition::new("w", FieldType::String)]);
 
         let mut code_edges = HashMap::new();
         code_edges.insert("r".into(), code_edge);
@@ -1596,7 +2044,7 @@ mod tests {
 
         let code_edge =
             typed_edge("r", "user", "post").with_indexes([IndexDefinition::new("idx", ["w"])]);
-        let db_edge = table_schema("r");
+        let db_edge = typed_edge("r", "user", "post");
 
         let mut code_edges = HashMap::new();
         code_edges.insert("r".into(), code_edge);
@@ -1615,30 +2063,320 @@ mod tests {
                 && r.message.contains("missing from database")));
     }
 
+    fn edges(list: impl IntoIterator<Item = EdgeDefinition>) -> HashMap<String, EdgeDefinition> {
+        list.into_iter().map(|e| (e.name.clone(), e)).collect()
+    }
+
     #[test]
-    fn edge_mode_info_emitted_for_relation() {
+    fn matching_relation_edge_yields_nothing() {
         use crate::schema::edge::typed_edge;
-
-        let code_edge = typed_edge("r", "user", "post");
-        let db_edge = table_schema("r");
-
-        let mut code_edges = HashMap::new();
-        code_edges.insert("r".into(), code_edge);
-        let mut db_edges = HashMap::new();
-        db_edges.insert("r".into(), db_edge);
-
+        let e = typed_edge("r", "user", "post");
         let results = validate_schema(
             &HashMap::new(),
             &HashMap::new(),
-            Some(&code_edges),
-            Some(&db_edges),
+            Some(&edges([e.clone()])),
+            Some(&edges([e])),
         );
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    #[test]
+    fn edge_only_in_database_is_reported() {
+        use crate::schema::edge::typed_edge;
+        let results = validate_schema(
+            &HashMap::new(),
+            &HashMap::new(),
+            Some(&edges([])),
+            Some(&edges([typed_edge("legacy", "a", "b")])),
+        );
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].severity, ValidationSeverity::Warning);
+        assert!(results[0].message.contains("not defined in code"));
+    }
+
+    #[test]
+    fn edge_mode_endpoints_and_permissions_are_compared() {
+        use crate::schema::edge::{typed_edge, EdgeMode};
+        let code = typed_edge("r", "user", "post").with_permissions([("select", "in = $auth.id")]);
+        let db = typed_edge("r", "user", "comment").with_mode(EdgeMode::Schemafull);
+        let r = validate_edge(&code, &db);
+        assert!(r.iter().any(|r| r.message == "Edge mode mismatch"), "{r:?}");
         assert!(
-            results
-                .iter()
-                .any(|r| r.severity == ValidationSeverity::Info
-                    && r.message.starts_with("Edge mode:"))
+            r.iter().any(|r| r.message == "Edge TO table mismatch"
+                && r.severity == ValidationSeverity::Error),
+            "{r:?}"
         );
+        assert!(!r.iter().any(|r| r.message == "Edge FROM table mismatch"));
+        assert!(r.iter().any(|r| r.message == "Edge permissions mismatch"));
+    }
+
+    #[test]
+    fn edge_endpoint_missing_on_one_side_is_a_warning() {
+        use crate::schema::edge::typed_edge;
+        let code = typed_edge("r", "user", "post");
+        let mut db = typed_edge("r", "user", "post");
+        db.to_table = None;
+        let r = validate_edge(&code, &db);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].severity, ValidationSeverity::Warning);
+    }
+
+    #[test]
+    fn edge_db_only_fields_indexes_and_events_are_reported() {
+        use crate::schema::edge::typed_edge;
+        let code = typed_edge("r", "user", "post");
+        let db = typed_edge("r", "user", "post")
+            .with_fields([FieldDefinition::new("w", FieldType::Int)])
+            .with_indexes([IndexDefinition::new("w_idx", ["w"])])
+            .with_events([event("e", "true", "RETURN 1")]);
+        let r = validate_edge(&code, &db);
+        let fields: Vec<_> = r.iter().filter_map(|r| r.field.as_deref()).collect();
+        assert_eq!(fields, vec!["w", "index:w_idx", "event:e"], "{r:?}");
+        assert!(r.iter().all(|r| r.severity == ValidationSeverity::Warning));
+    }
+
+    #[test]
+    fn edge_event_body_drift_is_reported() {
+        use crate::schema::edge::typed_edge;
+        let code = typed_edge("r", "a", "b").with_events([event("e", "true", "CREATE x")]);
+        let db = typed_edge("r", "a", "b").with_events([event("e", "true", "CREATE y")]);
+        let r = validate_edge(&code, &db);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].message.contains("THEN"));
+    }
+
+    #[test]
+    fn code_edge_held_as_plain_table_is_compared_as_an_edge() {
+        use crate::schema::edge::{edge_schema, EdgeMode};
+        let code_edge = edge_schema("follows").with_mode(EdgeMode::Schemafull);
+        let db_tables = one_table(table_schema("follows"));
+        let results = validate_schema(
+            &HashMap::new(),
+            &db_tables,
+            Some(&edges([code_edge])),
+            Some(&edges([])),
+        );
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    #[test]
+    fn code_table_defined_as_edge_in_database_is_one_error() {
+        use crate::schema::edge::typed_edge;
+        let results = validate_schema(
+            &one_table(table_schema("likes")),
+            &HashMap::new(),
+            Some(&edges([])),
+            Some(&edges([typed_edge("likes", "a", "b")])),
+        );
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].severity, ValidationSeverity::Error);
+        assert!(results[0].message.contains("as an edge"));
+    }
+
+    #[test]
+    fn results_are_ordered_by_name() {
+        let names = ["zeta", "alpha", "mid", "beta", "omega"];
+        let code: HashMap<String, TableDefinition> = names
+            .iter()
+            .map(|n| ((*n).to_string(), table_schema(*n)))
+            .collect();
+        let results = validate_schema(&code, &HashMap::new(), None, None);
+        let got: Vec<&str> = results.iter().map(|r| r.table.as_str()).collect();
+        assert_eq!(got, vec!["alpha", "beta", "mid", "omega", "zeta"]);
+    }
+
+    // -- Attributes that used to be skipped -----------------------------------
+
+    fn one_table(table: TableDefinition) -> HashMap<String, TableDefinition> {
+        let mut m = HashMap::new();
+        m.insert(table.name.clone(), table);
+        m
+    }
+
+    #[test]
+    fn field_reference_and_target_drift_is_reported() {
+        use crate::schema::reference::ReferenceAction;
+        let code = FieldDefinition::new("owner", FieldType::Record)
+            .with_target_table("user")
+            .with_reference(ReferenceAction::Cascade);
+        let db = FieldDefinition::new("owner", FieldType::Record)
+            .with_target_table("post")
+            .with_reference(ReferenceAction::Reject);
+        let r = validate_field("t", &code, &db);
+        assert!(r.iter().any(
+            |r| r.message.contains("record target") && r.severity == ValidationSeverity::Error
+        ));
+        assert!(r
+            .iter()
+            .any(|r| r.message.contains("REFERENCE") && r.severity == ValidationSeverity::Error));
+    }
+
+    #[test]
+    fn field_nullability_drift_is_reported() {
+        let code = FieldDefinition::new("nick", FieldType::String).with_nullable(true);
+        let db = FieldDefinition::new("nick", FieldType::String);
+        let r = validate_field("t", &code, &db);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].severity, ValidationSeverity::Error);
+        assert!(r[0].message.contains("nullab"));
+    }
+
+    #[test]
+    fn field_computed_drift_is_reported() {
+        let code = FieldDefinition::new("n", FieldType::Any).with_computed("<~post");
+        let db = FieldDefinition::new("n", FieldType::Any).with_computed("<~comment");
+        let r = validate_field("t", &code, &db);
+        assert!(r.iter().any(|r| r.message.contains("COMPUTED")));
+    }
+
+    #[test]
+    fn field_permissions_drift_is_reported() {
+        let code = FieldDefinition::new("secret", FieldType::String)
+            .with_permissions([("select", "$auth.admin = true")]);
+        let db = FieldDefinition::new("secret", FieldType::String);
+        let r = validate_field("t", &code, &db);
+        assert!(r
+            .iter()
+            .any(|r| r.message.contains("permissions") && r.severity == ValidationSeverity::Error));
+    }
+
+    #[test]
+    fn field_permissions_default_full_matches_explicit_full() {
+        let code = FieldDefinition::new("f", FieldType::String);
+        let db = FieldDefinition::new("f", FieldType::String).with_permissions([
+            ("select", "FULL"),
+            ("create", "FULL"),
+            ("update", "WHERE true"),
+        ]);
+        assert!(validate_field("t", &code, &db).is_empty());
+    }
+
+    #[test]
+    fn table_permissions_drift_is_reported() {
+        let code = table_schema("doc").with_permissions([("select", "owner = $auth.id")]);
+        let db = table_schema("doc");
+        let r = validate_table(&code, &db);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].severity, ValidationSeverity::Error);
+        assert!(r[0].message.contains("permissions"));
+    }
+
+    #[test]
+    fn table_permissions_grouped_actions_match_split_echo() {
+        let code = table_schema("doc").with_permissions([("select, update", "owner = $auth.id")]);
+        let db = table_schema("doc").with_permissions([
+            ("select", "owner  =  $auth.id"),
+            ("update", "owner = $auth.id"),
+        ]);
+        assert!(validate_table(&code, &db).is_empty());
+    }
+
+    #[test]
+    fn table_changefeed_view_and_drop_drift_is_reported() {
+        use crate::schema::changefeed::ChangeFeed;
+        use crate::schema::view::ViewDefinition;
+        let code = table_schema("t")
+            .with_changefeed(ChangeFeed::new("1d"))
+            .with_view(ViewDefinition::new(["count() AS n"], ["post"]))
+            .with_drop(true);
+        let db = table_schema("t").with_changefeed(ChangeFeed::new("7d"));
+        let r = validate_table(&code, &db);
+        assert!(r.iter().any(|r| r.message.contains("change feed")), "{r:?}");
+        assert!(r.iter().any(|r| r.message.contains("view")), "{r:?}");
+        assert!(r.iter().any(|r| r.message.contains("DROP")), "{r:?}");
+    }
+
+    #[test]
+    fn db_edges_none_skips_edge_validation() {
+        use crate::schema::edge::typed_edge;
+        let mut code_edges = HashMap::new();
+        code_edges.insert("likes".to_string(), typed_edge("likes", "user", "post"));
+        let results = validate_schema(
+            &one_table(table_schema("user")),
+            &one_table(table_schema("user")),
+            Some(&code_edges),
+            None,
+        );
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    #[test]
+    fn event_condition_and_action_drift_is_reported() {
+        let code = table_schema("t").with_events([event("e", "$event = 'CREATE'", "CREATE log")]);
+        let db = table_schema("t").with_events([event("e", "$event = 'DELETE'", "DELETE log")]);
+        let r = validate_table(&code, &db);
+        assert!(r.iter().any(|r| r.message.contains("condition")), "{r:?}");
+        assert!(r.iter().any(|r| r.message.contains("action")), "{r:?}");
+    }
+
+    #[test]
+    fn event_echo_reformatting_is_not_drift() {
+        let code = table_schema("t").with_events([
+            event("a", "$event = \"CREATE\"", "CREATE log SET x = 1"),
+            event("b", "true", "{ LET $a = 1; RETURN $a }"),
+        ]);
+        let db = table_schema("t").with_events([
+            event("a", "$event = 'CREATE'", "(CREATE log SET x = 1)"),
+            event("b", "true", "LET $a = 1; RETURN $a;"),
+        ]);
+        let r = validate_table(&code, &db);
+        assert!(r.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn index_column_order_is_significant() {
+        let code = IndexDefinition::new("ab", ["a", "b"]);
+        let db = IndexDefinition::new("ab", ["b", "a"]);
+        let r = validate_index("t", &code, &db);
+        assert!(r.iter().any(|r| r.message.contains("columns mismatch")));
+    }
+
+    #[test]
+    fn hnsw_engine_default_efc_and_m_match_unset() {
+        use crate::schema::table::{hnsw_index, HnswDistanceType};
+        let code = hnsw_index(
+            "v",
+            "emb",
+            4,
+            HnswDistanceType::Cosine,
+            MTreeVectorType::F32,
+            None,
+            None,
+        );
+        let db = hnsw_index(
+            "v",
+            "emb",
+            4,
+            HnswDistanceType::Cosine,
+            MTreeVectorType::F32,
+            Some(150),
+            Some(12),
+        );
+        assert!(validate_index("t", &code, &db).is_empty());
+    }
+
+    #[test]
+    fn fulltext_analyzer_and_highlights_drift_is_reported() {
+        let code = IndexDefinition::new("s", ["body"])
+            .with_type(IndexType::Search)
+            .with_analyzer("en")
+            .with_highlights();
+        let db = IndexDefinition::new("s", ["body"])
+            .with_type(IndexType::Search)
+            .with_analyzer("fr");
+        let r = validate_index("t", &code, &db);
+        assert!(r.iter().any(|r| r.message.contains("analyzer")), "{r:?}");
+        assert!(r.iter().any(|r| r.message.contains("HIGHLIGHTS")), "{r:?}");
+    }
+
+    #[test]
+    fn engine_array_child_fields_are_not_extra() {
+        let code = table_schema("t").with_fields([FieldDefinition::new("tags", FieldType::Array)]);
+        let db = table_schema("t").with_fields([
+            FieldDefinition::new("tags", FieldType::Array),
+            FieldDefinition::new("tags.*", FieldType::String),
+        ]);
+        assert!(validate_table(&code, &db).is_empty());
     }
 
     // -- normalize_expression --------------------------------------------------
