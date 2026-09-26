@@ -13,6 +13,7 @@ use crate::cli::GlobalOpts;
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
 use crate::migration::history::{ensure_migration_table, MIGRATION_TABLE_NAME};
+use crate::types::escape::quote_ident;
 
 /// `surql db <subcommand>` commands.
 #[derive(Debug, Subcommand)]
@@ -167,11 +168,21 @@ async fn reset(settings: &crate::settings::Settings, yes: bool) -> Result<()> {
         return Ok(());
     }
     fmt::info(format!("removing {} table(s)", tables.len()));
-    for t in &tables {
-        client.query(&format!("REMOVE TABLE {t};")).await?;
+    for statement in remove_table_statements(&tables) {
+        client.query(&statement).await?;
     }
     fmt::success(format!("removed {} table(s)", tables.len()));
     Ok(())
+}
+
+/// One `REMOVE TABLE` per name. The names come from `INFO FOR DB` and can
+/// be any text a table was defined with (`foo-bar`, or one carrying a `;`
+/// and a second statement), so each is quoted as an identifier.
+fn remove_table_statements(tables: &[String]) -> Vec<String> {
+    tables
+        .iter()
+        .map(|t| format!("REMOVE TABLE {};", quote_ident(t)))
+        .collect()
 }
 
 async fn query(
@@ -205,4 +216,26 @@ async fn version(settings: &crate::settings::Settings) -> Result<()> {
     fmt::info(format!("connected to {}", settings.database().url()));
     fmt::print_json(&info)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_table_statements_quote_every_name() {
+        let names = vec![
+            "user".to_string(),
+            "foo-bar".to_string(),
+            "x; REMOVE NAMESPACE other".to_string(),
+        ];
+        assert_eq!(
+            remove_table_statements(&names),
+            vec![
+                "REMOVE TABLE user;".to_string(),
+                "REMOVE TABLE `foo-bar`;".to_string(),
+                "REMOVE TABLE `x; REMOVE NAMESPACE other`;".to_string(),
+            ]
+        );
+    }
 }
