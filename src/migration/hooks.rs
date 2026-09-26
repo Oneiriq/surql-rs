@@ -46,9 +46,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
 use crate::migration::diff::{diff_schemas, SchemaSnapshot};
+use crate::migration::discovery::compare_versions;
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::migration::versioning::{
-    create_snapshot, list_snapshots, store_snapshot, VersionedSnapshot,
+    create_snapshot, load_snapshot, store_snapshot, VersionedSnapshot,
 };
 use crate::schema::registry::SchemaRegistry;
 
@@ -251,8 +252,9 @@ pub fn check_schema_drift_from_snapshots(
 /// # Errors
 ///
 /// Returns [`SurqlError::MigrationHistory`] when `snapshots_dir` exists
-/// but cannot be enumerated, or [`SurqlError::Io`] when a snapshot file
-/// cannot be read.
+/// but cannot be enumerated, [`SurqlError::Io`] when the newest snapshot
+/// file cannot be read, or [`SurqlError::Serialization`] when it is not a
+/// valid snapshot.
 pub fn check_schema_drift(
     registry: &SchemaRegistry,
     snapshots_dir: Option<&Path>,
@@ -293,13 +295,29 @@ pub fn versioned_to_snapshot(snapshot: &VersionedSnapshot) -> SchemaSnapshot {
     }
 }
 
+/// The newest snapshot in `dir`, by the version in its file name.
+///
+/// The newest file is loaded strictly: a corrupt newest snapshot is an
+/// error, not a silent fall-back to an older baseline (which would report
+/// drift against the wrong schema).
 fn latest_snapshot(dir: &Path) -> Result<Option<VersionedSnapshot>> {
-    let mut snaps = list_snapshots(dir)?;
-    if snaps.is_empty() {
-        return Ok(None);
-    }
-    // `list_snapshots` sorts ascending by version; take the last.
-    Ok(snaps.pop())
+    let entries = std::fs::read_dir(dir).map_err(|e| SurqlError::MigrationHistory {
+        reason: format!("failed to read snapshot directory {}: {e}", dir.display()),
+    })?;
+    let newest = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(VersionedSnapshot::FILE_EXTENSION))
+        })
+        .filter_map(|path| {
+            let version = path.file_stem()?.to_str()?.to_owned();
+            Some((version, path))
+        })
+        .max_by(|(a, _), (b, _)| compare_versions(a, b));
+    newest.map(|(_, path)| load_snapshot(&path)).transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +336,7 @@ pub fn default_schema_filter(path: &Path) -> bool {
 
 /// Return the list of files currently staged in git under `schema_dir`.
 ///
-/// Runs `git diff --cached --name-only --diff-filter=ACMR --relative`
+/// Runs `git diff --cached --name-only --diff-filter=ACMR --relative -z`
 /// with `schema_dir` as the current working directory. The `--relative`
 /// flag makes git scope output to `schema_dir` and emit paths relative
 /// to it, which matches the filtered view the caller wants.
@@ -353,6 +371,10 @@ where
     // accidentally read the outer repo's index. This also makes our
     // own `migration::hooks` tests deterministic when run under
     // `git push -> pre-push -> cargo test`.
+    // `-z` separates paths with NUL and turns off `core.quotePath`
+    // quoting, which otherwise wraps any path with a non-ASCII or special
+    // character in quotes and octal escapes (and the extension check then
+    // sees `surql"`).
     let output = Command::new("git")
         .args([
             "diff",
@@ -360,6 +382,7 @@ where
             "--name-only",
             "--diff-filter=ACMR",
             "--relative",
+            "-z",
         ])
         .current_dir(cwd)
         .env_remove("GIT_DIR")
@@ -381,12 +404,11 @@ where
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut staged: Vec<PathBuf> = Vec::new();
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for name in stdout.split('\0') {
+        if name.is_empty() {
             continue;
         }
-        let path = PathBuf::from(trimmed);
+        let path = PathBuf::from(name);
         if !filter(&path) {
             continue;
         }
@@ -1141,6 +1163,46 @@ mod tests {
         let files = get_staged_schema_files(&schema_subdir, default_schema_filter)
             .expect("get_staged_schema_files succeeds");
         assert_eq!(files.len(), 3);
+    }
+
+    /// git quotes non-ASCII paths (`"sch\303\251ma.surql"`) unless told
+    /// not to, and the quoted name failed the extension filter.
+    #[test]
+    fn staged_includes_non_ascii_file_names() {
+        let dir = unique_temp_dir("stage-unicode");
+        if !init_git_repo(&dir) {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        fs::write(dir.join("schéma.surql"), "x").unwrap();
+        fs::write(dir.join("with space.surql"), "x").unwrap();
+        assert!(git_add(&dir, "schéma.surql"));
+        assert!(git_add(&dir, "with space.surql"));
+        let mut files = get_staged_schema_files(&dir, default_schema_filter)
+            .expect("get_staged_schema_files succeeds");
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("schéma.surql"),
+                PathBuf::from("with space.surql")
+            ]
+        );
+    }
+
+    /// A corrupt newest snapshot used to be skipped, so drift was checked
+    /// against an older baseline without a word.
+    #[test]
+    fn check_drift_refuses_a_corrupt_newest_snapshot() {
+        let registry = SchemaRegistry::new();
+        registry.register_table(table_schema("user"));
+        let dir = unique_temp_dir("corrupt-newest");
+        store_snapshot(&VersionedSnapshot::builder("20260101_000000").build(), &dir)
+            .expect("store older");
+        fs::write(dir.join("20260301_000000.json"), "{ not json").unwrap();
+
+        let err = check_schema_drift(&registry, Some(&dir), None).unwrap_err();
+        assert!(matches!(err, SurqlError::Serialization { .. }), "{err}");
     }
 
     #[test]

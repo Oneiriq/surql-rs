@@ -354,72 +354,124 @@ pub async fn plan_rollback_to_version(
 // ---------------------------------------------------------------------------
 
 fn analyse_migration(migration: &Migration) -> Vec<RollbackIssue> {
-    let mut issues = Vec::new();
     if migration.down.is_empty() {
-        issues.push(RollbackIssue {
+        return vec![RollbackIssue {
             safety: RollbackSafety::Danger,
             migration: migration.version.clone(),
             description: "migration has no `down` statements; cannot roll back cleanly".into(),
             affected_data: None,
             recommendation: Some("add a `-- @down` block or restore from backup".into()),
-        });
-        return issues;
+        }];
     }
-    for statement in &migration.down {
-        // Classify by the leading keywords of the statement's code
-        // ("REMOVE TABLE …", "REMOVE FIELD …", "ALTER FIELD … TYPE …",
-        // "DELETE …"); comments in front of it do not count.
-        let toks = lexer::tokens(statement);
-        let (verb, object) = match toks.as_slice() {
-            [verb, object, ..] => (Some(verb), Some(object)),
-            [verb] => (Some(verb), None),
-            [] => (None, None),
-        };
-        let is = |tok: Option<&Token<'_>>, kw: &str| tok.is_some_and(|t| t.is_keyword(kw));
-        let is_remove_or_drop = is(verb, "REMOVE") || is(verb, "DROP");
+    analyze_statements(&migration.version, &migration.down)
+}
 
-        if is_remove_or_drop && is(object, "TABLE") {
-            let table = object_name(toks.get(2..).unwrap_or_default());
-            issues.push(RollbackIssue {
-                safety: RollbackSafety::Danger,
-                migration: migration.version.clone(),
-                description: format!("dropping table: {table}"),
-                affected_data: Some(format!("all records in table {table}")),
-                recommendation: Some("export table data before rollback".into()),
-            });
-        } else if is_remove_or_drop && is(object, "FIELD") {
-            let field = object_name(toks.get(2..).unwrap_or_default());
-            issues.push(RollbackIssue {
-                safety: RollbackSafety::Warning,
-                migration: migration.version.clone(),
-                description: format!("dropping field: {field}"),
-                affected_data: Some(format!("field data in {field}")),
-                recommendation: Some("back up affected field data".into()),
-            });
-        } else if is(verb, "ALTER")
-            && is(object, "FIELD")
-            && toks.iter().any(|t| t.is_keyword("TYPE"))
-        {
-            issues.push(RollbackIssue {
-                safety: RollbackSafety::Warning,
-                migration: migration.version.clone(),
-                description: "altering field type may cause data conversion issues".into(),
-                affected_data: None,
-                recommendation: Some("review data compatibility before rollback".into()),
-            });
-        } else if is(verb, "DELETE") {
-            let target = object_name(toks.get(1..).unwrap_or_default());
-            issues.push(RollbackIssue {
-                safety: RollbackSafety::Danger,
-                migration: migration.version.clone(),
-                description: format!("deleting records: {target}"),
-                affected_data: Some(format!("records deleted from {target}")),
-                recommendation: Some("export the records before rollback".into()),
-            });
+/// Classify SurrealQL statements by the data they can destroy.
+///
+/// The rollback analyser runs this over each migration's `down` body; it
+/// works on any statement list (a forward migration's `up`, say). Each
+/// statement is classified by its leading keywords, after any comments:
+///
+/// * [`RollbackSafety::Danger`]: `REMOVE TABLE`, `REMOVE NAMESPACE` /
+///   `NS`, `REMOVE DATABASE` / `DB`, `REMOVE BUCKET`, and `DELETE`.
+/// * [`RollbackSafety::Warning`]: `REMOVE FIELD`, and `ALTER FIELD … TYPE`.
+///
+/// (`DROP` is accepted as a synonym of `REMOVE`.) Everything else, index,
+/// event, function and other definition drops included, raises no issue.
+/// `version` is recorded as each issue's [`RollbackIssue::migration`].
+pub fn analyze_statements(version: &str, statements: &[String]) -> Vec<RollbackIssue> {
+    statements
+        .iter()
+        .filter_map(|statement| classify_statement(version, statement))
+        .collect()
+}
+
+fn classify_statement(version: &str, statement: &str) -> Option<RollbackIssue> {
+    let toks = lexer::tokens(statement);
+    let (verb, object) = match toks.as_slice() {
+        [verb, object, ..] => (Some(verb), Some(object)),
+        [verb] => (Some(verb), None),
+        [] => (None, None),
+    };
+    let is = |tok: Option<&Token<'_>>, kws: &[&str]| {
+        tok.is_some_and(|t| kws.iter().any(|kw| t.is_keyword(kw)))
+    };
+    let issue = |safety, description: String, affected: Option<String>, advice: &str| {
+        Some(RollbackIssue {
+            safety,
+            migration: version.to_string(),
+            description,
+            affected_data: affected,
+            recommendation: Some(advice.to_string()),
+        })
+    };
+    let name = || object_name(toks.get(2..).unwrap_or_default());
+
+    if is(verb, &["REMOVE", "DROP"]) {
+        if is(object, &["TABLE"]) {
+            let table = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping table: {table}"),
+                Some(format!("all records in table {table}")),
+                "export table data before rollback",
+            )
+        } else if is(object, &["NAMESPACE", "NS"]) {
+            let ns = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping namespace: {ns}"),
+                Some(format!("every database in namespace {ns}")),
+                "back up the namespace before rollback",
+            )
+        } else if is(object, &["DATABASE", "DB"]) {
+            let db = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping database: {db}"),
+                Some(format!("every table in database {db}")),
+                "back up the database before rollback",
+            )
+        } else if is(object, &["BUCKET"]) {
+            let bucket = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping bucket: {bucket}"),
+                Some(format!("files stored in bucket {bucket}")),
+                "export the bucket's files before rollback",
+            )
+        } else if is(object, &["FIELD"]) {
+            let field = name();
+            issue(
+                RollbackSafety::Warning,
+                format!("dropping field: {field}"),
+                Some(format!("field data in {field}")),
+                "back up affected field data",
+            )
+        } else {
+            None
         }
-        // Index / event drops and other operations are treated as safe.
+    } else if is(verb, &["ALTER"])
+        && is(object, &["FIELD"])
+        && toks.iter().any(|t| t.is_keyword("TYPE"))
+    {
+        issue(
+            RollbackSafety::Warning,
+            "altering field type may cause data conversion issues".into(),
+            None,
+            "review data compatibility before rollback",
+        )
+    } else if is(verb, &["DELETE"]) {
+        let target = object_name(toks.get(1..).unwrap_or_default());
+        issue(
+            RollbackSafety::Danger,
+            format!("deleting records: {target}"),
+            Some(format!("records deleted from {target}")),
+            "export the records before rollback",
+        )
+    } else {
+        None
     }
-    issues
 }
 
 /// The name after a kind keyword, past any `IF EXISTS` (or `FROM`, for a
@@ -571,6 +623,36 @@ mod tests {
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0].safety, RollbackSafety::Danger);
         assert_eq!(issues[0].description, "dropping table: user");
+    }
+
+    #[test]
+    fn analyze_statements_flags_every_destructive_kind() {
+        let stmts: Vec<String> = [
+            "REMOVE NAMESPACE app;",
+            "REMOVE NS app;",
+            "-- note\nREMOVE DATABASE IF EXISTS main;",
+            "REMOVE DB main;",
+            "REMOVE BUCKET avatars;",
+            "DELETE ONLY user:1;",
+            "REMOVE INDEX idx ON user;",
+            "REMOVE FUNCTION fn::a;",
+            "DEFINE TABLE t;",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let issues = analyze_statements("v1", &stmts);
+        let danger = |d: &str| {
+            issues
+                .iter()
+                .any(|i| i.safety == RollbackSafety::Danger && i.description == d)
+        };
+        assert!(danger("dropping namespace: app"), "{issues:#?}");
+        assert!(danger("dropping database: main"), "{issues:#?}");
+        assert!(danger("dropping bucket: avatars"), "{issues:#?}");
+        assert!(danger("deleting records: user"), "{issues:#?}");
+        assert_eq!(issues.len(), 6, "{issues:#?}");
+        assert!(issues.iter().all(|i| i.migration == "v1"));
     }
 
     #[test]

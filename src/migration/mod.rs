@@ -99,6 +99,6 @@ pub use history::{
 };
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use rollback::{
-    analyze_rollback_safety, create_rollback_plan, execute_rollback, plan_rollback_to_version,
-    RollbackIssue, RollbackPlan, RollbackResult, RollbackSafety,
+    analyze_rollback_safety, analyze_statements, create_rollback_plan, execute_rollback,
+    plan_rollback_to_version, RollbackIssue, RollbackPlan, RollbackResult, RollbackSafety,
 };

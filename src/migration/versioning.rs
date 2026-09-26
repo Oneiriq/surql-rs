@@ -35,13 +35,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::sha256_hex;
+use crate::migration::discovery::{compare_versions, sha256_hex};
 use crate::migration::models::Migration;
 use crate::schema::access::AccessDefinition;
 use crate::schema::bucket::BucketDefinition;
@@ -391,9 +391,12 @@ impl VersionGraph {
         self.nodes.get(version)
     }
 
-    /// Return a vector of all version identifiers in insertion order.
+    /// Return every version identifier, in version order (runs of digits
+    /// compared as numbers, as migrations are ordered).
     pub fn versions(&self) -> Vec<&str> {
-        self.nodes.keys().map(String::as_str).collect()
+        let mut versions: Vec<&str> = self.nodes.keys().map(String::as_str).collect();
+        versions.sort_by(|a, b| compare_versions(a, b));
+        versions
     }
 
     /// Return every ancestor of `version`, from root down to the immediate
@@ -515,16 +518,37 @@ pub fn create_snapshot(
 ///
 /// # Errors
 ///
-/// Returns [`SurqlError::Io`] or [`SurqlError::Serialization`] if the
-/// directory cannot be created or the file cannot be written.
+/// Returns [`SurqlError::Validation`] when the version cannot serve as a
+/// file name inside `directory` (empty, or containing a path separator or
+/// drive prefix, such as `../x` or an absolute path), and
+/// [`SurqlError::Io`] or [`SurqlError::Serialization`] if the directory
+/// cannot be created or the file cannot be written.
 pub fn store_snapshot(snapshot: &VersionedSnapshot, directory: &Path) -> Result<PathBuf> {
+    let filename = snapshot.filename();
+    let is_single_name = !snapshot.version.trim().is_empty()
+        && !snapshot.version.contains(['/', '\\', ':', '\0'])
+        && matches!(
+            Path::new(&filename)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [Component::Normal(_)]
+        );
+    if !is_single_name {
+        return Err(SurqlError::Validation {
+            reason: format!(
+                "snapshot version {:?} cannot be used as a file name",
+                snapshot.version
+            ),
+        });
+    }
     fs::create_dir_all(directory).map_err(|e| SurqlError::Io {
         reason: format!(
             "failed to create snapshot directory {}: {e}",
             directory.display(),
         ),
     })?;
-    let path = directory.join(snapshot.filename());
+    let path = directory.join(filename);
     let payload = serde_json::to_vec_pretty(snapshot).map_err(|e| SurqlError::Serialization {
         reason: format!("failed to serialise snapshot {}: {e}", snapshot.version),
     })?;
@@ -590,7 +614,7 @@ pub fn list_snapshots(directory: &Path) -> Result<Vec<VersionedSnapshot>> {
             snapshots.push(snap);
         }
     }
-    snapshots.sort_by(|a, b| a.version.cmp(&b.version));
+    snapshots.sort_by(|a, b| compare_versions(&a.version, &b.version));
     Ok(snapshots)
 }
 
@@ -618,6 +642,15 @@ pub struct SnapshotComparison {
     pub accesses_removed: Vec<String>,
     /// Access names present in both but with different serialised content.
     pub accesses_modified: Vec<String>,
+    /// Bucket names present in the target but missing from the source.
+    #[serde(default)]
+    pub buckets_added: Vec<String>,
+    /// Bucket names present in the source but missing from the target.
+    #[serde(default)]
+    pub buckets_removed: Vec<String>,
+    /// Bucket names present in both but with different content.
+    #[serde(default)]
+    pub buckets_modified: Vec<String>,
     /// `true` when the two snapshot checksums are equal.
     pub checksum_match: bool,
 }
@@ -634,6 +667,9 @@ impl SnapshotComparison {
             && self.accesses_added.is_empty()
             && self.accesses_removed.is_empty()
             && self.accesses_modified.is_empty()
+            && self.buckets_added.is_empty()
+            && self.buckets_removed.is_empty()
+            && self.buckets_modified.is_empty()
             && self.checksum_match
     }
 }
@@ -672,6 +708,13 @@ pub fn compare_snapshots(
         &mut out.accesses_added,
         &mut out.accesses_removed,
         &mut out.accesses_modified,
+    );
+    compare_maps(
+        &from_version.buckets,
+        &to_version.buckets,
+        &mut out.buckets_added,
+        &mut out.buckets_removed,
+        &mut out.buckets_modified,
     );
     out
 }
@@ -919,6 +962,29 @@ mod tests {
         assert!(nested.join("v1.json").exists());
     }
 
+    /// The file name came straight from the version, so `../x` or an
+    /// absolute path wrote outside the snapshot directory.
+    #[test]
+    fn store_snapshot_refuses_versions_that_leave_the_directory() {
+        let dir = tempdir().unwrap();
+        let inner = dir.path().join("snaps");
+        let outside = dir.path().join("escaped");
+        for version in [
+            "../escaped",
+            "..\\escaped",
+            "a/b",
+            "",
+            "C:evil",
+            outside.to_str().unwrap(),
+        ] {
+            let s = VersionedSnapshot::builder(version).build();
+            let err = store_snapshot(&s, &inner).unwrap_err();
+            assert!(matches!(err, SurqlError::Validation { .. }), "{version}");
+        }
+        assert!(!dir.path().join("escaped.json").exists());
+        assert!(!inner.exists());
+    }
+
     #[test]
     fn load_snapshot_errors_for_missing_file() {
         let dir = tempdir().unwrap();
@@ -1153,13 +1219,29 @@ mod tests {
     }
 
     #[test]
-    fn graph_versions_lists_all() {
+    fn graph_versions_lists_all_in_version_order() {
         let mut g = VersionGraph::new();
-        g.add_version(mig("v1"), None, None).unwrap();
-        g.add_version(mig("v2"), Some("v1"), None).unwrap();
-        let mut v = g.versions();
-        v.sort_unstable();
-        assert_eq!(v, vec!["v1", "v2"]);
+        for v in ["v10", "v2", "v9", "v1"] {
+            g.add_version(mig(v), None, None).unwrap();
+        }
+        assert_eq!(g.versions(), vec!["v1", "v2", "v9", "v10"]);
+    }
+
+    /// The checksum covers buckets, so two snapshots differing only in a
+    /// bucket compared as not identical with every list empty.
+    #[test]
+    fn compare_snapshots_reports_bucket_changes() {
+        use crate::schema::bucket::memory_bucket;
+        let from = VersionedSnapshot::builder("v1")
+            .with_buckets([memory_bucket("old")])
+            .build();
+        let to = VersionedSnapshot::builder("v2")
+            .with_buckets([memory_bucket("new")])
+            .build();
+        let diff = compare_snapshots(&from, &to);
+        assert_eq!(diff.buckets_added, vec!["new"]);
+        assert_eq!(diff.buckets_removed, vec!["old"]);
+        assert!(!diff.is_identical());
     }
 
     // ----- compare_snapshots -----
