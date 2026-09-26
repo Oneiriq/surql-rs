@@ -19,10 +19,13 @@
 //!
 //! ## Atomic writes
 //!
-//! Files are written via a temporary sibling file + `rename` so that a
-//! crash mid-write cannot leave a partially-written migration on disk.
-//! Readers that enumerate the directory will either see the old state
-//! (no file) or the new state (complete file), never a torn write.
+//! Files are written via a temporary sibling file that is then linked
+//! (or renamed) into place, so that a crash mid-write cannot leave a
+//! partially-written migration on disk. Readers that enumerate the
+//! directory will either see the old state (no file) or the new state
+//! (complete file), never a torn write. An existing file is never
+//! replaced: a version already used in the directory is bumped to the
+//! next free second, and a name clash that remains is an error.
 //!
 //! ## Deviation from Python
 //!
@@ -34,7 +37,7 @@
 //! [`load_migration`]: crate::migration::load_migration
 //! [`SchemaRegistry`]: crate::schema::SchemaRegistry
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -42,11 +45,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 
 use crate::error::{Result, SurqlError};
 use crate::migration::diff::SchemaSnapshot;
-use crate::migration::discovery::load_migration;
+use crate::migration::discovery::{get_version_from_filename, load_migration};
 use crate::migration::lexer;
 use crate::migration::models::{Migration, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
@@ -61,8 +64,9 @@ const DEFAULT_AUTHOR: &str = "surql";
 /// Generate a migration file from explicit up/down statement lists.
 ///
 /// Writes the migration atomically to `directory`, using the current UTC
-/// timestamp for the version, and returns the loaded [`Migration`] so
-/// callers can use it immediately without re-parsing from disk.
+/// timestamp for the version (or the next second no migration in
+/// `directory` uses yet), and returns the loaded [`Migration`] so callers
+/// can use it immediately without re-parsing from disk.
 ///
 /// The `name` parameter is used to derive the filename and the
 /// human-readable description. It is sanitised to lowercase
@@ -73,6 +77,7 @@ const DEFAULT_AUTHOR: &str = "surql";
 /// Returns [`SurqlError::MigrationGeneration`] if:
 /// * `name` sanitises to an empty string.
 /// * `directory` cannot be created or written to.
+/// * The target file already exists (it is never overwritten).
 /// * The round-trip load after write fails.
 ///
 /// # Examples
@@ -96,7 +101,7 @@ pub fn generate_migration(
     directory: &Path,
 ) -> Result<Migration> {
     let sanitized = sanitize_name(name)?;
-    let version = generate_version();
+    let version = next_free_version(directory)?;
     let description = description_from_name(name);
 
     let content = render_content(
@@ -205,7 +210,7 @@ pub fn create_blank_migration(
     directory: &Path,
 ) -> Result<Migration> {
     let sanitized = sanitize_name(name)?;
-    let version = generate_version();
+    let version = next_free_version(directory)?;
     let resolved_description = if description.is_empty() {
         description_from_name(name)
     } else {
@@ -302,9 +307,45 @@ pub fn generate_migration_from_diffs(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Generate a UTC timestamp version string (`YYYYMMDD_HHMMSS`).
-fn generate_version() -> String {
-    Utc::now().format("%Y%m%d_%H%M%S").to_string()
+/// A UTC timestamp version (`YYYYMMDD_HHMMSS`) for a new migration in
+/// `directory`: the current second, or the first later second no
+/// migration file in `directory` uses yet. Versions have one-second
+/// resolution, so two migrations generated within one second would
+/// otherwise share a version (and, with the same name, a file).
+pub(crate) fn next_free_version(directory: &Path) -> Result<String> {
+    let taken: BTreeSet<String> = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| get_version_from_filename(entry.file_name().to_str()?))
+        .collect();
+    let mut at = Utc::now();
+    loop {
+        let version = at.format("%Y%m%d_%H%M%S").to_string();
+        if !taken.contains(&version) {
+            return Ok(version);
+        }
+        at = at
+            .checked_add_signed(TimeDelta::seconds(1))
+            .ok_or_else(|| SurqlError::MigrationGeneration {
+                reason: "no free migration version left".to_string(),
+            })?;
+    }
+}
+
+/// `text` on a single line: line breaks and other control characters
+/// become spaces, so a description cannot end the metadata line and start
+/// a `-- @up` section marker of its own.
+pub(crate) fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Sanitize a human-supplied name into a safe filename component.
@@ -366,13 +407,17 @@ fn render_content(
 ) -> String {
     let mut out = String::new();
     out.push_str("-- @metadata\n");
-    let _ = writeln!(out, "-- version: {version}");
-    let _ = writeln!(out, "-- description: {description}");
-    let _ = writeln!(out, "-- author: {author}");
+    let _ = writeln!(out, "-- version: {}", single_line(version));
+    let _ = writeln!(out, "-- description: {}", single_line(description));
+    let _ = writeln!(out, "-- author: {}", single_line(author));
     if depends_on.is_empty() {
         out.push_str("-- depends_on: \n");
     } else {
-        let _ = writeln!(out, "-- depends_on: [{}]", depends_on.join(", "));
+        let _ = writeln!(
+            out,
+            "-- depends_on: [{}]",
+            single_line(&depends_on.join(", "))
+        );
     }
 
     out.push_str("-- @up\n");
@@ -394,9 +439,9 @@ fn render_content(
 fn render_blank_content(version: &str, description: &str, author: &str) -> String {
     let mut out = String::new();
     out.push_str("-- @metadata\n");
-    let _ = writeln!(out, "-- version: {version}");
-    let _ = writeln!(out, "-- description: {description}");
-    let _ = writeln!(out, "-- author: {author}");
+    let _ = writeln!(out, "-- version: {}", single_line(version));
+    let _ = writeln!(out, "-- description: {}", single_line(description));
+    let _ = writeln!(out, "-- author: {}", single_line(author));
     out.push_str("-- depends_on: \n");
     out.push_str("-- @up\n");
     // Intentionally left blank: fill in with forward migration statements.
@@ -444,20 +489,12 @@ fn write_migration_file(directory: &Path, filename: &str, content: &str) -> Resu
             })?;
         drop(file);
 
-        fs::rename(&temp, &target).map_err(|e| SurqlError::MigrationGeneration {
-            reason: format!(
-                "failed to rename {} to {}: {e}",
-                temp.display(),
-                target.display()
-            ),
-        })?;
-        Ok(())
+        publish_without_clobbering(&temp, &target)
     })();
 
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&temp);
-        return Err(err);
-    }
+    // The temp file is gone after a rename, and a leftover after a link.
+    let _ = fs::remove_file(&temp);
+    write_result?;
 
     load_migration(&target).map_err(|e| SurqlError::MigrationGeneration {
         reason: format!(
@@ -465,6 +502,30 @@ fn write_migration_file(directory: &Path, filename: &str, content: &str) -> Resu
             target.display()
         ),
     })
+}
+
+/// Move the finished `temp` file to `target`, refusing to replace an
+/// existing migration. A hard link fails atomically when `target` exists;
+/// where the filesystem cannot link, an existence check guards a rename.
+fn publish_without_clobbering(temp: &Path, target: &Path) -> Result<()> {
+    let exists = || SurqlError::MigrationGeneration {
+        reason: format!(
+            "refusing to overwrite existing migration {}",
+            target.display()
+        ),
+    };
+    match fs::hard_link(temp, target) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+        Err(_) if target.exists() => Err(exists()),
+        Err(_) => fs::rename(temp, target).map_err(|e| SurqlError::MigrationGeneration {
+            reason: format!(
+                "failed to rename {} to {}: {e}",
+                temp.display(),
+                target.display()
+            ),
+        }),
+    }
 }
 
 /// Build a unique temp filename for atomic writes.
@@ -572,7 +633,8 @@ mod tests {
 
     #[test]
     fn version_has_expected_format() {
-        let v = generate_version();
+        let dir = unique_temp_dir("version-format");
+        let v = next_free_version(&dir).unwrap();
         assert_eq!(v.len(), 15, "expected YYYYMMDD_HHMMSS (15 chars)");
         assert_eq!(v.chars().nth(8), Some('_'));
         let (date, time) = v.split_once('_').unwrap();
@@ -580,14 +642,69 @@ mod tests {
         assert!(time.chars().all(|c| c.is_ascii_digit()));
         assert_eq!(date.len(), 8);
         assert_eq!(time.len(), 6);
+
+        cleanup(&dir);
     }
 
     #[test]
-    fn version_is_monotonic_across_calls() {
-        let v1 = generate_version();
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let v2 = generate_version();
-        assert!(v2 >= v1, "expected {v2} >= {v1}");
+    fn version_skips_versions_already_in_the_directory() {
+        let dir = unique_temp_dir("version-taken");
+        let first = next_free_version(&dir).unwrap();
+        fs::write(dir.join(format!("{first}_other.surql")), "").unwrap();
+        let second = next_free_version(&dir).unwrap();
+        assert!(second > first, "expected {second} > {first}");
+
+        cleanup(&dir);
+    }
+
+    /// Versions have one-second resolution, and the second file used to
+    /// replace the first through the rename.
+    #[test]
+    fn two_migrations_in_one_second_both_survive() {
+        let dir = unique_temp_dir("same-second");
+        let a = generate_migration("same", &["SELECT 1;".into()], &[], &dir).unwrap();
+        let b = generate_migration("same", &["SELECT 2;".into()], &[], &dir).unwrap();
+        assert_ne!(a.version, b.version);
+        assert_ne!(a.path, b.path);
+        assert_eq!(load_migration(&a.path).unwrap().up, vec!["SELECT 1;"]);
+        assert_eq!(load_migration(&b.path).unwrap().up, vec!["SELECT 2;"]);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn an_existing_file_is_never_overwritten() {
+        let dir = unique_temp_dir("no-clobber");
+        let target = dir.join("20260101_000000_x.surql");
+        fs::write(&target, "keep me").unwrap();
+        let err = write_migration_file(&dir, "20260101_000000_x.surql", "new").unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        let leftover = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!leftover);
+
+        cleanup(&dir);
+    }
+
+    /// A description is written on the metadata line; a line break in it
+    /// used to start a section marker of its own.
+    #[test]
+    fn a_line_break_in_a_description_cannot_inject_a_section() {
+        let dir = unique_temp_dir("inject");
+        let m = create_blank_migration(
+            "inject",
+            "harmless\n-- @up\nREMOVE TABLE user;\n-- @down",
+            &dir,
+        )
+        .unwrap();
+        assert!(m.up.is_empty(), "{:?}", m.up);
+        assert!(m.description.starts_with("harmless"));
+        assert!(!m.description.contains('\n'));
+
+        cleanup(&dir);
     }
 
     // --- sanitize_name ------------------------------------------------------

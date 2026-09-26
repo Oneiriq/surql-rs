@@ -36,12 +36,14 @@
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
 use crate::error::{Result, SurqlError};
 use crate::migration::discovery::{compare_versions, discover_migrations, sha256_hex};
+use crate::migration::generator::{next_free_version, single_line};
 use crate::migration::lexer::{self, existence_clause, Clause, Token};
 use crate::migration::models::Migration;
 
@@ -503,11 +505,15 @@ pub fn generate_squashed_migration_content(
     let mut buf = String::new();
 
     buf.push_str("-- @metadata\n");
-    let _ = writeln!(buf, "-- version: {version}");
-    let _ = writeln!(buf, "-- description: {description}");
+    let _ = writeln!(buf, "-- version: {}", single_line(version));
+    let _ = writeln!(buf, "-- description: {}", single_line(description));
     buf.push_str("-- author: surql\n");
     if !original_migrations.is_empty() {
-        let _ = writeln!(buf, "-- squashed-from: {}", original_migrations.join(","));
+        let _ = writeln!(
+            buf,
+            "-- squashed-from: {}",
+            single_line(&original_migrations.join(","))
+        );
     }
     let _ = writeln!(buf, "-- generated_at: {}", now.to_rfc3339());
 
@@ -603,7 +609,7 @@ pub fn squash_migrations(directory: &Path, opts: &SquashOptions) -> Result<Squas
 
     let original_versions: Vec<String> = migrations.iter().map(|m| m.version.clone()).collect();
     let description = describe_range(&original_versions);
-    let version = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let version = next_free_version(directory)?;
 
     let content = generate_squashed_migration_content(
         &statements,
@@ -637,10 +643,15 @@ pub fn squash_migrations(directory: &Path, opts: &SquashOptions) -> Result<Squas
     })
 }
 
+/// `squashed_<first>_to_<last>`, reduced to filename-safe characters: it
+/// names the output file, and versions come from file metadata.
 fn describe_range(versions: &[String]) -> String {
     let first = versions.first().map_or("unknown", String::as_str);
     let last = versions.last().map_or("unknown", String::as_str);
     format!("squashed_{first}_to_{last}")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 fn persist_squashed_migration(output_path: &Path, content: &str, version: &str) -> Result<()> {
@@ -652,12 +663,19 @@ fn persist_squashed_migration(output_path: &Path, content: &str, version: &str) 
             ),
         })?;
     }
-    fs::write(output_path, content.as_bytes()).map_err(|e| SurqlError::Io {
-        reason: format!(
-            "failed to write squashed migration {}: {e}",
-            output_path.display()
-        ),
-    })?;
+    // Never replace an existing file: the default name carries a fresh
+    // version, so a clash means an explicit output path points at one.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
+        .and_then(|mut file| file.write_all(content.as_bytes()))
+        .map_err(|e| SurqlError::Io {
+            reason: format!(
+                "failed to write squashed migration {}: {e}",
+                output_path.display()
+            ),
+        })?;
     let checksum = sha256_hex(content.as_bytes());
     tracing::info!(
         target: "surql::migration::squash",
@@ -1510,6 +1528,27 @@ mod tests {
         let r = squash_migrations(&dir, &SquashOptions::new().dry_run(true)).unwrap();
         assert_eq!(r.optimizations_applied, 0);
         assert_eq!(r.statement_count, initial.up.len() + 1);
+    }
+
+    #[test]
+    fn squash_never_overwrites_an_existing_output() {
+        let dir = unique_temp_dir("no-clobber");
+        write_migration(&dir, "20260101_000000", "a", &["DEFINE TABLE a;"], &[]);
+        write_migration(&dir, "20260102_000000", "b", &["DEFINE TABLE b;"], &[]);
+        let existing = dir.join("keep.surql");
+        fs::write(&existing, "precious").unwrap();
+
+        let err =
+            squash_migrations(&dir, &SquashOptions::new().output_path(&existing)).unwrap_err();
+        assert!(matches!(err, SurqlError::Io { .. }), "{err}");
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "precious");
+
+        // Two squashes in the same second get distinct versions and files.
+        let first =
+            squash_migrations(&dir, &SquashOptions::new().to_version("20260102_000000")).unwrap();
+        let second =
+            squash_migrations(&dir, &SquashOptions::new().to_version("20260102_000000")).unwrap();
+        assert_ne!(first.squashed_path, second.squashed_path);
     }
 
     #[test]
