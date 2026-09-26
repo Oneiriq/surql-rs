@@ -42,7 +42,7 @@ pub mod references;
 pub mod results;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod typed;
-mod validate;
+pub(crate) mod validate;
 
 pub use batch::{build_relate_query, build_upsert_query, RelateItem};
 pub use builder::{Condition, Operation, OrderField, Query, WhereCondition};

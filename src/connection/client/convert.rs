@@ -9,8 +9,8 @@ use surrealdb::IndexedResults;
 
 use super::errors::query_err;
 use crate::error::{Result, SurqlError};
-use crate::types::escape::{is_identifier, quote_ident};
-use crate::types::RecordID;
+use crate::query::results::response_rows;
+use crate::query::validate::render_target as query_target;
 
 /// Unpack every statement of a response into one JSON array entry each.
 /// A statement's error fails the whole call (and is never retried).
@@ -31,21 +31,14 @@ pub(super) fn statement_results(mut response: IndexedResults) -> Result<Value> {
 
 /// Render a typed-CRUD or `LIVE SELECT` target as SurrealQL.
 ///
-/// The target is data, never SurrealQL: a table name renders through
-/// [`quote_ident`], anything with a `:` is parsed as a [`RecordID`], whose
-/// `Display` quotes the key so it cannot end the statement, and anything
-/// else is refused.
+/// The target is data, never SurrealQL, by the same rule the query builder
+/// applies ([`query_target`]): a table name renders through `quote_ident`,
+/// a `table:key` is parsed as a `RecordID` whose `Display` quotes the key
+/// so it cannot end the statement, keys SurrealQL would evaluate (arrays,
+/// objects, ranges, generators) are refused, and so is anything else.
+/// Surrounding whitespace is ignored.
 pub(crate) fn render_target(target: &str) -> Result<String> {
-    let target = target.trim();
-    if is_identifier(target) {
-        return Ok(quote_ident(target));
-    }
-    if target.contains(':') {
-        return RecordID::<()>::parse(target).map(|id| id.to_string());
-    }
-    Err(SurqlError::Validation {
-        reason: format!("invalid target {target:?}: expected a table name or a table:id record id"),
-    })
+    query_target(target.trim())
 }
 
 /// A config duration in seconds as a [`Duration`], refusing what
@@ -58,47 +51,19 @@ pub(super) fn seconds(secs: f64) -> Result<Duration> {
 
 /// Every row of a raw `query()` response, typed.
 ///
-/// The response holds one entry per statement. Each statement's result is
-/// spread exactly one level: an array contributes its elements as rows
-/// (whatever they are, arrays included), `null` contributes nothing, and
-/// any other value is one row. The legacy `{"result": …}` envelope is
-/// unwrapped at statement level only, and only when the object has no
-/// keys besides `result`, `status`, `time` and `type`: a row that merely
-/// has a `result` field is a row.
+/// Rows are split out by [`response_rows`], the one rule the whole crate
+/// uses: each statement's result spreads exactly one level, and the legacy
+/// `{"result": …}` envelope is unwrapped at statement level only, so a row
+/// that merely has a `result` field is a row.
 pub(super) fn flatten_rows_typed<T: DeserializeOwned>(raw: &Value) -> Result<Vec<T>> {
-    let statements = match raw {
-        Value::Array(statements) => statements.as_slice(),
-        single => std::slice::from_ref(single),
-    };
-    statements
-        .iter()
-        .map(unwrap_envelope)
-        .flat_map(|statement| match statement {
-            Value::Array(rows) => rows.as_slice(),
-            Value::Null => &[],
-            row => std::slice::from_ref(row),
-        })
+    response_rows(raw)
+        .into_iter()
         .map(|row| {
-            serde_json::from_value(row.clone()).map_err(|e| SurqlError::Serialization {
+            serde_json::from_value(row).map_err(|e| SurqlError::Serialization {
                 reason: e.to_string(),
             })
         })
         .collect()
-}
-
-/// The `result` of a legacy `{"result", "status", "time", "type"}`
-/// statement envelope, or `statement` itself when it is not one.
-fn unwrap_envelope(statement: &Value) -> &Value {
-    match statement {
-        Value::Object(obj)
-            if obj
-                .keys()
-                .all(|k| matches!(k.as_str(), "result" | "status" | "time" | "type")) =>
-        {
-            obj.get("result").unwrap_or(statement)
-        }
-        other => other,
-    }
 }
 
 pub(super) fn first_row_typed<T: DeserializeOwned>(raw: &Value) -> Result<Option<T>> {

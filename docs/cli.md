@@ -14,7 +14,7 @@ Every subcommand accepts:
 
 | Flag                 | Purpose                                                                          |
 |----------------------|----------------------------------------------------------------------------------|
-| `--config <PATH>`    | Read settings from this `Cargo.toml` (or the `Cargo.toml` in this directory).    |
+| `--config <PATH>`    | Read settings from this TOML file (or the `Cargo.toml` in this directory).       |
 | `-v`, `--verbose`    | Emit extra diagnostic output for subcommands that support it.                    |
 | `--help`             | Standard clap help.                                                              |
 | `--version`          | Print the crate version (propagated to every subcommand).                        |
@@ -23,13 +23,13 @@ Without `--config`, the standard layered lookup runs: environment
 variables, `.env`, then the `[package.metadata.surql]` table of the
 nearest `Cargo.toml` above the current directory.
 
-With `--config <PATH>`, that lookup reads the named `Cargo.toml` (and the
-`.env` beside it) instead; `SURQL_*` environment variables still take
-precedence over the file. The path must name a file called `Cargo.toml`,
-or a directory holding one, and the file must parse and contain a
-`[package.metadata.surql]` table. Anything else (a missing file,
-`prod.toml`, a file without the table) is an error rather than a silent
-fall back to the defaults.
+With `--config <PATH>`, the `[package.metadata.surql]` table is read from
+the named file (any name, such as `prod.toml`, or a directory holding a
+`Cargo.toml`) together with the `.env` beside it; `SURQL_*` environment
+variables still take precedence over the file. The file must exist,
+parse, and contain the table. Anything else (a missing file, invalid
+TOML, a file without the table) is an error rather than a silent fall
+back to the defaults.
 
 ## Exit codes
 

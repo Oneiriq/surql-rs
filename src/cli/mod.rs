@@ -18,13 +18,13 @@
 //!
 //! ## Configuration
 //!
-//! Every subcommand accepts `--config <path>` naming the `Cargo.toml`
-//! (or its directory) whose `[package.metadata.surql]` table the
+//! Every subcommand accepts `--config <path>` naming the TOML file
+//! (or `Cargo.toml` directory) whose `[package.metadata.surql]` table the
 //! [`Settings`] loader should read instead of discovering one; see
 //! [`GlobalOpts::settings`]. Without the flag the standard layered lookup
 //! runs (env, `.env`, `Cargo.toml [package.metadata.surql]`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -129,9 +129,9 @@ pub struct Cli {
 /// Global flags shared by every subcommand group.
 #[derive(Debug, Clone, clap::Args)]
 pub struct GlobalOpts {
-    /// Read settings from this `Cargo.toml` (or the `Cargo.toml` in this
-    /// directory) instead of discovering one from the current directory.
-    /// Its `[package.metadata.surql]` table must exist.
+    /// Read settings from the `[package.metadata.surql]` table of this TOML
+    /// file (or the `Cargo.toml` in this directory) instead of discovering
+    /// one from the current directory. The table must exist.
     #[arg(long = "config", global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -143,71 +143,36 @@ pub struct GlobalOpts {
 impl GlobalOpts {
     /// Resolve the effective [`Settings`] for this invocation.
     ///
-    /// When `--config <path>` is supplied, the settings loader reads that
-    /// `Cargo.toml` (a directory means the `Cargo.toml` inside it) and the
-    /// `.env` beside it, with the usual precedence: `SURQL_*` environment
-    /// variables still win over the file. The file must exist, parse, and
-    /// carry a `[package.metadata.surql]` table; anything else is an error
-    /// rather than a silent fall back to the defaults. Otherwise the loader
-    /// walks upward from the current directory as documented on
-    /// [`Settings::load`].
+    /// When `--config <path>` is supplied, the settings loader reads the
+    /// `[package.metadata.surql]` table of that TOML file (any name; a
+    /// directory means the `Cargo.toml` inside it) and the `.env` beside
+    /// it, with the usual precedence: `SURQL_*` environment variables still
+    /// win over the file. The file must exist, parse, and carry the table;
+    /// anything else is an error rather than a silent fall back to the
+    /// defaults. Otherwise the loader walks upward from the current
+    /// directory as documented on [`Settings::load`].
     ///
     /// # Errors
     ///
-    /// Returns [`SurqlError::Validation`] for an unusable `--config` path
-    /// and propagates validation errors from [`Settings::load`].
+    /// Returns [`SurqlError::Io`] for a file that cannot be read,
+    /// [`SurqlError::Validation`] for one that does not parse or lacks the
+    /// table, and propagates validation errors from [`Settings::load`].
     pub fn settings(&self) -> Result<Settings> {
         let mut builder = SettingsBuilder::default();
         if let Some(path) = &self.config {
-            builder = builder.cwd(config_dir(path)?);
+            let file = if path.is_dir() {
+                path.join("Cargo.toml")
+            } else {
+                path.clone()
+            };
+            let dir = match file.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            builder = builder.config_file(file).cwd(dir);
         }
         builder.load()
     }
-}
-
-/// The directory to hand the settings loader for `--config <path>`.
-///
-/// The loader reads the `Cargo.toml` of the directory it starts in before
-/// walking upward, so pointing it at the parent of the named file makes it
-/// read exactly that file. It only ever reads a file called `Cargo.toml`,
-/// and it quietly falls back to the defaults for a file that does not
-/// parse or has no `[package.metadata.surql]` table, so those cases are
-/// rejected here.
-fn config_dir(path: &Path) -> Result<PathBuf> {
-    let invalid = |why: String| SurqlError::Validation {
-        reason: format!("--config {}: {why}", path.display()),
-    };
-    let file = if path.is_dir() {
-        path.join("Cargo.toml")
-    } else {
-        path.to_path_buf()
-    };
-    if file.file_name().and_then(|n| n.to_str()) != Some("Cargo.toml") {
-        return Err(invalid(
-            "settings are read from a file named Cargo.toml (its [package.metadata.surql] table); \
-             pass that file or its directory"
-                .into(),
-        ));
-    }
-    if !file.is_file() {
-        return Err(invalid(format!("{} does not exist", file.display())));
-    }
-    let body = std::fs::read_to_string(&file)
-        .map_err(|e| invalid(format!("cannot read {}: {e}", file.display())))?;
-    let parsed: toml::Table =
-        toml::from_str(&body).map_err(|e| invalid(format!("cannot parse: {e}")))?;
-    let has_section = parsed
-        .get("package")
-        .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("surql"))
-        .is_some();
-    if !has_section {
-        return Err(invalid("has no [package.metadata.surql] table".into()));
-    }
-    Ok(match file.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-        _ => PathBuf::from("."),
-    })
 }
 
 /// Top-level subcommand selector.
@@ -235,6 +200,7 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn parse_version_command() {
@@ -280,16 +246,15 @@ mod tests {
     fn config_flag_rejects_a_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let err = opts(&dir.path().join("Cargo.toml")).settings().unwrap_err();
-        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(err.to_string().contains("cannot read config file"), "{err}");
     }
 
     #[test]
-    fn config_flag_rejects_a_file_the_loader_would_not_read() {
+    fn config_flag_reads_an_arbitrarily_named_file() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("prod.toml");
         std::fs::write(&file, SURQL_CARGO).unwrap();
-        let err = opts(&file).settings().unwrap_err();
-        assert!(err.to_string().contains("Cargo.toml"), "{err}");
+        assert_eq!(opts(&file).settings().unwrap().app_name, "from-config-flag");
     }
 
     #[test]
@@ -305,7 +270,7 @@ mod tests {
 
         std::fs::write(&file, "not = [valid").unwrap();
         let err = opts(&file).settings().unwrap_err();
-        assert!(err.to_string().contains("cannot parse"), "{err}");
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
     }
 
     #[test]

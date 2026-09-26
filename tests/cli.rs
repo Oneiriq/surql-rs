@@ -91,10 +91,10 @@ fn non_utf8_argument_is_a_usage_error_not_a_panic() {
 }
 
 #[test]
-fn config_flag_rejects_a_file_it_would_not_read() {
+fn config_flag_rejects_a_file_it_cannot_use() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let prod = tmp.path().join("prod.toml");
-    std::fs::write(&prod, "[package.metadata.surql]\nmigration_path = \"x\"\n").unwrap();
+    std::fs::write(&prod, "[other]\nmigration_path = \"x\"\n").unwrap();
     bin()
         .arg("--config")
         .arg(&prod)
@@ -102,7 +102,7 @@ fn config_flag_rejects_a_file_it_would_not_read() {
         .assert()
         .failure()
         .code(predicate::eq(1))
-        .stderr(predicate::str::contains("Cargo.toml"));
+        .stderr(predicate::str::contains("[package.metadata.surql]"));
     bin()
         .arg("--config")
         .arg(tmp.path().join("missing").join("Cargo.toml"))
@@ -110,7 +110,7 @@ fn config_flag_rejects_a_file_it_would_not_read() {
         .assert()
         .failure()
         .code(predicate::eq(1))
-        .stderr(predicate::str::contains("does not exist"));
+        .stderr(predicate::str::contains("cannot read config file"));
 }
 
 #[test]
