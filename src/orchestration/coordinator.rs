@@ -579,4 +579,40 @@ mod tests {
         let r = results.get("dry_run_env").unwrap();
         assert_eq!(r.status, DeploymentStatus::Success);
     }
+
+    #[tokio::test]
+    async fn plan_and_coordinator_debug_leave_out_passwords() {
+        let registry = EnvironmentRegistry::new();
+        let connection = crate::connection::ConnectionConfig::builder()
+            .url("ws://127.0.0.1:65535")
+            .namespace("prod")
+            .database("main")
+            .username("root")
+            .password("hunter2-secret")
+            .build()
+            .unwrap();
+        let env = EnvironmentConfig::builder("prod", connection)
+            .build()
+            .unwrap();
+        registry.register(env).await;
+        let plan = DeploymentPlan::builder(registry.clone())
+            .environment("prod")
+            .build();
+        let coordinator = MigrationCoordinator::with_strategy_label(
+            registry.clone(),
+            StrategyKind::Parallel,
+            1,
+            10.0,
+            2,
+        )
+        .unwrap();
+        for rendered in [
+            format!("{plan:?}"),
+            format!("{:?}", DeploymentPlan::builder(registry)),
+            format!("{coordinator:?}"),
+        ] {
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+            assert!(rendered.contains("prod"), "{rendered}");
+        }
+    }
 }
