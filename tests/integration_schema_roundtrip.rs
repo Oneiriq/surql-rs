@@ -25,9 +25,9 @@ use serde_json::Value;
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
-    analyzer, bm25_index, event, function_schema, index, jwt_access, param_schema,
-    record_access, string_field, table_schema, typed_edge, AccessType, FieldDefinition,
-    FieldType, JwtConfig, RecordAccessConfig, TableDefinition, TokenFilter, Tokenizer,
+    analyzer, bm25_index, event, function_schema, index, jwt_access, param_schema, record_access,
+    string_field, table_schema, typed_edge, AccessType, FieldDefinition, FieldType, JwtConfig,
+    RecordAccessConfig, TableDefinition, TokenFilter, Tokenizer,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -131,8 +131,8 @@ async fn field_permissions_reach_the_engine_and_read_back() {
 async fn table_permissions_read_back_without_the_separator() {
     let client = client().await;
     let tenant = table_schema("tenant_doc").with_permissions([("select", "tenant = $auth.tenant")]);
-    let open_delete = table_schema("open_delete")
-        .with_permissions([("select", "a = 1"), ("delete", "FULL")]);
+    let open_delete =
+        table_schema("open_delete").with_permissions([("select", "a = 1"), ("delete", "FULL")]);
     let full = table_schema("everyone").with_permissions([
         ("select", "FULL"),
         ("create", "FULL"),
@@ -156,7 +156,10 @@ async fn table_permissions_read_back_without_the_separator() {
         db.tables["tenant_doc"].permissions,
         Some(map(&[("select", "tenant = $auth.tenant")]))
     );
-    assert_eq!(db.tables["open_delete"].permissions, open_delete.permissions);
+    assert_eq!(
+        db.tables["open_delete"].permissions,
+        open_delete.permissions
+    );
     assert_eq!(db.tables["everyone"].permissions, full.permissions);
     assert!(db.tables["plain"].permissions.is_none());
 }
