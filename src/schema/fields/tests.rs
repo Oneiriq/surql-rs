@@ -357,7 +357,7 @@ fn reserved_and_odd_names_are_quoted() {
     let f = FieldDefinition::new("meta.type", FieldType::String);
     assert_eq!(
         f.to_surql("my-table"),
-        "DEFINE FIELD meta.`type` ON TABLE `my-table` TYPE string;"
+        "DEFINE FIELD meta.type ON TABLE `my-table` TYPE string;"
     );
     let f = FieldDefinition::new("tags[*]", FieldType::String);
     assert_eq!(
@@ -372,7 +372,7 @@ fn reserved_and_odd_names_are_quoted() {
     let f = FieldDefinition::new("link", FieldType::Record).with_target_table("user | order");
     assert_eq!(
         f.to_surql("t"),
-        "DEFINE FIELD link ON TABLE t TYPE record<user | `order`>;"
+        "DEFINE FIELD link ON TABLE t TYPE record<user | order>;"
     );
 }
 

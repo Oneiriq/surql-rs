@@ -740,7 +740,7 @@ mod tests {
         let idx = search_index("content_search", ["title", "content"]);
         assert_eq!(
             idx.to_surql("post"),
-            "DEFINE INDEX content_search ON TABLE post COLUMNS title, `content` FULLTEXT ANALYZER ascii;"
+            "DEFINE INDEX content_search ON TABLE post COLUMNS title, content FULLTEXT ANALYZER ascii;"
         );
     }
 
@@ -749,7 +749,7 @@ mod tests {
         let idx = bm25_index("content_bm25", ["content"], "text_en");
         assert_eq!(
             idx.to_surql("memory"),
-            "DEFINE INDEX content_bm25 ON TABLE memory COLUMNS `content` FULLTEXT ANALYZER text_en BM25;"
+            "DEFINE INDEX content_bm25 ON TABLE memory COLUMNS content FULLTEXT ANALYZER text_en BM25;"
         );
     }
 
@@ -761,7 +761,7 @@ mod tests {
             .with_highlights();
         assert_eq!(
             idx.to_surql("doc"),
-            "DEFINE INDEX s ON TABLE doc COLUMNS `content` FULLTEXT ANALYZER text_en BM25 HIGHLIGHTS;"
+            "DEFINE INDEX s ON TABLE doc COLUMNS content FULLTEXT ANALYZER text_en BM25 HIGHLIGHTS;"
         );
     }
 
@@ -770,7 +770,7 @@ mod tests {
         let idx = bm25_index("content_bm25", ["content"], "text_en");
         assert_eq!(
             idx.to_surql_with_options("memory", true),
-            "DEFINE INDEX IF NOT EXISTS content_bm25 ON TABLE memory COLUMNS `content` \
+            "DEFINE INDEX IF NOT EXISTS content_bm25 ON TABLE memory COLUMNS content \
              FULLTEXT ANALYZER text_en BM25;"
         );
     }

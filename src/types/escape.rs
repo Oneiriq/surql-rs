@@ -5,10 +5,12 @@
 //! They follow the engine's own printer (`surrealdb-core` `fmt/escape.rs`)
 //! and were checked against the SurrealDB 3.0 parser:
 //!
-//! * An identifier is bare when it matches `[A-Za-z_][A-Za-z0-9_]*`, is not a
-//!   reserved word (`CREATE select` is a parse error, `CREATE none` evaluates
-//!   `NONE`), and is not `NaN` or `Infinity`. Anything else is
-//!   backtick-quoted.
+//! * An identifier is bare when it matches `[A-Za-z_][A-Za-z0-9_]*`, is not
+//!   one of the words the engine's lexer reserves in identifier position
+//!   (`CREATE select` is a parse error, `CREATE none` evaluates `NONE`), and
+//!   is not `NaN` or `Infinity`. Anything else is backtick-quoted. Other
+//!   keywords (`order`, `event`, `from`) parse as identifiers and stay bare,
+//!   as the engine prints them.
 //! * A string literal is single-quoted.
 //! * A record-id key is bare when identifier-shaped and not made only of
 //!   digits and underscores. Otherwise it is wrapped in `⟨ ⟩`, which keeps
@@ -19,8 +21,6 @@
 //! Inside any quotes, `\` and the closing delimiter are backslash-escaped, and
 //! the control characters the engine escapes (`\0`, `\r`, `\t`, `\n`, form
 //! feed, backspace) are written the same way it writes them.
-
-use super::reserved::is_reserved_word;
 
 /// `true` when `s` has the bare-identifier shape `[A-Za-z_][A-Za-z0-9_]*`.
 ///
@@ -76,8 +76,7 @@ pub fn quote_str(s: &str) -> String {
 /// assert_eq!(quote_ident("a`b"), r"`a\`b`");
 /// ```
 pub fn quote_ident(s: &str) -> String {
-    let bare =
-        is_identifier(s) && !is_reserved_word(s) && !is_engine_reserved(s) && !is_float_keyword(s);
+    let bare = is_identifier(s) && !is_engine_reserved(s) && !is_float_keyword(s);
     if bare {
         s.to_owned()
     } else {
@@ -195,15 +194,19 @@ fn is_float_keyword(s: &str) -> bool {
 }
 
 /// Words the engine's parser may read as a keyword where an identifier is
-/// expected (`RESERVED_KEYWORD` in surrealdb-core's lexer). The crate's own
-/// [`is_reserved_word`] list exists to warn about field names and is not the
-/// same set, so both are consulted.
+/// expected: `RESERVED_KEYWORD` in surrealdb-core 3.2's lexer, which its own
+/// printer consults, plus `ONLY` and `EXPLAIN`, statement modifiers that
+/// printer leaves bare but that cannot name a table right after a verb
+/// (`CREATE only CONTENT {..}` is a parse error on 3.0 through 3.3). The
+/// integration test `every_lexer_word_is_a_usable_table_name` checks every
+/// lexer word against a live engine. The crate's `SURREAL_RESERVED_WORDS`
+/// list exists to warn about field names and is a different set.
 const ENGINE_RESERVED: &[&str] = &[
     "ALTER", "BEGIN", "BREAK", "CANCEL", "COMMIT", "CONTINUE", "CREATE", "DEFINE", "DELETE", "FOR",
     "IF", "INFO", "INSERT", "KILL", "LIVE", "OPTION", "REBUILD", "RETURN", "RELATE", "REMOVE",
     "SELECT", "LET", "SHOW", "SLEEP", "THROW", "UPDATE", "UPSERT", "USE", "DIFF", "RAND", "NONE",
     "NULL", "AFTER", "BEFORE", "VALUE", "BY", "ALL", "TRUE", "FALSE", "WHERE", "TABLE", "TB",
-    "SEQUENCE", "FUNCTION",
+    "SEQUENCE", "FUNCTION", "ONLY", "EXPLAIN",
 ];
 
 fn is_engine_reserved(s: &str) -> bool {

@@ -6,7 +6,7 @@
 //! [`RecordID`], which renders any key safely.
 
 use crate::error::{Result, SurqlError};
-use crate::types::escape::{is_identifier, quote_ident};
+use crate::types::escape::{is_identifier, quote_ident, unescape};
 use crate::types::record_id::RecordID;
 
 /// The deepest graph traversal the helpers render. Every hop is spelled
@@ -65,7 +65,9 @@ pub(crate) fn quote_field_path(path: &str) -> String {
 
 /// Render a statement target: a table name, or a `table:key` record id.
 ///
-/// A table must be an identifier. A record id is parsed with
+/// A table must be an identifier, and renders through [`quote_ident`] so a
+/// reserved word (`select`, `order`) stays a table name. A record id is
+/// parsed with
 /// [`RecordID::parse`] and re-rendered, so its key is escaped however it was
 /// written: `user:x; DELETE user` targets the record keyed
 /// `"x; DELETE user"` instead of running a second statement. Keys that are
@@ -75,8 +77,13 @@ pub(crate) fn render_target(target: &str) -> Result<String> {
     if target.contains(':') {
         parse_record(target).map(|id| id.to_string())
     } else {
-        validate_identifier(target, "table name")?;
-        Ok(target.to_owned())
+        // Accept the quoted form this function emits, so rendering is stable.
+        let table = target
+            .strip_prefix('`')
+            .and_then(|t| t.strip_suffix('`'))
+            .map_or_else(|| target.to_owned(), unescape);
+        validate_identifier(&table, "table name")?;
+        Ok(quote_ident(&table))
     }
 }
 
@@ -189,8 +196,27 @@ mod tests {
     }
 
     #[test]
+    fn reserved_word_tables_are_quoted() {
+        assert_eq!(render_target("select").unwrap(), "`select`");
+        assert_eq!(render_target("value").unwrap(), "`value`");
+        // A keyword the parser accepts as an identifier stays bare, as the
+        // engine prints it.
+        assert_eq!(render_target("order").unwrap(), "order");
+        assert_eq!(render_target("select:abc").unwrap(), "`select`:abc");
+        assert!(render_target("`a b`").is_err());
+    }
+
+    #[test]
     fn rendered_targets_are_stable() {
-        for target in ["user:a", "user:⟨a-b⟩", "user:x⟩y", "user:-5", "user:⟨(⟩"] {
+        for target in [
+            "user:a",
+            "user:⟨a-b⟩",
+            "user:x⟩y",
+            "user:-5",
+            "user:⟨(⟩",
+            "select",
+            "none:x",
+        ] {
             let once = render_target(target).unwrap();
             assert_eq!(render_target(&once).unwrap(), once, "{target}");
         }
