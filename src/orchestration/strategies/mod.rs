@@ -27,7 +27,7 @@ pub use sequential::SequentialStrategy;
 
 use crate::connection::DatabaseClient;
 use crate::error::Result;
-use crate::migration::{execute_migration, MigrationDirection};
+use crate::migration::{execute_migration, MigrationDirection, MigrationState};
 use crate::orchestration::coordinator::DeploymentPlan;
 use crate::orchestration::environment::EnvironmentConfig;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
@@ -92,12 +92,24 @@ pub async fn deploy_to_environment(
     let start = Instant::now();
     let mut applied = 0usize;
     for migration in &plan.migrations {
-        if let Err(err) = execute_migration(&client, migration, MigrationDirection::Up).await {
-            error!(environment = %env.name, migration = %migration.version, error = %err, "deployment_failed");
+        // `execute_migration` reports a failed statement or commit as
+        // `Ok` with a `Failed` state; only a transport or history error
+        // is an `Err`. Both mean the migration did not apply.
+        let failure = match execute_migration(&client, migration, MigrationDirection::Up).await {
+            Ok(status) if status.state == MigrationState::Failed => Some(
+                status
+                    .error
+                    .unwrap_or_else(|| format!("migration {} failed", migration.version)),
+            ),
+            Ok(_) => None,
+            Err(err) => Some(err.to_string()),
+        };
+        if let Some(reason) = failure {
+            error!(environment = %env.name, migration = %migration.version, error = %reason, "deployment_failed");
             let _ = client.disconnect().await;
             return DeploymentResult::builder(&env.name, DeploymentStatus::Failed, started_at)
                 .completed_at(Utc::now())
-                .error(err.to_string())
+                .error(format!("migration {}: {reason}", migration.version))
                 .migrations_applied(applied)
                 .build();
         }

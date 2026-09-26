@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
-use crate::migration::{execute_migration, Migration, MigrationDirection};
+use crate::migration::{execute_migration, Migration, MigrationDirection, MigrationState};
 use crate::orchestration::environment::{EnvironmentConfig, EnvironmentRegistry};
 use crate::orchestration::health::HealthCheck;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
@@ -422,14 +422,24 @@ async fn rollback_successful(
             continue;
         }
         for migration in migrations.iter().rev() {
-            if let Err(err) = execute_migration(&client, migration, MigrationDirection::Down).await
+            let failure = match execute_migration(&client, migration, MigrationDirection::Down)
+                .await
             {
+                Ok(status) if status.state == MigrationState::Failed => {
+                    Some(status.error.unwrap_or_default())
+                }
+                Ok(_) => None,
+                Err(err) => Some(err.to_string()),
+            };
+            if let Some(reason) = failure {
+                // Later `down` bodies assume this one ran; stop here.
                 error!(
                     environment = %env.name,
                     migration = %migration.version,
-                    error = %err,
+                    error = %reason,
                     "rollback_migration_failed"
                 );
+                break;
             }
         }
         let _ = client.disconnect().await;

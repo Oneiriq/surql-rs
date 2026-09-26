@@ -200,6 +200,92 @@ async fn sequential_deploy_applies_migration_against_live_surrealdb() {
     assert_eq!(MIGRATION_TABLE_NAME, "_migration_history");
 }
 
+fn migration_file(version: &str, up: &str, down: &str) -> String {
+    format!(
+        "-- @metadata\n-- version: {version}\n-- description: m{version}\n-- @up\n{up}\n-- @down\n{down}\n"
+    )
+}
+
+async fn query(cfg: &ConnectionConfig, surql: &str) -> serde_json::Value {
+    let client = connected_client(cfg.clone()).await;
+    let out = client.query(surql).await.expect("query");
+    let _ = client.disconnect().await;
+    out
+}
+
+async fn applied_versions(cfg: &ConnectionConfig) -> Vec<String> {
+    let client = connected_client(cfg.clone()).await;
+    let rows = get_applied_migrations(&client).await.expect("history");
+    let _ = client.disconnect().await;
+    rows.into_iter().map(|h| h.version).collect()
+}
+
+async fn table_names(cfg: &ConnectionConfig) -> Vec<String> {
+    let info = query(cfg, "INFO FOR DB;").await;
+    let tables = info
+        .as_array()
+        .and_then(|stmts| stmts.first())
+        .and_then(|stmt| stmt.get("tables"))
+        .and_then(serde_json::Value::as_object)
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    tables
+}
+
+async fn register(registry: &EnvironmentRegistry, name: &str, cfg: &ConnectionConfig) {
+    let env = EnvironmentConfig::builder(name, cfg.clone())
+        .build()
+        .expect("env");
+    registry.register(env).await;
+}
+
+fn coordinator(registry: &EnvironmentRegistry) -> MigrationCoordinator {
+    MigrationCoordinator::with_strategy_label(registry.clone(), StrategyKind::Sequential, 1, 10.0, 1)
+        .expect("coordinator")
+}
+
+#[tokio::test]
+async fn failed_migration_marks_environment_failed_and_stops() {
+    let database = unique_db("it_orch_fail");
+    let Some(cfg) = integration_config(&database) else {
+        eprintln!("SURREAL_URL not set; skipping");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_migration(
+        tmp.path(),
+        "20260101_000001_boom.surql",
+        &migration_file("20260101_000001", "THROW 'boom';", "SELECT 1;"),
+    );
+    write_migration(
+        tmp.path(),
+        "20260101_000002_after.surql",
+        &migration_file(
+            "20260101_000002",
+            "DEFINE TABLE after_boom;",
+            "REMOVE TABLE after_boom;",
+        ),
+    );
+    let migrations = discover_migrations(tmp.path()).expect("discover");
+
+    let registry = EnvironmentRegistry::new();
+    register(&registry, &database, &cfg).await;
+    let plan = DeploymentPlan::builder(registry.clone())
+        .environment(database.clone())
+        .migrations(migrations)
+        .verify_health(false)
+        .auto_rollback(false)
+        .build();
+    let results = coordinator(&registry).deploy(&plan).await.expect("deploy");
+    let result = results.get(&database).expect("result");
+
+    assert_eq!(result.status, DeploymentStatus::Failed, "{result:?}");
+    assert_eq!(result.migrations_applied, 0);
+    assert!(result.error.as_deref().unwrap_or("").contains("boom"));
+    assert!(applied_versions(&cfg).await.is_empty());
+    assert!(!table_names(&cfg).await.contains(&"after_boom".to_string()));
+}
+
 #[tokio::test]
 async fn coordinator_errors_on_missing_environment() {
     let registry = EnvironmentRegistry::new();
