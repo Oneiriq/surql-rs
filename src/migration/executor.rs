@@ -3,7 +3,8 @@
 //! Port of `surql/migration/executor.py`. Runs individual [`Migration`]
 //! definitions against a live [`DatabaseClient`] inside a
 //! [`Transaction`] (client-side buffered BEGIN/COMMIT) and records the
-//! outcome in the [`MigrationHistory`] table.
+//! outcome in the [`MigrationHistory`] table within that same
+//! transaction.
 //!
 //! All items here require the `client` cargo feature.
 //!
@@ -23,7 +24,6 @@
 //!   "migrations on disk" convention of the port.
 
 use std::path::Path;
-use std::time::Instant;
 
 use chrono::Utc;
 
@@ -32,7 +32,7 @@ use crate::error::{Result, SurqlError};
 use crate::migration::discovery::discover_migrations;
 use crate::migration::history::{
     ensure_migration_table, get_applied_migrations as history_get_applied, is_migration_applied,
-    record_migration, remove_migration_record,
+    record_statement, removal_statement,
 };
 use crate::migration::models::{
     Migration, MigrationDirection, MigrationHistory, MigrationPlan, MigrationState, MigrationStatus,
@@ -68,88 +68,99 @@ pub struct MigrateUpOptions {
     pub steps: Option<usize>,
 }
 
+/// Variable holding the transaction's start time, for the history row's
+/// `execution_time_ms`.
+const STARTED_VAR: &str = "$__surql_migration_started";
+
 /// Execute a single migration in the requested direction.
 ///
-/// Runs the migration's SurrealQL statements inside a
-/// [`Transaction`]; on success records (or removes, when rolling back)
-/// the migration from the history table.
+/// Runs the migration's SurrealQL statements and the matching history
+/// change (recording the version when applying, deleting its row when
+/// rolling back) in one [`Transaction`], so the schema change and the
+/// history row commit or fail together. The history row's id is derived
+/// from the version: when two runners apply the same migration at once,
+/// the second one's transaction is rejected as a whole, data statements
+/// included. Rolling back a migration that is not recorded as applied
+/// fails the same way.
+///
+/// A migration with no `down` statements (a squashed or a blank one) is
+/// refused in the `Down` direction instead of silently deleting its
+/// history row while the schema stays.
 ///
 /// Returns the resulting [`MigrationStatus`], including timing and, on
 /// failure, the error message captured during execution.
 ///
 /// # Errors
 ///
-/// Returns [`SurqlError::MigrationExecution`] when the transaction
-/// itself cannot be begun or the history update fails. Per-statement
-/// failures are reported via a [`MigrationStatus`] with
-/// [`MigrationState::Failed`] and a populated `error`.
+/// Returns [`SurqlError::MigrationExecution`] when the history table
+/// cannot be ensured or the transaction cannot be begun. Failures of the
+/// transaction itself (a bad statement, an already-recorded version) are
+/// reported via a [`MigrationStatus`] with [`MigrationState::Failed`] and
+/// a populated `error`; nothing was applied in that case.
 pub async fn execute_migration(
     client: &DatabaseClient,
     migration: &Migration,
     direction: MigrationDirection,
 ) -> Result<MigrationStatus> {
+    let failed = |error: String| MigrationStatus {
+        migration: migration.clone(),
+        state: MigrationState::Failed,
+        applied_at: None,
+        error: Some(error),
+    };
     let statements: &[String] = match direction {
         MigrationDirection::Up => &migration.up,
         MigrationDirection::Down => &migration.down,
     };
+    if direction == MigrationDirection::Down && statements.is_empty() {
+        return Ok(failed(format!(
+            "migration {} has no down statements; refusing to roll it back \
+             (restore from a snapshot or backup instead)",
+            migration.version
+        )));
+    }
 
-    let start = Instant::now();
-
-    let mut tx = Transaction::begin(client)
+    ensure_migration_table(client)
         .await
         .map_err(|e| SurqlError::MigrationExecution {
-            reason: format!("failed to begin transaction for {}: {e}", migration.version),
+            reason: format!("failed to ensure the migration history table: {e}"),
         })?;
 
-    for (idx, statement) in statements.iter().enumerate() {
-        if let Err(err) = tx.execute(statement).await {
-            let _ = tx.rollback().await;
-            return Ok(MigrationStatus {
-                migration: migration.clone(),
-                state: MigrationState::Failed,
-                applied_at: None,
-                error: Some(format!("statement {idx} failed: {err}")),
-            });
-        }
-    }
-
-    if let Err(err) = tx.commit().await {
-        return Ok(MigrationStatus {
-            migration: migration.clone(),
-            state: MigrationState::Failed,
-            applied_at: None,
-            error: Some(format!("commit failed: {err}")),
-        });
-    }
-
     let applied_at = Utc::now();
-    let execution_time_ms = u64::try_from(start.elapsed().as_millis()).ok();
-
-    match direction {
+    let history = match direction {
         MigrationDirection::Up => {
             let entry = MigrationHistory {
                 version: migration.version.clone(),
                 description: migration.description.clone(),
                 applied_at,
                 checksum: migration.checksum.clone().unwrap_or_default(),
-                execution_time_ms,
+                execution_time_ms: None,
             };
-            record_migration(client, &entry)
-                .await
-                .map_err(|e| SurqlError::MigrationExecution {
-                    reason: format!("failed to record migration {}: {e}", migration.version),
-                })?;
+            let elapsed = format!("duration::millis(time::now() - {STARTED_VAR})");
+            record_statement(&entry, Some(&elapsed))
         }
-        MigrationDirection::Down => {
-            remove_migration_record(client, &migration.version)
-                .await
-                .map_err(|e| SurqlError::MigrationExecution {
-                    reason: format!(
-                        "failed to remove migration record {}: {e}",
-                        migration.version
-                    ),
-                })?;
+        MigrationDirection::Down => removal_statement(&migration.version),
+    };
+
+    let mut tx = Transaction::begin(client)
+        .await
+        .map_err(|e| SurqlError::MigrationExecution {
+            reason: format!("failed to begin transaction for {}: {e}", migration.version),
+        })?;
+    let started = format!("LET {STARTED_VAR} = time::now();");
+    let queued = std::iter::once(started.as_str())
+        .chain(statements.iter().map(String::as_str))
+        .chain(std::iter::once(history.as_str()));
+    for statement in queued {
+        // Only fails when the transaction is no longer active, which a
+        // freshly begun one always is.
+        if let Err(err) = tx.execute(statement).await {
+            return Ok(failed(format!("failed to queue statement: {err}")));
         }
+    }
+
+    if let Err(err) = tx.commit().await {
+        return Ok(failed(format!("commit failed: {err}")));
     }
 
     let state = match direction {

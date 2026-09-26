@@ -101,9 +101,22 @@ pub struct RollbackPlan {
     /// `true` when the plan should require explicit user approval.
     #[serde(default)]
     pub requires_approval: bool,
+    /// `true` once the plan has been reviewed and approved (see
+    /// [`RollbackPlan::approve`]). [`execute_rollback`] refuses a plan
+    /// that `requires_approval` and is not approved.
+    #[serde(default)]
+    pub approved: bool,
 }
 
 impl RollbackPlan {
+    /// Mark the plan as reviewed, allowing [`execute_rollback`] to run it
+    /// even though it `requires_approval`.
+    #[must_use]
+    pub fn approve(mut self) -> Self {
+        self.approved = true;
+        self
+    }
+
     /// Number of migrations in the plan.
     pub fn migration_count(&self) -> usize {
         self.migrations.len()
@@ -243,6 +256,7 @@ pub async fn create_rollback_plan(
         migrations: to_rollback,
         overall_safety: overall,
         requires_approval: overall != RollbackSafety::Safe,
+        approved: false,
         issues,
     })
 }
@@ -254,12 +268,24 @@ pub async fn create_rollback_plan(
 ///
 /// # Errors
 ///
-/// Returns [`SurqlError::MigrationExecution`] if a transaction cannot
-/// be begun or the history update fails.
+/// Returns [`SurqlError::Validation`] without touching the database when
+/// the plan `requires_approval` and has not been [approved]; returns
+/// [`SurqlError::MigrationExecution`] if a transaction cannot be begun.
+///
+/// [approved]: RollbackPlan::approve
 pub async fn execute_rollback(
     client: &DatabaseClient,
     plan: RollbackPlan,
 ) -> Result<RollbackResult> {
+    if plan.requires_approval && !plan.approved {
+        return Err(SurqlError::Validation {
+            reason: format!(
+                "rollback from {} to {} is classified {} and requires approval; \
+                 review its issues and call RollbackPlan::approve",
+                plan.from_version, plan.to_version, plan.overall_safety
+            ),
+        });
+    }
     let start = std::time::Instant::now();
     let mut rolled_back_count = 0usize;
     let mut errors: Vec<String> = Vec::new();
@@ -464,10 +490,35 @@ mod tests {
             overall_safety: RollbackSafety::Warning,
             issues: vec![],
             requires_approval: true,
+            approved: false,
         };
         assert_eq!(plan.migration_count(), 1);
         assert!(!plan.is_safe());
         assert!(plan.has_data_loss());
+    }
+
+    #[tokio::test]
+    async fn execute_rollback_refuses_an_unapproved_risky_plan() {
+        use crate::connection::ConnectionConfig;
+
+        let client = DatabaseClient::new(ConnectionConfig::default()).unwrap();
+        let plan = RollbackPlan {
+            from_version: "v3".into(),
+            to_version: "v1".into(),
+            migrations: vec![m("v3", &["REMOVE TABLE t"])],
+            overall_safety: RollbackSafety::Danger,
+            issues: vec![],
+            requires_approval: true,
+            approved: false,
+        };
+        let err = execute_rollback(&client, plan.clone()).await.unwrap_err();
+        assert!(matches!(err, SurqlError::Validation { .. }), "{err}");
+        assert!(err.to_string().contains("requires approval"));
+
+        // Approved, it gets past the gate and fails on the unconnected
+        // client instead.
+        let err = execute_rollback(&client, plan.approve()).await.unwrap_err();
+        assert!(!matches!(err, SurqlError::Validation { .. }), "{err}");
     }
 
     #[test]

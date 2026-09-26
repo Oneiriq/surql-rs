@@ -15,12 +15,15 @@
 //!   [`auto_snapshot_after_apply`] helper is explicit: callers pass the
 //!   snapshots directory and the registry to snapshot.
 //! * The Python version relied on `client.create`'s implicit ID generation.
-//!   The Rust port pins the record id to the migration version to keep
-//!   removal by version a single-statement `DELETE` (no extra `SELECT`).
+//!   The Rust port pins the record id to the migration version, so one
+//!   version can be recorded only once: the executor records inside the
+//!   migration's own transaction, and a second runner applying the same
+//!   migration concurrently has its whole transaction rejected.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
@@ -28,6 +31,7 @@ use crate::migration::hooks::is_auto_snapshot_enabled;
 use crate::migration::models::MigrationHistory;
 use crate::migration::versioning::{create_snapshot, store_snapshot};
 use crate::schema::registry::SchemaRegistry;
+use crate::types::escape::{quote_record_key, quote_str};
 
 /// Name of the SurrealDB table used for migration history.
 pub const MIGRATION_TABLE_NAME: &str = "_migration_history";
@@ -80,60 +84,74 @@ pub async fn ensure_migration_table(client: &DatabaseClient) -> Result<()> {
 
 /// Record a migration as applied in the history table.
 ///
-/// The SurrealDB record id is pinned to the migration version so
-/// [`remove_migration_record`] can issue a single `DELETE` by id.
+/// The SurrealDB record id is pinned to the migration version, so a
+/// version can be recorded only once. The migration executor records
+/// inside the migration's own transaction instead of calling this.
 ///
 /// # Errors
 ///
-/// Returns [`SurqlError::MigrationHistory`] if the `CREATE` fails or if the
-/// history table cannot be ensured.
+/// Returns [`SurqlError::MigrationHistory`] if the `CREATE` fails (for
+/// instance because the version is already recorded) or if the history
+/// table cannot be ensured.
 pub async fn record_migration(client: &DatabaseClient, entry: &MigrationHistory) -> Result<()> {
     ensure_migration_table(client).await?;
-
-    // SurrealDB v3 rejects bare ISO-8601 strings for datetime-typed
-    // fields with "Expected `datetime` but found '...'", so we emit
-    // CREATE ... SET applied_at = <datetime> $applied_at and keep the
-    // cast visible in the SurrealQL rather than relying on CONTENT
-    // auto-coercion.
-    let mut vars: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-    vars.insert("id".into(), Value::String(record_id_for(&entry.version)));
-    vars.insert("version".into(), Value::String(entry.version.clone()));
-    vars.insert(
-        "description".into(),
-        Value::String(entry.description.clone()),
-    );
-    vars.insert(
-        "applied_at".into(),
-        Value::String(entry.applied_at.to_rfc3339()),
-    );
-    vars.insert("checksum".into(), Value::String(entry.checksum.clone()));
-
-    let mut set = String::from(
-        "version = $version, description = $description, \
-         applied_at = <datetime> $applied_at, checksum = $checksum",
-    );
-    if let Some(ms) = entry.execution_time_ms {
-        vars.insert("execution_time_ms".into(), json!(ms));
-        set.push_str(", execution_time_ms = $execution_time_ms");
-    }
-
-    // `type::thing` was renamed to `type::record` in SurrealDB v3; v2
-    // emitted "Invalid function/constant path, did you maybe mean
-    // `type::record`" when the old name was used on v3, so the rename
-    // must land alongside the crate bump for CI (now on v3.0.5) to go
-    // green.
-    let surql = format!(
-        "CREATE type::record('{table}', $id) SET {set};",
-        table = MIGRATION_TABLE_NAME,
-    );
-
+    let execution_time = entry.execution_time_ms.map(|ms| ms.to_string());
+    let surql = record_statement(entry, execution_time.as_deref());
     client
-        .query_with_vars(&surql, vars)
+        .query(&surql)
         .await
         .map_err(|e| SurqlError::MigrationHistory {
             reason: format!("failed to record migration {}: {e}", entry.version),
         })?;
     Ok(())
+}
+
+/// The `CREATE` that records `entry` as applied.
+///
+/// The record id is derived from the version, so a second attempt to
+/// record the same version fails (and, inside a transaction, takes the
+/// whole transaction down with it). `execution_time_ms` is a SurrealQL
+/// expression for the field, or `None` to leave it unset. Every value is
+/// rendered as a quoted literal.
+pub(crate) fn record_statement(
+    entry: &MigrationHistory,
+    execution_time_ms: Option<&str>,
+) -> String {
+    // SurrealDB v3 rejects a bare ISO-8601 string for a datetime-typed
+    // field, so the cast stays visible in the SurrealQL.
+    let mut set = format!(
+        "version = {version}, description = {description}, \
+         applied_at = <datetime> {applied_at}, checksum = {checksum}",
+        version = quote_str(&entry.version),
+        description = quote_str(&entry.description),
+        applied_at = quote_str(&entry.applied_at.to_rfc3339()),
+        checksum = quote_str(&entry.checksum),
+    );
+    if let Some(ms) = execution_time_ms {
+        let _ = write!(set, ", execution_time_ms = {ms}");
+    }
+    format!("CREATE {} SET {set};", history_record(&entry.version))
+}
+
+/// The statement that deletes `version`'s history row, and fails (taking a
+/// surrounding transaction down with it) when there is none: rolling back
+/// a migration that is not recorded as applied would run its down body
+/// against a schema it was never applied to.
+pub(crate) fn removal_statement(version: &str) -> String {
+    let message = format!("migration {version} is not recorded as applied");
+    format!(
+        "IF array::len((DELETE {table} WHERE version = {version} RETURN BEFORE)) == 0 \
+         {{ THROW {message} }};",
+        table = MIGRATION_TABLE_NAME,
+        version = quote_str(version),
+        message = quote_str(&message),
+    )
+}
+
+/// The record id of `version`'s history row. Distinct versions get
+/// distinct ids (`v1.2` and `v1_2` do not collide).
+fn history_record(version: &str) -> String {
+    format!("{MIGRATION_TABLE_NAME}:{}", quote_record_key(version))
 }
 
 /// Remove a migration record from history (used during rollback).
@@ -247,15 +265,6 @@ pub fn auto_snapshot_after_apply(registry: &SchemaRegistry, snapshots_dir: &Path
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn record_id_for(version: &str) -> String {
-    // SurrealDB record ids allow `⟨…⟩` delimiters; easier is to replace
-    // anything non-alphanumeric with `_` so the id is valid without quoting.
-    version
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
 fn parse_history_rows(raw: &Value) -> Vec<MigrationHistory> {
     let mut out = Vec::new();
     collect_rows(raw, &mut out);
@@ -327,10 +336,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn record_id_sanitises_separators() {
-        assert_eq!(record_id_for("20260102_120000"), "20260102_120000");
-        assert_eq!(record_id_for("20260102-120000"), "20260102_120000");
-        assert_eq!(record_id_for("v1.2.3"), "v1_2_3");
+    fn history_record_ids_keep_versions_distinct() {
+        assert_eq!(
+            history_record("20260102_120000"),
+            "_migration_history:⟨20260102_120000⟩"
+        );
+        assert_eq!(history_record("v1.2"), "_migration_history:⟨v1.2⟩");
+        assert_eq!(history_record("v1_2"), "_migration_history:v1_2");
+        assert_ne!(history_record("v1.2"), history_record("v1_2"));
+    }
+
+    #[test]
+    fn record_statement_quotes_every_value() {
+        let entry = MigrationHistory {
+            version: "v1".into(),
+            description: "it's'; DELETE _migration_history; --".into(),
+            applied_at: Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap(),
+            checksum: "abc".into(),
+            execution_time_ms: None,
+        };
+        let surql = record_statement(&entry, Some("42"));
+        assert_eq!(
+            surql,
+            "CREATE _migration_history:v1 SET version = 'v1', \
+             description = 'it\\'s\\'; DELETE _migration_history; --', \
+             applied_at = <datetime> '2026-01-02T12:00:00+00:00', checksum = 'abc', \
+             execution_time_ms = 42;"
+        );
+    }
+
+    #[test]
+    fn removal_statement_throws_when_nothing_was_recorded() {
+        assert_eq!(
+            removal_statement("v'1"),
+            "IF array::len((DELETE _migration_history WHERE version = 'v\\'1' RETURN BEFORE)) \
+             == 0 { THROW 'migration v\\'1 is not recorded as applied' };"
+        );
     }
 
     #[test]

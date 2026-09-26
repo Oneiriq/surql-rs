@@ -21,9 +21,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::Utc;
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::migration::{
-    create_migration_plan, ensure_migration_table, execute_migration_plan, get_applied_migrations,
+    create_migration_plan, create_rollback_plan, discover_migrations, ensure_migration_table,
+    execute_migration, execute_migration_plan, execute_rollback, get_applied_migrations,
     get_migration_status, get_pending_migrations, is_migration_applied, migrate_down, migrate_up,
-    record_migration, MigrateUpOptions, MigrationDirection, MigrationHistory, MigrationState,
+    record_migration, MigrateUpOptions, Migration, MigrationDirection, MigrationHistory,
+    MigrationState,
 };
 
 fn env_url() -> Option<String> {
@@ -227,4 +229,169 @@ async fn migration_plan_execution_applies_all() {
 
     let applied = get_applied_migrations(&client).await.unwrap();
     assert_eq!(applied.len(), 2);
+}
+
+fn only_migration(dir: &Path) -> Migration {
+    let mut all = discover_migrations(dir).unwrap();
+    assert_eq!(all.len(), 1);
+    all.remove(0)
+}
+
+async fn table_names(client: &DatabaseClient) -> Vec<String> {
+    let info = client.query("INFO FOR DB;").await.unwrap();
+    info[0]["tables"]
+        .as_object()
+        .map(|tables| tables.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The history row used to be written after the migration's own
+/// transaction committed, so a failed write left the schema applied with
+/// no record of it. Now a rejected row rejects the whole migration.
+#[tokio::test]
+async fn a_rejected_history_row_rolls_the_migration_back() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    sample_up_down(tmp.path(), "20260101_000020", "marker");
+    let migration = only_migration(tmp.path());
+
+    ensure_migration_table(&client).await.unwrap();
+    let entry = MigrationHistory {
+        version: migration.version.clone(),
+        description: "recorded by someone else".into(),
+        applied_at: Utc::now(),
+        checksum: String::new(),
+        execution_time_ms: None,
+    };
+    record_migration(&client, &entry).await.unwrap();
+
+    let status = execute_migration(&client, &migration, MigrationDirection::Up)
+        .await
+        .unwrap();
+    assert_eq!(status.state, MigrationState::Failed, "{status:?}");
+    assert!(!table_names(&client).await.contains(&"marker".to_string()));
+}
+
+/// Two runners that both saw the migration as pending used to both apply
+/// it, running its data statements twice.
+#[tokio::test]
+async fn concurrent_runners_apply_a_migration_once() {
+    let db = unique_db();
+    let (Some(first), Some(second)) = (connected_client(&db).await, connected_client(&db).await)
+    else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write_migration(
+        tmp.path(),
+        "20260101_000021_seed.surql",
+        "-- @up\nCREATE counter SET n = 1;\n-- @down\nDELETE counter;\n",
+    );
+    let migration = only_migration(tmp.path());
+    ensure_migration_table(&first).await.unwrap();
+
+    let (a, b) = tokio::join!(
+        execute_migration(&first, &migration, MigrationDirection::Up),
+        execute_migration(&second, &migration, MigrationDirection::Up),
+    );
+    let states = [a.unwrap().state, b.unwrap().state];
+    let applied = states
+        .iter()
+        .filter(|s| **s == MigrationState::Applied)
+        .count();
+    assert_eq!(applied, 1, "{states:?}");
+
+    let raw = first
+        .query("RETURN count(SELECT * FROM counter);")
+        .await
+        .unwrap();
+    assert_eq!(raw[0], serde_json::json!(1));
+    assert_eq!(get_applied_migrations(&first).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn history_records_the_execution_time() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    sample_up_down(tmp.path(), "20260101_000022", "timed");
+    migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+    let applied = get_applied_migrations(&client).await.unwrap();
+    assert!(applied[0].execution_time_ms.is_some(), "{applied:?}");
+}
+
+/// A squashed or blank migration has no down statements; rolling it back
+/// used to delete its history row and report success while the schema
+/// stayed.
+#[tokio::test]
+async fn rolling_back_without_down_statements_is_refused() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write_migration(
+        tmp.path(),
+        "20260101_000023_one_way.surql",
+        "-- @up\nDEFINE TABLE one_way;\n-- @down\n-- nothing to undo\n",
+    );
+    migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+
+    let rolled = migrate_down(&client, tmp.path(), 1).await.unwrap();
+    assert_eq!(rolled.len(), 1);
+    assert_eq!(rolled[0].state, MigrationState::Failed);
+    assert!(rolled[0]
+        .error
+        .as_deref()
+        .is_some_and(|e| e.contains("no down statements")));
+    assert!(is_migration_applied(&client, "20260101_000023")
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn rolling_back_an_unrecorded_migration_runs_nothing() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    sample_up_down(tmp.path(), "20260101_000024", "keep");
+    let migration = only_migration(tmp.path());
+    client.query("DEFINE TABLE keep;").await.unwrap();
+
+    let status = execute_migration(&client, &migration, MigrationDirection::Down)
+        .await
+        .unwrap();
+    assert_eq!(status.state, MigrationState::Failed, "{status:?}");
+    assert!(table_names(&client).await.contains(&"keep".to_string()));
+}
+
+#[tokio::test]
+async fn a_destructive_rollback_waits_for_approval() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    sample_up_down(tmp.path(), "20260101_000025", "first");
+    sample_up_down(tmp.path(), "20260101_000026", "second");
+    migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+
+    let plan = create_rollback_plan(&client, tmp.path(), "20260101_000025")
+        .await
+        .unwrap();
+    assert!(plan.requires_approval);
+    assert!(execute_rollback(&client, plan.clone()).await.is_err());
+    assert!(table_names(&client).await.contains(&"second".to_string()));
+
+    let result = execute_rollback(&client, plan.approve()).await.unwrap();
+    assert!(result.success, "{result:?}");
+    assert!(!table_names(&client).await.contains(&"second".to_string()));
 }
