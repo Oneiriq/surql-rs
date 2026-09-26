@@ -98,6 +98,7 @@ impl std::fmt::Display for MigrationDirection {
 ///     down: vec!["REMOVE TABLE user;".into()],
 ///     checksum: Some("abc123".into()),
 ///     depends_on: vec![],
+///     squashed_from: vec![],
 /// };
 /// assert_eq!(m.version, "20260102_120000");
 /// ```
@@ -115,9 +116,16 @@ pub struct Migration {
     pub down: Vec<String>,
     /// Content checksum (SHA-256 hex) of the source file, if computed.
     pub checksum: Option<String>,
-    /// Versions of other migrations this migration depends on.
+    /// Versions of other migrations this migration depends on. A migration
+    /// is applied after every dependency present in the same set.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// For a squashed migration, the versions it was squashed from (its
+    /// `-- squashed-from:` metadata); empty otherwise. A squashed migration
+    /// counts as applied on a database that applied all of its sources,
+    /// and its sources count as applied where it was.
+    #[serde(default)]
+    pub squashed_from: Vec<String>,
 }
 
 /// Migration history record stored in the database.
@@ -204,6 +212,7 @@ impl MigrationPlan {
 ///     description: "Create user table".into(),
 ///     author: MigrationMetadata::default_author(),
 ///     depends_on: vec![],
+///     squashed_from: vec![],
 /// };
 /// assert_eq!(meta.author, "surql");
 /// ```
@@ -219,6 +228,9 @@ pub struct MigrationMetadata {
     /// Versions of other migrations this one depends on.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Versions a squashed migration replaces (`-- squashed-from:`).
+    #[serde(default)]
+    pub squashed_from: Vec<String>,
 }
 
 impl MigrationMetadata {
@@ -246,6 +258,7 @@ impl MigrationMetadata {
 ///     down: vec![],
 ///     checksum: None,
 ///     depends_on: vec![],
+///     squashed_from: vec![],
 /// };
 /// let s = MigrationStatus {
 ///     migration: m,
@@ -289,10 +302,15 @@ pub enum DiffOperation {
     AddIndex,
     /// An existing index was removed.
     DropIndex,
+    /// An existing index's definition changed (columns, uniqueness,
+    /// analyzer, ...).
+    ModifyIndex,
     /// A new event was added.
     AddEvent,
     /// An existing event was removed.
     DropEvent,
+    /// An existing event's condition or action changed.
+    ModifyEvent,
     /// Permissions were modified on a table or field.
     ModifyPermissions,
     /// A new analyzer was added.
@@ -340,8 +358,10 @@ impl DiffOperation {
             Self::ModifyField => "modify_field",
             Self::AddIndex => "add_index",
             Self::DropIndex => "drop_index",
+            Self::ModifyIndex => "modify_index",
             Self::AddEvent => "add_event",
             Self::DropEvent => "drop_event",
+            Self::ModifyEvent => "modify_event",
             Self::ModifyPermissions => "modify_permissions",
             Self::AddAnalyzer => "add_analyzer",
             Self::ModifyAnalyzer => "modify_analyzer",
@@ -508,6 +528,7 @@ mod tests {
             down: vec!["REMOVE TABLE t;".into()],
             checksum: Some("deadbeef".into()),
             depends_on: vec![],
+            squashed_from: vec![],
         }
     }
 
@@ -627,6 +648,7 @@ mod tests {
             description: "d".into(),
             author: "alice".into(),
             depends_on: vec!["v0".into()],
+            squashed_from: vec!["v00".into()],
         };
         let j = serde_json::to_string(&meta).unwrap();
         let back: MigrationMetadata = serde_json::from_str(&j).unwrap();
@@ -685,6 +707,8 @@ mod tests {
         assert_eq!(DiffOperation::DropIndex.as_str(), "drop_index");
         assert_eq!(DiffOperation::AddEvent.as_str(), "add_event");
         assert_eq!(DiffOperation::DropEvent.as_str(), "drop_event");
+        assert_eq!(DiffOperation::ModifyIndex.as_str(), "modify_index");
+        assert_eq!(DiffOperation::ModifyEvent.as_str(), "modify_event");
         assert_eq!(
             DiffOperation::ModifyPermissions.as_str(),
             "modify_permissions"
@@ -731,6 +755,8 @@ mod tests {
             DiffOperation::DropIndex,
             DiffOperation::AddEvent,
             DiffOperation::DropEvent,
+            DiffOperation::ModifyIndex,
+            DiffOperation::ModifyEvent,
             DiffOperation::ModifyPermissions,
             DiffOperation::AddBucket,
             DiffOperation::DropBucket,

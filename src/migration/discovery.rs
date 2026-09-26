@@ -30,17 +30,25 @@
 //!   line (trailing whitespace tolerated).
 //! * Inside `-- @metadata`, each `-- key: value` line sets a field. Unknown
 //!   keys are ignored.
-//! * `-- @up` and `-- @down` bodies are split on `;` with empty segments
-//!   discarded; a trailing `;` on each statement is preserved.
+//! * `-- @up` and `-- @down` bodies are split into statements on `;`. A `;`
+//!   inside a comment (`--`, `//`, `#`, `/* */`), a string literal, a quoted
+//!   identifier, or a `{ }` / `( )` / `[ ]` block does not end a statement.
+//!   Each statement keeps its text verbatim, trailing `;` included; pieces
+//!   holding only whitespace and comments are discarded.
 //! * `@up` and `@down` are both required; `@metadata` is optional (version
 //!   and description fall back to the filename when absent).
+//! * A leading UTF-8 byte-order mark is ignored.
 
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sha2_lite::sha256_hex;
+use sha2::{Digest, Sha256};
 
 use crate::error::{Result, SurqlError};
+use crate::migration::lexer;
 use crate::migration::models::{Migration, MigrationMetadata};
 
 /// Discover all migration files in a directory.
@@ -119,16 +127,96 @@ pub fn discover_migrations(directory: &Path) -> Result<Vec<Migration>> {
         migrations.push(migration);
     }
 
-    migrations.sort_by(|a, b| a.version.cmp(&b.version));
+    order_migrations(migrations)
+}
 
-    Ok(migrations)
+/// Order migrations for applying: by version, comparing digit runs as
+/// numbers (so `v9` sorts before `v10`), and then moved as little as
+/// needed for every migration to follow the ones it `depends_on`.
+/// Dependencies on versions outside `migrations` do not constrain the
+/// order ([`crate::migration::validate_migrations`] reports them).
+///
+/// # Errors
+///
+/// Returns [`SurqlError::MigrationDiscovery`] when the dependencies form a
+/// cycle.
+pub(crate) fn order_migrations(mut migrations: Vec<Migration>) -> Result<Vec<Migration>> {
+    migrations.sort_by(|a, b| compare_versions(&a.version, &b.version));
+    let mut ordered: Vec<Migration> = Vec::with_capacity(migrations.len());
+    let mut placed: BTreeSet<String> = BTreeSet::new();
+    let known: BTreeSet<String> = migrations.iter().map(|m| m.version.clone()).collect();
+    while !migrations.is_empty() {
+        // The earliest migration whose dependencies are all placed.
+        let ready = migrations.iter().position(|m| {
+            m.depends_on
+                .iter()
+                .all(|dep| placed.contains(dep) || !known.contains(dep) || *dep == m.version)
+        });
+        let Some(idx) = ready else {
+            let stuck: Vec<&str> = migrations.iter().map(|m| m.version.as_str()).collect();
+            return Err(SurqlError::MigrationDiscovery {
+                reason: format!(
+                    "migration dependencies form a cycle among: {}",
+                    stuck.join(", ")
+                ),
+            });
+        };
+        let next = migrations.remove(idx);
+        placed.insert(next.version.clone());
+        ordered.push(next);
+    }
+    Ok(ordered)
+}
+
+/// Compare migration versions, reading runs of ASCII digits as numbers:
+/// `v9` < `v10`, and `YYYYMMDD_HHMMSS` timestamps compare as they always
+/// did. Versions whose runs are numerically equal (`v01`, `v1`) fall back
+/// to plain string order, so only equal strings compare equal.
+pub(crate) fn compare_versions(a: &str, b: &str) -> Ordering {
+    let mut left = version_runs(a);
+    let mut right = version_runs(b);
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+                let order = if digits(x) && digits(y) {
+                    let (x, y) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+                    x.len().cmp(&y.len()).then_with(|| x.cmp(y))
+                } else {
+                    x.cmp(y)
+                };
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+        }
+    }
+}
+
+/// Split `s` into maximal runs of ASCII digits and of everything else.
+fn version_runs(s: &str) -> impl Iterator<Item = &str> {
+    let mut rest = s;
+    std::iter::from_fn(move || {
+        let first = rest.chars().next()?;
+        let digit = first.is_ascii_digit();
+        let len = rest
+            .find(|c: char| c.is_ascii_digit() != digit)
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(len);
+        rest = tail;
+        Some(run)
+    })
 }
 
 /// Load a single migration file.
 ///
 /// Reads the file at `path`, parses the `@metadata`, `@up` and `@down`
 /// sections, and returns a [`Migration`] with a SHA-256 checksum of the
-/// file content.
+/// file content. The checksum ignores a byte-order mark and `\r\n` versus
+/// `\n` line endings, so a checkout on any platform hashes the same.
 ///
 /// # Errors
 ///
@@ -173,13 +261,12 @@ pub fn load_migration(path: &Path) -> Result<Migration> {
 
     let (version, description) = resolve_identity(parsed.metadata.as_ref(), file_name, path)?;
 
-    let depends_on = parsed
+    let (depends_on, squashed_from) = parsed
         .metadata
-        .as_ref()
-        .map(|m| m.depends_on.clone())
+        .map(|m| (m.depends_on, m.squashed_from))
         .unwrap_or_default();
 
-    let checksum = sha256_hex(content.as_bytes());
+    let checksum = content_checksum(&content);
 
     Ok(Migration {
         version,
@@ -189,6 +276,7 @@ pub fn load_migration(path: &Path) -> Result<Migration> {
         down: parsed.down,
         checksum: Some(checksum),
         depends_on,
+        squashed_from,
     })
 }
 
@@ -206,25 +294,21 @@ pub fn load_migration(path: &Path) -> Result<Migration> {
 /// assert!(!validate_migration_name("20260102_120000_create_user.py"));
 /// ```
 pub fn validate_migration_name(filename: &str) -> bool {
-    let Some(stem) = filename.strip_suffix(".surql") else {
-        return false;
-    };
+    name_parts(filename).is_some()
+}
 
-    let parts: Vec<&str> = stem.split('_').collect();
-    if parts.len() < 3 {
-        return false;
-    }
-
-    if parts[0].len() != 8 || !parts[0].chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-
-    if parts[1].len() != 6 || !parts[1].chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-
-    // Description part must be non-empty.
-    !parts[2..].iter().all(|p| p.is_empty())
+/// The `(date, time, description)` parts of a valid migration filename.
+fn name_parts(filename: &str) -> Option<(&str, &str, &str)> {
+    let stem = filename.strip_suffix(".surql")?;
+    let mut parts = stem.splitn(3, '_');
+    let (date, time, description) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
+    // The description must hold something other than separators.
+    (digits(date, 8) && digits(time, 6) && description.contains(|c| c != '_')).then_some((
+        date,
+        time,
+        description,
+    ))
 }
 
 /// Extract version from a migration filename.
@@ -243,12 +327,7 @@ pub fn validate_migration_name(filename: &str) -> bool {
 /// assert_eq!(get_version_from_filename("invalid.surql"), None);
 /// ```
 pub fn get_version_from_filename(filename: &str) -> Option<String> {
-    if !validate_migration_name(filename) {
-        return None;
-    }
-    let stem = filename.strip_suffix(".surql")?;
-    let parts: Vec<&str> = stem.split('_').collect();
-    Some(format!("{}_{}", parts[0], parts[1]))
+    name_parts(filename).map(|(date, time, _)| format!("{date}_{time}"))
 }
 
 /// Extract the description portion from a migration filename.
@@ -267,12 +346,7 @@ pub fn get_version_from_filename(filename: &str) -> Option<String> {
 /// assert_eq!(get_description_from_filename("invalid.surql"), None);
 /// ```
 pub fn get_description_from_filename(filename: &str) -> Option<String> {
-    if !validate_migration_name(filename) {
-        return None;
-    }
-    let stem = filename.strip_suffix(".surql")?;
-    let parts: Vec<&str> = stem.split('_').collect();
-    Some(parts[2..].join("_"))
+    name_parts(filename).map(|(_, _, description)| description.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -294,12 +368,16 @@ enum Section {
 }
 
 fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration> {
+    // An editor-added byte-order mark would otherwise hide the first
+    // line's `-- @metadata` marker.
+    let content = content.strip_prefix(BYTE_ORDER_MARK).unwrap_or(content);
     let mut section = Section::None;
 
     let mut metadata_version: Option<String> = None;
     let mut metadata_description: Option<String> = None;
     let mut metadata_author: Option<String> = None;
     let mut metadata_depends_on: Vec<String> = Vec::new();
+    let mut metadata_squashed_from: Vec<String> = Vec::new();
     let mut saw_metadata = false;
 
     let mut up_lines: Vec<String> = Vec::new();
@@ -333,13 +411,9 @@ fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration
                         "version" => metadata_version = Some(value),
                         "description" => metadata_description = Some(value),
                         "author" => metadata_author = Some(value),
-                        "depends_on" => {
-                            metadata_depends_on = value
-                                .trim_matches(|c| c == '[' || c == ']')
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect();
+                        "depends_on" => metadata_depends_on = parse_version_list(&value),
+                        "squashed-from" | "squashed_from" => {
+                            metadata_squashed_from = parse_version_list(&value);
                         }
                         _ => {}
                     }
@@ -361,8 +435,8 @@ fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration
         });
     }
 
-    let up = split_statements(&up_lines);
-    let down = split_statements(&down_lines);
+    let up = lexer::split_statements(&up_lines.join("\n"));
+    let down = lexer::split_statements(&down_lines.join("\n"));
 
     let metadata = if saw_metadata {
         let version = metadata_version.ok_or_else(|| SurqlError::MigrationLoad {
@@ -382,6 +456,7 @@ fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration
             description,
             author: metadata_author.unwrap_or_else(MigrationMetadata::default_author),
             depends_on: metadata_depends_on,
+            squashed_from: metadata_squashed_from,
         })
     } else {
         None
@@ -402,6 +477,16 @@ fn parse_section_marker(line: &str) -> Option<Section> {
     }
 }
 
+/// `a, b` or `[a, b]` as a list of versions.
+fn parse_version_list(value: &str) -> Vec<String> {
+    value
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn parse_metadata_line(line: &str) -> Option<(String, String)> {
     let rest = line.strip_prefix("--")?;
     let rest = rest.trim();
@@ -409,54 +494,25 @@ fn parse_metadata_line(line: &str) -> Option<(String, String)> {
     Some((key.trim().to_string(), value.trim().to_string()))
 }
 
-/// Split a migration section into statements on `;`, respecting the
-/// nesting a statement may legitimately contain. A `DEFINE FUNCTION`
-/// body and a `FOR` loop both carry semicolons inside `{ }`, string
-/// literals may carry anything at all, and splitting inside either
-/// shatters one statement into fragments that individually fail to
-/// parse. Only a semicolon at depth zero, outside every quote, ends a
-/// statement.
-fn split_statements(lines: &[String]) -> Vec<String> {
-    let joined = lines.join("\n");
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
+const BYTE_ORDER_MARK: char = '\u{FEFF}';
 
-    for ch in joined.chars() {
-        current.push(ch);
-        if let Some(open) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == open {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' | '`' => quote = Some(ch),
-            '{' | '(' => depth += 1,
-            '}' | ')' => depth = depth.saturating_sub(1),
-            ';' if depth == 0 => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() && trimmed != ";" {
-                    statements.push(trimmed);
-                }
-                current.clear();
-            }
-            _ => {}
-        }
-    }
+/// SHA-256 of a migration file's text with a byte-order mark and `\r\n`
+/// line endings normalised away, so the same file checked out on Windows
+/// and Unix hashes the same.
+fn content_checksum(content: &str) -> String {
+    let content = content.strip_prefix(BYTE_ORDER_MARK).unwrap_or(content);
+    sha256_hex(content.replace("\r\n", "\n").as_bytes())
+}
 
-    let trailing = current.trim();
-    if !trailing.is_empty() {
-        statements.push(trailing.to_string());
-    }
-
-    statements
+/// Lowercase hex SHA-256 of `bytes`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            // Writing to a `String` cannot fail.
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn resolve_identity(
@@ -485,732 +541,5 @@ fn resolve_identity(
     Ok((version, description))
 }
 
-// ---------------------------------------------------------------------------
-// Minimal SHA-256 implementation (vendored to avoid adding a runtime dep)
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::many_single_char_names)]
-pub(crate) mod sha2_lite {
-    // FIPS 180-4 SHA-256. Pure-safe Rust; no unsafe. Written for checksum
-    // use only: we do NOT rely on this for cryptographic security.
-    use std::fmt::Write as _;
-
-    const K: [u32; 64] = [
-        0x428a_2f98,
-        0x7137_4491,
-        0xb5c0_fbcf,
-        0xe9b5_dba5,
-        0x3956_c25b,
-        0x59f1_11f1,
-        0x923f_82a4,
-        0xab1c_5ed5,
-        0xd807_aa98,
-        0x1283_5b01,
-        0x2431_85be,
-        0x550c_7dc3,
-        0x72be_5d74,
-        0x80de_b1fe,
-        0x9bdc_06a7,
-        0xc19b_f174,
-        0xe49b_69c1,
-        0xefbe_4786,
-        0x0fc1_9dc6,
-        0x240c_a1cc,
-        0x2de9_2c6f,
-        0x4a74_84aa,
-        0x5cb0_a9dc,
-        0x76f9_88da,
-        0x983e_5152,
-        0xa831_c66d,
-        0xb003_27c8,
-        0xbf59_7fc7,
-        0xc6e0_0bf3,
-        0xd5a7_9147,
-        0x06ca_6351,
-        0x1429_2967,
-        0x27b7_0a85,
-        0x2e1b_2138,
-        0x4d2c_6dfc,
-        0x5338_0d13,
-        0x650a_7354,
-        0x766a_0abb,
-        0x81c2_c92e,
-        0x9272_2c85,
-        0xa2bf_e8a1,
-        0xa81a_664b,
-        0xc24b_8b70,
-        0xc76c_51a3,
-        0xd192_e819,
-        0xd699_0624,
-        0xf40e_3585,
-        0x106a_a070,
-        0x19a4_c116,
-        0x1e37_6c08,
-        0x2748_774c,
-        0x34b0_bcb5,
-        0x391c_0cb3,
-        0x4ed8_aa4a,
-        0x5b9c_ca4f,
-        0x682e_6ff3,
-        0x748f_82ee,
-        0x78a5_636f,
-        0x84c8_7814,
-        0x8cc7_0208,
-        0x90be_fffa,
-        0xa450_6ceb,
-        0xbef9_a3f7,
-        0xc671_78f2,
-    ];
-
-    const H0: [u32; 8] = [
-        0x6a09_e667,
-        0xbb67_ae85,
-        0x3c6e_f372,
-        0xa54f_f53a,
-        0x510e_527f,
-        0x9b05_688c,
-        0x1f83_d9ab,
-        0x5be0_cd19,
-    ];
-
-    pub fn sha256_hex(data: &[u8]) -> String {
-        let digest = sha256(data);
-        let mut s = String::with_capacity(64);
-        for byte in digest {
-            let _ = write!(s, "{:02x}", byte);
-        }
-        s
-    }
-
-    fn sha256(data: &[u8]) -> [u8; 32] {
-        let mut h = H0;
-
-        // Padding: append 0x80, then 0x00s, then 64-bit big-endian length in bits.
-        let bit_len = (data.len() as u64).wrapping_mul(8);
-        let mut padded = Vec::with_capacity(data.len() + 72);
-        padded.extend_from_slice(data);
-        padded.push(0x80);
-        while padded.len() % 64 != 56 {
-            padded.push(0);
-        }
-        padded.extend_from_slice(&bit_len.to_be_bytes());
-
-        for chunk in padded.as_chunks::<64>().0 {
-            process_chunk(chunk, &mut h);
-        }
-
-        let mut out = [0u8; 32];
-        for (i, word) in h.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        out
-    }
-
-    fn process_chunk(chunk: &[u8], h: &mut [u32; 8]) {
-        let mut w = [0u32; 64];
-        for (i, word) in w.iter_mut().enumerate().take(16) {
-            let j = i * 4;
-            *word = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn sha256_empty_string() {
-            assert_eq!(
-                sha256_hex(b""),
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            );
-        }
-
-        #[test]
-        fn sha256_abc() {
-            assert_eq!(
-                sha256_hex(b"abc"),
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-            );
-        }
-
-        #[test]
-        fn sha256_longer_message() {
-            assert_eq!(
-                sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos: u128 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("surql-mig-{tag}-{pid}-{nanos}-{n}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    fn sample_migration_text() -> String {
-        String::from(
-            "-- @metadata\n\
-             -- version: 20260102_120000\n\
-             -- description: Create user table\n\
-             -- author: surql\n\
-             -- depends_on: \n\
-             -- @up\n\
-             DEFINE TABLE user SCHEMAFULL;\n\
-             DEFINE FIELD email ON TABLE user TYPE string;\n\
-             -- @down\n\
-             REMOVE TABLE user;\n",
-        )
-    }
-
-    // --- validate_migration_name -------------------------------------------
-
-    #[test]
-    fn validate_name_accepts_valid_surql() {
-        assert!(validate_migration_name("20260102_120000_create_user.surql"));
-    }
-
-    #[test]
-    fn validate_name_accepts_description_with_underscores() {
-        assert!(validate_migration_name(
-            "20260102_120000_create_user_table.surql"
-        ));
-    }
-
-    #[test]
-    fn validate_name_rejects_non_surql_extension() {
-        assert!(!validate_migration_name("20260102_120000_create_user.py"));
-        assert!(!validate_migration_name("20260102_120000_create_user.sql"));
-        assert!(!validate_migration_name("20260102_120000_create_user"));
-    }
-
-    #[test]
-    fn validate_name_rejects_bad_date_part() {
-        assert!(!validate_migration_name(
-            "2026_010_120000_create_user.surql"
-        ));
-        assert!(!validate_migration_name(
-            "20260aa2_120000_create_user.surql"
-        ));
-        assert!(!validate_migration_name("0260102_120000_create_user.surql"));
-    }
-
-    #[test]
-    fn validate_name_rejects_bad_time_part() {
-        assert!(!validate_migration_name("20260102_12000_create_user.surql"));
-        assert!(!validate_migration_name(
-            "20260102_abcdef_create_user.surql"
-        ));
-        assert!(!validate_migration_name(
-            "20260102_1200000_create_user.surql"
-        ));
-    }
-
-    #[test]
-    fn validate_name_rejects_too_few_parts() {
-        assert!(!validate_migration_name("20260102_120000.surql"));
-    }
-
-    #[test]
-    fn validate_name_rejects_empty_description() {
-        assert!(!validate_migration_name("20260102_120000_.surql"));
-    }
-
-    #[test]
-    fn validate_name_rejects_empty_string() {
-        assert!(!validate_migration_name(""));
-        assert!(!validate_migration_name(".surql"));
-    }
-
-    // --- get_version_from_filename -----------------------------------------
-
-    #[test]
-    fn version_from_valid_filename() {
-        assert_eq!(
-            get_version_from_filename("20260102_120000_create_user.surql").as_deref(),
-            Some("20260102_120000"),
-        );
-    }
-
-    #[test]
-    fn version_from_multi_underscore_description() {
-        assert_eq!(
-            get_version_from_filename("20260102_120000_create_user_table.surql").as_deref(),
-            Some("20260102_120000"),
-        );
-    }
-
-    #[test]
-    fn version_from_invalid_filename_is_none() {
-        assert!(get_version_from_filename("invalid.surql").is_none());
-        assert!(get_version_from_filename("20260102_120000_create_user.py").is_none());
-    }
-
-    // --- get_description_from_filename -------------------------------------
-
-    #[test]
-    fn description_from_valid_filename() {
-        assert_eq!(
-            get_description_from_filename("20260102_120000_create_user.surql").as_deref(),
-            Some("create_user"),
-        );
-    }
-
-    #[test]
-    fn description_joins_multiple_parts() {
-        assert_eq!(
-            get_description_from_filename("20260102_120000_create_user_table.surql").as_deref(),
-            Some("create_user_table"),
-        );
-    }
-
-    #[test]
-    fn description_from_invalid_filename_is_none() {
-        assert!(get_description_from_filename("invalid.surql").is_none());
-    }
-
-    // --- load_migration ----------------------------------------------------
-
-    fn split(text: &str) -> Vec<String> {
-        split_statements(&[text.to_string()])
-    }
-
-    /// A `DEFINE FUNCTION` body and a `FOR` loop both hold semicolons
-    /// inside braces; splitting there shatters one statement into
-    /// fragments that individually fail to parse. The reference
-    /// backfill rewrite is exactly this shape, and it must survive a
-    /// trip through a migration file.
-    #[test]
-    fn split_statements_respects_nesting_and_strings() {
-        let function = split(
-            "DEFINE FUNCTION fn::double($n: int) { LET $d = $n * 2; RETURN $d; };\n\
-             DEFINE TABLE t SCHEMAFULL;",
-        );
-        assert_eq!(function.len(), 2, "{function:#?}");
-        assert!(function[0].contains("RETURN $d;"), "{}", function[0]);
-
-        let dance = split(
-            "FOR $rid IN ((SELECT VALUE id FROM f WHERE link IS NOT NONE) ?? []) \
-             { LET $held = $rid.link; UPDATE $rid SET link = NONE; \
-             UPDATE $rid SET link = $held; };\n\
-             DEFINE TABLE t SCHEMAFULL;",
-        );
-        assert_eq!(dance.len(), 2, "{dance:#?}");
-        assert!(dance[0].starts_with("FOR $rid"), "{}", dance[0]);
-        assert!(dance[0].ends_with("};"), "{}", dance[0]);
-
-        let strings = split("CREATE t SET s = 'a;{b}(c'; CREATE u SET n = \"d;e\";");
-        assert_eq!(strings.len(), 2, "{strings:#?}");
-
-        let escaped = split("CREATE t SET s = 'it\\'s; fine'; CREATE u SET n = 1;");
-        assert_eq!(escaped.len(), 2, "{escaped:#?}");
-
-        // The old behaviour survives for the plain cases.
-        let plain = split("DEFINE TABLE a SCHEMAFULL; DEFINE TABLE b SCHEMAFULL");
-        assert_eq!(plain.len(), 2, "{plain:#?}");
-    }
-
-    #[test]
-    fn load_migration_happy_path() {
-        let dir = unique_temp_dir("load-ok");
-        let path = dir.join("20260102_120000_create_user.surql");
-        fs::write(&path, sample_migration_text()).unwrap();
-
-        let m = load_migration(&path).unwrap();
-        assert_eq!(m.version, "20260102_120000");
-        assert_eq!(m.description, "Create user table");
-        assert_eq!(m.up.len(), 2);
-        assert!(m.up[0].starts_with("DEFINE TABLE user"));
-        assert!(m.up[1].starts_with("DEFINE FIELD email"));
-        assert_eq!(m.down.len(), 1);
-        assert!(m.down[0].starts_with("REMOVE TABLE user"));
-        assert!(m.checksum.as_ref().is_some_and(|c| c.len() == 64));
-        assert!(m.depends_on.is_empty());
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_parses_depends_on_list() {
-        let dir = unique_temp_dir("load-deps");
-        let path = dir.join("20260102_120000_create_user.surql");
-        let text = "-- @metadata\n\
-             -- version: 20260102_120000\n\
-             -- description: demo\n\
-             -- depends_on: [20260101_000000_init, 20260101_000001_seed]\n\
-             -- @up\n\
-             SELECT 1;\n\
-             -- @down\n\
-             SELECT 2;\n";
-        fs::write(&path, text).unwrap();
-
-        let m = load_migration(&path).unwrap();
-        assert_eq!(
-            m.depends_on,
-            vec![
-                "20260101_000000_init".to_string(),
-                "20260101_000001_seed".to_string()
-            ]
-        );
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_falls_back_to_filename_when_no_metadata() {
-        let dir = unique_temp_dir("load-nometa");
-        let path = dir.join("20260102_120000_seed_users.surql");
-        let text = "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n";
-        fs::write(&path, text).unwrap();
-
-        let m = load_migration(&path).unwrap();
-        assert_eq!(m.version, "20260102_120000");
-        assert_eq!(m.description, "seed_users");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_missing_up_section_errors() {
-        let dir = unique_temp_dir("load-no-up");
-        let path = dir.join("20260102_120000_x.surql");
-        fs::write(&path, "-- @down\nSELECT 1;\n").unwrap();
-
-        let err = load_migration(&path).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationLoad { .. }));
-        assert!(err.to_string().contains("@up"));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_missing_down_section_errors() {
-        let dir = unique_temp_dir("load-no-down");
-        let path = dir.join("20260102_120000_x.surql");
-        fs::write(&path, "-- @up\nSELECT 1;\n").unwrap();
-
-        let err = load_migration(&path).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationLoad { .. }));
-        assert!(err.to_string().contains("@down"));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_missing_metadata_version_errors() {
-        let dir = unique_temp_dir("load-no-ver");
-        let path = dir.join("20260102_120000_x.surql");
-        let text = "-- @metadata\n\
-             -- description: demo\n\
-             -- @up\n\
-             SELECT 1;\n\
-             -- @down\n\
-             SELECT 2;\n";
-        fs::write(&path, text).unwrap();
-
-        let err = load_migration(&path).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationLoad { .. }));
-        assert!(err.to_string().contains("version"));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_missing_metadata_description_errors() {
-        let dir = unique_temp_dir("load-no-desc");
-        let path = dir.join("20260102_120000_x.surql");
-        let text = "-- @metadata\n\
-             -- version: v1\n\
-             -- @up\n\
-             SELECT 1;\n\
-             -- @down\n\
-             SELECT 2;\n";
-        fs::write(&path, text).unwrap();
-
-        let err = load_migration(&path).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationLoad { .. }));
-        assert!(err.to_string().contains("description"));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_nonexistent_file_errors() {
-        let err =
-            load_migration(Path::new("/nonexistent/path/to/nothing_xyzzy.surql")).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationLoad { .. }));
-    }
-
-    #[test]
-    fn load_migration_directory_instead_of_file_errors() {
-        let dir = unique_temp_dir("load-is-dir");
-        let err = load_migration(&dir).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationLoad { .. }));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_default_author_when_omitted() {
-        let dir = unique_temp_dir("load-def-author");
-        let path = dir.join("20260102_120000_x.surql");
-        let text = "-- @metadata\n\
-             -- version: v1\n\
-             -- description: d\n\
-             -- @up\n\
-             SELECT 1;\n\
-             -- @down\n\
-             SELECT 2;\n";
-        fs::write(&path, text).unwrap();
-
-        let m = load_migration(&path).unwrap();
-        // Author is not part of Migration; we only check metadata didn't error.
-        assert_eq!(m.version, "v1");
-        assert_eq!(m.description, "d");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn load_migration_checksum_changes_with_content() {
-        let dir = unique_temp_dir("load-checksum");
-        let p1 = dir.join("20260102_120000_a.surql");
-        let p2 = dir.join("20260102_120001_b.surql");
-        let t1 = "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n";
-        let t2 = "-- @up\nSELECT 3;\n-- @down\nSELECT 4;\n";
-        fs::write(&p1, t1).unwrap();
-        fs::write(&p2, t2).unwrap();
-
-        let m1 = load_migration(&p1).unwrap();
-        let m2 = load_migration(&p2).unwrap();
-        assert_ne!(m1.checksum, m2.checksum);
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    // --- discover_migrations -----------------------------------------------
-
-    #[test]
-    fn discover_returns_empty_for_missing_directory() {
-        let path = std::env::temp_dir().join("surql-mig-does-not-exist-xyzzy-123");
-        let migrations = discover_migrations(&path).unwrap();
-        assert!(migrations.is_empty());
-    }
-
-    #[test]
-    fn discover_errors_when_path_is_file() {
-        let dir = unique_temp_dir("disc-is-file");
-        let path = dir.join("not_a_dir.surql");
-        fs::write(&path, "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n").unwrap();
-
-        let err = discover_migrations(&path).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationDiscovery { .. }));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discover_empty_directory_returns_empty() {
-        let dir = unique_temp_dir("disc-empty");
-        let migrations = discover_migrations(&dir).unwrap();
-        assert!(migrations.is_empty());
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discover_loads_valid_migrations_sorted() {
-        let dir = unique_temp_dir("disc-valid");
-        let p1 = dir.join("20260102_120000_a.surql");
-        let p2 = dir.join("20260103_120000_b.surql");
-        let p3 = dir.join("20260101_120000_c.surql");
-        for p in [&p1, &p2, &p3] {
-            fs::write(p, "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n").unwrap();
-        }
-
-        let migrations = discover_migrations(&dir).unwrap();
-        assert_eq!(migrations.len(), 3);
-        assert_eq!(migrations[0].version, "20260101_120000");
-        assert_eq!(migrations[1].version, "20260102_120000");
-        assert_eq!(migrations[2].version, "20260103_120000");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discover_skips_non_matching_files() {
-        let dir = unique_temp_dir("disc-skip");
-        fs::write(dir.join("README.md"), "readme").unwrap();
-        fs::write(dir.join("notes.txt"), "notes").unwrap();
-        fs::write(dir.join("not_a_migration.surql"), "-- @up\n-- @down\n").unwrap();
-        fs::write(
-            dir.join("20260101_120000_good.surql"),
-            "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n",
-        )
-        .unwrap();
-
-        let migrations = discover_migrations(&dir).unwrap();
-        assert_eq!(migrations.len(), 1);
-        assert_eq!(migrations[0].version, "20260101_120000");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discover_skips_underscore_prefixed_files() {
-        let dir = unique_temp_dir("disc-underscore");
-        fs::write(
-            dir.join("_20260101_120000_private.surql"),
-            "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("20260101_120000_ok.surql"),
-            "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n",
-        )
-        .unwrap();
-
-        let migrations = discover_migrations(&dir).unwrap();
-        assert_eq!(migrations.len(), 1);
-        assert_eq!(migrations[0].version, "20260101_120000");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discover_propagates_load_errors() {
-        let dir = unique_temp_dir("disc-badload");
-        // Valid filename pattern but missing @up/@down -> load error.
-        fs::write(dir.join("20260101_120000_broken.surql"), "no sections").unwrap();
-
-        let err = discover_migrations(&dir).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationLoad { .. }));
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn discover_ignores_subdirectories() {
-        let dir = unique_temp_dir("disc-subdir");
-        let sub = dir.join("20260101_120000_subdir.surql");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(
-            dir.join("20260101_120000_real.surql"),
-            "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n",
-        )
-        .unwrap();
-
-        let migrations = discover_migrations(&dir).unwrap();
-        assert_eq!(migrations.len(), 1);
-        assert_eq!(migrations[0].version, "20260101_120000");
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    // --- parse_migration_content corner cases -------------------------------
-
-    #[test]
-    fn parse_allows_blank_lines_before_sections() {
-        let dir = unique_temp_dir("parse-blank");
-        let path = dir.join("20260101_120000_x.surql");
-        let text = "\n\n-- preamble comment\n-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n";
-        fs::write(&path, text).unwrap();
-
-        let m = load_migration(&path).unwrap();
-        assert_eq!(m.up, vec!["SELECT 1;".to_string()]);
-        assert_eq!(m.down, vec!["SELECT 2;".to_string()]);
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn parse_splits_multiple_statements_on_semicolons() {
-        let dir = unique_temp_dir("parse-split");
-        let path = dir.join("20260101_120000_x.surql");
-        let text = "-- @up\nSELECT 1; SELECT 2;\nSELECT 3;\n-- @down\nSELECT 4;\n";
-        fs::write(&path, text).unwrap();
-
-        let m = load_migration(&path).unwrap();
-        assert_eq!(
-            m.up,
-            vec![
-                "SELECT 1;".to_string(),
-                "SELECT 2;".to_string(),
-                "SELECT 3;".to_string(),
-            ]
-        );
-
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn parse_trailing_statement_without_semicolon_is_preserved() {
-        let dir = unique_temp_dir("parse-nosc");
-        let path = dir.join("20260101_120000_x.surql");
-        let text = "-- @up\nSELECT 1\n-- @down\nSELECT 2;\n";
-        fs::write(&path, text).unwrap();
-
-        let m = load_migration(&path).unwrap();
-        assert_eq!(m.up, vec!["SELECT 1".to_string()]);
-
-        fs::remove_dir_all(&dir).ok();
-    }
-}
+mod tests;

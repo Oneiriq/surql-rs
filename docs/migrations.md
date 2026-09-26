@@ -18,7 +18,21 @@ REMOVE TABLE IF EXISTS user;
 
 The `version` pattern is `YYYYMMDD_HHMMSS`. Descriptions are slug-cased by
 the generator. Every file is validated on load and includes a SHA-256
-checksum for drift detection.
+checksum; the checksum ignores a leading byte-order mark and `\r\n`
+versus `\n` line endings, so a file hashes the same on every platform.
+(Checksums are recorded in the history table but not yet compared
+against the files on disk.)
+
+Sections are split into statements on `;`, but only on a `;` that is
+code: one inside a `--`, `//`, `#` or `/* */` comment, a `'…'` or `"…"`
+string, a `` `…` `` or `⟨…⟩` quoted name, or a `{ }` / `( )` / `[ ]`
+block does not end a statement, so `DEFINE FUNCTION` bodies and `FOR`
+loops stay whole. A comment in front of a statement stays attached to
+it; a piece holding only comments is not a statement. A leading UTF-8
+byte-order mark is ignored.
+
+`-- depends_on:` lists versions the migration must follow, and a
+squashed migration carries `-- squashed-from:` (see below).
 
 ## Generating migrations
 
@@ -39,6 +53,79 @@ let m = generate_initial_migration(&registry, Path::new("migrations"))?;
 let m = generate_migration_from_diffs("rename_email", &diffs, Path::new("migrations"))?;
 ```
 
+The generator never replaces an existing file. Versions have one-second
+resolution, so a migration generated in a second some file in the
+directory already uses gets the next free second instead. Line breaks in
+a description are written as spaces, so a description cannot start a
+section of its own.
+
+## Applying and rolling back
+
+```rust
+use surql::migration::{migrate_up, migrate_down, get_migration_status, MigrateUpOptions};
+
+let applied = migrate_up(&client, Path::new("migrations"), MigrateUpOptions::default()).await?;
+let rolled_back = migrate_down(&client, Path::new("migrations"), 1).await?;
+let report = get_migration_status(&client, Path::new("migrations")).await?;
+```
+
+Migrations apply in version order, with runs of digits compared as
+numbers (`v9` before `v10`; timestamp versions order as strings do), and
+each after the migrations it `depends_on`. A dependency cycle is an
+error.
+
+Each migration runs in one transaction together with its history
+change: applying creates the `_migration_history` row for its version,
+rolling back deletes it. The schema change and the history row therefore
+commit or fail together. The row's record id is derived from the
+version, so when two runners apply the same migration at once the
+second one's transaction is rejected as a whole and its statements do
+not run twice. Rolling back a migration that is not recorded as applied
+fails without running its down body. A failed migration is reported as a
+`Failed` status and stops the run; nothing of it was applied.
+
+A migration with no `down` statements (a squashed or a blank one) is
+refused when rolling back, rather than deleting its history row while
+the schema stays.
+
+`create_rollback_plan` rolls back every applied migration newer than the
+target, most recently applied first, and classifies the plan by what its
+down statements can destroy (`analyze_statements` exposes the same
+rules for any statement list): `REMOVE TABLE`, `REMOVE NAMESPACE`,
+`REMOVE DATABASE`, `REMOVE BUCKET` and `DELETE` are `Danger`, `REMOVE
+FIELD` and `ALTER FIELD … TYPE` are `Warning`. A plan that is not `Safe`
+has `requires_approval` set, and `execute_rollback` refuses it until it
+is approved:
+
+```rust
+use surql::migration::{create_rollback_plan, execute_rollback};
+
+let plan = create_rollback_plan(&client, Path::new("migrations"), "20260418_180000").await?;
+for issue in &plan.issues {
+    println!("{}: {}", issue.safety, issue.description);
+}
+let result = execute_rollback(&client, plan.approve()).await?;
+```
+
+## Squashing
+
+`squash_migrations` combines a range of migrations into one file whose
+metadata lists the originals in `-- squashed-from:`. On a database that
+applied the originals the squashed migration counts as applied (and on
+one that recorded the squashed migration, so do its originals), so it is
+never re-run. The squashed file has no down section, so it cannot be
+rolled back; restore from a snapshot instead.
+
+The optimiser (on by default) only removes definitions it can read, with
+nothing in between that touches the same object: a plain `DEFINE`
+followed by a `REMOVE` of the same table, field, index or event is
+dropped as a pair, an earlier definition is dropped when a later one
+`OVERWRITE`s it, and a later `IF NOT EXISTS` definition of an object
+already defined is dropped. Data statements and anything it cannot parse
+are never removed. The safety scan refuses a range containing a
+`DELETE` unless `force` is set; comments in front of a statement do not
+hide it.
+
 ## Diffing
 
 ```rust
@@ -52,6 +139,15 @@ let code = SchemaSnapshot::from_all_parts(
 let db = SchemaSnapshot::from_parts(db_tables, db_edges);
 let changes = diff_schemas(&code, &db);
 ```
+
+`diff_schemas` returns the changes in an order that applies cleanly:
+object additions first (functions, params, sequences, analyzers,
+buckets), then every table and edge drop, then table changes, then edge
+changes, and finally object drops in reverse. A changed index, event or
+edge shape is re-defined with `OVERWRITE`, in both the forward and the
+backward direction. Index and event changes are reported as
+`DiffOperation::ModifyIndex` and `ModifyEvent`, both graded `Warning` by
+the drift check.
 
 `from_parts` takes tables and edges, `from_all_parts` adds buckets, and
 `SchemaSnapshot::new()` gives an empty one to fill field by field.
@@ -115,16 +211,31 @@ use surql::migration::versioning::{
     compare_snapshots, VersionGraph,
 };
 
-let snap = create_snapshot(&registry, "after user table");
+let snap = create_snapshot(&registry, "20260418_193300", "after user table")?;
 store_snapshot(&snap, Path::new("snapshots"))?;
 let all = list_snapshots(Path::new("snapshots"))?;
 
 let comparison = compare_snapshots(&all[0], &all[1]);
 let mut graph = VersionGraph::new();
-for s in all {
-    graph.add(s);
+for m in &migrations {
+    graph.add_version(m.clone(), None, None)?;
 }
 ```
+
+A snapshot is stored as `<version>.json`; a version that is not a plain
+file name (`../x`, an absolute path) is rejected. `compare_snapshots`
+reports tables, edges, accesses and buckets. The drift check compares
+against the newest snapshot and fails if that file is corrupt rather
+than falling back to an older one.
+
+## Watching schema files
+
+`SchemaWatcher::start` (feature `watcher`) must be called inside a Tokio
+runtime; outside one it returns an error. It yields debounced
+`DriftReport`s through a bounded channel: while the consumer is behind,
+file events are coalesced rather than queued. `stop()` (or dropping the
+watcher) ends the background task, after which the receiver yields
+`None`.
 
 ## What's next
 

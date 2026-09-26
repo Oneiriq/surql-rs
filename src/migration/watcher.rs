@@ -49,12 +49,11 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, SurqlError};
 use crate::migration::diff::SchemaSnapshot;
@@ -133,20 +132,25 @@ pub fn is_schema_file(path: &Path) -> bool {
 // Watcher
 // ---------------------------------------------------------------------------
 
+/// Drift reports buffered for a slow consumer. Once it is full the
+/// debounce task waits for the consumer instead of queueing more.
+pub const REPORT_CHANNEL_CAPACITY: usize = 16;
+
 /// Active schema file watcher.
 ///
 /// Owns the [`notify`] watcher handle and a background debounce task.
 /// Dropping the value stops the watcher; [`SchemaWatcher::stop`] is
-/// provided as an explicit shutdown helper.
+/// provided as an explicit shutdown helper. Once the task has stopped,
+/// the report receiver yields `None`.
 pub struct SchemaWatcher {
-    running: Arc<AtomicBool>,
+    cancel: CancellationToken,
     _watcher: RecommendedWatcher,
 }
 
 impl std::fmt::Debug for SchemaWatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SchemaWatcher")
-            .field("running", &self.running.load(Ordering::Relaxed))
+            .field("running", &!self.cancel.is_cancelled())
             .finish_non_exhaustive()
     }
 }
@@ -164,44 +168,52 @@ impl SchemaWatcher {
     ///   against. Held for the lifetime of the watcher.
     ///
     /// Returns the watcher handle plus a receiver that yields a
-    /// [`DriftReport`] every debounce tick.
+    /// [`DriftReport`] every debounce tick. The receiver holds at most
+    /// [`REPORT_CHANNEL_CAPACITY`] reports; while it is full the watcher
+    /// coalesces further file events instead of queueing reports.
+    ///
+    /// Must be called from within a Tokio runtime, on which the debounce
+    /// task is spawned.
     ///
     /// # Errors
     ///
-    /// Returns [`SurqlError::MigrationWatcher`] if the underlying
-    /// `notify` watcher cannot be constructed, or if no paths can be
-    /// registered.
+    /// Returns [`SurqlError::MigrationWatcher`] if there is no current
+    /// Tokio runtime, if the underlying `notify` watcher cannot be
+    /// constructed, or if no paths can be registered.
     pub fn start<F>(
         paths: &[PathBuf],
         config: &WatcherConfig,
         current_snapshot_provider: F,
         recorded_snapshot: SchemaSnapshot,
-    ) -> Result<(Self, UnboundedReceiver<DriftReport>)>
+    ) -> Result<(Self, Receiver<DriftReport>)>
     where
-        F: Fn() -> SchemaSnapshot + Send + Sync + 'static,
+        F: Fn() -> SchemaSnapshot + Send + 'static,
     {
-        let (report_tx, report_rx) = unbounded_channel::<DriftReport>();
-        let running = Arc::new(AtomicBool::new(true));
-        let pending_flag = Arc::new(AtomicBool::new(false));
-        let (event_tx, event_rx) = unbounded_channel::<()>();
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|e| SurqlError::MigrationWatcher {
+                reason: format!("SchemaWatcher::start needs a Tokio runtime: {e}"),
+            })?;
+        let (report_tx, report_rx) = channel::<DriftReport>(REPORT_CHANNEL_CAPACITY);
+        // One slot: a queued wake-up already stands for every event after it.
+        let (event_tx, event_rx) = channel::<()>(1);
 
         let allow_ext = config.extensions.clone();
-        let mut watcher = build_notify_watcher(Arc::clone(&pending_flag), event_tx, allow_ext)?;
+        let mut watcher = build_notify_watcher(event_tx, allow_ext)?;
         register_paths(&mut watcher, paths, config)?;
 
-        spawn_debounce_task(
-            Arc::clone(&running),
-            Arc::clone(&pending_flag),
+        let cancel = CancellationToken::new();
+        runtime.spawn(debounce_loop(
+            cancel.clone(),
             event_rx,
             Duration::from_millis(config.debounce_ms),
-            Arc::new(Mutex::new(recorded_snapshot)),
-            Arc::new(current_snapshot_provider),
+            recorded_snapshot,
+            current_snapshot_provider,
             report_tx,
-        );
+        ));
 
         Ok((
             Self {
-                running,
+                cancel,
                 _watcher: watcher,
             },
             report_rx,
@@ -210,7 +222,7 @@ impl SchemaWatcher {
 
     /// Stop the watcher. Safe to call multiple times.
     pub fn stop(&self) {
-        self.running.store(false, Ordering::Release);
+        self.cancel.cancel();
     }
 }
 
@@ -221,8 +233,7 @@ impl Drop for SchemaWatcher {
 }
 
 fn build_notify_watcher(
-    pending_flag: Arc<AtomicBool>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    event_tx: Sender<()>,
     allow_ext: Vec<String>,
 ) -> Result<RecommendedWatcher> {
     NotifyWatcher::new(
@@ -231,8 +242,9 @@ fn build_notify_watcher(
                 if !event_of_interest(&event, &allow_ext) {
                     return;
                 }
-                pending_flag.store(true, Ordering::Release);
-                let _ = event_tx.send(());
+                // Full: a wake-up is already queued. Closed: the debounce
+                // task has stopped. Either way there is nothing to add.
+                let _ = event_tx.try_send(());
             }
             Err(err) => {
                 tracing::warn!(
@@ -294,46 +306,52 @@ fn register_paths(
     Ok(())
 }
 
-fn spawn_debounce_task<F>(
-    running: Arc<AtomicBool>,
-    pending: Arc<AtomicBool>,
-    mut event_rx: UnboundedReceiver<()>,
+/// Wait for file events, let them settle for `debounce`, then send one
+/// drift report; until the watcher is stopped or dropped, or the report
+/// receiver is dropped.
+async fn debounce_loop<F>(
+    cancel: CancellationToken,
+    mut events: Receiver<()>,
     debounce: Duration,
-    recorded: Arc<Mutex<SchemaSnapshot>>,
-    provider: Arc<F>,
-    report_tx: tokio::sync::mpsc::UnboundedSender<DriftReport>,
+    recorded: SchemaSnapshot,
+    provider: F,
+    reports: Sender<DriftReport>,
 ) where
-    F: Fn() -> SchemaSnapshot + Send + Sync + 'static,
+    F: Fn() -> SchemaSnapshot,
 {
-    tokio::spawn(async move {
-        while running.load(Ordering::Acquire) {
-            if event_rx.recv().await.is_none() {
-                break;
-            }
-            // Collapse subsequent events that arrive during the window.
-            while tokio::time::timeout(debounce, event_rx.recv())
-                .await
-                .is_ok()
-            {
-                // A value (Some or None) arrived in-time; keep collapsing
-                // until the window goes quiet.
-            }
-            if !running.load(Ordering::Acquire) {
-                break;
-            }
-            if !pending.swap(false, Ordering::AcqRel) {
-                continue;
-            }
-            let report = {
-                let code = (provider)();
-                let recorded = recorded.lock().expect("recorded mutex poisoned");
-                check_schema_drift_from_snapshots(&code, &recorded)
-            };
-            if report_tx.send(report).is_err() {
-                break;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            event = events.recv() => {
+                if event.is_none() {
+                    // The file watcher is gone.
+                    return;
+                }
             }
         }
-    });
+        // Collapse the events that keep arriving within the window. A
+        // closed channel ends the task here too: it used to count as "an
+        // event arrived in time" and spin forever.
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                event = tokio::time::timeout(debounce, events.recv()) => match event {
+                    Ok(Some(())) => {}
+                    Ok(None) => return,
+                    Err(_quiet) => break,
+                },
+            }
+        }
+        let report = check_schema_drift_from_snapshots(&provider(), &recorded);
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            sent = reports.send(report) => {
+                if sent.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn event_of_interest(event: &Event, extensions: &[String]) -> bool {
@@ -483,6 +501,67 @@ mod tests {
         )
         .expect_err("should fail when every path is missing");
         assert!(matches!(err, SurqlError::MigrationWatcher { .. }));
+    }
+
+    /// `start` is synchronous and used to call `tokio::spawn`, which
+    /// panics outside a runtime.
+    #[test]
+    fn start_outside_a_runtime_is_an_error_not_a_panic() {
+        let dir = unique_temp_dir("no-runtime");
+        let err = SchemaWatcher::start(
+            std::slice::from_ref(&dir),
+            &WatcherConfig::new(),
+            SchemaSnapshot::new,
+            SchemaSnapshot::new(),
+        )
+        .expect_err("no runtime");
+        assert!(matches!(err, SurqlError::MigrationWatcher { .. }), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Once the event sender was gone, `recv()` returned `None` at once,
+    /// the debounce window "never went quiet", and the task spun forever
+    /// (holding the report sender, so the receiver never closed either).
+    #[tokio::test]
+    async fn the_debounce_task_ends_when_file_events_stop_mid_window() {
+        let (event_tx, event_rx) = channel::<()>(1);
+        let (report_tx, mut report_rx) = channel::<DriftReport>(1);
+        let task = tokio::spawn(debounce_loop(
+            CancellationToken::new(),
+            event_rx,
+            Duration::from_millis(200),
+            SchemaSnapshot::new(),
+            SchemaSnapshot::new,
+            report_tx,
+        ));
+        event_tx.send(()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(event_tx);
+
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the task finishes")
+            .unwrap();
+        assert!(report_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_closes_the_report_channel() {
+        let dir = unique_temp_dir("stop-closes");
+        let (w, mut rx) = SchemaWatcher::start(
+            std::slice::from_ref(&dir),
+            &WatcherConfig::new().debounce_ms(50),
+            SchemaSnapshot::new,
+            SchemaSnapshot::new(),
+        )
+        .expect("start watcher");
+        w.stop();
+        let closed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the receiver closes");
+        assert!(closed.is_none());
+        drop(w);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

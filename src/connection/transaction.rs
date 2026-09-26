@@ -13,6 +13,8 @@
 //! SurrealDB does **not** support nested transactions; begin one at a
 //! time.
 
+use std::future::{ready, Ready};
+
 use serde_json::Value;
 
 use crate::connection::client::DatabaseClient;
@@ -45,19 +47,23 @@ pub struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     /// Begin a new transaction bound to `client`.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn begin(client: &'a DatabaseClient) -> Result<Transaction<'a>> {
+    ///
+    /// Nothing is sent to the server yet, so the returned future is already
+    /// complete; it is a future so that callers `.await` it like the other
+    /// client calls.
+    pub fn begin(client: &'a DatabaseClient) -> Ready<Result<Transaction<'a>>> {
         // Surface an early error if the client is not connected, so the
         // caller learns about it before issuing `execute` calls.
-        if !client.is_connected() {
-            return Err(SurqlError::Transaction {
+        ready(if client.is_connected() {
+            Ok(Self {
+                client,
+                statements: Vec::new(),
+                state: TransactionState::Active,
+            })
+        } else {
+            Err(SurqlError::Transaction {
                 reason: "cannot begin transaction: client is not connected".into(),
-            });
-        }
-        Ok(Self {
-            client,
-            statements: Vec::new(),
-            state: TransactionState::Active,
+            })
         })
     }
 
@@ -74,19 +80,21 @@ impl<'a> Transaction<'a> {
     /// Queue a statement for execution inside the transaction.
     ///
     /// The statement is **not** executed until [`Transaction::commit`]
-    /// is called. Returns [`serde_json::Value::Null`] on success; the
-    /// actual result becomes available in `commit`'s response.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn execute(&mut self, surql: &str) -> Result<Value> {
+    /// is called, and it is sent exactly as given (surrounding whitespace
+    /// aside), with or without a trailing `;`. Returns
+    /// [`serde_json::Value::Null`] on success; the actual result becomes
+    /// available in `commit`'s response.
+    ///
+    /// The statement is queued when this is called; the returned future is
+    /// already complete.
+    pub fn execute(&mut self, surql: &str) -> Ready<Result<Value>> {
         if !self.is_active() {
-            return Err(SurqlError::Transaction {
+            return ready(Err(SurqlError::Transaction {
                 reason: format!("transaction is not active (state = {:?})", self.state),
-            });
+            }));
         }
-        // Normalise the trailing semicolon so we can concatenate cleanly.
-        let trimmed = surql.trim().trim_end_matches(';').to_owned();
-        self.statements.push(trimmed);
-        Ok(Value::Null)
+        self.statements.push(surql.trim().to_owned());
+        ready(Ok(Value::Null))
     }
 
     /// Commit the transaction.
@@ -101,12 +109,7 @@ impl<'a> Transaction<'a> {
                 reason: format!("cannot commit in state {:?}", self.state),
             });
         }
-        let mut surql = String::from("BEGIN TRANSACTION;\n");
-        for stmt in &self.statements {
-            surql.push_str(stmt);
-            surql.push_str(";\n");
-        }
-        surql.push_str("COMMIT TRANSACTION;\n");
+        let surql = render_transaction(&self.statements);
 
         match self.client.query(&surql).await {
             Ok(results) => {
@@ -126,18 +129,36 @@ impl<'a> Transaction<'a> {
     ///
     /// Since queued statements are buffered client-side until commit,
     /// there is nothing to undo server-side; this simply discards the
-    /// buffer and marks the transaction as terminated.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn rollback(mut self) -> Result<()> {
+    /// buffer and marks the transaction as terminated. The returned future
+    /// is already complete.
+    pub fn rollback(mut self) -> Ready<Result<()>> {
         if !self.is_active() {
-            return Err(SurqlError::Transaction {
+            return ready(Err(SurqlError::Transaction {
                 reason: format!("cannot rollback in state {:?}", self.state),
-            });
+            }));
         }
         self.statements.clear();
         self.state = TransactionState::RolledBack;
-        Ok(())
+        ready(Ok(()))
     }
+}
+
+/// The single request a transaction's statements are flushed as.
+///
+/// Each statement goes in verbatim and is closed by a `;` on a line of its
+/// own. Appending the `;` to the statement's own line would put it inside a
+/// trailing `-- comment`, gluing the next statement onto this one; and
+/// stripping a statement's own `;` first would cut into a literal or a
+/// comment that happens to end with one. The extra empty statement a
+/// terminated statement is left with is skipped by the engine's parser.
+fn render_transaction(statements: &[String]) -> String {
+    let mut surql = String::from("BEGIN TRANSACTION;\n");
+    for stmt in statements {
+        surql.push_str(stmt);
+        surql.push_str("\n;\n");
+    }
+    surql.push_str("COMMIT TRANSACTION;\n");
+    surql
 }
 
 #[cfg(test)]
@@ -150,6 +171,24 @@ mod tests {
         let client = DatabaseClient::new(ConnectionConfig::default()).unwrap();
         let err = Transaction::begin(&client).await.unwrap_err();
         assert!(matches!(err, SurqlError::Transaction { .. }));
+    }
+
+    #[test]
+    fn render_keeps_statement_text_verbatim() {
+        let stmts = vec![
+            "CREATE t SET note = 'a;b';".to_owned(),
+            "SELECT 1 -- trailing comment".to_owned(),
+            "SELECT 'ends with ;'".to_owned(),
+        ];
+        let surql = render_transaction(&stmts);
+        assert_eq!(
+            surql,
+            "BEGIN TRANSACTION;\n\
+             CREATE t SET note = 'a;b';\n;\n\
+             SELECT 1 -- trailing comment\n;\n\
+             SELECT 'ends with ;'\n;\n\
+             COMMIT TRANSACTION;\n"
+        );
     }
 
     #[test]

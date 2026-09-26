@@ -19,10 +19,13 @@
 //!
 //! ## Atomic writes
 //!
-//! Files are written via a temporary sibling file + `rename` so that a
-//! crash mid-write cannot leave a partially-written migration on disk.
-//! Readers that enumerate the directory will either see the old state
-//! (no file) or the new state (complete file), never a torn write.
+//! Files are written via a temporary sibling file that is then linked
+//! (or renamed) into place, so that a crash mid-write cannot leave a
+//! partially-written migration on disk. Readers that enumerate the
+//! directory will either see the old state (no file) or the new state
+//! (complete file), never a torn write. An existing file is never
+//! replaced: a version already used in the directory is bumped to the
+//! next free second, and a name clash that remains is an error.
 //!
 //! ## Deviation from Python
 //!
@@ -34,7 +37,7 @@
 //! [`load_migration`]: crate::migration::load_migration
 //! [`SchemaRegistry`]: crate::schema::SchemaRegistry
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -42,17 +45,19 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 
 use crate::error::{Result, SurqlError};
 use crate::migration::diff::SchemaSnapshot;
-use crate::migration::discovery::load_migration;
+use crate::migration::discovery::{get_version_from_filename, load_migration};
+use crate::migration::lexer;
 use crate::migration::models::{Migration, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
 use crate::schema::sql::generate_schema_sql;
 use crate::schema::table::TableDefinition;
 use crate::schema::SchemaRegistry;
+use crate::types::escape::quote_ident;
 
 /// Default author string written to the `-- @metadata` section.
 const DEFAULT_AUTHOR: &str = "surql";
@@ -60,8 +65,9 @@ const DEFAULT_AUTHOR: &str = "surql";
 /// Generate a migration file from explicit up/down statement lists.
 ///
 /// Writes the migration atomically to `directory`, using the current UTC
-/// timestamp for the version, and returns the loaded [`Migration`] so
-/// callers can use it immediately without re-parsing from disk.
+/// timestamp for the version (or the next second no migration in
+/// `directory` uses yet), and returns the loaded [`Migration`] so callers
+/// can use it immediately without re-parsing from disk.
 ///
 /// The `name` parameter is used to derive the filename and the
 /// human-readable description. It is sanitised to lowercase
@@ -72,6 +78,7 @@ const DEFAULT_AUTHOR: &str = "surql";
 /// Returns [`SurqlError::MigrationGeneration`] if:
 /// * `name` sanitises to an empty string.
 /// * `directory` cannot be created or written to.
+/// * The target file already exists (it is never overwritten).
 /// * The round-trip load after write fails.
 ///
 /// # Examples
@@ -95,7 +102,7 @@ pub fn generate_migration(
     directory: &Path,
 ) -> Result<Migration> {
     let sanitized = sanitize_name(name)?;
-    let version = generate_version();
+    let version = next_free_version(directory)?;
     let description = description_from_name(name);
 
     let content = render_content(
@@ -204,7 +211,7 @@ pub fn create_blank_migration(
     directory: &Path,
 ) -> Result<Migration> {
     let sanitized = sanitize_name(name)?;
-    let version = generate_version();
+    let version = next_free_version(directory)?;
     let resolved_description = if description.is_empty() {
         description_from_name(name)
     } else {
@@ -301,9 +308,45 @@ pub fn generate_migration_from_diffs(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Generate a UTC timestamp version string (`YYYYMMDD_HHMMSS`).
-fn generate_version() -> String {
-    Utc::now().format("%Y%m%d_%H%M%S").to_string()
+/// A UTC timestamp version (`YYYYMMDD_HHMMSS`) for a new migration in
+/// `directory`: the current second, or the first later second no
+/// migration file in `directory` uses yet. Versions have one-second
+/// resolution, so two migrations generated within one second would
+/// otherwise share a version (and, with the same name, a file).
+pub(crate) fn next_free_version(directory: &Path) -> Result<String> {
+    let taken: BTreeSet<String> = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| get_version_from_filename(entry.file_name().to_str()?))
+        .collect();
+    let mut at = Utc::now();
+    loop {
+        let version = at.format("%Y%m%d_%H%M%S").to_string();
+        if !taken.contains(&version) {
+            return Ok(version);
+        }
+        at = at
+            .checked_add_signed(TimeDelta::seconds(1))
+            .ok_or_else(|| SurqlError::MigrationGeneration {
+                reason: "no free migration version left".to_string(),
+            })?;
+    }
+}
+
+/// `text` on a single line: line breaks and other control characters
+/// become spaces, so a description cannot end the metadata line and start
+/// a `-- @up` section marker of its own.
+pub(crate) fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Sanitize a human-supplied name into a safe filename component.
@@ -345,19 +388,13 @@ fn description_from_name(name: &str) -> String {
     }
 }
 
-/// Trim a statement and ensure it ends with `;`.
+/// Trim a statement and ensure it ends with `;` (on a line of its own when
+/// the statement ends in a line comment).
 ///
 /// Returns `None` when the trimmed input is empty.
 fn normalise_statement(stmt: &str) -> Option<String> {
     let trimmed = stmt.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.ends_with(';') {
-        Some(trimmed.to_string())
-    } else {
-        Some(format!("{trimmed};"))
-    }
+    (!trimmed.is_empty()).then(|| lexer::terminate_statement(trimmed))
 }
 
 /// Render the complete file content for a non-blank migration.
@@ -371,13 +408,17 @@ fn render_content(
 ) -> String {
     let mut out = String::new();
     out.push_str("-- @metadata\n");
-    let _ = writeln!(out, "-- version: {version}");
-    let _ = writeln!(out, "-- description: {description}");
-    let _ = writeln!(out, "-- author: {author}");
+    let _ = writeln!(out, "-- version: {}", single_line(version));
+    let _ = writeln!(out, "-- description: {}", single_line(description));
+    let _ = writeln!(out, "-- author: {}", single_line(author));
     if depends_on.is_empty() {
         out.push_str("-- depends_on: \n");
     } else {
-        let _ = writeln!(out, "-- depends_on: [{}]", depends_on.join(", "));
+        let _ = writeln!(
+            out,
+            "-- depends_on: [{}]",
+            single_line(&depends_on.join(", "))
+        );
     }
 
     out.push_str("-- @up\n");
@@ -399,9 +440,9 @@ fn render_content(
 fn render_blank_content(version: &str, description: &str, author: &str) -> String {
     let mut out = String::new();
     out.push_str("-- @metadata\n");
-    let _ = writeln!(out, "-- version: {version}");
-    let _ = writeln!(out, "-- description: {description}");
-    let _ = writeln!(out, "-- author: {author}");
+    let _ = writeln!(out, "-- version: {}", single_line(version));
+    let _ = writeln!(out, "-- description: {}", single_line(description));
+    let _ = writeln!(out, "-- author: {}", single_line(author));
     out.push_str("-- depends_on: \n");
     out.push_str("-- @up\n");
     // Intentionally left blank: fill in with forward migration statements.
@@ -449,20 +490,12 @@ fn write_migration_file(directory: &Path, filename: &str, content: &str) -> Resu
             })?;
         drop(file);
 
-        fs::rename(&temp, &target).map_err(|e| SurqlError::MigrationGeneration {
-            reason: format!(
-                "failed to rename {} to {}: {e}",
-                temp.display(),
-                target.display()
-            ),
-        })?;
-        Ok(())
+        publish_without_clobbering(&temp, &target)
     })();
 
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&temp);
-        return Err(err);
-    }
+    // The temp file is gone after a rename, and a leftover after a link.
+    let _ = fs::remove_file(&temp);
+    write_result?;
 
     load_migration(&target).map_err(|e| SurqlError::MigrationGeneration {
         reason: format!(
@@ -470,6 +503,30 @@ fn write_migration_file(directory: &Path, filename: &str, content: &str) -> Resu
             target.display()
         ),
     })
+}
+
+/// Move the finished `temp` file to `target`, refusing to replace an
+/// existing migration. A hard link fails atomically when `target` exists;
+/// where the filesystem cannot link, an existence check guards a rename.
+fn publish_without_clobbering(temp: &Path, target: &Path) -> Result<()> {
+    let exists = || SurqlError::MigrationGeneration {
+        reason: format!(
+            "refusing to overwrite existing migration {}",
+            target.display()
+        ),
+    };
+    match fs::hard_link(temp, target) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+        Err(_) if target.exists() => Err(exists()),
+        Err(_) => fs::rename(temp, target).map_err(|e| SurqlError::MigrationGeneration {
+            reason: format!(
+                "failed to rename {} to {}: {e}",
+                temp.display(),
+                target.display()
+            ),
+        }),
+    }
 }
 
 /// Build a unique temp filename for atomic writes.
@@ -534,13 +591,19 @@ fn build_initial_statements(snapshot: &SchemaSnapshot) -> Result<(Vec<String>, V
     // Drop buckets first (independent), then edges (reference tables), then
     // tables.
     for bucket_name in buckets_map.keys().rev() {
-        down_statements.push(format!("REMOVE BUCKET {bucket_name};"));
+        down_statements.push(format!("REMOVE BUCKET {};", quote_ident(bucket_name)));
     }
     for edge_name in edges_map.keys().rev() {
-        down_statements.push(format!("REMOVE TABLE IF EXISTS {edge_name};"));
+        down_statements.push(format!(
+            "REMOVE TABLE IF EXISTS {};",
+            quote_ident(edge_name)
+        ));
     }
     for table_name in tables_map.keys().rev() {
-        down_statements.push(format!("REMOVE TABLE IF EXISTS {table_name};"));
+        down_statements.push(format!(
+            "REMOVE TABLE IF EXISTS {};",
+            quote_ident(table_name)
+        ));
     }
 
     Ok((up_statements, down_statements))
@@ -551,627 +614,4 @@ fn build_initial_statements(snapshot: &SchemaSnapshot) -> Result<(Vec<String>, V
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::migration::models::DiffOperation;
-    use crate::schema::edge::typed_edge;
-    use crate::schema::table::{table_schema, TableMode};
-    use std::path::PathBuf;
-
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos: u128 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let n = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("surql-gen-{tag}-{pid}-{nanos}-{n}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    fn cleanup(dir: &Path) {
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    // --- generate_version ---------------------------------------------------
-
-    #[test]
-    fn version_has_expected_format() {
-        let v = generate_version();
-        assert_eq!(v.len(), 15, "expected YYYYMMDD_HHMMSS (15 chars)");
-        assert_eq!(v.chars().nth(8), Some('_'));
-        let (date, time) = v.split_once('_').unwrap();
-        assert!(date.chars().all(|c| c.is_ascii_digit()));
-        assert!(time.chars().all(|c| c.is_ascii_digit()));
-        assert_eq!(date.len(), 8);
-        assert_eq!(time.len(), 6);
-    }
-
-    #[test]
-    fn version_is_monotonic_across_calls() {
-        let v1 = generate_version();
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let v2 = generate_version();
-        assert!(v2 >= v1, "expected {v2} >= {v1}");
-    }
-
-    // --- sanitize_name ------------------------------------------------------
-
-    #[test]
-    fn sanitize_lowercases_and_replaces_spaces() {
-        assert_eq!(
-            sanitize_name("Create User Table").unwrap(),
-            "create_user_table"
-        );
-    }
-
-    #[test]
-    fn sanitize_strips_punctuation() {
-        assert_eq!(sanitize_name("fix bug #123!").unwrap(), "fix_bug_123");
-    }
-
-    #[test]
-    fn sanitize_keeps_underscores() {
-        assert_eq!(sanitize_name("add_user_email").unwrap(), "add_user_email");
-    }
-
-    #[test]
-    fn sanitize_rejects_empty() {
-        assert!(sanitize_name("").is_err());
-        assert!(sanitize_name("!!!").is_err());
-        assert!(sanitize_name("   ").is_err());
-    }
-
-    // --- description_from_name ---------------------------------------------
-
-    #[test]
-    fn description_from_name_replaces_underscores() {
-        assert_eq!(
-            description_from_name("create_user_table"),
-            "Create user table"
-        );
-    }
-
-    #[test]
-    fn description_from_name_capitalises_first() {
-        assert_eq!(description_from_name("fix"), "Fix");
-    }
-
-    // --- normalise_statement -----------------------------------------------
-
-    #[test]
-    fn normalise_adds_trailing_semicolon() {
-        assert_eq!(
-            normalise_statement("SELECT 1").as_deref(),
-            Some("SELECT 1;"),
-        );
-    }
-
-    #[test]
-    fn normalise_preserves_trailing_semicolon() {
-        assert_eq!(
-            normalise_statement("SELECT 1;").as_deref(),
-            Some("SELECT 1;"),
-        );
-    }
-
-    #[test]
-    fn normalise_trims_whitespace() {
-        assert_eq!(
-            normalise_statement("  SELECT 1;\n").as_deref(),
-            Some("SELECT 1;"),
-        );
-    }
-
-    #[test]
-    fn normalise_empty_returns_none() {
-        assert!(normalise_statement("").is_none());
-        assert!(normalise_statement("   \n\t  ").is_none());
-    }
-
-    // --- filename layout ---------------------------------------------------
-
-    #[test]
-    fn filename_matches_pattern() {
-        let dir = unique_temp_dir("filename");
-        let m = generate_migration(
-            "Create user",
-            &["DEFINE TABLE user SCHEMAFULL;".to_string()],
-            &["REMOVE TABLE user;".to_string()],
-            &dir,
-        )
-        .unwrap();
-        let filename = m.path.file_name().unwrap().to_str().unwrap();
-        assert!(filename.ends_with("_create_user.surql"));
-        assert_eq!(&filename[8..9], "_");
-        assert_eq!(&filename[15..16], "_");
-
-        cleanup(&dir);
-    }
-
-    // --- generate_migration happy path -------------------------------------
-
-    #[test]
-    fn generate_migration_round_trips_through_load_migration() {
-        let dir = unique_temp_dir("roundtrip");
-
-        let up = vec![
-            "DEFINE TABLE user SCHEMAFULL;".to_string(),
-            "DEFINE FIELD email ON TABLE user TYPE string;".to_string(),
-        ];
-        let down = vec!["REMOVE TABLE user;".to_string()];
-
-        let m = generate_migration("create_user", &up, &down, &dir).unwrap();
-
-        let reloaded = load_migration(&m.path).unwrap();
-        assert_eq!(reloaded.up, up);
-        assert_eq!(reloaded.down, down);
-        assert_eq!(reloaded.description, "Create user");
-        assert_eq!(m, reloaded);
-
-        cleanup(&dir);
-    }
-
-    /// A field that gains `REFERENCE` puts its rewrite in the file,
-    /// right after the DDL, and the whole thing survives the trip back
-    /// through `load_migration` as one statement: the rewrite is a
-    /// `FOR` body full of semicolons, which is exactly what the
-    /// statement splitter used to shatter.
-    #[test]
-    fn a_gained_reference_rides_the_generated_file() {
-        use crate::migration::diff::diff_fields;
-        use crate::schema::{record_field, ReferenceAction};
-
-        let dir = unique_temp_dir("reference-backfill");
-        let old = record_field("link", Some("b"))
-            .nullable(true)
-            .build_unchecked()
-            .unwrap();
-        let new = record_field("link", Some("b"))
-            .nullable(true)
-            .reference(ReferenceAction::Ignore)
-            .build_unchecked()
-            .unwrap();
-        let diffs = diff_fields("f", &[new], &[old]);
-        assert_eq!(diffs.len(), 1);
-
-        let m = generate_migration_from_diffs("gain_reference", &diffs, &dir).unwrap();
-        let reloaded = load_migration(&m.path).unwrap();
-        assert_eq!(reloaded.up.len(), 2, "{:#?}", reloaded.up);
-        assert!(reloaded.up[0].contains("REFERENCE ON DELETE IGNORE"));
-        assert!(reloaded.up[1].starts_with("FOR $rid"), "{}", reloaded.up[1]);
-        assert!(
-            reloaded.up[1].contains("SET link = $held"),
-            "the dance survives the file as one statement: {}",
-            reloaded.up[1]
-        );
-        // Removing the clause needs no un-backfill: down is the old DDL alone.
-        assert_eq!(reloaded.down.len(), 1, "{:#?}", reloaded.down);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn generate_migration_creates_missing_directory() {
-        let parent = unique_temp_dir("mkdir");
-        let dir = parent.join("nested/a/b");
-        assert!(!dir.exists());
-
-        let m = generate_migration(
-            "init",
-            &["SELECT 1;".to_string()],
-            &["SELECT 2;".to_string()],
-            &dir,
-        )
-        .unwrap();
-        assert!(dir.exists());
-        assert!(m.path.starts_with(&dir));
-
-        cleanup(&parent);
-    }
-
-    #[test]
-    fn generate_migration_rejects_invalid_name() {
-        let dir = unique_temp_dir("invalid-name");
-        let err = generate_migration("!!!", &[], &[], &dir).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationGeneration { .. }));
-        assert!(err.to_string().contains("sanitises"));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn generate_migration_writes_metadata_section() {
-        let dir = unique_temp_dir("metadata");
-        let m = generate_migration(
-            "demo_feature",
-            &["SELECT 1;".to_string()],
-            &["SELECT 2;".to_string()],
-            &dir,
-        )
-        .unwrap();
-        let text = fs::read_to_string(&m.path).unwrap();
-        assert!(text.contains("-- @metadata"));
-        assert!(text.contains("-- version: "));
-        assert!(text.contains("-- description: Demo feature"));
-        assert!(text.contains("-- author: surql"));
-        assert!(text.contains("-- @up"));
-        assert!(text.contains("-- @down"));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn generate_migration_empty_statements_round_trip_to_empty_vectors() {
-        let dir = unique_temp_dir("empty");
-        let m = generate_migration("noop", &[], &[], &dir).unwrap();
-        assert!(m.up.is_empty());
-        assert!(m.down.is_empty());
-
-        cleanup(&dir);
-    }
-
-    // --- atomic write -------------------------------------------------------
-
-    #[test]
-    fn atomic_write_leaves_no_temp_file_on_success() {
-        let dir = unique_temp_dir("atomic-ok");
-        generate_migration(
-            "ok",
-            &["SELECT 1;".to_string()],
-            &["SELECT 2;".to_string()],
-            &dir,
-        )
-        .unwrap();
-
-        let leftover = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
-        assert!(!leftover, "temp files should be gone after success");
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn atomic_write_rejects_when_directory_is_a_file() {
-        let parent = unique_temp_dir("atomic-bad");
-        let path_as_file = parent.join("nota_dir");
-        fs::write(&path_as_file, "blocker").unwrap();
-
-        let err = generate_migration(
-            "x",
-            &["SELECT 1;".to_string()],
-            &["SELECT 2;".to_string()],
-            &path_as_file,
-        )
-        .unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationGeneration { .. }));
-
-        cleanup(&parent);
-    }
-
-    // --- create_blank_migration --------------------------------------------
-
-    #[test]
-    fn blank_migration_round_trips_to_empty_statements() {
-        let dir = unique_temp_dir("blank");
-        let m = create_blank_migration("manual_fix", "Manual data fix", &dir).unwrap();
-        assert!(m.up.is_empty());
-        assert!(m.down.is_empty());
-        assert_eq!(m.description, "Manual data fix");
-
-        let reloaded = load_migration(&m.path).unwrap();
-        assert_eq!(m, reloaded);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn blank_migration_uses_name_when_description_empty() {
-        let dir = unique_temp_dir("blank-nodesc");
-        let m = create_blank_migration("seed_users", "", &dir).unwrap();
-        assert_eq!(m.description, "Seed users");
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn blank_migration_rejects_empty_name() {
-        let dir = unique_temp_dir("blank-empty");
-        let err = create_blank_migration("", "desc", &dir).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationGeneration { .. }));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn blank_migration_filename_has_surql_extension() {
-        let dir = unique_temp_dir("blank-ext");
-        let m = create_blank_migration("test", "Test", &dir).unwrap();
-        assert_eq!(m.path.extension().and_then(|s| s.to_str()), Some("surql"));
-
-        cleanup(&dir);
-    }
-
-    // --- generate_initial_migration ----------------------------------------
-
-    #[test]
-    fn initial_migration_from_single_table() {
-        let dir = unique_temp_dir("initial-one");
-        let registry = SchemaRegistry::new();
-        registry.register_table(table_schema("user").with_mode(TableMode::Schemafull));
-
-        let m = generate_initial_migration(&registry, &dir).unwrap();
-        assert_eq!(m.description, "Initial schema");
-        assert!(m
-            .up
-            .iter()
-            .any(|s| s.contains("DEFINE TABLE IF NOT EXISTS user")));
-        assert!(m
-            .down
-            .iter()
-            .any(|s| s.contains("REMOVE TABLE IF EXISTS user")));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn initial_migration_from_multi_table_registry() {
-        let dir = unique_temp_dir("initial-multi");
-        let registry = SchemaRegistry::new();
-        registry.register_table(table_schema("user").with_mode(TableMode::Schemafull));
-        registry.register_table(table_schema("post").with_mode(TableMode::Schemafull));
-        registry.register_table(table_schema("comment").with_mode(TableMode::Schemafull));
-        registry.register_edge(typed_edge("likes", "user", "post"));
-
-        let m = generate_initial_migration(&registry, &dir).unwrap();
-
-        // All tables + edges present in up.
-        for name in ["user", "post", "comment", "likes"] {
-            assert!(
-                m.up.iter()
-                    .any(|s| s.contains(&format!("DEFINE TABLE IF NOT EXISTS {name}"))),
-                "expected DEFINE for {name} in up"
-            );
-        }
-
-        // All tables + edges present in down.
-        for name in ["user", "post", "comment", "likes"] {
-            assert!(
-                m.down
-                    .iter()
-                    .any(|s| s.contains(&format!("REMOVE TABLE IF EXISTS {name}"))),
-                "expected REMOVE for {name} in down"
-            );
-        }
-
-        // Round-trip.
-        let reloaded = load_migration(&m.path).unwrap();
-        assert_eq!(m, reloaded);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn initial_migration_errors_on_empty_registry() {
-        let dir = unique_temp_dir("initial-empty");
-        let registry = SchemaRegistry::new();
-        let err = generate_initial_migration(&registry, &dir).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationGeneration { .. }));
-        assert!(err.to_string().contains("registry is empty"));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn initial_migration_up_uses_if_not_exists() {
-        let dir = unique_temp_dir("initial-ifne");
-        let registry = SchemaRegistry::new();
-        registry.register_table(table_schema("user").with_mode(TableMode::Schemafull));
-
-        let m = generate_initial_migration(&registry, &dir).unwrap();
-        assert!(m
-            .up
-            .iter()
-            .all(|s| !s.contains("DEFINE") || s.contains("IF NOT EXISTS")));
-
-        cleanup(&dir);
-    }
-
-    // --- generate_migration_from_diffs -------------------------------------
-
-    fn make_add_table_diff(name: &str) -> SchemaDiff {
-        SchemaDiff {
-            operation: DiffOperation::AddTable,
-            table: name.to_string(),
-            field: None,
-            index: None,
-            event: None,
-            bucket: None,
-            analyzer: None,
-            object: None,
-            description: format!("Add {name} table"),
-            forward_sql: format!("DEFINE TABLE {name} SCHEMAFULL;"),
-            backward_sql: format!("REMOVE TABLE {name};"),
-            details: BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn from_diffs_combines_forward_and_backward_sql() {
-        let dir = unique_temp_dir("diffs-basic");
-        let diffs = vec![make_add_table_diff("user"), make_add_table_diff("post")];
-
-        let m = generate_migration_from_diffs("initial_tables", &diffs, &dir).unwrap();
-        assert_eq!(
-            m.up,
-            vec![
-                "DEFINE TABLE user SCHEMAFULL;",
-                "DEFINE TABLE post SCHEMAFULL;"
-            ]
-        );
-        // Down is reverse order.
-        assert_eq!(m.down, vec!["REMOVE TABLE post;", "REMOVE TABLE user;"]);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn from_diffs_errors_on_empty_input() {
-        let dir = unique_temp_dir("diffs-empty");
-        let err = generate_migration_from_diffs("noop", &[], &dir).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationGeneration { .. }));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn from_diffs_filters_empty_sql_entries() {
-        let dir = unique_temp_dir("diffs-skip");
-        let diffs = vec![
-            SchemaDiff {
-                operation: DiffOperation::AddTable,
-                table: "x".into(),
-                field: None,
-                index: None,
-                event: None,
-                bucket: None,
-                analyzer: None,
-                object: None,
-                description: "x".into(),
-                forward_sql: String::new(),
-                backward_sql: String::new(),
-                details: BTreeMap::new(),
-            },
-            make_add_table_diff("keep"),
-        ];
-
-        let m = generate_migration_from_diffs("mixed", &diffs, &dir).unwrap();
-        assert_eq!(m.up, vec!["DEFINE TABLE keep SCHEMAFULL;"]);
-        assert_eq!(m.down, vec!["REMOVE TABLE keep;"]);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn from_diffs_normalises_missing_semicolons() {
-        let dir = unique_temp_dir("diffs-semi");
-        let diff = SchemaDiff {
-            operation: DiffOperation::AddTable,
-            table: "x".into(),
-            field: None,
-            index: None,
-            event: None,
-            bucket: None,
-            analyzer: None,
-            object: None,
-            description: "x".into(),
-            forward_sql: "DEFINE TABLE x SCHEMAFULL".into(),
-            backward_sql: "REMOVE TABLE x".into(),
-            details: BTreeMap::new(),
-        };
-
-        let m = generate_migration_from_diffs("semi", &[diff], &dir).unwrap();
-        assert_eq!(m.up, vec!["DEFINE TABLE x SCHEMAFULL;"]);
-        assert_eq!(m.down, vec!["REMOVE TABLE x;"]);
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn from_diffs_round_trips_through_load_migration() {
-        let dir = unique_temp_dir("diffs-rt");
-        let diffs = vec![make_add_table_diff("user"), make_add_table_diff("post")];
-
-        let m = generate_migration_from_diffs("initial", &diffs, &dir).unwrap();
-        let reloaded = load_migration(&m.path).unwrap();
-        assert_eq!(m, reloaded);
-
-        cleanup(&dir);
-    }
-
-    // --- render_content formatting -----------------------------------------
-
-    #[test]
-    fn rendered_content_orders_sections_correctly() {
-        let text = render_content(
-            "20260102_120000",
-            "demo",
-            "surql",
-            &[],
-            &["SELECT 1;".into()],
-            &["SELECT 2;".into()],
-        );
-
-        let meta_idx = text.find("-- @metadata").unwrap();
-        let up_idx = text.find("-- @up").unwrap();
-        let down_idx = text.find("-- @down").unwrap();
-        assert!(meta_idx < up_idx);
-        assert!(up_idx < down_idx);
-    }
-
-    #[test]
-    fn rendered_content_includes_depends_on_list() {
-        let text = render_content(
-            "20260102_120000",
-            "demo",
-            "surql",
-            &["v0".to_string(), "v00".to_string()],
-            &[],
-            &[],
-        );
-        assert!(text.contains("-- depends_on: [v0, v00]"));
-    }
-
-    #[test]
-    fn rendered_blank_content_has_both_sections() {
-        let text = render_blank_content("20260102_120000", "demo", "surql");
-        assert!(text.contains("-- @up"));
-        assert!(text.contains("-- @down"));
-        assert!(text.contains("-- version: 20260102_120000"));
-    }
-
-    // --- temp_filename uniqueness ------------------------------------------
-
-    #[test]
-    fn temp_filename_has_expected_prefix_and_counter() {
-        let a = temp_filename("x.surql");
-        let b = temp_filename("x.surql");
-        assert!(a.starts_with("x.surql.tmp."));
-        assert!(b.starts_with("x.surql.tmp."));
-        assert_ne!(a, b);
-    }
-
-    // --- path stability ----------------------------------------------------
-
-    #[test]
-    fn generate_migration_returns_path_inside_directory() {
-        let dir = unique_temp_dir("path-in");
-        let m = generate_migration(
-            "x",
-            &["SELECT 1;".to_string()],
-            &["SELECT 2;".to_string()],
-            &dir,
-        )
-        .unwrap();
-        assert!(m.path.starts_with(&dir));
-
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn generated_file_exists_after_successful_write() {
-        let dir = unique_temp_dir("path-exists");
-        let m = generate_migration(
-            "x",
-            &["SELECT 1;".to_string()],
-            &["SELECT 2;".to_string()],
-            &dir,
-        )
-        .unwrap();
-        assert!(m.path.is_file());
-
-        cleanup(&dir);
-    }
-}
+mod tests;
