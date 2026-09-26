@@ -1,7 +1,7 @@
 
 ## Local pre-push hook
 
-This repo ships a `.githooks/pre-push` that runs the same checks GitHub Actions runs: `cargo fmt`, `clippy`, `cargo test --lib`, doc tests, the `client-rustls` build (and the check that it pulls no OpenSSL), `cargo audit`, the MSRV check on Rust 1.92, the `client-wasm` build, and `mkdocs build --strict`. Wire it up once per clone:
+This repo ships a `.githooks/pre-push` that runs the same checks GitHub Actions runs: `cargo fmt`, `clippy`, `cargo test --lib`, doc tests, the `client-rustls` build (and the check that it pulls no OpenSSL), the no-features build, `cargo audit`, the MSRV check on Rust 1.92, the `client-wasm` build, and `mkdocs build --strict`. Wire it up once per clone:
 
 ```bash
 git config core.hooksPath .githooks
@@ -27,4 +27,22 @@ Bypass (rarely, only with authorisation):
 
 ```bash
 git push --no-verify
+```
+
+## Fuzzing
+
+`fuzz/` is a `cargo fuzz` crate with its own workspace. Its targets use the engine's own SurrealQL parser (`surrealdb-core`) as the oracle: rendered record ids, identifiers, string literals, and values must parse back as exactly one statement and as the input they were rendered from, and the `INFO` parsers must never panic on server text.
+
+| Target | Checks |
+|---|---|
+| `record_id` | `RecordID` display parses to the same table and string key; `parse` inverts it |
+| `ident` | `quote_ident` / `quote_str` read back unchanged and stay one statement |
+| `value` | any JSON rendered by `quote_value_public` is one inert literal equal to the input |
+| `schema_info` | every `schema::parser` entry point returns on arbitrary definition text |
+
+libFuzzer needs Linux (or Docker) and a nightly toolchain. `-a` keeps debug assertions and overflow checks on in the optimised build:
+
+```bash
+cd fuzz
+cargo +nightly fuzz run -O -a value -- -max_total_time=600
 ```
