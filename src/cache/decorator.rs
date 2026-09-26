@@ -63,10 +63,12 @@ where
 pub fn cache_key_for<T: Serialize + ?Sized>(module: &str, name: &str, args: &T) -> Result<String> {
     let identity = serde_json::to_string(&(module, name, args))?;
     let digest = Sha256::digest(identity.as_bytes());
-    let hex = digest.iter().take(8).fold(String::new(), |mut acc, byte| {
-        acc.push_str(&format!("{byte:02x}"));
-        acc
-    });
+    let hex: String = digest
+        .iter()
+        .take(8)
+        .flat_map(|byte| [byte >> 4, byte & 0x0f])
+        .filter_map(|nibble| char::from_digit(u32::from(nibble), 16))
+        .collect();
     Ok(format!("{module}.{name}:{hex}"))
 }
 

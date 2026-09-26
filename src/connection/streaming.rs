@@ -467,24 +467,27 @@ mod tests {
         assert_eq!(m.count().await, 0);
     }
 
+    /// The handle of a task that has already run to completion, standing
+    /// in for a subscription whose stream ended.
+    async fn ended_task() -> JoinHandle<()> {
+        let handle = tokio::spawn(async {});
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        handle
+    }
+
     /// Regression: a subscription whose stream had ended stayed in the
     /// pool, so `count` kept counting it and `kill` reported stopping it.
     #[tokio::test]
     async fn ended_subscriptions_are_neither_counted_nor_killed() {
         let m = StreamingManager::new();
-        let ended = || async {
-            let handle = tokio::spawn(async {});
-            while !handle.is_finished() {
-                tokio::task::yield_now().await;
-            }
-            handle
-        };
         let a = SubscriptionId::new();
-        m.inner.tasks.lock().await.insert(a, ended().await);
+        m.inner.tasks.lock().await.insert(a, ended_task().await);
         assert!(!m.kill(a).await, "an ended subscription is not killed");
 
         let b = SubscriptionId::new();
-        m.inner.tasks.lock().await.insert(b, ended().await);
+        m.inner.tasks.lock().await.insert(b, ended_task().await);
         assert_eq!(m.count().await, 0);
         assert!(m.ids().await.is_empty());
     }

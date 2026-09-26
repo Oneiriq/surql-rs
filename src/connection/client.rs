@@ -882,12 +882,8 @@ fn collect_rows<T: DeserializeOwned>(value: &Value, out: &mut Vec<T>) -> Result<
 }
 
 fn first_row_typed<T: DeserializeOwned>(raw: &Value) -> Result<Option<T>> {
-    let mut rows: Vec<T> = flatten_rows_typed(raw)?;
-    Ok(if rows.is_empty() {
-        None
-    } else {
-        Some(rows.remove(0))
-    })
+    let rows: Vec<T> = flatten_rows_typed(raw)?;
+    Ok(rows.into_iter().next())
 }
 
 fn payload_str(map: &serde_json::Map<String, Value>, key: &str) -> Result<String> {
@@ -961,13 +957,8 @@ mod tests {
 
     #[test]
     fn first_row_typed_returns_none_for_empty_array() {
-        #[derive(serde::Deserialize, Debug)]
-        struct Row {
-            #[allow(dead_code)]
-            name: String,
-        }
         let raw = serde_json::json!([[]]);
-        let row: Option<Row> = first_row_typed(&raw).unwrap();
+        let row: Option<Value> = first_row_typed(&raw).unwrap();
         assert!(row.is_none());
     }
 
