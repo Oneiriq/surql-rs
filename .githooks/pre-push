@@ -5,7 +5,7 @@
 # Wire it up once per clone: `git config core.hooksPath .githooks`.
 #
 # Every CI job has a step here. The ones that need an extra toolchain
-# (cargo-audit, Rust 1.92, a wasm-capable clang, mkdocs) run when it is
+# (cargo-audit, Rust 1.95, a wasm-capable clang, mkdocs) run when it is
 # installed and print a SKIPPED line naming what to install when it is not,
 # so a skipped gate is visible rather than silent.
 #
@@ -51,12 +51,12 @@ else
   skipped+=("cargo audit (cargo install --locked cargo-audit)")
 fi
 
-if rustup run 1.92 rustc --version >/dev/null 2>&1; then
-  echo "[pre-push] cargo +1.92 check (MSRV)"
-  cargo +1.92 check --lib --bins --all-features
-  cargo +1.92 check --lib --no-default-features --features client-rustls
+if rustup run 1.95 rustc --version >/dev/null 2>&1; then
+  echo "[pre-push] cargo +1.95 check (MSRV)"
+  cargo +1.95 check --lib --bins --all-features
+  cargo +1.95 check --lib --no-default-features --features client-rustls
 else
-  skipped+=("MSRV check (rustup toolchain install 1.92 --profile minimal)")
+  skipped+=("MSRV check (rustup toolchain install 1.95 --profile minimal)")
 fi
 
 # Mirrors the compiler discovery in scripts/check-wasm.sh.

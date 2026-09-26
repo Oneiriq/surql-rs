@@ -1,7 +1,7 @@
 
 ## Local pre-push hook
 
-This repo ships a `.githooks/pre-push` that runs the same checks GitHub Actions runs: `cargo fmt`, `clippy`, `cargo test --lib`, doc tests, the `client-rustls` build (and the check that it pulls no OpenSSL), the no-features build, `cargo audit`, the MSRV check on Rust 1.92, the `client-wasm` build, and `mkdocs build --strict`. Wire it up once per clone:
+This repo ships a `.githooks/pre-push` that runs the same checks GitHub Actions runs: `cargo fmt`, `clippy`, `cargo test --lib`, doc tests, the `client-rustls` build (and the check that it pulls no OpenSSL), the no-features build, `cargo audit`, the MSRV check on Rust 1.95, the `client-wasm` build, and `mkdocs build --strict`. Wire it up once per clone:
 
 ```bash
 git config core.hooksPath .githooks
@@ -11,7 +11,7 @@ The gates that need an extra tool run when it is installed and otherwise print a
 
 ```bash
 cargo install --locked cargo-audit
-rustup toolchain install 1.92 --profile minimal
+rustup toolchain install 1.95 --profile minimal
 rustup target add wasm32-unknown-unknown   # plus a wasm-capable clang, see scripts/check-wasm.sh
 pip install mkdocs-material mkdocs-minify-plugin
 ```
@@ -40,7 +40,7 @@ git push --no-verify
 | `value` | any JSON rendered by `quote_value_public` is one inert literal equal to the input |
 | `schema_info` | every `schema::parser` entry point returns on arbitrary definition text |
 
-libFuzzer needs Linux (or Docker) and the unstable sanitizer flags. Current nightlies do not compile `diskann-wide` 0.54 (a surrealdb-core dependency, E0283), so run cargo-fuzz on a stable toolchain with `RUSTC_BOOTSTRAP=1`. `-a` keeps debug assertions and overflow checks on in the optimised build:
+libFuzzer needs Linux (or Docker) and the unstable sanitizer flags. Recent nightlies have rejected `diskann-wide` (a surrealdb-core dependency) with E0283 inference errors, so run cargo-fuzz on a stable toolchain with `RUSTC_BOOTSTRAP=1`. `-a` keeps debug assertions and overflow checks on in the optimised build:
 
 ```bash
 cd fuzz

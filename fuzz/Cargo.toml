@@ -14,8 +14,8 @@ oneiriq-surql = { path = "..", default-features = false }
 # The engine's own SurrealQL parser is the oracle: whatever this crate
 # renders has to parse back, as the statement count and the value it was
 # rendered from. Pinned to the version the root lockfile resolves.
-surrealdb-core = { version = "=3.2.4", default-features = false }
-surrealdb-types = "=3.2.4"
+surrealdb-core = { version = "=3.3.0", default-features = false }
+surrealdb-types = "=3.3.0"
 
 # Its own workspace, so the root package stays a single crate and
 # `cargo fuzz` builds with its nightly sanitizer flags in isolation.

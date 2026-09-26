@@ -154,10 +154,11 @@ jobs:
   # `rust-version` in Cargo.toml is a promise to consumers; this is the
   # job that keeps it. It checks the committed lockfile, which is what
   # the other jobs test, on the declared toolchain. The floor comes from
-  # the engine's dependency graph (diskann 0.54 needs 1.92), so raise
-  # both together when a surrealdb bump moves it.
+  # the engine's dependency graph (surrealdb 3.3 uses `std::hint::cold_path`,
+  # stable since 1.95), so raise both together when a surrealdb bump
+  # moves it.
   msrv:
-    name: MSRV (Rust 1.92)
+    name: MSRV (Rust 1.95)
     needs: lint
     runs-on: [self-hosted, aur0]
     steps:
@@ -173,7 +174,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.92"
+          toolchain: "1.95"
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
