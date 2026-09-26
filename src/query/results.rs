@@ -40,6 +40,15 @@ fn default_true() -> bool {
 
 impl<T> RecordResult<T> {
     /// Unwrap the record, panicking on `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the record is absent, like [`Option::unwrap`]; use
+    /// [`RecordResult::try_unwrap`] to get an error instead.
+    #[allow(
+        clippy::expect_used,
+        reason = "panicking on None is this method's documented contract"
+    )]
     pub fn unwrap(self) -> T {
         self.record
             .expect("RecordResult::unwrap called on a None record")
