@@ -7,26 +7,40 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use surrealdb::IndexedResults;
 
-use super::errors::query_err;
+use super::errors::{query_err, statement_was_not_executed};
 use crate::error::{Result, SurqlError};
 use crate::query::results::response_rows;
 use crate::query::validate::render_target as query_target;
 
 /// Unpack every statement of a response into one JSON array entry each.
-/// A statement's error fails the whole call (and is never retried).
+///
+/// A statement's error fails the whole call (and is never retried). When a
+/// transaction fails, the engine marks every other statement in it "not
+/// executed"; the error reported is the one that says why, and a
+/// not-executed error only when no statement says more.
 pub(super) fn statement_results(mut response: IndexedResults) -> Result<Value> {
     let count = response.num_statements();
     let mut out = Vec::with_capacity(count);
+    let mut skipped = None;
     for i in 0..count {
         // `IndexedResults::take(usize)` in 3.x only accepts
         // `surrealdb::types::Value` / `Vec<T>` / `Option<T>` for
         // index-based retrieval. Take the core `Value` (which
         // preserves record IDs, durations, decimals, etc.) and
         // downgrade to `serde_json::Value` via `into_json_value`.
-        let raw: surrealdb::types::Value = response.take(i).map_err(|e| query_err(&e))?;
-        out.push(raw.into_json_value());
+        let taken: std::result::Result<surrealdb::types::Value, _> = response.take(i);
+        match taken {
+            Ok(raw) => out.push(raw.into_json_value()),
+            Err(e) if statement_was_not_executed(&e) => {
+                skipped.get_or_insert_with(|| query_err(&e));
+            }
+            Err(e) => return Err(query_err(&e)),
+        }
     }
-    Ok(Value::Array(out))
+    match skipped {
+        Some(err) => Err(err),
+        None => Ok(Value::Array(out)),
+    }
 }
 
 /// Render a typed-CRUD or `LIVE SELECT` target as SurrealQL.

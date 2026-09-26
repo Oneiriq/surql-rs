@@ -1,7 +1,7 @@
 //! Mapping [`surrealdb::Error`] onto [`SurqlError`], and reading the few
 //! engine errors the client reacts to.
 
-use surrealdb::types::{AuthError, ConnectionError, NotAllowedError};
+use surrealdb::types::{AuthError, ConnectionError, NotAllowedError, QueryError};
 
 use crate::error::SurqlError;
 
@@ -78,6 +78,19 @@ pub(super) fn request_says_session_expired(err: &surrealdb::Error) -> bool {
             .trim()
             .eq_ignore_ascii_case("the session has expired");
     structured || fixed_message
+}
+
+/// A statement the engine skipped because another statement of the same
+/// transaction failed. It carries no cause of its own, so it must never be
+/// the error a caller sees when the failing statement's error is available.
+/// Read from the structured details, with an exact match on the engine's
+/// fixed message for a peer that sends the text without them.
+pub(super) fn statement_was_not_executed(err: &surrealdb::Error) -> bool {
+    matches!(err.query_details(), Some(QueryError::NotExecuted))
+        || err
+            .message()
+            .trim()
+            .eq_ignore_ascii_case("the query was not executed due to a failed transaction")
 }
 
 pub(super) fn query_err(err: &surrealdb::Error) -> SurqlError {
