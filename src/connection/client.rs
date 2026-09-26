@@ -16,6 +16,7 @@
 //! types (not `SurrealValue`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +27,8 @@ use surrealdb::opt::auth::{
     Database as SdkDatabase, Namespace as SdkNamespace, Record as SdkRecord, Root as SdkRoot, Token,
 };
 use surrealdb::opt::Config as SdkConfig;
-use surrealdb::Surreal;
+use surrealdb::types::{AuthError, ConnectionError, NotAllowedError, SurrealValue};
+use surrealdb::{IndexedResults, Surreal};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
@@ -61,14 +63,22 @@ pub struct DatabaseClient {
     /// the step that actually failed -- otherwise every retry dies on the
     /// re-connect and its error masks the real one.
     engine_connected: Arc<RwLock<bool>>,
-    /// Whether an expired engine session may be re-established from the
-    /// config credentials. On by default: for a client whose authority IS
-    /// the config (the root/owner service shape), a replay reproduces
-    /// exactly the session it held. Off for [`DatabaseClient::caller_session`]
-    /// clones, whose authority is a caller's token that only the caller
-    /// layer may renew -- replaying config credentials there would swap the
-    /// caller's identity for the service's.
-    replay_expired_session: bool,
+    /// Whether the shared engine session currently holds the authority
+    /// [`DatabaseClient::connect`] established from the config. Only then
+    /// may an expired session be re-established from the config
+    /// credentials: the replay reproduces exactly the session it held.
+    /// Shared by every clone because the clones share the one session;
+    /// set only by `connect`, cleared by `signin`, `signup`,
+    /// `authenticate`, `invalidate` and `disconnect`, each of which gives
+    /// the session some other identity (or none). Replaying the config
+    /// credentials after any of them would swap that identity for the
+    /// service's own.
+    config_authority: Arc<AtomicBool>,
+    /// Whether this client is a [`DatabaseClient::caller_session`], whose
+    /// authority is a caller's token that only the caller layer may renew.
+    /// Such a client never replays and refuses `connect`, which would sign
+    /// it in with the config credentials.
+    caller_bound: bool,
 }
 
 impl DatabaseClient {
@@ -81,7 +91,8 @@ impl DatabaseClient {
             inner: Arc::new(Surreal::init()),
             connected: Arc::new(RwLock::new(false)),
             engine_connected: Arc::new(RwLock::new(false)),
-            replay_expired_session: true,
+            config_authority: Arc::new(AtomicBool::new(false)),
+            caller_bound: false,
         })
     }
 
@@ -109,7 +120,25 @@ impl DatabaseClient {
     /// already-connected client -- resumes at the step that failed
     /// (credential signin, namespace selection), so the error that surfaces
     /// is the real failure, never the SDK's "Already connected" rejection.
+    ///
+    /// A successful connect is what lets the client heal an expired
+    /// session from the config credentials (see
+    /// [`DatabaseClient::query_with_vars`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurqlError::Connection`] on a
+    /// [`DatabaseClient::caller_session`]: connecting signs the session in
+    /// with the config credentials, which would hand the caller the
+    /// service's authority.
     pub async fn connect(&self) -> Result<()> {
+        if self.caller_bound {
+            return Err(SurqlError::Connection {
+                reason: "a caller session cannot connect: it would sign the caller's session \
+                         in with the config credentials"
+                    .into(),
+            });
+        }
         // Reconnect is idempotent: disconnect any previous session first.
         if *self.connected.read().await {
             self.disconnect().await.ok();
@@ -121,6 +150,7 @@ impl DatabaseClient {
         for attempt in 1..=attempts {
             match self.connect_once().await {
                 Ok(()) => {
+                    self.config_authority.store(true, Ordering::SeqCst);
                     *self.connected.write().await = true;
                     return Ok(());
                 }
@@ -148,6 +178,7 @@ impl DatabaseClient {
             }
             *guard = false;
         }
+        self.leave_config_authority();
         // The SDK exposes `invalidate` to clear auth, but there is no
         // explicit disconnect on `Surreal<Any>` beyond dropping the
         // handle. We invalidate the session so subsequent calls fail
@@ -157,8 +188,14 @@ impl DatabaseClient {
     }
 
     /// Sign in using one of the four auth levels.
+    ///
+    /// The shared session takes the signed-in identity, so from here on
+    /// an expired session surfaces its error instead of being replayed
+    /// from the config credentials, until the next
+    /// [`DatabaseClient::connect`].
     pub async fn signin<C: Credentials + ?Sized>(&self, creds: &C) -> Result<TokenAuth> {
         self.require_connected()?;
+        self.leave_config_authority();
         let payload = creds.to_signin_payload();
         let token = match creds.auth_type() {
             AuthType::Root => {
@@ -226,8 +263,13 @@ impl DatabaseClient {
     }
 
     /// Sign up a scope user (record access).
+    ///
+    /// Like [`DatabaseClient::signin`], this gives the shared session the
+    /// new user's identity and ends config-credential replay until the next
+    /// [`DatabaseClient::connect`].
     pub async fn signup(&self, creds: &ScopeCredentials) -> Result<TokenAuth> {
         self.require_connected()?;
+        self.leave_config_authority();
         let mut params = serde_json::Map::new();
         for (k, v) in &creds.variables {
             params.insert(k.clone(), v.clone());
@@ -246,8 +288,13 @@ impl DatabaseClient {
     }
 
     /// Authenticate using a previously-issued JWT.
+    ///
+    /// Like [`DatabaseClient::signin`], this gives the shared session the
+    /// token's identity and ends config-credential replay until the next
+    /// [`DatabaseClient::connect`].
     pub async fn authenticate(&self, token: &str) -> Result<()> {
         self.require_connected()?;
+        self.leave_config_authority();
         self.inner
             .authenticate(Token::from(token))
             .await
@@ -276,6 +323,10 @@ impl DatabaseClient {
     /// session. Enforcement does not depend on the engine holding
     /// credentials: a record session is constrained even on an open
     /// engine, where only anonymous sessions act as owner.
+    ///
+    /// The returned client never re-establishes an expired session from
+    /// the config credentials, and its [`DatabaseClient::connect`] refuses:
+    /// either would replace the caller's identity with the service's.
     pub async fn caller_session(&self, token: &str) -> Result<DatabaseClient> {
         self.require_connected()?;
         let session = DatabaseClient {
@@ -287,11 +338,11 @@ impl DatabaseClient {
             // session must leave the parent client's state alone.
             connected: Arc::new(RwLock::new(true)),
             engine_connected: Arc::new(RwLock::new(true)),
-            // Never replay config credentials on a caller-bound session:
-            // the whole point of this session is that it holds the
-            // CALLER's authority, and a service-credential replay would
-            // silently hand it the service's.
-            replay_expired_session: false,
+            // The session holds the CALLER's authority, never the
+            // config's, and being caller-bound keeps it that way: no
+            // replay, no connect.
+            config_authority: Arc::new(AtomicBool::new(false)),
+            caller_bound: true,
         };
         session
             .inner
@@ -311,8 +362,12 @@ impl DatabaseClient {
     }
 
     /// Invalidate the current session.
+    ///
+    /// The session is left unauthenticated, so config-credential replay
+    /// ends until the next [`DatabaseClient::connect`].
     pub async fn invalidate(&self) -> Result<()> {
         self.require_connected()?;
+        self.leave_config_authority();
         self.inner
             .invalidate()
             .await
@@ -332,52 +387,22 @@ impl DatabaseClient {
     /// server-side while the socket stays healthy, after which every
     /// request fails "The session has expired" until something
     /// re-authenticates (observed in production as a service erroring
-    /// on all traffic until restarted). Where this client's authority
-    /// is the config's own credentials, that something is this method:
-    /// the session is re-established and the statement retried, once.
+    /// on all traffic until restarted). Where the session holds the
+    /// authority [`DatabaseClient::connect`] established from the config
+    /// credentials, that something is this method: the session is
+    /// re-established and the request retried, once.
+    ///
+    /// Only the engine's refusal of the whole request counts as expiry.
+    /// The engine checks the session before it runs any statement, so the
+    /// retry cannot repeat a write; an error raised by one statement of
+    /// the request (a `THROW`, a failed `ASSERT`) is never retried,
+    /// whatever its message says.
     pub async fn query_with_vars(
         &self,
         surql: &str,
         vars: BTreeMap<String, Value>,
     ) -> Result<Value> {
-        self.require_connected()?;
-        // Cloned up front only where a replay is possible, because the
-        // retry needs the variables after the first attempt consumed them.
-        let retry_vars = self.can_replay_session().then(|| vars.clone());
-        match self.run_json_query(surql, vars).await {
-            Err(err) if retry_vars.is_some() && err_says_session_expired(&err) => {
-                self.replay_session().await?;
-                self.run_json_query(surql, retry_vars.unwrap_or_default())
-                    .await
-            }
-            other => other,
-        }
-    }
-
-    async fn run_json_query(&self, surql: &str, vars: BTreeMap<String, Value>) -> Result<Value> {
-        let mut builder = self.inner.query(surql.to_owned());
-        for (k, v) in vars {
-            // In 3.x the `bind` input must implement `SurrealValue`;
-            // `(String, serde_json::Value)` qualifies because both
-            // components do (and tuples are encoded as 2-element
-            // arrays which `into_variables` unpacks as key/value
-            // chunks).
-            builder = builder.bind((k, v));
-        }
-        let mut response = builder.await.map_err(|e| query_err(&e))?;
-        let count = response.num_statements();
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            // `IndexedResults::take(usize)` in 3.x only accepts
-            // `surrealdb::types::Value` / `Vec<T>` / `Option<T>` for
-            // index-based retrieval. Take the core `Value` (which
-            // preserves record IDs, durations, decimals, etc.) and
-            // downgrade to `serde_json::Value` via
-            // `into_json_value`.
-            let raw: surrealdb::types::Value = response.take(i).map_err(|e| query_err(&e))?;
-            out.push(raw.into_json_value());
-        }
-        Ok(Value::Array(out))
+        self.run_query(surql, vars).await
     }
 
     /// Execute a raw SurrealQL query, binding native
@@ -391,7 +416,8 @@ impl DatabaseClient {
     /// preserves the `bytes` type, which is what the file `put` API needs.
     ///
     /// Each statement's result is returned as one entry of a JSON array, the
-    /// same shape as [`query_with_vars`].
+    /// same shape as [`query_with_vars`], and an expired session heals the
+    /// same way.
     ///
     /// [`query_with_vars`]: DatabaseClient::query_with_vars
     pub async fn query_with_surreal_vars(
@@ -399,42 +425,55 @@ impl DatabaseClient {
         surql: &str,
         vars: BTreeMap<String, surrealdb::types::Value>,
     ) -> Result<Value> {
+        self.run_query(surql, vars).await
+    }
+
+    /// The query funnel behind both public variants: send, heal an expired
+    /// session once where that is safe, then unpack every statement.
+    async fn run_query<V>(&self, surql: &str, vars: BTreeMap<String, V>) -> Result<Value>
+    where
+        V: SurrealValue + Clone,
+    {
         self.require_connected()?;
-        // Same expired-session replay as `query_with_vars`. The clone can
-        // carry `Value::Bytes` payloads, so it is taken only where a
-        // replay is actually possible.
+        // Cloned up front only where a replay is possible, because the
+        // retry needs the variables after the first attempt consumed them
+        // (and they can carry `Value::Bytes` payloads).
         let retry_vars = self.can_replay_session().then(|| vars.clone());
-        match self.run_surreal_query(surql, vars).await {
-            Err(err) if retry_vars.is_some() && err_says_session_expired(&err) => {
+        let response = match self.send_query(surql, vars).await {
+            Err(err) if request_says_session_expired(&err) => {
+                // Re-checked after the failure: a signin on another clone
+                // while the request was in flight changed whose session
+                // this is.
+                let Some(vars) = retry_vars.filter(|_| self.can_replay_session()) else {
+                    return Err(query_err(&err));
+                };
                 self.replay_session().await?;
-                self.run_surreal_query(surql, retry_vars.unwrap_or_default())
-                    .await
+                self.send_query(surql, vars).await
             }
             other => other,
         }
+        .map_err(|e| query_err(&e))?;
+        statement_results(response)
     }
 
-    async fn run_surreal_query(
+    /// Send one request. `Err` here is the engine refusing the request as
+    /// a whole; per-statement errors stay inside the returned results.
+    async fn send_query<V: SurrealValue>(
         &self,
         surql: &str,
-        vars: BTreeMap<String, surrealdb::types::Value>,
-    ) -> Result<Value> {
+        vars: BTreeMap<String, V>,
+    ) -> std::result::Result<IndexedResults, surrealdb::Error> {
         let mut builder = self.inner.query(surql.to_owned());
         for (k, v) in vars {
-            // `(String, surrealdb::types::Value)` implements `SurrealValue`
-            // (both components do), so it binds as a 2-element key/value chunk
-            // exactly like the JSON path — but the value keeps its native
-            // type, including `Value::Bytes`.
+            // In 3.x the `bind` input must implement `SurrealValue`;
+            // `(String, V)` qualifies because both components do (and
+            // tuples are encoded as 2-element arrays which
+            // `into_variables` unpacks as key/value chunks). A native
+            // `surrealdb::types::Value` keeps its type, including
+            // `Value::Bytes`.
             builder = builder.bind((k, v));
         }
-        let mut response = builder.await.map_err(|e| query_err(&e))?;
-        let count = response.num_statements();
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            let raw: surrealdb::types::Value = response.take(i).map_err(|e| query_err(&e))?;
-            out.push(raw.into_json_value());
-        }
-        Ok(Value::Array(out))
+        builder.await
     }
 
     /// Typed `SELECT` against a table or record ID (`"user"` / `"user:alice"`).
@@ -529,13 +568,21 @@ impl DatabaseClient {
     // -- internal ----------------------------------------------------------
 
     /// True when a failed operation may be retried on a fresh session: the
-    /// config holds credentials, so a replay reproduces exactly the
-    /// authority this client was built with, and this client is not a
-    /// caller session.
+    /// session holds the authority `connect` established, the config holds
+    /// credentials, so a replay reproduces exactly that authority, and this
+    /// client is not a caller session.
     fn can_replay_session(&self) -> bool {
-        self.replay_expired_session
+        !self.caller_bound
+            && self.config_authority.load(Ordering::SeqCst)
             && self.config.username().is_some()
             && self.config.password().is_some()
+    }
+
+    /// Record that the shared session no longer holds the config's
+    /// authority. Called BEFORE the identity-changing request, so a request
+    /// that fails half-way leaves replay off rather than on.
+    fn leave_config_authority(&self) {
+        self.config_authority.store(false, Ordering::SeqCst);
     }
 
     /// Re-establish the configured session on the live engine.
@@ -673,24 +720,57 @@ pub(crate) fn connection_err(err: &surrealdb::Error) -> SurqlError {
 }
 
 /// The SDK's rejection of a second `connect` on an already-connected handle.
-/// (A message match, like [`classify_surrealdb_error`]'s fallbacks: the 3.x
-/// error type does not discriminate this case.)
+/// Read from the structured details, with a message match for SDK paths
+/// that report it without them.
 fn sdk_says_already_connected(err: &surrealdb::Error) -> bool {
-    err.to_string().to_lowercase().contains("already connected")
+    matches!(
+        err.connection_details(),
+        Some(ConnectionError::AlreadyConnected)
+    ) || err.to_string().to_lowercase().contains("already connected")
 }
 
-/// The engine's refusal of a request whose authenticated session has
-/// expired. (A message match on the mapped error, like
-/// [`sdk_says_already_connected`]: the 3.x error type folds this case
-/// into the query kind.)
-fn err_says_session_expired(err: &SurqlError) -> bool {
-    err.to_string()
-        .to_lowercase()
-        .contains("session has expired")
+/// The engine's refusal of a whole request because its authenticated
+/// session has expired.
+///
+/// Only ever asked of the error a request as a whole failed with, never of
+/// a per-statement result: a statement error carries user data (a `THROW`
+/// message, the value a failed `ASSERT` rejected), so reading one as expiry
+/// would let a stored value trigger a replay. The engine reports expiry as
+/// a structured not-allowed error; the fallback, for a peer that sends the
+/// kind without the details, is an exact match on the engine's fixed
+/// message, never a substring.
+fn request_says_session_expired(err: &surrealdb::Error) -> bool {
+    let structured = matches!(
+        err.not_allowed_details(),
+        Some(NotAllowedError::Auth(AuthError::SessionExpired))
+    );
+    let fixed_message = (err.is_not_allowed() || err.is_internal())
+        && err
+            .message()
+            .trim()
+            .eq_ignore_ascii_case("the session has expired");
+    structured || fixed_message
 }
 
 pub(crate) fn query_err(err: &surrealdb::Error) -> SurqlError {
     classify_surrealdb_error(err, err.to_string())
+}
+
+/// Unpack every statement of a response into one JSON array entry each.
+/// A statement's error fails the whole call (and is never retried).
+fn statement_results(mut response: IndexedResults) -> Result<Value> {
+    let count = response.num_statements();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        // `IndexedResults::take(usize)` in 3.x only accepts
+        // `surrealdb::types::Value` / `Vec<T>` / `Option<T>` for
+        // index-based retrieval. Take the core `Value` (which
+        // preserves record IDs, durations, decimals, etc.) and
+        // downgrade to `serde_json::Value` via `into_json_value`.
+        let raw: surrealdb::types::Value = response.take(i).map_err(|e| query_err(&e))?;
+        out.push(raw.into_json_value());
+    }
+    Ok(Value::Array(out))
 }
 
 /// Flatten every row in the raw `query()` response into a typed vector.
@@ -757,6 +837,7 @@ fn payload_str(map: &serde_json::Map<String, Value>, key: &str) -> Result<String
 mod tests {
     use super::*;
     use crate::connection::auth::RootCredentials;
+    use crate::connection::auth_manager::AuthManager;
 
     #[test]
     fn new_validates_config() {
@@ -897,36 +978,27 @@ mod tests {
     }
 
     /// A long-lived session the engine expires must heal in place on a
-    /// client whose authority is the config credentials: sign in as a
-    /// user whose sessions live one second, let it expire, and the next
-    /// query must succeed by replaying the configured root session --
-    /// the production incident (every request failing "The session has
-    /// expired" until a restart) in miniature. On runs where the engine
-    /// declines to enforce the expiry (embedded engines are not
-    /// deterministic about it) the query succeeds directly, so the test
-    /// can never false-fail; the runs that do enforce it exercise the
-    /// whole replay path.
+    /// client whose session holds the config credentials' authority: give
+    /// the config's own user one-second sessions, reconnect to start one,
+    /// let it expire, and the next query must succeed by replaying the
+    /// configured session -- the production incident (every request
+    /// failing "The session has expired" until a restart) in miniature.
+    /// On runs where the embedded engine declines to enforce the expiry
+    /// the query succeeds directly, so the test can never false-fail; the
+    /// runs that do enforce it exercise the whole replay path (the ws
+    /// integration suite exercises it deterministically).
     #[tokio::test]
     async fn expired_session_heals_on_a_config_credentialed_client() {
-        let cfg = ConnectionConfig::builder()
-            .url("mem://")
-            .namespace("t")
-            .database("t")
-            .username("root")
-            .password("root")
-            .retry_max_attempts(1)
-            .build()
-            .unwrap();
-        let client = DatabaseClient::new(cfg).unwrap();
+        let client = DatabaseClient::new(root_mem_config("heal")).unwrap();
         client.connect().await.unwrap();
         client
-            .query("DEFINE USER brief ON ROOT PASSWORD 'pw' ROLES OWNER DURATION FOR SESSION 1s;")
+            .query(
+                "DEFINE USER OVERWRITE root ON ROOT PASSWORD 'root' ROLES OWNER \
+                 DURATION FOR SESSION 1s;",
+            )
             .await
             .unwrap();
-        client
-            .signin(&RootCredentials::new("brief", "pw"))
-            .await
-            .unwrap();
+        client.connect().await.unwrap();
         sleep(Duration::from_millis(2500)).await;
         client
             .query("INFO FOR DB")
@@ -934,48 +1006,81 @@ mod tests {
             .expect("the expired session replays the config credentials and retries");
     }
 
-    /// The replay guard is the security boundary, and it is pure logic:
-    /// only a client whose authority IS the config credentials may
-    /// replay them. Asserting the guard through the engine proved
-    /// untestable -- whether an embedded engine refuses or quietly
-    /// downgrades an expired session is not deterministic across runs --
-    /// so the truth table is pinned here directly, private-field access
-    /// standing in for [`DatabaseClient::caller_session`]'s construction
-    /// (which is the one production source of `replay_expired_session:
-    /// false`).
-    #[test]
-    fn replay_guard_truth_table() {
-        let with_creds = ConnectionConfig::builder()
-            .url("mem://")
-            .namespace("t")
-            .database("t")
-            .username("root")
-            .password("root")
-            .build()
-            .unwrap();
-        let without_creds = ConnectionConfig::builder()
-            .url("mem://")
-            .namespace("t")
-            .database("t")
-            .build()
-            .unwrap();
+    /// The replay guard is the security boundary: only a session whose
+    /// authority IS the config credentials may have them replayed. The
+    /// truth table runs every transition through the real methods on an
+    /// embedded engine, so the guard is pinned to what `connect`,
+    /// `signin`, `signup`, `authenticate`, `invalidate`, `disconnect` and
+    /// `caller_session` actually do, not to a hand-set field.
+    #[tokio::test]
+    async fn replay_guard_truth_table() {
+        let service = DatabaseClient::new(root_mem_config("truth")).unwrap();
+        assert!(
+            !service.can_replay_session(),
+            "never connected: no session to heal"
+        );
 
-        let service = DatabaseClient::new(with_creds.clone()).unwrap();
+        service.connect().await.unwrap();
         assert!(
             service.can_replay_session(),
-            "config credentials + primary client: the one shape that replays"
+            "config credentials + connect: the one shape that replays"
+        );
+        assert!(
+            service.clone().can_replay_session(),
+            "clones share the session, so they share the authority"
         );
 
-        let caller_shaped = DatabaseClient {
-            replay_expired_session: false,
-            ..DatabaseClient::new(with_creds).unwrap()
-        };
+        let token = service
+            .signin(&RootCredentials::new("root", "root"))
+            .await
+            .unwrap();
         assert!(
-            !caller_shaped.can_replay_session(),
+            !service.can_replay_session(),
+            "signin gives the session another identity"
+        );
+        service.connect().await.unwrap();
+        assert!(service.can_replay_session(), "connect restores it");
+
+        let clone = service.clone();
+        clone.authenticate(&token.token).await.unwrap();
+        assert!(
+            !service.can_replay_session(),
+            "authenticate on ANY clone changes the shared session"
+        );
+        service.connect().await.unwrap();
+
+        define_member_access(&service).await;
+        let member = service
+            .signup(&ScopeCredentials::new("truth", "truth", "member").with("name", "m"))
+            .await
+            .unwrap();
+        assert!(!service.can_replay_session(), "signup, likewise");
+        service.connect().await.unwrap();
+
+        service.invalidate().await.unwrap();
+        assert!(!service.can_replay_session(), "invalidate, likewise");
+        service.connect().await.unwrap();
+
+        let caller = service.caller_session(&member.token).await.unwrap();
+        assert!(
+            !caller.can_replay_session(),
             "a caller session never replays, even with config credentials present"
         );
+        assert!(
+            service.can_replay_session(),
+            "a caller session is its own session: the parent keeps its authority"
+        );
 
-        let anonymous = DatabaseClient::new(without_creds).unwrap();
+        service.disconnect().await.unwrap();
+        assert!(!service.can_replay_session(), "disconnect ends it");
+
+        let anonymous = DatabaseClient::new(ConnectionConfig {
+            db_user: None,
+            db_pass: None,
+            ..root_mem_config("truth_anon")
+        })
+        .unwrap();
+        anonymous.connect().await.unwrap();
         assert!(
             !anonymous.can_replay_session(),
             "no config credentials: nothing safe to replay"
@@ -983,15 +1088,22 @@ mod tests {
     }
 
     #[test]
-    fn session_expiry_matcher_reads_the_mapped_error() {
-        let expired = SurqlError::Query {
-            reason: "The session has expired".into(),
-        };
-        assert!(err_says_session_expired(&expired));
-        let other = SurqlError::Query {
-            reason: "There was a problem with the database".into(),
-        };
-        assert!(!err_says_session_expired(&other));
+    fn session_expiry_is_read_from_the_request_error_only() {
+        let structured = surrealdb::Error::not_allowed(
+            "The session has expired".into(),
+            NotAllowedError::Auth(AuthError::SessionExpired),
+        );
+        assert!(request_says_session_expired(&structured));
+        let unstructured = surrealdb::Error::not_allowed("The session has expired".into(), None);
+        assert!(request_says_session_expired(&unstructured));
+        // A statement's own error text is never read as expiry.
+        let thrown = surrealdb::Error::thrown("The session has expired".into());
+        assert!(!request_says_session_expired(&thrown));
+        let embedded = surrealdb::Error::not_allowed(
+            "Found 'The session has expired' for field `note`".into(),
+            None,
+        );
+        assert!(!request_says_session_expired(&embedded));
     }
 
     #[test]
@@ -1008,5 +1120,102 @@ mod tests {
 
         let internal: SurqlError = surrealdb::Error::internal("boom".into()).into();
         assert!(matches!(internal, SurqlError::Database { .. }));
+    }
+
+    fn root_mem_config(ns: &str) -> ConnectionConfig {
+        ConnectionConfig::builder()
+            .url("mem://")
+            .namespace(ns)
+            .database(ns)
+            .username("root")
+            .password("root")
+            .retry_max_attempts(1)
+            .build()
+            .unwrap()
+    }
+
+    /// A record access method whose sessions live one second, plus a
+    /// table only system users may read.
+    async fn define_member_access(client: &DatabaseClient) {
+        client
+            .query(
+                "DEFINE ACCESS member ON DATABASE TYPE RECORD \
+                 SIGNUP (CREATE member SET name = $name) \
+                 SIGNIN (SELECT * FROM member WHERE name = $name) \
+                 DURATION FOR SESSION 1s; \
+                 DEFINE TABLE secret SCHEMALESS PERMISSIONS NONE; \
+                 CREATE secret SET v = 1;",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Regression: the replay used to be a fixed per-client flag, so a
+    /// root-configured service that signed its shared session in as a
+    /// record user had that user's expired session silently replaced by
+    /// ROOT, which then ran the user's statement unfiltered. Whatever
+    /// the engine does with the expiry, the statement must never see a
+    /// row that `PERMISSIONS NONE` hides from the record user.
+    #[tokio::test]
+    async fn expired_record_session_never_replays_as_config_root() {
+        let client = DatabaseClient::new(root_mem_config("escalate")).unwrap();
+        client.connect().await.unwrap();
+        define_member_access(&client).await;
+        AuthManager::new()
+            .signup(
+                &client,
+                &ScopeCredentials::new("escalate", "escalate", "member").with("name", "m"),
+            )
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(2500)).await;
+        if let Ok(rows) = client.query("SELECT * FROM secret;").await {
+            assert_eq!(
+                rows,
+                serde_json::json!([[]]),
+                "the record user's statement ran with root authority"
+            );
+        }
+    }
+
+    /// Regression: `connect` on a caller session signed it in with the
+    /// config credentials, handing the caller the service's authority.
+    #[tokio::test]
+    async fn connect_refuses_on_a_caller_session() {
+        let root = DatabaseClient::new(root_mem_config("callerconnect")).unwrap();
+        root.connect().await.unwrap();
+        define_member_access(&root).await;
+        let token = root
+            .signup(
+                &ScopeCredentials::new("callerconnect", "callerconnect", "member")
+                    .with("name", "m"),
+            )
+            .await
+            .unwrap();
+        // The signup switched the shared session; put root back.
+        root.connect().await.unwrap();
+        let caller = root.caller_session(&token.token).await.unwrap();
+        assert!(caller.connect().await.is_err());
+        let seen = caller.query("SELECT * FROM secret;").await.unwrap();
+        assert_eq!(seen, serde_json::json!([[]]));
+    }
+
+    /// Regression: the expiry check matched a substring of ANY error,
+    /// including a per-statement error that carries user data, and the
+    /// replay then re-ran every statement of the request.
+    #[tokio::test]
+    async fn statement_errors_never_trigger_a_replay() {
+        let client = DatabaseClient::new(root_mem_config("noreplay")).unwrap();
+        client.connect().await.unwrap();
+        let err = client
+            .query("CREATE counter SET n = 1; THROW 'The session has expired';")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("session has expired"), "{err}");
+        let count = client
+            .query("SELECT count() FROM counter GROUP ALL;")
+            .await
+            .unwrap();
+        assert_eq!(count, serde_json::json!([[{ "count": 1 }]]));
     }
 }

@@ -101,6 +101,27 @@ if !auth.is_authenticated().await {
 (useful after a reconnect because the v3 SDK has no dedicated refresh
 endpoint).
 
+## Expired sessions
+
+A long-lived connection's authenticated session can expire server-side
+while the socket stays up. When the session holds the authority
+`connect()` established from the config's `username` / `password`,
+`DatabaseClient` heals it: a request the engine refuses with "The
+session has expired" signs the config credentials in again and is
+retried once. The engine refuses an expired session before it runs any
+statement, so the retry never repeats a write. An error raised by a
+statement (a `THROW`, a failed `ASSERT`) is never read as expiry,
+whatever its text says.
+
+The replay stops as soon as the shared session takes another identity.
+`signin`, `signup`, `authenticate` (directly or through `AuthManager`),
+`invalidate` and `disconnect` all end it, on every clone of the client,
+and only the next `connect()` brings it back. An expired record-user
+session therefore surfaces its error; it is never silently replaced by
+the service's own (typically root) session, which would run the user's
+statement unfiltered by `PERMISSIONS`. Sessions from `caller_session`
+never replay, and their `connect()` refuses.
+
 ## Streaming and live queries
 
 `LiveQuery` is the typed subscription handle; `StreamingManager` holds
