@@ -52,3 +52,10 @@ path = "fuzz_targets/schema_info.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "migration"
+path = "fuzz_targets/migration.rs"
+test = false
+doc = false
+bench = false
