@@ -776,6 +776,24 @@ version = "0.0.0"
         assert!("loud".parse::<LogLevel>().is_err());
     }
 
+    /// Regression: `SURQL_TIMEOUT=inf` or a TOML `timeout = inf` loaded
+    /// fine and then panicked in `Duration::from_secs_f64` on connect.
+    #[test]
+    fn unbounded_timeouts_fail_to_load() {
+        for raw in ["inf", "1e20", "NaN"] {
+            let lookup = |key: &str| (key == "SURQL_TIMEOUT").then(|| raw.to_owned());
+            assert!(
+                build_connection_config(None, &lookup, None).is_err(),
+                "SURQL_TIMEOUT={raw}"
+            );
+        }
+        let toml_db = DatabaseTable {
+            timeout: Some(f64::INFINITY),
+            ..DatabaseTable::default()
+        };
+        assert!(build_connection_config(None, &|_: &str| None, Some(&toml_db)).is_err());
+    }
+
     #[test]
     fn parse_bool_covers_common_forms() {
         assert!(parse_bool("yes").unwrap());

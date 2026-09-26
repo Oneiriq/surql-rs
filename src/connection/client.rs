@@ -595,7 +595,7 @@ impl DatabaseClient {
     }
 
     async fn connect_once(&self) -> Result<()> {
-        let timeout = Duration::from_secs_f64(self.config.timeout().max(0.1));
+        let timeout = seconds(self.config.timeout().max(0.1))?;
 
         // Connect the engine at most once per handle (the write lock also
         // serialises concurrent connectors). On later attempts -- a retry
@@ -663,7 +663,9 @@ impl DatabaseClient {
         let mult = self.config.retry_multiplier();
         let exp = f64::from(attempt.saturating_sub(1));
         let secs = (min * mult.powf(exp)).clamp(min, max);
-        Duration::from_secs_f64(secs)
+        // Validation bounds every input, so this only falls back on a
+        // config mutated past `validate` (the fields are public).
+        seconds(secs).unwrap_or(Duration::from_secs(1))
     }
 
     fn require_connected(&self) -> Result<()> {
@@ -771,6 +773,14 @@ fn statement_results(mut response: IndexedResults) -> Result<Value> {
         out.push(raw.into_json_value());
     }
     Ok(Value::Array(out))
+}
+
+/// A config duration in seconds as a [`Duration`], refusing what
+/// `Duration` cannot hold instead of panicking.
+fn seconds(secs: f64) -> Result<Duration> {
+    Duration::try_from_secs_f64(secs).map_err(|e| SurqlError::Validation {
+        reason: format!("invalid duration of {secs} seconds: {e}"),
+    })
 }
 
 /// Flatten every row in the raw `query()` response into a typed vector.
@@ -1104,6 +1114,14 @@ mod tests {
             None,
         );
         assert!(!request_says_session_expired(&embedded));
+    }
+
+    #[test]
+    fn seconds_refuses_what_duration_cannot_hold() {
+        assert_eq!(seconds(1.5).unwrap(), Duration::from_millis(1500));
+        for bad in [f64::INFINITY, f64::NAN, 1e300, -1.0] {
+            assert!(seconds(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

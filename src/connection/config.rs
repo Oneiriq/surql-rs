@@ -15,6 +15,16 @@ use crate::error::{Result, SurqlError};
 /// Environment variable prefix used by [`ConnectionConfig::from_env`].
 pub const ENV_PREFIX: &str = "SURQL_";
 
+/// Largest accepted [`ConnectionConfig::db_timeout`], in seconds (one day).
+pub const MAX_TIMEOUT_SECS: f64 = 86_400.0;
+
+/// Largest accepted retry wait ([`ConnectionConfig::db_retry_min_wait`] and
+/// [`ConnectionConfig::db_retry_max_wait`]), in seconds (one hour).
+pub const MAX_RETRY_WAIT_SECS: f64 = 3_600.0;
+
+/// Largest accepted [`ConnectionConfig::db_retry_multiplier`].
+pub const MAX_RETRY_MULTIPLIER: f64 = 100.0;
+
 /// Protocol implied by the configured URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Protocol {
@@ -136,11 +146,16 @@ impl ConnectionConfig {
     }
 
     /// Validate the configuration values according to the Python port's rules.
+    ///
+    /// Every float must be finite and within its bounds: the timeout is at
+    /// most [`MAX_TIMEOUT_SECS`], the retry waits at most
+    /// [`MAX_RETRY_WAIT_SECS`], and the multiplier at most
+    /// [`MAX_RETRY_MULTIPLIER`], so each converts to a `Duration` safely.
     pub fn validate(&self) -> Result<()> {
         validate_url(&self.db_url)?;
         validate_identifier(&self.db_ns, "namespace")?;
         validate_identifier(&self.db, "database")?;
-        validate_numeric_range("timeout", self.db_timeout, 1.0, f64::INFINITY)?;
+        validate_numeric_range("timeout", self.db_timeout, 1.0, MAX_TIMEOUT_SECS)?;
         validate_numeric_range(
             "max_connections",
             f64::from(self.db_max_connections),
@@ -153,13 +168,23 @@ impl ConnectionConfig {
             1.0,
             10.0,
         )?;
-        validate_numeric_range("retry_min_wait", self.db_retry_min_wait, 0.1, f64::INFINITY)?;
-        validate_numeric_range("retry_max_wait", self.db_retry_max_wait, 1.0, f64::INFINITY)?;
+        validate_numeric_range(
+            "retry_min_wait",
+            self.db_retry_min_wait,
+            0.1,
+            MAX_RETRY_WAIT_SECS,
+        )?;
+        validate_numeric_range(
+            "retry_max_wait",
+            self.db_retry_max_wait,
+            1.0,
+            MAX_RETRY_WAIT_SECS,
+        )?;
         validate_numeric_range(
             "retry_multiplier",
             self.db_retry_multiplier,
             1.0,
-            f64::INFINITY,
+            MAX_RETRY_MULTIPLIER,
         )?;
         if self.db_retry_max_wait <= self.db_retry_min_wait {
             return Err(SurqlError::Validation {
@@ -552,7 +577,7 @@ fn validate_identifier(value: &str, context: &str) -> Result<()> {
 }
 
 fn validate_numeric_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
-    if value.is_nan() {
+    if !value.is_finite() {
         return Err(SurqlError::Validation {
             reason: format!("{name} must be a finite number"),
         });
@@ -801,6 +826,32 @@ mod tests {
         let named = NamedConnectionConfig::from_source("primary", |k| env.get(k).cloned()).unwrap();
         assert_eq!(named.name, "primary");
         assert_eq!(named.config.url(), "ws://primary.example/rpc");
+    }
+
+    /// Regression: the float settings were only bounded below, so
+    /// `inf` or `1e20` validated and then panicked in
+    /// `Duration::from_secs_f64` on connect.
+    #[test]
+    fn rejects_unbounded_durations() {
+        for bad in [f64::INFINITY, 1e20, 1e300] {
+            let timeout = ConnectionConfig {
+                db_timeout: bad,
+                ..Default::default()
+            };
+            assert!(timeout.validate().is_err(), "timeout {bad}");
+            let max_wait = ConnectionConfig {
+                db_retry_max_wait: bad,
+                ..Default::default()
+            };
+            assert!(max_wait.validate().is_err(), "retry_max_wait {bad}");
+            let multiplier = ConnectionConfig {
+                db_retry_multiplier: bad,
+                ..Default::default()
+            };
+            assert!(multiplier.validate().is_err(), "retry_multiplier {bad}");
+        }
+        let env: HashMap<String, String> = [("SURQL_TIMEOUT".to_owned(), "inf".to_owned())].into();
+        assert!(ConnectionConfig::from_map_with_prefix("SURQL_", &env).is_err());
     }
 
     #[test]
