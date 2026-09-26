@@ -5,76 +5,19 @@
 //! `MTREE`, `HNSW`, `DISKANN`). Split out of the monolithic `parser.rs` so
 //! each submodule stays under the 1000-LOC budget; see parent [`super`] for
 //! the public entry points.
+//!
+//! The engine echoes `DEFINE INDEX <name> ON <table> FIELDS <a>, <b> [<kind>
+//! <params>] [COMMENT …] [CONCURRENTLY]`. The statement is read word by word
+//! after its head: the column list is the comma-separated run after
+//! `FIELDS` / `COLUMNS`, and the index kind is the word that follows it, so
+//! neither a table named `custom_fields` nor a column named `year` or
+//! `research` can be mistaken for a clause.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
-
-use super::field::type_regex;
-use super::regex_case_insensitive;
+use super::scan::{define_head, split_top_level, tokens, unquote_ident, Token};
 use crate::schema::table::{
     DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
     MTreeVectorType,
 };
-
-// --- Regex accessors ---------------------------------------------------------
-
-fn columns_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex_case_insensitive(r"COLUMNS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|DISKANN|\s*;|\s*$)")
-    })
-}
-
-fn fields_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex_case_insensitive(r"FIELDS\s+([^;]+?)(?:UNIQUE|SEARCH|HNSW|MTREE|DISKANN|\s*;|\s*$)")
-    })
-}
-
-fn dimension_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"DIMENSION\s+(\d+)"))
-}
-
-fn distance_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"(?:DIST|DISTANCE)\s+(\w+)"))
-}
-
-fn efc_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"EFC\s+(\d+)"))
-}
-
-fn m_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bM\s+(\d+)"))
-}
-
-fn analyzer_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"ANALYZER\s+(\w+)"))
-}
-
-fn degree_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bDEGREE\s+(\d+)"))
-}
-
-fn l_build_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bL_BUILD\s+(\d+)"))
-}
-
-/// `ALPHA <decimal>`. The engine echoes a float literal with a trailing `f`
-/// suffix (`ALPHA 1.2f`) and an integer literal bare (`ALPHA 2`); the capture
-/// excludes the suffix so the stored value matches what code declares.
-fn alpha_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bALPHA\s+(\d+(?:\.\d+)?)"))
-}
 
 // --- Public parsers ----------------------------------------------------------
 
@@ -87,144 +30,157 @@ pub fn parse_indexes(ix: &std::collections::BTreeMap<String, String>) -> Vec<Ind
 
 /// Parse one `DEFINE INDEX` statement.
 ///
+/// A full-text index always reads back with `bm25` set: the engine scores
+/// every `FULLTEXT` index with BM25 and always echoes `BM25(k1,b)`, whether
+/// or not the statement asked for it.
+///
 /// Returns `None` when the definition string is empty.
 pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
-    if definition.is_empty() {
+    if definition.trim().is_empty() {
         return None;
     }
-
-    let mut columns = extract_index_columns(definition);
-    if columns.is_empty() {
-        columns = extract_index_fields(definition);
+    let body = define_head(definition, "INDEX", true).map_or(definition, |head| head.rest);
+    let toks = tokens(body);
+    let mut index = IndexDefinition::new(name, Vec::<String>::new());
+    let mut i = 0;
+    while let Some(token) = toks.get(i) {
+        i += 1;
+        if token.is("FIELDS") || token.is("COLUMNS") {
+            let (columns, next) = read_columns(&toks, i);
+            index.columns = columns;
+            i = next;
+        } else if token.is("UNIQUE") {
+            index.index_type = IndexType::Unique;
+        } else if token.is("FULLTEXT") || token.is("SEARCH") {
+            index.index_type = IndexType::Search;
+            i = read_fulltext(&toks, i, &mut index);
+        } else if token.is("HNSW") {
+            index.index_type = IndexType::Hnsw;
+            i = read_vector(&toks, i, &mut index);
+        } else if token.is("MTREE") {
+            index.index_type = IndexType::Mtree;
+            i = read_vector(&toks, i, &mut index);
+        } else if token.is("DISKANN") {
+            index.index_type = IndexType::Diskann;
+            i = read_vector(&toks, i, &mut index);
+        } else if token.is("COMMENT") {
+            i += 1;
+        } else if token.is("COUNT") {
+            // A count index keeps an optional `WHERE` condition this crate
+            // does not model; nothing after it is an index clause.
+            break;
+        }
     }
-
-    let index_type = extract_index_type(definition);
-
-    let mut dimension = None;
-    let mut distance = None;
-    let mut vector_type = None;
-    let mut hnsw_distance = None;
-    let mut efc = None;
-    let mut m = None;
-    let mut diskann_distance = None;
-    let mut degree = None;
-    let mut l_build = None;
-    let mut alpha = None;
-    let mut hashed_vector = false;
-    let mut analyzer = None;
-    let mut bm25 = false;
-    let mut highlights = false;
-
-    match index_type {
-        IndexType::Mtree => {
-            dimension = extract_dimension(definition);
-            distance = extract_mtree_distance(definition);
-            vector_type = extract_vector_type(definition);
-        }
-        IndexType::Hnsw => {
-            dimension = extract_dimension(definition);
-            vector_type = extract_vector_type(definition);
-            hnsw_distance = extract_hnsw_distance(definition);
-            efc = extract_hnsw_efc(definition);
-            m = extract_hnsw_m(definition);
-        }
-        IndexType::Diskann => {
-            dimension = extract_dimension(definition);
-            vector_type = extract_vector_type(definition);
-            diskann_distance = extract_diskann_distance(definition);
-            degree = extract_diskann_degree(definition);
-            l_build = extract_diskann_l_build(definition);
-            alpha = extract_diskann_alpha(definition);
-            hashed_vector = definition.to_uppercase().contains("HASHED_VECTOR");
-        }
-        IndexType::Search => {
-            analyzer = extract_analyzer(definition);
-            let upper = definition.to_uppercase();
-            bm25 = upper.contains("BM25");
-            highlights = upper.contains("HIGHLIGHTS");
-        }
-        _ => {}
-    }
-
-    Some(IndexDefinition {
-        name: name.to_string(),
-        columns,
-        index_type,
-        dimension,
-        distance,
-        vector_type,
-        hnsw_distance,
-        efc,
-        m,
-        diskann_distance,
-        degree,
-        l_build,
-        alpha,
-        hashed_vector,
-        analyzer,
-        bm25,
-        highlights,
-        // `CONCURRENTLY` is a build directive the engine drops from the
-        // definition it echoes, so a parsed index is never concurrent. Reading
-        // it back as `true` would make a background-built index look modified
-        // on every reconcile.
-        concurrently: false,
-    })
+    // `CONCURRENTLY` is a build directive the engine drops from the
+    // definition it echoes, so a parsed index is never concurrent. Reading
+    // it back as `true` would make a background-built index look modified on
+    // every reconcile.
+    index.concurrently = false;
+    Some(index)
 }
 
 // --- Index extractors --------------------------------------------------------
 
-fn split_cols(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn extract_index_columns(definition: &str) -> Vec<String> {
-    columns_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| split_cols(m.as_str()))
-        .unwrap_or_default()
-}
-
-fn extract_index_fields(definition: &str) -> Vec<String> {
-    fields_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| split_cols(m.as_str()))
-        .unwrap_or_default()
-}
-
-fn extract_index_type(definition: &str) -> IndexType {
-    let upper = definition.to_uppercase();
-    if upper.contains("UNIQUE") {
-        IndexType::Unique
-    } else if upper.contains("FULLTEXT") || upper.contains("SEARCH") {
-        IndexType::Search
-    } else if upper.contains("HNSW") {
-        IndexType::Hnsw
-    } else if upper.contains("MTREE") {
-        IndexType::Mtree
-    } else if upper.contains("DISKANN") {
-        IndexType::Diskann
-    } else {
-        IndexType::Standard
+/// Read the comma-separated column list starting at token `at`. Returns the
+/// unquoted columns and the index of the first token after the list.
+fn read_columns(toks: &[Token<'_>], at: usize) -> (Vec<String>, usize) {
+    let mut raw = String::new();
+    let mut i = at;
+    while let Some(token) = toks.get(i) {
+        let continues = raw.is_empty() || raw.ends_with(',') || token.text.starts_with(',');
+        if !continues {
+            break;
+        }
+        raw.push(' ');
+        raw.push_str(token.text.trim_end_matches(';'));
+        i += 1;
     }
+    let columns = split_top_level(&raw, ',')
+        .into_iter()
+        .map(|column| unquote_ident(column.trim()))
+        .filter(|column| !column.is_empty())
+        .collect();
+    (columns, i)
 }
 
-fn extract_dimension(definition: &str) -> Option<u32> {
-    dimension_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
+/// Read `ANALYZER <name> BM25[(k1,b)] HIGHLIGHTS` after `FULLTEXT`.
+fn read_fulltext(toks: &[Token<'_>], at: usize, index: &mut IndexDefinition) -> usize {
+    let mut i = at;
+    while let Some(token) = toks.get(i) {
+        let word = token.text.trim_end_matches(';');
+        if token.is("ANALYZER") {
+            index.analyzer = toks
+                .get(i + 1)
+                .map(|t| unquote_ident(t.text.trim_end_matches(';')))
+                .filter(|a| !a.eq_ignore_ascii_case("ascii"));
+            i += 2;
+        } else if word
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case("BM25"))
+        {
+            index.bm25 = true;
+            i += 1;
+        } else if token.is("HIGHLIGHTS") {
+            index.highlights = true;
+            i += 1;
+        } else if token.is("VS") {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
 }
 
-fn extract_mtree_distance(definition: &str) -> Option<MTreeDistanceType> {
-    let caps = distance_regex().captures(definition)?;
-    let m = caps.get(1)?;
-    match m.as_str().to_uppercase().as_str() {
+/// Read the parameters of an `MTREE`, `HNSW`, or `DISKANN` index.
+fn read_vector(toks: &[Token<'_>], at: usize, index: &mut IndexDefinition) -> usize {
+    let mut i = at;
+    while let Some(token) = toks.get(i) {
+        let value = toks.get(i + 1).map(|t| t.text.trim_end_matches(';'));
+        let number = || value.and_then(|v| v.parse::<u32>().ok());
+        if token.is("DIMENSION") {
+            index.dimension = number();
+        } else if token.is("DIST") || token.is("DISTANCE") {
+            let metric = value.unwrap_or("").to_ascii_uppercase();
+            match index.index_type {
+                IndexType::Hnsw => index.hnsw_distance = hnsw_distance(&metric),
+                IndexType::Diskann => index.diskann_distance = diskann_distance(&metric),
+                _ => index.distance = mtree_distance(&metric),
+            }
+        } else if token.is("TYPE") {
+            index.vector_type = value.and_then(vector_type);
+        } else if token.is("EFC") {
+            index.efc = number();
+        } else if token.is("M") {
+            index.m = number();
+        } else if token.is("DEGREE") {
+            index.degree = number();
+        } else if token.is("L_BUILD") {
+            index.l_build = number();
+        } else if token.is("ALPHA") {
+            // The engine echoes a float literal with a trailing `f` suffix
+            // (`ALPHA 1.2f`) and an integer bare (`ALPHA 2`); the suffix is
+            // dropped so the stored value matches what code declares.
+            index.alpha = value.map(|v| v.trim_end_matches(['f', 'F']).to_string());
+        } else if token.is("M0") || token.is("LM") || token.is("CAPACITY") {
+            // Engine-derived tuning the definition does not model.
+        } else if token.is("HASHED_VECTOR") {
+            index.hashed_vector = index.index_type == IndexType::Diskann;
+            i += 1;
+            continue;
+        } else if token.is("EXTEND_CANDIDATES") || token.is("KEEP_PRUNED_CONNECTIONS") {
+            i += 1;
+            continue;
+        } else {
+            break;
+        }
+        i += 2;
+    }
+    i
+}
+
+fn mtree_distance(metric: &str) -> Option<MTreeDistanceType> {
+    match metric {
         "COSINE" => Some(MTreeDistanceType::Cosine),
         "EUCLIDEAN" => Some(MTreeDistanceType::Euclidean),
         "MANHATTAN" => Some(MTreeDistanceType::Manhattan),
@@ -233,10 +189,8 @@ fn extract_mtree_distance(definition: &str) -> Option<MTreeDistanceType> {
     }
 }
 
-fn extract_hnsw_distance(definition: &str) -> Option<HnswDistanceType> {
-    let caps = distance_regex().captures(definition)?;
-    let m = caps.get(1)?;
-    match m.as_str().to_uppercase().as_str() {
+fn hnsw_distance(metric: &str) -> Option<HnswDistanceType> {
+    match metric {
         "CHEBYSHEV" => Some(HnswDistanceType::Chebyshev),
         "COSINE" => Some(HnswDistanceType::Cosine),
         "EUCLIDEAN" => Some(HnswDistanceType::Euclidean),
@@ -249,10 +203,8 @@ fn extract_hnsw_distance(definition: &str) -> Option<HnswDistanceType> {
     }
 }
 
-fn extract_diskann_distance(definition: &str) -> Option<DiskAnnDistanceType> {
-    let caps = distance_regex().captures(definition)?;
-    let m = caps.get(1)?;
-    match m.as_str().to_uppercase().as_str() {
+fn diskann_distance(metric: &str) -> Option<DiskAnnDistanceType> {
+    match metric {
         "COSINE" => Some(DiskAnnDistanceType::Cosine),
         "COSINE_NORMALIZED" => Some(DiskAnnDistanceType::CosineNormalized),
         "EUCLIDEAN" => Some(DiskAnnDistanceType::Euclidean),
@@ -261,71 +213,74 @@ fn extract_diskann_distance(definition: &str) -> Option<DiskAnnDistanceType> {
     }
 }
 
-fn extract_vector_type(definition: &str) -> Option<MTreeVectorType> {
-    // Vector `TYPE` clauses usually appear after `MTREE` / `HNSW` /
-    // `DISKANN`. Scan every TYPE occurrence in case the first one is
-    // swallowed by the field type clause (SurrealDB uses `TYPE` twice for
-    // these indexes).
-    for caps in type_regex().captures_iter(definition) {
-        let Some(m) = caps.get(1) else { continue };
-        match m.as_str().to_uppercase().as_str() {
-            "F64" => return Some(MTreeVectorType::F64),
-            "F32" => return Some(MTreeVectorType::F32),
-            "F16" => return Some(MTreeVectorType::F16),
-            "I64" => return Some(MTreeVectorType::I64),
-            "I32" => return Some(MTreeVectorType::I32),
-            "I16" => return Some(MTreeVectorType::I16),
-            "I8" => return Some(MTreeVectorType::I8),
-            "U8" => return Some(MTreeVectorType::U8),
-            _ => {}
-        }
+fn vector_type(word: &str) -> Option<MTreeVectorType> {
+    match word.to_ascii_uppercase().as_str() {
+        "F64" => Some(MTreeVectorType::F64),
+        "F32" => Some(MTreeVectorType::F32),
+        "F16" => Some(MTreeVectorType::F16),
+        "I64" => Some(MTreeVectorType::I64),
+        "I32" => Some(MTreeVectorType::I32),
+        "I16" => Some(MTreeVectorType::I16),
+        "I8" => Some(MTreeVectorType::I8),
+        "U8" => Some(MTreeVectorType::U8),
+        _ => None,
     }
-    None
 }
 
-fn extract_hnsw_efc(definition: &str) -> Option<u32> {
-    efc_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn extract_hnsw_m(definition: &str) -> Option<u32> {
-    m_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
+    #[test]
+    fn fulltext_params_are_not_columns() {
+        let idx = parse_index(
+            "ft",
+            "DEFINE INDEX ft ON TABLE post FIELDS title, content FULLTEXT ANALYZER ascii \
+             BM25(1.2,0.75)",
+        )
+        .unwrap();
+        assert_eq!(idx.columns, ["title", "content"]);
+        assert_eq!(idx.index_type, IndexType::Search);
+        assert!(idx.bm25);
+        assert!(idx.analyzer.is_none());
+    }
 
-fn extract_diskann_degree(definition: &str) -> Option<u32> {
-    degree_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
+    #[test]
+    fn the_kind_comes_from_the_word_after_the_columns() {
+        let idx = parse_index("yr", "DEFINE INDEX yr ON research_paper FIELDS year").unwrap();
+        assert_eq!(idx.index_type, IndexType::Standard);
+        assert_eq!(idx.columns, ["year"]);
+        let idx = parse_index("r", "DEFINE INDEX r ON t FIELDS research").unwrap();
+        assert_eq!(idx.columns, ["research"]);
+        let idx = parse_index("i", "DEFINE INDEX i ON custom_fields FIELDS a").unwrap();
+        assert_eq!(idx.columns, ["a"]);
+        let idx = parse_index("bm25_idx", "DEFINE INDEX bm25_idx ON t FIELDS unique_code").unwrap();
+        assert_eq!(idx.index_type, IndexType::Standard);
+        assert!(!idx.bm25);
+    }
 
-fn extract_diskann_l_build(definition: &str) -> Option<u32> {
-    l_build_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
+    #[test]
+    fn keyword_named_columns_and_comments_are_read_in_place() {
+        let idx = parse_index("on", "DEFINE INDEX on ON nm2 FIELDS type, comment").unwrap();
+        assert_eq!(idx.columns, ["type", "comment"]);
+        let idx = parse_index(
+            "u",
+            "DEFINE INDEX u ON t FIELDS research, `select` UNIQUE COMMENT 'unique FIELDS x'",
+        )
+        .unwrap();
+        assert_eq!(idx.columns, ["research", "select"]);
+        assert_eq!(idx.index_type, IndexType::Unique);
+    }
 
-fn extract_diskann_alpha(definition: &str) -> Option<String> {
-    alpha_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-}
-
-/// Extract the `SEARCH ANALYZER <name>` analyzer. The historical `ascii`
-/// default (what a plain `search_index` renders) normalises back to `None` so a
-/// round-trip of the default form is an identity, leaving an explicit non-`ascii`
-/// analyzer as `Some`.
-fn extract_analyzer(definition: &str) -> Option<String> {
-    analyzer_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .filter(|a| !a.eq_ignore_ascii_case("ascii"))
+    #[test]
+    fn highlights_and_a_named_analyzer_read_back() {
+        let idx = parse_index(
+            "s",
+            "DEFINE INDEX s ON doc FIELDS content FULLTEXT ANALYZER text_en BM25(1.2,0.75) \
+             HIGHLIGHTS",
+        )
+        .unwrap();
+        assert_eq!(idx.analyzer.as_deref(), Some("text_en"));
+        assert!(idx.highlights);
+    }
 }

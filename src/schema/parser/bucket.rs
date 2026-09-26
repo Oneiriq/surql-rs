@@ -5,37 +5,28 @@
 //! `diff_buckets`, mirroring [`super::access`]. Split out of the monolithic
 //! `parser.rs` so each submodule stays under the 1000-LOC budget; see parent
 //! [`super`] for the public entry points.
+//!
+//! The engine echoes `DEFINE BUCKET <name> [READONLY] BACKEND '<url>'
+//! PERMISSIONS <NONE | FULL | WHERE expr> [COMMENT '<text>']`: a bucket has a
+//! single permission, not a per-action list.
 
-use std::sync::OnceLock;
+use super::scan::{clause, clauses, define_head, string_literal, Shape};
+use crate::schema::bucket::{BucketDefinition, DEFAULT_BUCKET_PERMISSIONS};
 
-use regex::Regex;
-
-use super::permissions::parse_table_permissions;
-use super::regex_case_insensitive;
-use crate::schema::bucket::BucketDefinition;
-
-// --- Regex accessors ---------------------------------------------------------
-
-fn backend_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    // Accept both quoted (`BACKEND "memory"`) and bare (`BACKEND memory`)
-    // forms; SurrealDB echoes the quoted form but tolerate either on input.
-    RE.get_or_init(|| regex_case_insensitive(r#"BACKEND\s+(?:"([^"]*)"|'([^']*)'|(\S+))"#))
-}
-
-fn readonly_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bREADONLY\b"))
-}
-
-fn comment_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r#"(?s)COMMENT\s+(?:"([^"]*)"|'([^']*)')"#))
-}
+const BUCKET_CLAUSES: &[(&str, Shape)] = &[
+    ("READONLY", Shape::Flag),
+    ("BACKEND", Shape::Expr),
+    ("PERMISSIONS", Shape::Expr),
+    ("COMMENT", Shape::Str),
+];
 
 // --- Public parser -----------------------------------------------------------
 
 /// Parse one `DEFINE BUCKET` statement into a [`BucketDefinition`].
+///
+/// The engine always echoes a `PERMISSIONS` clause; its default,
+/// [`DEFAULT_BUCKET_PERMISSIONS`], reads back as `None`, which is what a
+/// definition that never set one holds. String literals are unescaped.
 ///
 /// Returns `None` when the definition is empty or has no `BACKEND` clause
 /// (the backend is required, so a definition without one is not a usable
@@ -44,30 +35,18 @@ pub fn parse_bucket(name: &str, definition: &str) -> Option<BucketDefinition> {
     if definition.is_empty() {
         return None;
     }
-    let backend = extract_backend(definition)?;
+    let body = define_head(definition, "BUCKET", false).map_or(definition, |head| head.rest);
+    let found = clauses(body, BUCKET_CLAUSES);
+    let backend = clause(&found, "BACKEND").filter(|b| !b.is_empty())?;
+    let backend = string_literal(backend).unwrap_or_else(|| backend.to_string());
 
     let mut bucket = BucketDefinition::new(name, backend);
-    bucket.readonly = readonly_regex().is_match(definition);
-    bucket.permissions = parse_table_permissions(definition);
-    bucket.comment = extract_comment(definition);
+    bucket.readonly = clause(&found, "READONLY").is_some();
+    bucket.permissions = clause(&found, "PERMISSIONS")
+        .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case(DEFAULT_BUCKET_PERMISSIONS))
+        .map(str::to_string);
+    bucket.comment = clause(&found, "COMMENT").and_then(string_literal);
     Some(bucket)
-}
-
-// --- Extractors --------------------------------------------------------------
-
-fn extract_backend(definition: &str) -> Option<String> {
-    let caps = backend_regex().captures(definition)?;
-    caps.get(1)
-        .or_else(|| caps.get(2))
-        .or_else(|| caps.get(3))
-        .map(|m| m.as_str().to_string())
-}
-
-fn extract_comment(definition: &str) -> Option<String> {
-    let caps = comment_regex().captures(definition)?;
-    caps.get(1)
-        .or_else(|| caps.get(2))
-        .map(|m| m.as_str().to_string())
 }
 
 #[cfg(test)]
@@ -123,17 +102,29 @@ mod tests {
     }
 
     #[test]
-    fn parses_permissions() {
+    fn parses_the_engine_echo_with_its_single_permission() {
         let b = parse_bucket(
             "p",
-            "DEFINE BUCKET p BACKEND \"memory\" PERMISSIONS FOR select WHERE $auth.id != NONE",
+            "DEFINE BUCKET p READONLY BACKEND 'memory' PERMISSIONS WHERE $auth.id != NONE \
+             COMMENT 'x'",
         )
         .unwrap();
-        let perms = b.permissions.expect("permissions parsed");
-        assert_eq!(
-            perms.get("select").map(String::as_str),
-            Some("$auth.id != NONE")
-        );
+        assert!(b.readonly);
+        assert_eq!(b.permissions.as_deref(), Some("WHERE $auth.id != NONE"));
+        assert_eq!(b.comment.as_deref(), Some("x"));
+        let b = parse_bucket("p", "DEFINE BUCKET p BACKEND 'memory' PERMISSIONS FULL").unwrap();
+        assert!(b.permissions.is_none());
+    }
+
+    #[test]
+    fn escaped_literals_are_unescaped() {
+        let b = parse_bucket(
+            "d",
+            r"DEFINE BUCKET d BACKEND 'file:C:\\data' PERMISSIONS FULL COMMENT 'a\nb'",
+        )
+        .unwrap();
+        assert_eq!(b.backend, r"file:C:\data");
+        assert_eq!(b.comment.as_deref(), Some("a\nb"));
     }
 
     #[test]

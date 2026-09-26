@@ -12,15 +12,21 @@
 //! Splitting is depth-aware so a projection such as `math::max([a, b])` is
 //! not torn apart at the comma inside it.
 
+use super::scan::{find_keyword, split_top_level as split_at};
+use super::table::read_table;
 use crate::schema::view::{ViewDefinition, ViewGroup};
 
 /// Parse the `AS SELECT` body out of a `DEFINE TABLE` statement.
 ///
 /// Returns `None` for a table that is not a view.
 pub fn parse_view(definition: &str) -> Option<ViewDefinition> {
-    let body = clause_after(definition, "AS SELECT")?;
-    let body = truncate_at_clause(&body);
-    let body = body.trim().trim_end_matches(';').trim();
+    let body = read_table(definition).view?;
+    let body = body
+        .get("SELECT".len()..)
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(';')
+        .trim();
 
     let (projections, rest) = split_at_keyword(body, "FROM")?;
     let (tables, rest) = match split_at_keyword(&rest, "WHERE") {
@@ -71,138 +77,25 @@ fn parse_group(rest: &str) -> Option<ViewGroup> {
     }
 }
 
-/// Everything after the first case-insensitive occurrence of `keyword`.
-fn clause_after(text: &str, keyword: &str) -> Option<String> {
-    let at = find_keyword(text, keyword)?;
-    Some(text[at + keyword.len()..].to_string())
-}
-
 /// Split `text` at the first top-level occurrence of `keyword`, returning the
 /// text before it and the text after it.
 fn split_at_keyword(text: &str, keyword: &str) -> Option<(String, String)> {
     let at = find_keyword(text, keyword)?;
     Some((
-        text[..at].trim().to_string(),
-        text[at + keyword.len()..].trim().to_string(),
+        text.get(..at)?.trim().to_string(),
+        text.get(at + keyword.len()..)?.trim().to_string(),
     ))
-}
-
-/// Cut the `AS SELECT` body at the first clause that can follow it.
-///
-/// `COMMENT` only counts when a quoted string follows: `comment` is also a
-/// perfectly ordinary table name, and a view selecting `FROM comment` must
-/// not be truncated at its own source.
-fn truncate_at_clause(text: &str) -> String {
-    let mut end = text.len();
-    for keyword in ["PERMISSIONS", "CHANGEFEED"] {
-        if let Some(at) = find_keyword(text, keyword) {
-            end = end.min(at);
-        }
-    }
-    let mut from = 0;
-    while let Some(at) = find_keyword_from(text, "COMMENT", from) {
-        let after = text[at + "COMMENT".len()..].trim_start();
-        if after.starts_with('\'') || after.starts_with('"') {
-            end = end.min(at);
-            break;
-        }
-        from = at + "COMMENT".len();
-    }
-    text[..end].to_string()
-}
-
-/// Locate `keyword` case-insensitively at a word boundary and outside any
-/// bracket, parenthesis, or quoted run.
-fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
-    find_keyword_from(text, keyword, 0)
-}
-
-/// [`find_keyword`] starting the scan at byte offset `from`.
-fn find_keyword_from(text: &str, keyword: &str, from: usize) -> Option<usize> {
-    let haystack = text.to_ascii_uppercase();
-    let needle = keyword.to_ascii_uppercase();
-    let bytes = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    let mut depth = 0i32;
-    let mut quote: Option<u8> = None;
-    let mut i = from;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match quote {
-            Some(q) => {
-                if b == q {
-                    quote = None;
-                }
-                i += 1;
-                continue;
-            }
-            None => match b {
-                b'\'' | b'"' => {
-                    quote = Some(b);
-                    i += 1;
-                    continue;
-                }
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                _ => {}
-            },
-        }
-        if depth == 0 && i + needle.len() <= bytes.len() && bytes[i..i + needle.len()] == *needle {
-            let left_ok = i == 0 || !is_word_byte(bytes[i - 1]);
-            let right_ok =
-                i + needle.len() == bytes.len() || !is_word_byte(bytes[i + needle.len()]);
-            if left_ok && right_ok {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Split a comma-separated list, ignoring commas nested in brackets or
 /// quotes.
 fn split_top_level(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    let mut current = String::new();
-    for c in text.chars() {
-        match quote {
-            Some(q) => {
-                current.push(c);
-                if c == q {
-                    quote = None;
-                }
-                continue;
-            }
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
-                ',' if depth == 0 => {
-                    push_trimmed(&mut out, &current);
-                    current.clear();
-                    continue;
-                }
-                _ => {}
-            },
-        }
-        current.push(c);
-    }
-    push_trimmed(&mut out, &current);
-    out
-}
-
-fn push_trimmed(out: &mut Vec<String>, value: &str) {
-    let trimmed = value.trim();
-    if !trimmed.is_empty() {
-        out.push(trimmed.to_string());
-    }
+    split_at(text, ',')
+        .into_iter()
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

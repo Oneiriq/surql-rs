@@ -6,8 +6,9 @@
 //!
 //! Edges round-trip through SurrealDB as regular tables in
 //! `INFO FOR DB.tables`; the only thing that makes them edges is the
-//! `TYPE RELATION FROM <x> TO <y>` clause on the `DEFINE TABLE`
-//! statement. Without an edge-aware parser, a drift detector using
+//! `TYPE RELATION` clause on the `DEFINE TABLE` statement, which the engine
+//! echoes as `TYPE RELATION IN <x> OUT <y>` whatever spelling
+//! (`FROM` / `TO`) created it. Without an edge-aware parser, a drift detector using
 //! [`super::parse_table_info`] against an edge table would see it as a
 //! `Schemaless` table missing every field-level diff signal an edge
 //! expects (mode, from/to constraints, auto `in`/`out` proxies).
@@ -23,10 +24,11 @@
 //!   `DEFINE TABLE <e> TYPE RELATION SCHEMAFULL FROM x TO y` and the
 //!   edge mode is what matters for downstream diffing.
 //!
-//! - **FROM / TO endpoints** — extracted independently so a malformed
-//!   live definition that lost one clause surfaces as missing-endpoint
-//!   drift instead of a parse failure. The emitter writes both when
-//!   `TYPE RELATION` is set, but the parser stays permissive on read.
+//! - **IN / OUT endpoints** (or `FROM` / `TO`) — extracted independently
+//!   so a malformed live definition that lost one clause surfaces as
+//!   missing-endpoint drift instead of a parse failure. The emitter writes
+//!   both when `TYPE RELATION` is set, but the parser stays permissive on
+//!   read. A list (`IN user | admin`) reads back as `"user | admin"`.
 //!
 //! - **Auto `in` / `out` field stripping** — on `Relation`-mode edges
 //!   SurrealDB auto-emits `in` and `out` `FIELD` declarations. They are
@@ -37,7 +39,7 @@
 //! - **Per-action `PERMISSIONS`** — delegated to
 //!   [`super::parse_table_permissions`], including the comma-joined
 //!   `FOR select, create, update, delete WHERE …` shape v3 emits when
-//!   several actions share a rule.
+//!   several actions share a rule, and the `", "` it joins lines with.
 //!
 //! ## v3 caller pattern
 //!
@@ -48,41 +50,16 @@
 //! string as `define_table`; without it, mode + FROM/TO + PERMISSIONS
 //! cannot be recovered and default to `Schemaless` / `None`.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::Value;
 
 use super::event::parse_events;
 use super::field::parse_fields;
 use super::index::parse_indexes;
 use super::permissions::parse_table_permissions;
-use super::{expect_object, pick_map, regex_case_insensitive, value_to_string_map};
+use super::table::read_table;
+use super::{expect_object, pick_map, value_to_string_map};
 use crate::error::{Result, SurqlError};
 use crate::schema::edge::{EdgeDefinition, EdgeMode};
-
-// --- Regex accessors ---------------------------------------------------------
-
-/// Match the `TYPE RELATION` keyword anywhere in a `DEFINE TABLE` string.
-/// Word-boundary anchored so `TYPE RELATIONAL_SOMETHING` does not match.
-fn type_relation_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+RELATION\b"))
-}
-
-/// Match a `FROM <ident>` clause, independent of `TO`. Identifier
-/// characters mirror SurrealDB's table-name grammar
-/// (`[A-Za-z_][A-Za-z0-9_]*`).
-fn edge_from_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)"))
-}
-
-/// Match a `TO <ident>` clause, independent of `FROM`.
-fn edge_to_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bTO\s+([A-Za-z_][A-Za-z0-9_]*)"))
-}
 
 // --- Edge mode + endpoint helpers --------------------------------------------
 
@@ -96,35 +73,31 @@ fn edge_to_regex() -> &'static Regex {
 /// `DEFINE TABLE <e> TYPE RELATION SCHEMAFULL FROM x TO y` and the edge
 /// mode is what matters for downstream diffing.
 pub(super) fn parse_edge_mode(definition: &str) -> EdgeMode {
-    if definition.is_empty() {
-        return EdgeMode::Schemaless;
+    let table = read_table(definition);
+    if table.relation.is_some() {
+        EdgeMode::Relation
+    } else if table.schemafull {
+        EdgeMode::Schemafull
+    } else {
+        EdgeMode::Schemaless
     }
-    if type_relation_regex().is_match(definition) {
-        return EdgeMode::Relation;
-    }
-    if definition.to_ascii_uppercase().contains("SCHEMAFULL") {
-        return EdgeMode::Schemafull;
-    }
-    EdgeMode::Schemaless
 }
 
-/// Extract `FROM <table>` and `TO <table>` independently. Returns
+/// Extract the source and target tables independently. Returns
 /// `(None, None)` for an empty input and `(Some, None)` / `(None, Some)`
-/// when only one clause is present — the parser is permissive on read
+/// when only one side is present — the parser is permissive on read
 /// so a malformed live definition surfaces as missing-endpoint drift.
+///
+/// The engine echoes `TYPE RELATION IN a OUT b`; `FROM` / `TO` (the
+/// spelling this crate renders) are read too. A side naming several tables
+/// (`IN user | admin`) reads back as `"user | admin"`, which renders
+/// unchanged; backticked names are unquoted.
 pub(super) fn parse_edge_endpoints(definition: &str) -> (Option<String>, Option<String>) {
-    if definition.is_empty() {
+    let Some(relation) = read_table(definition).relation else {
         return (None, None);
-    }
-    let from = edge_from_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string());
-    let to = edge_to_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string());
-    (from, to)
+    };
+    let join = |names: Vec<String>| (!names.is_empty()).then(|| names.join(" | "));
+    (join(relation.from), join(relation.to))
 }
 
 // --- Public parser -----------------------------------------------------------
@@ -452,6 +425,38 @@ mod tests {
         let e = parse_edge_info("custom", &info, Some("DEFINE TABLE custom SCHEMAFULL")).unwrap();
         assert_eq!(e.fields.len(), 1);
         assert_eq!(e.fields[0].name, "default");
+    }
+
+    #[test]
+    fn reads_the_in_out_endpoints_the_engine_echoes() {
+        // Exact 3.0.5 echo of `TYPE RELATION FROM user TO post`: the old
+        // parser only knew FROM/TO, so every parsed edge lost its endpoints
+        // and could not be rendered again.
+        let define =
+            "DEFINE TABLE likes TYPE RELATION IN user OUT post SCHEMALESS PERMISSIONS NONE";
+        let e = parse_edge_info("likes", &json!({ "fields": {} }), Some(define)).unwrap();
+        assert_eq!(e.from_table.as_deref(), Some("user"));
+        assert_eq!(e.to_table.as_deref(), Some("post"));
+        assert!(e.permissions.is_none());
+        assert_eq!(
+            e.to_surql().unwrap(),
+            "DEFINE TABLE likes TYPE RELATION FROM user TO post;"
+        );
+    }
+
+    #[test]
+    fn reads_endpoint_lists_and_quoted_names() {
+        let (from, to) = parse_edge_endpoints(
+            "DEFINE TABLE e2 TYPE RELATION IN user | post OUT `my-table` ENFORCED SCHEMALESS \
+             PERMISSIONS NONE",
+        );
+        assert_eq!(from.as_deref(), Some("user | post"));
+        assert_eq!(to.as_deref(), Some("my-table"));
+        let (from, to) = parse_edge_endpoints(
+            "DEFINE TABLE e3 TYPE RELATION IN schemafull OUT select SCHEMALESS",
+        );
+        assert_eq!(from.as_deref(), Some("schemafull"));
+        assert_eq!(to.as_deref(), Some("select"));
     }
 
     #[test]

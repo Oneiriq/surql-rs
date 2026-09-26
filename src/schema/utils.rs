@@ -17,13 +17,15 @@
 //! assert_eq!(display_width("\u{1b}[1;31mhello\u{1b}[0m"), 5);
 //! ```
 
-use std::sync::OnceLock;
-
-use regex::Regex;
-
-fn ansi_escape_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*m").expect("valid ANSI regex"))
+/// Length of the ANSI SGR sequence (`ESC [ <digits and ;> m`) at the start
+/// of `text`, if one starts there.
+fn sgr_len(text: &str) -> Option<usize> {
+    let body = text.strip_prefix('\u{1b}')?.strip_prefix('[')?;
+    let params = body
+        .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+        .unwrap_or(body.len());
+    body.get(params..)?.strip_prefix('m')?;
+    Some(2 + params + 1)
 }
 
 /// Remove ANSI SGR escape codes from a string slice.
@@ -41,7 +43,20 @@ fn ansi_escape_regex() -> &'static Regex {
 /// ```
 #[must_use]
 pub fn strip_ansi(text: &str) -> String {
-    ansi_escape_regex().replace_all(text, "").into_owned()
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('\u{1b}') {
+        let (before, from_escape) = rest.split_at_checked(at).unwrap_or((rest, ""));
+        out.push_str(before);
+        if let Some(len) = sgr_len(from_escape) {
+            rest = from_escape.get(len..).unwrap_or("");
+        } else {
+            out.push('\u{1b}');
+            rest = from_escape.get(1..).unwrap_or("");
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Calculate terminal display width, stripping ANSI and counting wide chars.
@@ -144,6 +159,13 @@ mod tests {
     fn strip_ansi_preserves_plain_text() {
         assert_eq!(strip_ansi("plain"), "plain");
         assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_keeps_escapes_that_are_not_sgr() {
+        assert_eq!(strip_ansi("\u{1b}[2Jx"), "\u{1b}[2Jx");
+        assert_eq!(strip_ansi("a\u{1b}"), "a\u{1b}");
+        assert_eq!(strip_ansi("\u{1b}[m\u{1b}[0;1mé"), "é");
     }
 
     #[test]
