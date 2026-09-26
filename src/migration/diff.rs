@@ -38,7 +38,7 @@
 //! whitespace-normalised equality so that cosmetic reformatting by the
 //! database server does not produce spurious diffs.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -165,9 +165,13 @@ const SAFE_DEFAULT_PATTERN: &str = concat!(
     r")$",
 );
 
-fn safe_default_regex() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(SAFE_DEFAULT_PATTERN).expect("valid regex"))
+/// The compiled [`SAFE_DEFAULT_PATTERN`]. `None` would mean the constant
+/// failed to compile, which a unit test rules out; every default then reads
+/// as unsafe rather than the process panicking.
+fn safe_default_regex() -> Option<&'static regex::Regex> {
+    static RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(SAFE_DEFAULT_PATTERN).ok())
+        .as_ref()
 }
 
 /// Validate that an event expression has no injection patterns.
@@ -205,7 +209,8 @@ pub fn validate_event_expression(expr: &str, label: &str) -> Result<()> {
 /// Returns [`SurqlError::Validation`] when the expression does not match
 /// the safe-default pattern.
 pub fn validate_default_value(default: &str) -> Result<()> {
-    if !safe_default_regex().is_match(default.trim()) {
+    let safe = safe_default_regex().is_some_and(|re| re.is_match(default.trim()));
+    if !safe {
         return Err(SurqlError::Validation {
             reason: format!(
                 "Unsafe default value expression: {default:?}. \
@@ -495,22 +500,23 @@ pub fn diff_tables(code: &[TableDefinition], db: &[TableDefinition]) -> Vec<Sche
     let db_map = index_by_name(db, |t| t.name.as_str());
     let mut out: Vec<SchemaDiff> = Vec::new();
 
+    // The maps iterate in name order, so the output is stable whatever
+    // order the slices came in.
     // Added tables — present in code, absent in db.
-    for name in sorted_keys(&code_map) {
+    for (name, table) in &code_map {
         if !db_map.contains_key(name) {
-            out.extend(generate_add_table_diffs(code_map[name]));
+            out.extend(generate_add_table_diffs(table));
         }
     }
     // Dropped tables — present in db, absent in code.
-    for name in sorted_keys(&db_map) {
+    for (name, table) in &db_map {
         if !code_map.contains_key(name) {
-            out.extend(generate_drop_table_diffs(db_map[name]));
+            out.extend(generate_drop_table_diffs(table));
         }
     }
     // Modified tables — present in both, diff recursively.
-    for name in sorted_keys(&code_map) {
+    for (name, code_table) in &code_map {
         if let Some(db_table) = db_map.get(name) {
-            let code_table = code_map[name];
             out.extend(diff_table_pair_inner(code_table, db_table));
         }
     }
@@ -680,19 +686,18 @@ pub fn diff_edges(code: &[EdgeDefinition], db: &[EdgeDefinition]) -> Vec<SchemaD
     let db_map = index_by_name(db, |e| e.name.as_str());
     let mut out: Vec<SchemaDiff> = Vec::new();
 
-    for name in sorted_keys(&code_map) {
+    for (name, edge) in &code_map {
         if !db_map.contains_key(name) {
-            out.extend(generate_add_edge_diffs(code_map[name]));
+            out.extend(generate_add_edge_diffs(edge));
         }
     }
-    for name in sorted_keys(&db_map) {
+    for (name, edge) in &db_map {
         if !code_map.contains_key(name) {
-            out.extend(generate_drop_edge_diffs(db_map[name]));
+            out.extend(generate_drop_edge_diffs(edge));
         }
     }
-    for name in sorted_keys(&code_map) {
+    for (name, code_edge) in &code_map {
         if let Some(db_edge) = db_map.get(name) {
-            let code_edge = code_map[name];
             out.extend(diff_edge_pair_inner(code_edge, db_edge));
         }
     }
@@ -1732,34 +1737,20 @@ fn event_body(action: &str) -> String {
     normalize_expression(inner.trim().trim_end_matches(';'))
 }
 
+/// Key `items` by name. The map iterates in name order, which is what makes
+/// every diff's output order independent of the input order; a later
+/// duplicate name replaces an earlier one.
 pub(super) fn index_by_name<'a, T, F>(items: &'a [T], key: F) -> BTreeMap<&'a str, &'a T>
 where
     F: Fn(&'a T) -> &'a str,
 {
-    let mut map = BTreeMap::new();
-    for item in items {
-        map.insert(key(item), item);
-    }
-    map
+    items.iter().map(|item| (key(item), item)).collect()
 }
-
-pub(super) fn sorted_keys<'a, V>(map: &'a BTreeMap<&'a str, V>) -> Vec<&'a str> {
-    // BTreeMap iterates in key order already, so we just need to collect
-    // the keys into a concrete vector to avoid holding the borrow across
-    // the map while iterating mutably elsewhere.
-    let mut keys: Vec<&str> = map.keys().copied().collect();
-    keys.sort_unstable();
-    // dedupe is not needed — a BTreeMap cannot have duplicates — but keep
-    // a stable Vec<&str> interface.
-    let set: BTreeSet<&str> = keys.into_iter().collect();
-    set.into_iter().collect()
-}
-
-// Silence clippy::missing_fields_in_debug warnings from older toolchains:
-// all public types here derive Debug explicitly.
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::schema::edge::{EdgeDefinition, EdgeMode};
     use crate::schema::fields::{FieldDefinition, FieldType};
@@ -1898,6 +1889,11 @@ mod tests {
         assert!(validate_default_value("'hello'").is_ok());
         assert!(validate_default_value("time::now()").is_ok());
         assert!(validate_default_value("$auth").is_ok());
+    }
+
+    #[test]
+    fn the_safe_default_pattern_compiles() {
+        assert!(safe_default_regex().is_some());
     }
 
     #[test]

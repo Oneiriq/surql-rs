@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::migration::diff::{index_by_name, sorted_keys};
+use crate::migration::diff::index_by_name;
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::analyzer::AnalyzerDefinition;
 use crate::schema::bucket::BucketDefinition;
@@ -82,45 +82,28 @@ pub fn diff_named<T: PartialEq>(
     overwrite: impl Fn(&T) -> String,
     remove: impl Fn(&T) -> String,
 ) -> Vec<SchemaDiff> {
-    let index = |items: &'_ [T]| -> BTreeMap<String, usize> {
-        items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| (name_of(item).to_owned(), i))
-            .collect()
-    };
-    let code_map = index(code);
-    let db_map = index(db);
+    let code_map = index_by_name(code, &name_of);
+    let db_map = index_by_name(db, &name_of);
     let mut out = Vec::new();
 
-    for (name, &i) in &code_map {
+    for (name, item) in &code_map {
         if !db_map.contains_key(name) {
-            out.push(object_diff(
-                kinds.add,
-                name,
-                define(&code[i]),
-                remove(&code[i]),
-            ));
+            out.push(object_diff(kinds.add, name, define(item), remove(item)));
         }
     }
-    for (name, &i) in &db_map {
+    for (name, item) in &db_map {
         if !code_map.contains_key(name) {
-            out.push(object_diff(
-                kinds.drop,
-                name,
-                remove(&db[i]),
-                define(&db[i]),
-            ));
+            out.push(object_diff(kinds.drop, name, remove(item), define(item)));
         }
     }
-    for (name, &i) in &code_map {
-        if let Some(&j) = db_map.get(name) {
-            if code[i] != db[j] {
+    for (name, code_item) in &code_map {
+        if let Some(db_item) = db_map.get(name) {
+            if code_item != db_item {
                 out.push(object_diff(
                     kinds.modify,
                     name,
-                    overwrite(&code[i]),
-                    overwrite(&db[j]),
+                    overwrite(code_item),
+                    overwrite(db_item),
                 ));
             }
         }
@@ -266,20 +249,19 @@ pub fn diff_buckets(code: &[BucketDefinition], db: &[BucketDefinition]) -> Vec<S
     let db_map = index_by_name(db, |b| b.name.as_str());
     let mut out: Vec<SchemaDiff> = Vec::new();
 
-    for name in sorted_keys(&code_map) {
+    for (name, bucket) in &code_map {
         if !db_map.contains_key(name) {
-            out.push(generate_add_bucket_diff(code_map[name]));
+            out.push(generate_add_bucket_diff(bucket));
         }
     }
-    for name in sorted_keys(&db_map) {
+    for (name, bucket) in &db_map {
         if !code_map.contains_key(name) {
-            out.push(generate_drop_bucket_diff(db_map[name]));
+            out.push(generate_drop_bucket_diff(bucket));
         }
     }
-    for name in sorted_keys(&code_map) {
+    for (name, code_bucket) in &code_map {
         if let Some(db_bucket) = db_map.get(name) {
-            let code_bucket = code_map[name];
-            if code_bucket != *db_bucket {
+            if code_bucket != db_bucket {
                 out.push(generate_modify_bucket_diff(code_bucket, db_bucket));
             }
         }
@@ -310,8 +292,7 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
             details: BTreeMap::new(),
         };
     let remove = |name: &str| format!("REMOVE ANALYZER IF EXISTS {};", quote_ident(name));
-    for name in sorted_keys(&code_map) {
-        let analyzer = code_map[name];
+    for (name, analyzer) in &code_map {
         match db_map.get(name) {
             None => out.push(analyzer_diff(
                 DiffOperation::AddAnalyzer,
@@ -319,7 +300,7 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
                 analyzer.to_surql(),
                 remove(name),
             )),
-            Some(db_analyzer) if *db_analyzer != analyzer => out.push(analyzer_diff(
+            Some(db_analyzer) if db_analyzer != analyzer => out.push(analyzer_diff(
                 DiffOperation::ModifyAnalyzer,
                 name,
                 analyzer.to_surql_overwrite(),
@@ -328,13 +309,13 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
             Some(_) => {}
         }
     }
-    for name in sorted_keys(&db_map) {
+    for (name, analyzer) in &db_map {
         if !code_map.contains_key(name) {
             out.push(analyzer_diff(
                 DiffOperation::DropAnalyzer,
                 name,
                 remove(name),
-                db_map[name].to_surql(),
+                analyzer.to_surql(),
             ));
         }
     }
