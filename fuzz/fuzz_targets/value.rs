@@ -76,8 +76,13 @@ fuzz_target!(|node: Node| {
     let text = quote_value_public(&value);
 
     let statement = format!("RETURN {text};");
-    let ast =
-        syn::parse(&statement).unwrap_or_else(|e| panic!("engine rejected {statement:?}: {e}"));
+    let ast = match syn::parse(&statement) {
+        Ok(ast) => ast,
+        // Nesting past the parser's recursion limit is refused outright, not
+        // misread: a known limit of inline literals, not an escaping bug.
+        Err(e) if e.to_string().contains("recursion depth limit") => return,
+        Err(e) => panic!("engine rejected {statement:?}: {e}"),
+    };
     assert_eq!(ast.num_statements(), 1, "{statement:?}");
 
     let parsed = syn::value(&text).unwrap_or_else(|e| panic!("engine rejected {text:?}: {e}"));

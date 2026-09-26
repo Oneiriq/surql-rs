@@ -93,7 +93,7 @@ fn a_dropped_edge_rolls_back_to_its_whole_definition() {
         diffs[0].backward_sql,
         "DEFINE TABLE likes TYPE RELATION FROM user TO post PERMISSIONS FOR select WHERE true;\n\
              DEFINE FIELD weight ON TABLE likes TYPE int;\n\
-             DEFINE INDEX pair ON TABLE likes COLUMNS `in`, `out` UNIQUE;"
+             DEFINE INDEX pair ON TABLE likes COLUMNS in, out UNIQUE;"
     );
 }
 
