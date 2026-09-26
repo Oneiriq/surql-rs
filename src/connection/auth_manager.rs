@@ -172,6 +172,21 @@ mod tests {
         assert!(am.auth_type().await.is_none());
     }
 
+    /// Regression: `AuthManager`'s derived `Debug` printed the cached JWT
+    /// through the mutex.
+    #[tokio::test]
+    async fn debug_redacts_the_cached_token() {
+        let am = AuthManager::new();
+        *am.inner.state.lock().await = Some(TokenState {
+            token: TokenAuth::new("eyJhbGciOiJIUzI1NiJ9.secret"),
+            auth_type: AuthType::Scope,
+        });
+        let shown = format!("{am:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        let state = am.inner.state.lock().await.clone();
+        assert!(!format!("{state:?}").contains("secret"));
+    }
+
     #[tokio::test]
     async fn refresh_without_token_errors() {
         let am = AuthManager::new();

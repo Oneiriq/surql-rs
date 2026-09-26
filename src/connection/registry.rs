@@ -2,8 +2,9 @@
 //!
 //! Port of `surql/connection/registry.py`. The Python module exposes a
 //! single module-level `_registry` singleton. The Rust equivalent lives
-//! behind a process-wide [`OnceLock`] (see [`get_registry`]); tests can
-//! swap in a dedicated registry with [`set_registry`].
+//! behind a process-wide [`OnceLock`] (see [`get_registry`]), which
+//! [`set_registry`] can fill once, before anything reads it. Tests that
+//! need isolation should build their own [`ConnectionRegistry::new`].
 //!
 //! The registry owns `Arc<DatabaseClient>` values (not owned clients) so
 //! callers can share handles with [`crate::connection::context`].
@@ -242,17 +243,18 @@ pub fn get_registry() -> ConnectionRegistry {
     global().clone()
 }
 
-/// Replace the process-wide registry.
+/// Install `registry` as the process-wide registry.
 ///
-/// Primarily useful in tests. No-op if the global is already
-/// initialised **and** equal to the supplied instance (by `Arc`
-/// identity); otherwise it swaps the inner-most slot.
+/// The global can be set only once per process, so call this at
+/// startup, before anything reads the registry: [`get_registry`]
+/// initialises an empty global on first use, after which this always
+/// fails. There is no replacing or swapping an installed registry.
 ///
 /// # Errors
 ///
-/// Returns [`SurqlError::Registry`] if the global has already been
-/// initialised with a different instance and cannot be overwritten
-/// (the `OnceLock` can only be set once per process).
+/// Returns [`SurqlError::Registry`] whenever the global is already
+/// initialised, whether by an earlier `set_registry` or by
+/// [`get_registry`], even if `registry` is a clone of the installed one.
 pub fn set_registry(registry: ConnectionRegistry) -> Result<()> {
     GLOBAL.set(registry).map_err(|_| SurqlError::Registry {
         reason: "global registry is already initialised".into(),
@@ -367,6 +369,32 @@ mod tests {
         let mut names = r.list().await;
         names.sort();
         assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    /// `set_registry` used to be documented as a no-op or a swap on an
+    /// initialised global; it always refuses, which is what callers
+    /// must plan for.
+    #[test]
+    fn set_registry_refuses_once_the_global_exists() {
+        let installed = get_registry();
+        assert!(set_registry(ConnectionRegistry::new()).is_err());
+        assert!(set_registry(installed).is_err());
+    }
+
+    /// Regression: the registry's `Debug` printed every registered
+    /// config, passwords included.
+    #[tokio::test]
+    async fn debug_redacts_registered_secrets() {
+        let r = ConnectionRegistry::new();
+        let cfg = ConnectionConfig {
+            db_pass: Some("hunter2".into()),
+            db_user: Some("svc".into()),
+            ..make_config("a")
+        };
+        r.register("a", cfg, false, false).await.unwrap();
+        let shown = format!("{r:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("svc"), "{shown}");
     }
 
     #[tokio::test]

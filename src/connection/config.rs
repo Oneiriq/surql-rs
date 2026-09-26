@@ -15,6 +15,16 @@ use crate::error::{Result, SurqlError};
 /// Environment variable prefix used by [`ConnectionConfig::from_env`].
 pub const ENV_PREFIX: &str = "SURQL_";
 
+/// Largest accepted [`ConnectionConfig::db_timeout`], in seconds (one day).
+pub const MAX_TIMEOUT_SECS: f64 = 86_400.0;
+
+/// Largest accepted retry wait ([`ConnectionConfig::db_retry_min_wait`] and
+/// [`ConnectionConfig::db_retry_max_wait`]), in seconds (one hour).
+pub const MAX_RETRY_WAIT_SECS: f64 = 3_600.0;
+
+/// Largest accepted [`ConnectionConfig::db_retry_multiplier`].
+pub const MAX_RETRY_MULTIPLIER: f64 = 100.0;
+
 /// Protocol implied by the configured URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Protocol {
@@ -82,7 +92,10 @@ impl fmt::Display for Protocol {
 /// assert_eq!(cfg.namespace(), "prod");
 /// assert_eq!(cfg.database(), "app");
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` output redacts the password and any credentials embedded in the
+/// URL, so a config can be logged.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     /// SurrealDB connection URL. Aliases: `url`.
     pub db_url: String,
@@ -108,6 +121,42 @@ pub struct ConnectionConfig {
     pub db_retry_multiplier: f64,
     /// Enable live query support. Requires WebSocket or embedded URL.
     pub enable_live_queries: bool,
+}
+
+impl fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionConfig")
+            .field("db_url", &redact_url(&self.db_url))
+            .field("db_ns", &self.db_ns)
+            .field("db", &self.db)
+            .field("db_user", &self.db_user)
+            .field("db_pass", &self.db_pass.as_ref().map(|_| REDACTED))
+            .field("db_timeout", &self.db_timeout)
+            .field("db_max_connections", &self.db_max_connections)
+            .field("db_retry_max_attempts", &self.db_retry_max_attempts)
+            .field("db_retry_min_wait", &self.db_retry_min_wait)
+            .field("db_retry_max_wait", &self.db_retry_max_wait)
+            .field("db_retry_multiplier", &self.db_retry_multiplier)
+            .field("enable_live_queries", &self.enable_live_queries)
+            .finish()
+    }
+}
+
+/// What `Debug` output shows in place of a secret.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+/// `url` with any `user:password@` userinfo replaced by [`REDACTED`], for
+/// `Debug` output. URLs without userinfo come back unchanged.
+pub(crate) fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let tail = rest.strip_prefix(authority).unwrap_or_default();
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://{REDACTED}@{host}{tail}"),
+        None => url.to_owned(),
+    }
 }
 
 impl Default for ConnectionConfig {
@@ -136,11 +185,16 @@ impl ConnectionConfig {
     }
 
     /// Validate the configuration values according to the Python port's rules.
+    ///
+    /// Every float must be finite and within its bounds: the timeout is at
+    /// most [`MAX_TIMEOUT_SECS`], the retry waits at most
+    /// [`MAX_RETRY_WAIT_SECS`], and the multiplier at most
+    /// [`MAX_RETRY_MULTIPLIER`], so each converts to a `Duration` safely.
     pub fn validate(&self) -> Result<()> {
         validate_url(&self.db_url)?;
         validate_identifier(&self.db_ns, "namespace")?;
         validate_identifier(&self.db, "database")?;
-        validate_numeric_range("timeout", self.db_timeout, 1.0, f64::INFINITY)?;
+        validate_numeric_range("timeout", self.db_timeout, 1.0, MAX_TIMEOUT_SECS)?;
         validate_numeric_range(
             "max_connections",
             f64::from(self.db_max_connections),
@@ -153,13 +207,23 @@ impl ConnectionConfig {
             1.0,
             10.0,
         )?;
-        validate_numeric_range("retry_min_wait", self.db_retry_min_wait, 0.1, f64::INFINITY)?;
-        validate_numeric_range("retry_max_wait", self.db_retry_max_wait, 1.0, f64::INFINITY)?;
+        validate_numeric_range(
+            "retry_min_wait",
+            self.db_retry_min_wait,
+            0.1,
+            MAX_RETRY_WAIT_SECS,
+        )?;
+        validate_numeric_range(
+            "retry_max_wait",
+            self.db_retry_max_wait,
+            1.0,
+            MAX_RETRY_WAIT_SECS,
+        )?;
         validate_numeric_range(
             "retry_multiplier",
             self.db_retry_multiplier,
             1.0,
-            f64::INFINITY,
+            MAX_RETRY_MULTIPLIER,
         )?;
         if self.db_retry_max_wait <= self.db_retry_min_wait {
             return Err(SurqlError::Validation {
@@ -552,7 +616,7 @@ fn validate_identifier(value: &str, context: &str) -> Result<()> {
 }
 
 fn validate_numeric_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
-    if value.is_nan() {
+    if !value.is_finite() {
         return Err(SurqlError::Validation {
             reason: format!("{name} must be a finite number"),
         });
@@ -801,6 +865,71 @@ mod tests {
         let named = NamedConnectionConfig::from_source("primary", |k| env.get(k).cloned()).unwrap();
         assert_eq!(named.name, "primary");
         assert_eq!(named.config.url(), "ws://primary.example/rpc");
+    }
+
+    /// Regression: the float settings were only bounded below, so
+    /// `inf` or `1e20` validated and then panicked in
+    /// `Duration::from_secs_f64` on connect.
+    #[test]
+    fn rejects_unbounded_durations() {
+        for bad in [f64::INFINITY, 1e20, 1e300] {
+            let timeout = ConnectionConfig {
+                db_timeout: bad,
+                ..Default::default()
+            };
+            assert!(timeout.validate().is_err(), "timeout {bad}");
+            let max_wait = ConnectionConfig {
+                db_retry_max_wait: bad,
+                ..Default::default()
+            };
+            assert!(max_wait.validate().is_err(), "retry_max_wait {bad}");
+            let multiplier = ConnectionConfig {
+                db_retry_multiplier: bad,
+                ..Default::default()
+            };
+            assert!(multiplier.validate().is_err(), "retry_multiplier {bad}");
+        }
+        let env: HashMap<String, String> = [("SURQL_TIMEOUT".to_owned(), "inf".to_owned())].into();
+        assert!(ConnectionConfig::from_map_with_prefix("SURQL_", &env).is_err());
+    }
+
+    /// Regression: the derived `Debug` printed the password and URL
+    /// credentials, so logging a config (or anything holding one) leaked
+    /// them.
+    #[test]
+    fn debug_redacts_secrets() {
+        let cfg = ConnectionConfig {
+            db_url: "wss://svc:urlsecret@db.example:8000/rpc".into(),
+            db_user: Some("svc".into()),
+            db_pass: Some("hunter2".into()),
+            ..Default::default()
+        };
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("urlsecret"), "{shown}");
+        assert!(shown.contains("db.example:8000/rpc"), "{shown}");
+        let builder = format!("{:?}", ConnectionConfig::builder().password("hunter2"));
+        assert!(!builder.contains("hunter2"), "{builder}");
+        let named = NamedConnectionConfig {
+            name: "primary".into(),
+            config: cfg,
+        };
+        assert!(!format!("{named:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn redact_url_replaces_only_the_userinfo() {
+        assert_eq!(
+            redact_url("redis://:pw@host:6379/0?x=1"),
+            "redis://<redacted>@host:6379/0?x=1"
+        );
+        assert_eq!(
+            redact_url("ws://u:p@ss@host/rpc"),
+            "ws://<redacted>@host/rpc"
+        );
+        assert_eq!(redact_url("ws://host/a@b"), "ws://host/a@b");
+        assert_eq!(redact_url("mem://"), "mem://");
+        assert_eq!(redact_url("not a url"), "not a url");
     }
 
     #[test]

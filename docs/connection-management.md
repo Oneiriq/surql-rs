@@ -36,9 +36,18 @@ connection_scope(client.clone(), async {
 - `set_db` / `clear_db` mutate the current scope's slot and fail
   outside a scope.
 
-Spawned `tokio::spawn` tasks inherit the task-local automatically via
-`TaskLocalFuture` provided you pass the future through one of the
-`connection::context` helpers.
+A task started with `tokio::spawn` does not inherit the scope: a
+task-local belongs to the future it wraps, and the spawned future runs
+outside it, so `get_db` fails there. Carry the client across by giving
+the spawned future its own scope:
+
+```rust
+let db = get_db()?;
+tokio::spawn(connection_scope(db, async move {
+    get_db()?.query("RETURN 1;").await?;
+    Ok::<_, surql::SurqlError>(())
+}));
+```
 
 ## Connection registry
 
@@ -59,6 +68,11 @@ set_registry(registry)?;
 let registry = get_registry();
 let dev = registry.get("dev").await?;
 ```
+
+`set_registry` installs the process-wide registry once: it fails if the
+global is already set, including by an earlier `get_registry` call,
+which initialises an empty one on first use. Call it at startup, before
+anything reads the registry; there is no swapping it later.
 
 The registry is cheap to clone because it stores `Arc<DatabaseClient>`
 values internally. `register` returns the `Arc<DatabaseClient>` it
@@ -101,6 +115,34 @@ if !auth.is_authenticated().await {
 (useful after a reconnect because the v3 SDK has no dedicated refresh
 endpoint).
 
+`Debug` output never carries a secret: `ConnectionConfig` (and
+everything that holds one, such as `DatabaseClient`,
+`ConnectionRegistry` and `Settings`) shows the password and any
+`user:password@` in the URL as `<redacted>`, the credential types and
+`TokenAuth` redact their password or token (`ScopeCredentials` shows its
+variable names only), and so `AuthManager` never prints the cached JWT.
+
+## Expired sessions
+
+A long-lived connection's authenticated session can expire server-side
+while the socket stays up. When the session holds the authority
+`connect()` established from the config's `username` / `password`,
+`DatabaseClient` heals it: a request the engine refuses with "The
+session has expired" signs the config credentials in again and is
+retried once. The engine refuses an expired session before it runs any
+statement, so the retry never repeats a write. An error raised by a
+statement (a `THROW`, a failed `ASSERT`) is never read as expiry,
+whatever its text says.
+
+The replay stops as soon as the shared session takes another identity.
+`signin`, `signup`, `authenticate` (directly or through `AuthManager`),
+`invalidate` and `disconnect` all end it, on every clone of the client,
+and only the next `connect()` brings it back. An expired record-user
+session therefore surfaces its error; it is never silently replaced by
+the service's own (typically root) session, which would run the user's
+statement unfiltered by `PERMISSIONS`. Sessions from `caller_session`
+never replay, and their `connect()` refuses.
+
 ## Streaming and live queries
 
 `LiveQuery` is the typed subscription handle; `StreamingManager` holds
@@ -118,15 +160,29 @@ while let Some(event) = live.next().await {
 // Or hand off to the manager so the subscription can outlive the
 // caller frame and be cancelled by id later.
 let manager = StreamingManager::new();
-let id = manager.spawn::<User, _>(&client, "user", |event| async move {
+let id = manager.spawn::<User, _>(&client, "user", |event| {
     handle_change(event);
 }).await?;
 manager.kill(id).await;
 ```
 
+The callback is a plain `FnMut(Notification<T>)` run on the spawned
+task; hand work that needs to await to a channel or another task.
+
+The target is a table name or a `table:id` record id, never SurrealQL,
+under the same rules as the typed CRUD methods (`select`, `create`,
+`update`, `merge`, `delete`): a record key is always a literal key, so
+`"user:x; REMOVE TABLE user"` names the record whose key is
+`x; REMOVE TABLE user`, and anything that is neither shape is refused
+with `SurqlError::Validation`. Key expressions such as `user:ulid()` or
+ranges belong in a hand-written query with bound variables.
+
 `manager.count`, `manager.ids`, and `manager.drain_all` give you the
 operational surface needed to enumerate or tear down every active
-subscription on a graceful exit.
+subscription on a graceful exit. A subscription whose stream has ended
+(the server closed it, or the callback panicked) is dropped from the
+pool: `count` and `ids` no longer include it, and `kill` on its id
+returns `false`.
 
 ## Transactions
 

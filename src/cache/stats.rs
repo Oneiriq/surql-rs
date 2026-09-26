@@ -90,16 +90,7 @@ impl CacheStats {
 
     /// Compute the hit ratio on the current counts.
     pub fn hit_ratio(&self) -> f64 {
-        let h = self.hits();
-        let m = self.misses();
-        let total = h + m;
-        if total == 0 {
-            0.0
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            let ratio = h as f64 / total as f64;
-            ratio
-        }
+        self.snapshot().hit_ratio()
     }
 }
 
@@ -119,10 +110,11 @@ pub struct CacheStatsSnapshot {
 impl CacheStatsSnapshot {
     /// Compute the hit ratio from this snapshot's counts.
     pub fn hit_ratio(&self) -> f64 {
-        let total = self.hits + self.misses;
+        let total = self.hits.saturating_add(self.misses);
         if total == 0 {
             0.0
         } else {
+            // A ratio needs no more than f64's 53 bits of precision.
             #[allow(clippy::cast_precision_loss)]
             let ratio = self.hits as f64 / total as f64;
             ratio

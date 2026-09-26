@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
-use crate::connection::client::DatabaseClient;
+use crate::connection::client::{render_target, DatabaseClient};
 use crate::error::{Result, SurqlError};
 use crate::query::builder::{Condition, WhereCondition};
 
@@ -92,7 +92,9 @@ where
     /// Start a `LIVE SELECT * FROM <target>` subscription.
     ///
     /// Fails with [`SurqlError::Streaming`] if the client's protocol
-    /// does not support live queries (i.e. `http://` or `https://`).
+    /// does not support live queries (i.e. `http://` or `https://`), and
+    /// with [`SurqlError::Validation`] when `target` is not a table name
+    /// or `table:id` record id (the rules on [`DatabaseClient::select`]).
     pub async fn start(client: &DatabaseClient, target: &str) -> Result<Self> {
         Self::start_where(client, target, Vec::<Condition>::new()).await
     }
@@ -133,7 +135,7 @@ where
             });
         }
 
-        let surql = render_live_select(target, conditions);
+        let surql = render_live_select(target, conditions)?;
         // Clone BEFORE issuing the statement, and issue it through the
         // clone this struct keeps: the subscription belongs to whichever
         // session ran it.
@@ -154,24 +156,26 @@ where
 }
 
 /// Render the statement, split out so its shape is testable without a
-/// connection.
-fn render_live_select<C, I>(target: &str, conditions: I) -> String
+/// connection. The target is a table name or record id, validated and
+/// quoted like the typed CRUD targets (see [`DatabaseClient::select`]).
+fn render_live_select<C, I>(target: &str, conditions: I) -> Result<String>
 where
     C: WhereCondition,
     I: IntoIterator<Item = C>,
 {
+    let target = render_target(target)?;
     let clauses: Vec<String> = conditions
         .into_iter()
         .map(|c| format!("({})", c.to_condition()))
         .collect();
-    if clauses.is_empty() {
+    Ok(if clauses.is_empty() {
         format!("LIVE SELECT * FROM {target};")
     } else {
         format!(
             "LIVE SELECT * FROM {target} WHERE {};",
             clauses.join(" AND ")
         )
-    }
+    })
 }
 
 impl<T> Stream for LiveQuery<T>
@@ -225,10 +229,10 @@ impl std::fmt::Display for SubscriptionId {
 ///
 /// 1. Starts a new `LIVE SELECT` against `target`.
 /// 2. Spawns a tokio task that polls the stream and dispatches every
-///    notification to the supplied callback (sync or `async` via
-///    `async move` closure).
+///    notification to the supplied (synchronous) callback.
 /// 3. Stores the task's [`JoinHandle`] against a fresh
-///    [`SubscriptionId`].
+///    [`SubscriptionId`], until the subscription is killed or its
+///    stream ends.
 ///
 /// Dropping the manager aborts every spawned task; the
 /// [`LiveQuery`] stored inside each task is dropped as part of the
@@ -343,35 +347,46 @@ impl StreamingManager {
             }
         });
 
-        self.inner.tasks.lock().await.insert(id, handle);
+        let mut tasks = self.inner.tasks.lock().await;
+        prune_ended(&mut tasks);
+        tasks.insert(id, handle);
         Ok(id)
     }
 
     /// Kill a single subscription by id.
     ///
-    /// Returns `true` when a matching subscription was found; `false`
-    /// otherwise (unknown id or already-drained).
+    /// Returns `true` when a matching subscription was still running and
+    /// has been stopped; `false` otherwise (unknown id, already killed or
+    /// drained, or a subscription whose stream had already ended).
     pub async fn kill(&self, id: SubscriptionId) -> bool {
-        if let Some(handle) = self.inner.tasks.lock().await.remove(&id) {
-            handle.abort();
-            // Wait for the abort to settle so the SDK's KILL flush
-            // happens before we return; ignore the JoinError (AbortError
-            // variant is expected).
-            let _ = handle.await;
-            true
-        } else {
-            false
+        let handle = self.inner.tasks.lock().await.remove(&id);
+        match handle {
+            Some(handle) if !handle.is_finished() => {
+                handle.abort();
+                // Wait for the abort to settle so the SDK's KILL flush
+                // happens before we return; ignore the JoinError
+                // (AbortError variant is expected).
+                let _ = handle.await;
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Number of live subscriptions currently managed.
+    /// Number of live subscriptions currently managed. A subscription
+    /// whose stream has ended (the server closed it, or the callback
+    /// panicked) is no longer counted.
     pub async fn count(&self) -> usize {
-        self.inner.tasks.lock().await.len()
+        let mut tasks = self.inner.tasks.lock().await;
+        prune_ended(&mut tasks);
+        tasks.len()
     }
 
-    /// Return the set of known subscription ids (snapshot).
+    /// Return the ids of the live subscriptions (snapshot).
     pub async fn ids(&self) -> Vec<SubscriptionId> {
-        self.inner.tasks.lock().await.keys().copied().collect()
+        let mut tasks = self.inner.tasks.lock().await;
+        prune_ended(&mut tasks);
+        tasks.keys().copied().collect()
     }
 
     /// Abort every managed subscription and clear the pool.
@@ -385,6 +400,12 @@ impl StreamingManager {
             let _ = h.await;
         }
     }
+}
+
+/// Forget the subscriptions whose task has finished: their stream ended,
+/// so there is nothing left to count or kill.
+fn prune_ended(tasks: &mut HashMap<SubscriptionId, JoinHandle<()>>) {
+    tasks.retain(|_, handle| !handle.is_finished());
 }
 
 impl Drop for StreamingManager {
@@ -446,6 +467,31 @@ mod tests {
         assert_eq!(m.count().await, 0);
     }
 
+    /// The handle of a task that has already run to completion, standing
+    /// in for a subscription whose stream ended.
+    async fn ended_task() -> JoinHandle<()> {
+        let handle = tokio::spawn(async {});
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        handle
+    }
+
+    /// Regression: a subscription whose stream had ended stayed in the
+    /// pool, so `count` kept counting it and `kill` reported stopping it.
+    #[tokio::test]
+    async fn ended_subscriptions_are_neither_counted_nor_killed() {
+        let m = StreamingManager::new();
+        let a = SubscriptionId::new();
+        m.inner.tasks.lock().await.insert(a, ended_task().await);
+        assert!(!m.kill(a).await, "an ended subscription is not killed");
+
+        let b = SubscriptionId::new();
+        m.inner.tasks.lock().await.insert(b, ended_task().await);
+        assert_eq!(m.count().await, 0);
+        assert!(m.ids().await.is_empty());
+    }
+
     #[tokio::test]
     async fn drain_all_empties_pool() {
         let m = StreamingManager::new();
@@ -458,11 +504,11 @@ mod tests {
         use crate::types::operators::eq;
 
         assert_eq!(
-            render_live_select("file_event", Vec::<Condition>::new()),
+            render_live_select("file_event", Vec::<Condition>::new()).unwrap(),
             "LIVE SELECT * FROM file_event;",
         );
         assert_eq!(
-            render_live_select("file_event", [eq("tenant_id", "acme")]),
+            render_live_select("file_event", [eq("tenant_id", "acme")]).unwrap(),
             "LIVE SELECT * FROM file_event WHERE (tenant_id = 'acme');",
         );
         // Parenthesised and AND-joined, matching Query.
@@ -473,8 +519,22 @@ mod tests {
                     Condition::from(eq("tenant_id", "acme")),
                     Condition::from("dispatched = false"),
                 ],
-            ),
+            )
+            .unwrap(),
             "LIVE SELECT * FROM file_event WHERE (tenant_id = 'acme') AND (dispatched = false);",
+        );
+    }
+
+    /// Regression: the target was spliced in verbatim, so a table name
+    /// taken from input could close the `LIVE SELECT` and run another
+    /// statement.
+    #[test]
+    fn live_select_target_cannot_inject_statements() {
+        let err = render_live_select("user; REMOVE TABLE user", Vec::<Condition>::new());
+        assert!(matches!(err, Err(SurqlError::Validation { .. })));
+        assert_eq!(
+            render_live_select("user:x; REMOVE TABLE user", Vec::<Condition>::new()).unwrap(),
+            "LIVE SELECT * FROM user:⟨x; REMOVE TABLE user⟩;",
         );
     }
 

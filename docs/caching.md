@@ -21,7 +21,16 @@ oneiriq-surql = { version = "0.2", features = ["cache", "cache-redis"] }
 | `RedisCache`        | Redis-backed backend with lazy connection setup and JSON-on-the-wire values.                          |
 | `CacheManager`      | Owns a backend, tracks table to keys associations for invalidation, records hit/miss statistics.      |
 | `CacheConfig`       | Layered configuration (`CacheConfigBuilder`, `CacheOptions`) covering backend kind, TTLs, key prefix. |
-| `CacheStatsSnapshot`| Cloneable view of hit, miss, set, and eviction counters.                                              |
+| `CacheStatsSnapshot`| Copyable view of the hit, miss, size, and eviction counters.                                          |
+
+When full, `MemoryCache` first drops every expired entry and evicts
+the least-recently-used live entry only if none had expired. A manager
+built on the memory backend reports the backend's size and evictions in
+`stats_snapshot()`; on Redis and custom backends those two stay at 0.
+
+Every key the manager stores is `key_prefix` followed by the key you
+pass, always: `"x"` and `"surql:x"` are two different entries, whatever
+the prefix is.
 
 ## Quick start
 
@@ -56,7 +65,10 @@ let users: Vec<User> = cached("users:active", Some(30), || async {
 The closure runs only on a miss. When no manager is configured the
 closure runs every call and the result is returned directly, so
 library code can call `cached` unconditionally and let the consumer
-opt in to caching by configuring the global manager.
+opt in to caching by configuring the global manager. A cached value
+that no longer deserialises as the requested type (a different type
+under the same key, or a changed shape) counts as a miss: the closure
+runs and its result replaces the entry.
 
 `ttl_secs` is `Option<u64>`; `None` falls back to the manager's
 configured `default_ttl_secs`.
@@ -91,7 +103,9 @@ let user: Option<User> = cached(&key, Some(30), || async {
 
 `cache_key_for` hashes the supplied identifier and serialisable
 argument list into a stable string of the form
-`{module}.{name}:{8-byte hex}`.
+`{module}.{name}:{8-byte hex}`. The hash covers the JSON array
+`[module, name, args]`, so `("a.b", "c")` and `("a", "b.c")` get
+different keys even though their readable part is the same.
 
 ## Redis backend
 
@@ -110,6 +124,19 @@ let manager = configure_cache(config)?;
 `RedisCache` lazily opens its connection on the first `get` / `set`.
 Values are JSON-encoded on the wire so the backend can be shared with
 non-Rust consumers that adhere to the same prefix and value contract.
+A connection the server drops is discarded on the error that reveals
+it, and the next call connects afresh.
+
+The manager applies `key_prefix` to every key, so the `RedisCache` it
+builds carries no prefix of its own and `surql:users:active` is stored
+under exactly that name. A standalone `RedisCache::new(url, prefix,
+ttl)` stores every key under `prefix`, and its `clear(None)` deletes
+only keys under it. With an empty prefix that would be every key in the
+Redis database, so `clear(None)` refuses; likewise `CacheManager::clear`
+with an empty `key_prefix` on Redis. Always give a Redis-backed cache a
+prefix.
+The `Debug` output of `CacheConfig`, `CacheManager` and `RedisCache`
+redacts the credentials a `redis://user:password@host` URL carries.
 
 ## Statistics and invalidation
 
@@ -128,10 +155,20 @@ manager.clear().await?;
 
 `invalidate_table` deletes every key the manager has associated with
 the given table; associations are recorded when callers tag a
-`get_or_set` invocation with the relevant table list. `invalidate_key`
-removes a single key, `invalidate_pattern` accepts the backend's
-native wildcard form (Redis `KEYS` style), and `clear` drops every
-entry.
+`get_or_set` invocation with the relevant table list, and those of
+entries that have since expired or been evicted are swept out as the
+tracking grows, so it stays proportional to the live entries.
+`invalidate_key`
+removes a single key, and `clear` drops every entry under the manager's
+`key_prefix`.
+
+`invalidate_pattern` takes a glob matched against the keys as you pass
+them to `set` (the prefix is applied for you, literally): `*` matches
+any run of characters, `?` a single character, and `\` makes the next
+character literal. Every other character, including `[`, `]`, `<`, `>`
+and non-ASCII letters, matches only itself, on both backends, so
+`invalidate_pattern("café:*")` removes the `café:` entries and nothing
+else.
 
 ## Installing a custom backend
 

@@ -20,7 +20,8 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surql::connection::{
-    ConnectionConfig, DatabaseClient, LiveQuery, RootCredentials, Transaction,
+    AuthManager, ConnectionConfig, DatabaseClient, LiveQuery, RootCredentials, ScopeCredentials,
+    Transaction,
 };
 
 fn env_url() -> Option<String> {
@@ -248,5 +249,146 @@ async fn live_query_receives_change() {
     );
 
     producer.await.expect("writer task finished");
+    client.disconnect().await.unwrap();
+}
+
+/// The production incident: a service whose own session expires must heal
+/// in place. The config user gets one-second sessions, so the session the
+/// client connects with expires under it; the next query replays the config
+/// credentials and succeeds. A server enforces the expiry deterministically,
+/// so this exercises the whole replay path.
+#[tokio::test]
+async fn expired_config_session_heals_in_place() {
+    let database = unique_db();
+    let Some(admin) = connected_client(&database).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    let user = format!("heal_{database}");
+    admin
+        .query(&format!(
+            "DEFINE USER {user} ON ROOT PASSWORD 'pw' ROLES OWNER DURATION FOR SESSION 1s;"
+        ))
+        .await
+        .expect("define short-session user");
+
+    let cfg = ConnectionConfig::builder()
+        .url(env_url().expect("checked above"))
+        .namespace("it_test")
+        .database(&database)
+        .username(&user)
+        .password("pw")
+        .timeout(10.0)
+        .build()
+        .expect("valid config");
+    let client = DatabaseClient::new(cfg).expect("client constructs");
+    client
+        .connect()
+        .await
+        .expect("connect as the short-session user");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let value = client
+        .query("RETURN 1;")
+        .await
+        .expect("the expired config session heals and the request is retried");
+    assert_eq!(value, json!([1]));
+
+    client.disconnect().await.unwrap();
+    admin
+        .query(&format!("REMOVE USER {user} ON ROOT;"))
+        .await
+        .expect("remove user");
+    admin.disconnect().await.unwrap();
+}
+
+/// A root-configured service that signs its shared session in as a record
+/// user must NOT heal that user's expired session as root: the statement
+/// would run with root authority, unfiltered by `PERMISSIONS`.
+#[tokio::test]
+async fn expired_record_session_is_never_replayed_as_root() {
+    let database = unique_db();
+    let Some(client) = connected_client(&database).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    client
+        .query(
+            "DEFINE ACCESS member ON DATABASE TYPE RECORD \
+             SIGNUP (CREATE member SET name = $name) \
+             SIGNIN (SELECT * FROM member WHERE name = $name) \
+             DURATION FOR SESSION 1s; \
+             DEFINE TABLE secret SCHEMALESS PERMISSIONS NONE; \
+             CREATE secret SET v = 1;",
+        )
+        .await
+        .expect("define access and secret");
+    AuthManager::new()
+        .signup(
+            &client,
+            &ScopeCredentials::new("it_test", &database, "member").with("name", "m"),
+        )
+        .await
+        .expect("record signup");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let err = client
+        .query("SELECT * FROM secret;")
+        .await
+        .expect_err("an expired record session must surface, not be replayed as root");
+    assert!(
+        err.to_string().contains("expired"),
+        "unexpected error: {err}"
+    );
+
+    // Reconnecting is the explicit way back to the config's authority.
+    client.connect().await.expect("reconnect as root");
+    let rows = client.query("SELECT * FROM secret;").await.expect("root");
+    assert_eq!(rows[0].as_array().map(Vec::len), Some(1));
+    client.disconnect().await.unwrap();
+}
+
+/// A statement error whose text reads like expiry is data, not a session
+/// failure: nothing is replayed, so the first statement's write lands once.
+#[tokio::test]
+async fn statement_error_text_never_triggers_a_replay() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    let err = client
+        .query("CREATE counter SET n = 1; THROW 'The session has expired';")
+        .await
+        .expect_err("the THROW fails the call");
+    assert!(err.to_string().contains("session has expired"), "{err}");
+    let count = client
+        .query("SELECT count() FROM counter GROUP ALL;")
+        .await
+        .expect("count");
+    assert_eq!(count, json!([[{ "count": 1 }]]));
+    client.disconnect().await.unwrap();
+}
+
+/// Typed CRUD targets are data: a record key from user input cannot end the
+/// statement and run another.
+#[tokio::test]
+async fn crud_target_cannot_inject_statements() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    client
+        .query("CREATE user:a SET name = 'a', age = 1;")
+        .await
+        .expect("seed");
+    let none: Vec<User> = client
+        .select("user:x; REMOVE TABLE user")
+        .await
+        .expect("a strange key is still just a key");
+    assert!(none.is_empty());
+    assert!(client
+        .select::<User>("user; REMOVE TABLE user")
+        .await
+        .is_err());
+    let rows: Vec<User> = client.select("user").await.expect("table still there");
+    assert_eq!(rows.len(), 1);
     client.disconnect().await.unwrap();
 }
