@@ -40,9 +40,11 @@ git push --no-verify
 | `value` | any JSON rendered by `quote_value_public` is one inert literal equal to the input |
 | `schema_info` | every `schema::parser` entry point returns on arbitrary definition text |
 
-libFuzzer needs Linux (or Docker) and a nightly toolchain. `-a` keeps debug assertions and overflow checks on in the optimised build:
+libFuzzer needs Linux (or Docker) and the unstable sanitizer flags. Current nightlies do not compile `diskann-wide` 0.54 (a surrealdb-core dependency, E0283), so run cargo-fuzz on a stable toolchain with `RUSTC_BOOTSTRAP=1`. `-a` keeps debug assertions and overflow checks on in the optimised build:
 
 ```bash
 cd fuzz
-cargo +nightly fuzz run -O -a value -- -max_total_time=600
+RUSTC_BOOTSTRAP=1 cargo +1.98 fuzz run -O -a value -- -max_total_time=600
 ```
+
+The first build compiles the engine with instrumentation: allow about half an hour and 8 GB of memory.
