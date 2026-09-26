@@ -16,17 +16,20 @@ use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
 use crate::query::builder::Query;
 use crate::query::executor::extract_rows;
+use crate::query::validate::render_target;
 use crate::types::record_id::RecordID;
 
 /// Create a typed record in `table`.
 ///
-/// Serializes the payload to JSON, binds it as `$data`, and dispatches
-/// `CREATE <table> CONTENT $data` through the raw query channel. The
-/// first returned row is deserialized back into `T`.
+/// `table` is a table name or a record id (`"user:alice"`), rendered as in
+/// [`Query::from_table`]. Serializes the payload to JSON, binds it as
+/// `$data`, and dispatches `CREATE <table> CONTENT $data` through the raw
+/// query channel. The first returned row is deserialized back into `T`.
 pub async fn create_typed<T>(client: &DatabaseClient, table: &str, data: &T) -> Result<T>
 where
     T: Serialize + DeserializeOwned,
 {
+    let table = render_target(table)?;
     let mut vars = BTreeMap::new();
     vars.insert("data".to_owned(), to_value(data)?);
     let surql = format!("CREATE {table} CONTENT $data");
