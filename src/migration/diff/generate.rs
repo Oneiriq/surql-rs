@@ -242,17 +242,15 @@ pub(super) fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> Sc
     }
 }
 
-/// An index whose definition changed, re-defined whole in both directions.
-///
-/// There is no index-specific modify operation, so the change reports as
-/// [`DiffOperation::ModifyTable`] with [`SchemaDiff::index`] naming the index.
+/// An index whose definition changed, re-defined whole in both directions
+/// and reported as [`DiffOperation::ModifyIndex`].
 pub(super) fn generate_modify_index_diff(
     table: &str,
     old_idx: &IndexDefinition,
     new_idx: &IndexDefinition,
 ) -> SchemaDiff {
     SchemaDiff {
-        operation: DiffOperation::ModifyTable,
+        operation: DiffOperation::ModifyIndex,
         table: table.to_string(),
         field: None,
         index: Some(new_idx.name.clone()),
@@ -306,15 +304,14 @@ pub(super) fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> Sch
 }
 
 /// An event whose `WHEN` or `THEN` changed, re-defined whole in both
-/// directions; reported as [`DiffOperation::ModifyTable`] with
-/// [`SchemaDiff::event`] naming the event, as for an index.
+/// directions and reported as [`DiffOperation::ModifyEvent`].
 pub(super) fn generate_modify_event_diff(
     table: &str,
     old_ev: &EventDefinition,
     new_ev: &EventDefinition,
 ) -> SchemaDiff {
     SchemaDiff {
-        operation: DiffOperation::ModifyTable,
+        operation: DiffOperation::ModifyEvent,
         table: table.to_string(),
         field: None,
         index: None,

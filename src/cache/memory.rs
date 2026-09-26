@@ -199,7 +199,7 @@ mod tests {
     use serde_json::json;
 
     fn cache() -> MemoryCache {
-        MemoryCache::new(16, Duration::from_secs(60))
+        MemoryCache::new(16, Duration::from_mins(1))
     }
 
     #[tokio::test]
@@ -245,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_expiry_removes_entries() {
-        let c = MemoryCache::new(4, Duration::from_secs(60));
+        let c = MemoryCache::new(4, Duration::from_mins(1));
         c.set("k", json!(1), Some(1)).await.unwrap();
         assert_eq!(c.get("k").await.unwrap(), Some(json!(1)));
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -255,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_on_capacity_overflow() {
-        let c = MemoryCache::new(2, Duration::from_secs(60));
+        let c = MemoryCache::new(2, Duration::from_mins(1));
         c.set("a", json!(1), None).await.unwrap();
         c.set("b", json!(2), None).await.unwrap();
         c.set("c", json!(3), None).await.unwrap();
@@ -271,7 +271,7 @@ mod tests {
     /// every request was evicted ahead of a cold one.
     #[tokio::test]
     async fn eviction_spares_recently_read_entries() {
-        let c = MemoryCache::new(2, Duration::from_secs(60));
+        let c = MemoryCache::new(2, Duration::from_mins(1));
         c.set("hot", json!(1), None).await.unwrap();
         c.set("cold", json!(2), None).await.unwrap();
         assert!(c.get("hot").await.unwrap().is_some());
@@ -284,7 +284,7 @@ mod tests {
     /// one was sitting there to be dropped instead.
     #[tokio::test]
     async fn expired_entries_make_room_before_live_ones() {
-        let c = MemoryCache::new(2, Duration::from_secs(60));
+        let c = MemoryCache::new(2, Duration::from_mins(1));
         c.set("live", json!(1), None).await.unwrap();
         c.set("brief", json!(2), Some(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1100)).await;

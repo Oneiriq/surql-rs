@@ -370,7 +370,7 @@ fn a_changed_index_is_redefined_both_ways() {
         &[index("email_idx", ["email"])],
     );
     assert_eq!(diffs.len(), 1, "{diffs:#?}");
-    assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+    assert_eq!(diffs[0].operation, DiffOperation::ModifyIndex);
     assert_eq!(diffs[0].index.as_deref(), Some("email_idx"));
     assert_eq!(
         diffs[0].forward_sql,
@@ -444,7 +444,7 @@ fn a_changed_event_is_redefined_both_ways() {
     let new = event("audit", "$event = 'CREATE'", "CREATE log SET n = 2");
     let diffs = diff_events("t", std::slice::from_ref(&new), std::slice::from_ref(&old));
     assert_eq!(diffs.len(), 1, "{diffs:#?}");
-    assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+    assert_eq!(diffs[0].operation, DiffOperation::ModifyEvent);
     assert_eq!(diffs[0].event.as_deref(), Some("audit"));
     assert_eq!(
         diffs[0].forward_sql,

@@ -284,6 +284,7 @@ mod tests {
             down: vec![],
             checksum: None,
             depends_on: vec![],
+            squashed_from: vec![],
         };
         let status = |state, error: Option<&str>| MigrationStatus {
             migration: migration.clone(),

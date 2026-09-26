@@ -210,6 +210,7 @@ mod tests {
             down: down.iter().map(|s| (*s).to_string()).collect(),
             checksum: None,
             depends_on: vec![],
+            squashed_from: vec![],
         }
     }
 
