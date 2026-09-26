@@ -1,7 +1,7 @@
 # surql-rs
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.90%2B-orange)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.92%2B-orange)](https://www.rust-lang.org/)
 [![SurrealDB](https://img.shields.io/badge/SurrealDB-3.0%2B-ff00a0)](https://surrealdb.com/)
 
 A code-first database toolkit for [SurrealDB](https://surrealdb.com/). Define schemas, generate migrations, build queries, and perform typed CRUD -- all from Rust.
@@ -180,7 +180,7 @@ Selected pages:
 
 ## Requirements
 
-- Rust 1.90+
+- Rust 1.92+
 - SurrealDB 3.0+
 
 ## License

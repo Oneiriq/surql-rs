@@ -10,6 +10,8 @@ name: CI
 #   lint -> test ---> integration -+
 #        |       \--> coverage ----+
 #        |--> build-rustls --------+
+#        |--> msrv ----------------+
+#        |--> wasm ----------------+
 #        |--> audit ---------------+--> docs-build --> docs-approval --> docs-deploy
 #
 # `docs-approval` and `docs-deploy` only fire on push to main; the
@@ -143,6 +145,74 @@ jobs:
             exit 1
           fi
 
+  # `rust-version` in Cargo.toml is a promise to consumers; this is the
+  # job that keeps it. It checks the committed lockfile, which is what
+  # the other jobs test, on the declared toolchain. The floor comes from
+  # the engine's dependency graph (diskann 0.54 needs 1.92), so raise
+  # both together when a surrealdb bump moves it.
+  msrv:
+    name: MSRV (Rust 1.92)
+    needs: lint
+    runs-on: [self-hosted, aur0]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install libssl-dev
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-msrv"
+
+      - name: cargo check (all features)
+        run: cargo check --lib --bins --all-features
+
+      - name: cargo check (client-rustls only)
+        run: cargo check --lib --no-default-features --features client-rustls
+
+  # `client-wasm` is a published feature; `scripts/check-wasm.sh` is its
+  # gate. `ring`'s build script needs a wasm-capable clang, which the
+  # distro clang is.
+  wasm:
+    name: Build client-wasm (wasm32-unknown-unknown)
+    needs: lint
+    runs-on: [self-hosted, aur0]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install clang
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends clang llvm
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-wasm"
+
+      - name: scripts/check-wasm.sh
+        run: ./scripts/check-wasm.sh
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+
   audit:
     name: cargo audit
     needs: lint
@@ -249,7 +319,7 @@ jobs:
 
   docs-build:
     name: Build docs site
-    needs: [test, integration, coverage, audit, build-rustls]
+    needs: [test, integration, coverage, audit, build-rustls, msrv, wasm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

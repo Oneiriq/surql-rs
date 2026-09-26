@@ -53,7 +53,7 @@ Subcommand reference: [CLI](cli.md).
 
 ## Requirements
 
-- Rust 1.90 or newer.
+- Rust 1.92 or newer.
 - For the `client` feature: SurrealDB 3.0 or newer, plus a system
   TLS stack (`libssl-dev` on Linux, `Security.framework` on macOS).
 - For the `client-rustls` feature: SurrealDB 3.0 or newer. No system
