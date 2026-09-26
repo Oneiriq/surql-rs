@@ -212,3 +212,42 @@ async fn a_reference_action_change_is_migrated_both_ways() {
         .unwrap();
     field_change_round_trips(old, new).await;
 }
+
+/// A string literal compares by content: the engine re-quoting a
+/// double-quoted default is no change, and a change to the spaces inside
+/// one is.
+#[tokio::test]
+async fn literal_defaults_compare_by_content() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let quoted = string_field("motto")
+        .default("\"hello  there\"")
+        .build_unchecked()
+        .unwrap();
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            quoted.to_surql("doc"),
+        ],
+    )
+    .await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&quoted), &stored.fields);
+    assert!(
+        residual.is_empty(),
+        "the echo is not a change: {residual:#?}"
+    );
+
+    let respaced = string_field("motto")
+        .default("'hello there'")
+        .build_unchecked()
+        .unwrap();
+    let diffs = diff_fields("doc", std::slice::from_ref(&respaced), &stored.fields);
+    assert_eq!(diffs.len(), 1, "the spaces are content: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&respaced), &stored.fields);
+    assert!(residual.is_empty(), "{residual:#?}");
+}

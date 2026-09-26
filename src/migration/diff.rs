@@ -57,6 +57,7 @@ use crate::schema::table::{
     MTreeVectorType, TableDefinition,
 };
 use crate::schema::view::ViewDefinition;
+use crate::types::escape::{quote_str, unquote_str};
 
 /// Full schema snapshot passed to [`diff_schemas`].
 ///
@@ -211,66 +212,234 @@ pub fn validate_default_value(default: &str) -> Result<()> {
     Ok(())
 }
 
-/// Normalise whitespace in an expression for semantic equality comparison.
+/// Normalise an expression for semantic equality comparison.
 ///
-/// Collapses runs of whitespace to a single space and trims the ends. Used
-/// when comparing field expressions — a database server may reformat
-/// expressions when echoing them back.
+/// A database server reformats expressions when it echoes them back, so the
+/// comparison folds what the engine is free to change: runs of whitespace
+/// become one space and the ends are trimmed, one level of wrapping
+/// parentheses goes, `IS NONE` / `IS NOT NONE` read as `= NONE` /
+/// `!= NONE`, a cast loses the space after it (`<string> id`), and a string
+/// literal takes one quote style (the engine prints `"it's"` for what code
+/// wrote as `'it\'s'`).
+///
+/// None of that reaches inside a quoted token. String literals, backtick
+/// identifiers, and `⟨…⟩` record keys keep every byte, so `'a  b'` and
+/// `'a b'` stay different.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff::normalize_expression;
+///
+/// assert_eq!(normalize_expression("($value  IS NONE)"), "$value = NONE");
+/// assert_eq!(normalize_expression("\"a  b\""), "'a  b'");
+/// ```
 #[must_use]
 pub fn normalize_expression(expr: &str) -> String {
-    let mut out = String::with_capacity(expr.len());
+    let mut pieces: Vec<Piece> = split_quoted(expr)
+        .into_iter()
+        .map(|piece| match piece {
+            Piece::Code(code) => Piece::Code(collapse_whitespace(&code)),
+            Piece::Quoted(quoted) => Piece::Quoted(canonical_literal(quoted)),
+        })
+        .collect();
+    trim_code_ends(&mut pieces);
+    if strip_wrapping_parens(&mut pieces) {
+        trim_code_ends(&mut pieces);
+    }
+    pieces
+        .into_iter()
+        .map(|piece| match piece {
+            Piece::Code(code) => fold_cast_spacing(&fold_none_checks(&code)),
+            Piece::Quoted(quoted) => quoted.text,
+        })
+        .collect()
+}
+
+/// One run of expression text.
+enum Piece {
+    /// SurrealQL outside any quotes, where formatting is free.
+    Code(String),
+    /// A quoted token, delimiters included, whose bytes are content.
+    Quoted(Quoted),
+}
+
+/// A string literal, backtick identifier, or `⟨…⟩` record key.
+struct Quoted {
+    text: String,
+    /// Whether the closing delimiter was found before the input ran out.
+    terminated: bool,
+}
+
+/// Split `expr` into alternating code and quoted runs. Inside quotes a
+/// backslash escapes the next character; an unterminated quote runs to the
+/// end of the input.
+fn split_quoted(expr: &str) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let mut code = String::new();
+    let mut chars = expr.chars();
+    while let Some(ch) = chars.next() {
+        let close = match ch {
+            '\'' | '"' | '`' => ch,
+            '⟨' => '⟩',
+            _ => {
+                code.push(ch);
+                continue;
+            }
+        };
+        if !code.is_empty() {
+            pieces.push(Piece::Code(std::mem::take(&mut code)));
+        }
+        let mut text = String::from(ch);
+        let mut terminated = false;
+        let mut escaped = false;
+        for inner in chars.by_ref() {
+            text.push(inner);
+            if escaped {
+                escaped = false;
+            } else if inner == '\\' {
+                escaped = true;
+            } else if inner == close {
+                terminated = true;
+                break;
+            }
+        }
+        pieces.push(Piece::Quoted(Quoted { text, terminated }));
+    }
+    if !code.is_empty() {
+        pieces.push(Piece::Code(code));
+    }
+    pieces
+}
+
+/// Collapse every run of whitespace to a single space.
+fn collapse_whitespace(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
     let mut in_space = false;
-    for ch in expr.trim().chars() {
+    for ch in code.chars() {
         if ch.is_whitespace() {
             if !in_space {
                 out.push(' ');
-                in_space = true;
             }
+            in_space = true;
         } else {
             out.push(ch);
             in_space = false;
         }
     }
-    // The engine normalizes expressions in its echo: one level of
-    // wrapping parentheses, `IS NONE` reported as `= NONE`, and a
-    // space after casts (`<string> id`). Fold those so code and echo
-    // compare equal.
-    let mut out = out.trim().to_owned();
-    if out.starts_with('(') && out.ends_with(')') {
-        let inner = &out[1..out.len() - 1];
-        let mut depth = 0i32;
-        let balanced = inner.chars().all(|c| {
-            match c {
+    out
+}
+
+/// Re-quote a complete string literal in the one style [`quote_str`]
+/// renders; backtick identifiers, record keys, and unterminated text stay
+/// as written.
+fn canonical_literal(quoted: Quoted) -> Quoted {
+    if !quoted.terminated {
+        return quoted;
+    }
+    match unquote_str(&quoted.text) {
+        Some(value) => Quoted {
+            text: quote_str(&value),
+            terminated: true,
+        },
+        None => quoted,
+    }
+}
+
+/// Trim leading whitespace off the first run and trailing whitespace off
+/// the last, when those runs are code.
+fn trim_code_ends(pieces: &mut [Piece]) {
+    if let Some(Piece::Code(first)) = pieces.first_mut() {
+        *first = first.trim_start().to_owned();
+    }
+    if let Some(Piece::Code(last)) = pieces.last_mut() {
+        *last = last.trim_end().to_owned();
+    }
+}
+
+/// Drop one pair of parentheses that wraps the whole expression, returning
+/// whether it did. Parentheses inside quotes do not count towards the
+/// balance.
+fn strip_wrapping_parens(pieces: &mut [Piece]) -> bool {
+    let opens = matches!(pieces.first(), Some(Piece::Code(c)) if c.starts_with('('));
+    let closes = matches!(pieces.last(), Some(Piece::Code(c)) if c.ends_with(')'));
+    if !opens || !closes {
+        return false;
+    }
+    let code_chars: usize = pieces
+        .iter()
+        .map(|piece| match piece {
+            Piece::Code(code) => code.chars().count(),
+            Piece::Quoted(_) => 0,
+        })
+        .sum();
+    // The opening parenthesis wraps the whole expression when its depth
+    // first returns to zero on the very last code character.
+    let mut depth = 0usize;
+    let mut seen = 0usize;
+    for piece in pieces.iter() {
+        let Piece::Code(code) = piece else { continue };
+        for ch in code.chars() {
+            seen += 1;
+            match ch {
                 '(' => depth += 1,
-                ')' => depth -= 1,
+                ')' => depth = depth.saturating_sub(1),
                 _ => {}
             }
-            depth >= 0
-        }) && depth == 0;
-        if balanced {
-            out = inner.trim().to_owned();
+            if depth == 0 && seen < code_chars {
+                return false;
+            }
         }
     }
-    let out = out
+    if let Some(Piece::Code(first)) = pieces.first_mut() {
+        if let Some(rest) = first.strip_prefix('(') {
+            *first = rest.to_owned();
+        }
+    }
+    if let Some(Piece::Code(last)) = pieces.last_mut() {
+        if let Some(rest) = last.strip_suffix(')') {
+            *last = rest.to_owned();
+        }
+    }
+    true
+}
+
+/// The engine echoes `IS NONE` as `= NONE` and `IS NOT NONE` as `!= NONE`.
+fn fold_none_checks(code: &str) -> String {
+    code.replace(" IS NOT NONE", " != NONE")
+        .replace(" is not none", " != NONE")
         .replace(" IS NONE", " = NONE")
-        .replace(" is none", " = NONE");
-    let mut folded = String::with_capacity(out.len());
-    let mut chars = out.chars().peekable();
+        .replace(" is none", " = NONE")
+}
+
+/// `<string> id` and `<string>id` are the same cast. Comparison spacing
+/// (`a > b`) is kept by requiring the `<` side to look like a cast: a
+/// non-empty run of ASCII letters and digits.
+fn fold_cast_spacing(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    // Whether the text since the last `<` still looks like a cast name, and
+    // how long it is; `None` outside any `<...>`.
+    let mut cast: Option<(bool, usize)> = None;
+    let mut chars = code.chars().peekable();
     while let Some(ch) = chars.next() {
-        folded.push(ch);
-        if ch == '>' && chars.peek() == Some(&' ') {
-            // `<string> id` and `<string>id` are the same cast; keep
-            // comparison spacing (`a > b`) by requiring the `<` side
-            // to look like a cast start.
-            if let Some(open) = folded.rfind('<') {
-                let inside = &folded[open + 1..folded.len() - 1];
-                if !inside.is_empty() && inside.chars().all(|c| c.is_ascii_alphanumeric()) {
+        out.push(ch);
+        match ch {
+            '<' => cast = Some((true, 0)),
+            '>' => {
+                if matches!(cast, Some((true, len)) if len > 0) && chars.peek() == Some(&' ') {
                     chars.next();
+                }
+                cast = None;
+            }
+            other => {
+                if let Some((looks_like_cast, len)) = cast.as_mut() {
+                    *looks_like_cast = *looks_like_cast && other.is_ascii_alphanumeric();
+                    *len += 1;
                 }
             }
         }
     }
-    folded
+    out
 }
 
 /// Whether two optional expressions are the same once normalised with
@@ -1287,6 +1456,66 @@ mod tests {
     #[test]
     fn normalize_expression_empty_is_empty() {
         assert_eq!(normalize_expression("   "), "");
+    }
+
+    /// Whitespace inside a string literal is content, not formatting.
+    #[test]
+    fn normalize_expression_keeps_whitespace_inside_literals() {
+        assert_eq!(normalize_expression("'a  b'"), "'a  b'");
+        assert!(!expr_eq(Some("'a  b'"), Some("'a b'")));
+        // A raw tab and its escape are the same character; both come out in
+        // the escaped spelling the engine prints.
+        assert_eq!(
+            normalize_expression("  $value  =  'x\t\ty'  "),
+            r"$value = 'x\t\ty'"
+        );
+        assert!(expr_eq(Some("'x\ty'"), Some(r"'x\ty'")));
+        assert_eq!(normalize_expression("`my  field` = 1"), "`my  field` = 1");
+        assert_eq!(normalize_expression("r:⟨a  b⟩"), "r:⟨a  b⟩");
+    }
+
+    /// The engine echoes every string literal single-quoted unless it
+    /// holds a `'`; the quote style is not a difference.
+    #[test]
+    fn normalize_expression_ignores_the_quote_style() {
+        assert!(expr_eq(Some("\"hello  there\""), Some("'hello  there'")));
+        assert!(expr_eq(
+            Some(r"$value != 'it\'s'"),
+            Some("$value != \"it's\"")
+        ));
+        assert!(!expr_eq(Some("\"a\""), Some("'b'")));
+    }
+
+    /// The echo folds only apply to code: a literal that happens to spell
+    /// `IS NONE`, a cast, or a parenthesis is left alone.
+    #[test]
+    fn normalize_expression_folds_nothing_inside_literals() {
+        assert_eq!(
+            normalize_expression("$value = ' IS NONE'"),
+            "$value = ' IS NONE'"
+        );
+        assert_eq!(normalize_expression("'<string> x'"), "'<string> x'");
+        assert_eq!(normalize_expression("(a = ')')"), "a = ')'");
+        assert_eq!(normalize_expression("('(' + x"), "('(' + x");
+    }
+
+    #[test]
+    fn normalize_expression_folds_the_engine_echo() {
+        assert_eq!(normalize_expression("($value IS NONE)"), "$value = NONE");
+        assert_eq!(normalize_expression("$value IS NOT NONE"), "$value != NONE");
+        assert_eq!(normalize_expression("<string> id"), "<string>id");
+        assert_eq!(normalize_expression("a > b"), "a > b");
+        assert_eq!(normalize_expression("(a) + (b)"), "(a) + (b)");
+    }
+
+    /// An unterminated literal and non-ASCII text survive intact.
+    #[test]
+    fn normalize_expression_handles_ragged_input() {
+        assert_eq!(normalize_expression("'abc  "), "'abc  ");
+        assert_eq!(normalize_expression(r"'a\'"), r"'a\'");
+        assert_eq!(normalize_expression("é  <ü> ö"), "é <ü> ö");
+        assert_eq!(normalize_expression("<int> 'ü  x'"), "<int>'ü  x'");
+        assert_eq!(normalize_expression("(ä)"), "ä");
     }
 
     // ----- validate_event_expression -----
