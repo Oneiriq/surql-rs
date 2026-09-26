@@ -57,6 +57,7 @@ use crate::schema::edge::EdgeDefinition;
 use crate::schema::sql::generate_schema_sql;
 use crate::schema::table::TableDefinition;
 use crate::schema::SchemaRegistry;
+use crate::types::escape::quote_ident;
 
 /// Default author string written to the `-- @metadata` section.
 const DEFAULT_AUTHOR: &str = "surql";
@@ -590,13 +591,19 @@ fn build_initial_statements(snapshot: &SchemaSnapshot) -> Result<(Vec<String>, V
     // Drop buckets first (independent), then edges (reference tables), then
     // tables.
     for bucket_name in buckets_map.keys().rev() {
-        down_statements.push(format!("REMOVE BUCKET {bucket_name};"));
+        down_statements.push(format!("REMOVE BUCKET {};", quote_ident(bucket_name)));
     }
     for edge_name in edges_map.keys().rev() {
-        down_statements.push(format!("REMOVE TABLE IF EXISTS {edge_name};"));
+        down_statements.push(format!(
+            "REMOVE TABLE IF EXISTS {};",
+            quote_ident(edge_name)
+        ));
     }
     for table_name in tables_map.keys().rev() {
-        down_statements.push(format!("REMOVE TABLE IF EXISTS {table_name};"));
+        down_statements.push(format!(
+            "REMOVE TABLE IF EXISTS {};",
+            quote_ident(table_name)
+        ));
     }
 
     Ok((up_statements, down_statements))
@@ -1069,6 +1076,30 @@ mod tests {
         // Round-trip.
         let reloaded = load_migration(&m.path).unwrap();
         assert_eq!(m, reloaded);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn initial_migration_quotes_names_in_down() {
+        use crate::schema::bucket::memory_bucket;
+
+        let dir = unique_temp_dir("initial-quoted");
+        let registry = SchemaRegistry::new();
+        registry.register_table(table_schema("select"));
+        registry.register_bucket(memory_bucket("my-files"));
+        let m = generate_initial_migration(&registry, &dir).unwrap();
+        assert!(
+            m.down
+                .contains(&"REMOVE TABLE IF EXISTS `select`;".to_string()),
+            "{:?}",
+            m.down
+        );
+        assert!(
+            m.down.contains(&"REMOVE BUCKET `my-files`;".to_string()),
+            "{:?}",
+            m.down
+        );
 
         cleanup(&dir);
     }

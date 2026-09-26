@@ -302,10 +302,15 @@ pub enum DiffOperation {
     AddIndex,
     /// An existing index was removed.
     DropIndex,
+    /// An existing index's definition changed (columns, uniqueness,
+    /// analyzer, ...).
+    ModifyIndex,
     /// A new event was added.
     AddEvent,
     /// An existing event was removed.
     DropEvent,
+    /// An existing event's condition or action changed.
+    ModifyEvent,
     /// Permissions were modified on a table or field.
     ModifyPermissions,
     /// A new analyzer was added.
@@ -353,8 +358,10 @@ impl DiffOperation {
             Self::ModifyField => "modify_field",
             Self::AddIndex => "add_index",
             Self::DropIndex => "drop_index",
+            Self::ModifyIndex => "modify_index",
             Self::AddEvent => "add_event",
             Self::DropEvent => "drop_event",
+            Self::ModifyEvent => "modify_event",
             Self::ModifyPermissions => "modify_permissions",
             Self::AddAnalyzer => "add_analyzer",
             Self::ModifyAnalyzer => "modify_analyzer",
@@ -700,6 +707,8 @@ mod tests {
         assert_eq!(DiffOperation::DropIndex.as_str(), "drop_index");
         assert_eq!(DiffOperation::AddEvent.as_str(), "add_event");
         assert_eq!(DiffOperation::DropEvent.as_str(), "drop_event");
+        assert_eq!(DiffOperation::ModifyIndex.as_str(), "modify_index");
+        assert_eq!(DiffOperation::ModifyEvent.as_str(), "modify_event");
         assert_eq!(
             DiffOperation::ModifyPermissions.as_str(),
             "modify_permissions"
@@ -746,6 +755,8 @@ mod tests {
             DiffOperation::DropIndex,
             DiffOperation::AddEvent,
             DiffOperation::DropEvent,
+            DiffOperation::ModifyIndex,
+            DiffOperation::ModifyEvent,
             DiffOperation::ModifyPermissions,
             DiffOperation::AddBucket,
             DiffOperation::DropBucket,

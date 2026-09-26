@@ -98,6 +98,8 @@ pub fn severity_for_operation(op: DiffOperation) -> DriftSeverity {
         | DiffOperation::AddParam => DriftSeverity::Info,
         DiffOperation::ModifyField
         | DiffOperation::ModifyTable
+        | DiffOperation::ModifyIndex
+        | DiffOperation::ModifyEvent
         | DiffOperation::ModifyPermissions
         | DiffOperation::DropEvent
         | DiffOperation::ModifyAnalyzer
@@ -721,6 +723,14 @@ mod tests {
         );
         assert_eq!(
             severity_for_operation(DiffOperation::ModifyPermissions),
+            DriftSeverity::Warning
+        );
+        assert_eq!(
+            severity_for_operation(DiffOperation::ModifyIndex),
+            DriftSeverity::Warning
+        );
+        assert_eq!(
+            severity_for_operation(DiffOperation::ModifyEvent),
             DriftSeverity::Warning
         );
     }
