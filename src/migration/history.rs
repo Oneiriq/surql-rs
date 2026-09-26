@@ -163,10 +163,7 @@ fn history_record(version: &str) -> String {
 /// Returns [`SurqlError::MigrationHistory`] if the `DELETE` fails.
 pub async fn remove_migration_record(client: &DatabaseClient, version: &str) -> Result<()> {
     ensure_migration_table(client).await?;
-    let surql = format!(
-        "DELETE FROM {table} WHERE version = $version;",
-        table = MIGRATION_TABLE_NAME,
-    );
+    let surql = format!("DELETE FROM {MIGRATION_TABLE_NAME} WHERE version = $version;");
     let mut vars: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     vars.insert("version".into(), Value::String(version.to_string()));
     client
@@ -186,10 +183,7 @@ pub async fn remove_migration_record(client: &DatabaseClient, version: &str) -> 
 /// cannot be decoded.
 pub async fn get_applied_migrations(client: &DatabaseClient) -> Result<Vec<MigrationHistory>> {
     ensure_migration_table(client).await?;
-    let surql = format!(
-        "SELECT * FROM {table} ORDER BY applied_at ASC;",
-        table = MIGRATION_TABLE_NAME,
-    );
+    let surql = format!("SELECT * FROM {MIGRATION_TABLE_NAME} ORDER BY applied_at ASC;");
     let raw = client
         .query(&surql)
         .await
@@ -211,10 +205,7 @@ pub async fn is_migration_applied(client: &DatabaseClient, version: &str) -> Res
     // through `parse_history_rows` -- that helper requires `applied_at`
     // to decode successfully, and would skip rows whose payload is
     // missing it.
-    let surql = format!(
-        "SELECT * FROM {table} WHERE version = $version LIMIT 1;",
-        table = MIGRATION_TABLE_NAME,
-    );
+    let surql = format!("SELECT * FROM {MIGRATION_TABLE_NAME} WHERE version = $version LIMIT 1;");
     let mut vars: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     vars.insert("version".into(), Value::String(version.to_string()));
     let raw =

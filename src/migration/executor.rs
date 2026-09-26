@@ -603,7 +603,7 @@ mod tests {
     }
 
     /// A squashed migration has a version of its own; on a database that
-    /// applied its sources it used to be pending forever, and migrate_up
+    /// applied its sources it used to be pending forever, and `migrate_up`
     /// re-applied every statement in it.
     #[test]
     fn a_squash_of_applied_migrations_is_not_pending() {

@@ -1,0 +1,2 @@
+# Product names that doc comments spell as prose, not as code.
+doc-valid-idents = ["SurrealDB", "SurrealQL", "GraphViz", ".."]

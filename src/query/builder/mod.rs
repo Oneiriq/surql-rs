@@ -708,7 +708,7 @@ impl Query {
     /// effort and makes the engine use the field's vector index; a
     /// metric name (what [`Query::vector_search`] renders) makes it
     /// compare every row, which is correct and slow. Use this whenever
-    /// the field carries an HNSW or DiskANN index, and let the index's
+    /// the field carries an HNSW or `DiskANN` index, and let the index's
     /// own metric apply.
     ///
     /// `ef` bounds the candidate list the search keeps. Higher values

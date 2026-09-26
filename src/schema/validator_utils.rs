@@ -148,8 +148,7 @@ pub fn format_validation_report(results: &[ValidationResult], include_info: bool
     let warning_count = filter_warnings(&filtered).len();
 
     lines.push(format!(
-        "Schema Validation Report: {} errors, {} warnings",
-        error_count, warning_count,
+        "Schema Validation Report: {error_count} errors, {warning_count} warnings",
     ));
     lines.push("=".repeat(60));
 

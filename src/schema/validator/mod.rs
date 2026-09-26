@@ -158,13 +158,13 @@ impl std::fmt::Display for ValidationResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] {}", self.severity.as_upper_str(), self.table)?;
         if let Some(field) = &self.field {
-            write!(f, ".{}", field)?;
+            write!(f, ".{field}")?;
         }
         write!(f, ": {}", self.message)?;
         if self.code_value.is_some() || self.db_value.is_some() {
             let code = self.code_value.as_deref().unwrap_or("None");
             let db = self.db_value.as_deref().unwrap_or("None");
-            write!(f, " (code: {}, db: {})", code, db)?;
+            write!(f, " (code: {code}, db: {db})")?;
         }
         Ok(())
     }

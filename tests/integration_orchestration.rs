@@ -187,8 +187,7 @@ async fn sequential_deploy_applies_migration_against_live_surrealdb() {
     let applied = get_applied_migrations(&client).await.expect("history");
     assert!(
         applied.iter().any(|h| h.version == "20260101_000001"),
-        "expected applied version, got: {:?}",
-        applied
+        "expected applied version, got: {applied:?}"
     );
     let _ = client.disconnect().await;
 

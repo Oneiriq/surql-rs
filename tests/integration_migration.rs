@@ -373,7 +373,7 @@ async fn rolling_back_an_unrecorded_migration_runs_nothing() {
 }
 
 /// A squashed migration gets a version of its own; on a database that had
-/// applied its sources it used to be pending, and migrate_up re-ran every
+/// applied its sources it used to be pending, and `migrate_up` re-ran every
 /// statement in it.
 #[tokio::test]
 async fn a_squashed_migration_is_not_reapplied() {

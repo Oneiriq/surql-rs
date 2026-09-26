@@ -430,7 +430,7 @@ impl IndexDefinition {
     }
 
     /// Render the `DISKANN` form. The engine always echoes DIST / TYPE /
-    /// DEGREE / L_BUILD / ALPHA back with its defaults filled in, even when
+    /// DEGREE / `L_BUILD` / ALPHA back with its defaults filled in, even when
     /// the definition never stated them, so this spells them all — the same
     /// lesson as the sequence BATCH/START echo. A definition that omitted
     /// one would never compare equal to its own echo, and a reconcile would

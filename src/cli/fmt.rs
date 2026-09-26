@@ -15,7 +15,7 @@ use crate::error::{Result, SurqlError};
 
 /// Print an informational message to stdout.
 pub fn info(msg: impl Display) {
-    println!("{}", msg);
+    println!("{msg}");
 }
 
 /// Print a success message in green to stdout.

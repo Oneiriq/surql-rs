@@ -377,17 +377,17 @@ pub fn math_abs(field_name: &str) -> Expression {
     Expression::function(format!("math::abs({field_name})"))
 }
 
-/// `math::ceil(field)` - snake_case alias of [`ceil`].
+/// `math::ceil(field)` - `snake_case` alias of [`ceil`].
 pub fn math_ceil(field_name: &str) -> Expression {
     Expression::function(format!("math::ceil({field_name})"))
 }
 
-/// `math::floor(field)` - snake_case alias of [`floor`].
+/// `math::floor(field)` - `snake_case` alias of [`floor`].
 pub fn math_floor(field_name: &str) -> Expression {
     Expression::function(format!("math::floor({field_name})"))
 }
 
-/// `math::round(field, precision)` - snake_case alias of [`round_`].
+/// `math::round(field, precision)` - `snake_case` alias of [`round_`].
 pub fn math_round(field_name: &str, precision: i32) -> Expression {
     Expression::function(format!("math::round({field_name}, {precision})"))
 }
@@ -397,7 +397,7 @@ pub fn string_len(field_name: &str) -> Expression {
     Expression::function(format!("string::len({field_name})"))
 }
 
-/// `string::concat(a, b, c, ...)` - snake_case alias of [`concat()`].
+/// `string::concat(a, b, c, ...)` - `snake_case` alias of [`concat()`].
 pub fn string_concat<A>(fields: impl IntoIterator<Item = A>) -> Expression
 where
     A: Into<ExprArg>,
@@ -405,12 +405,12 @@ where
     concat(fields)
 }
 
-/// `string::lowercase(field)` - snake_case alias of [`lower`].
+/// `string::lowercase(field)` - `snake_case` alias of [`lower`].
 pub fn string_lower(field_name: &str) -> Expression {
     Expression::function(format!("string::lowercase({field_name})"))
 }
 
-/// `string::uppercase(field)` - snake_case alias of [`upper`].
+/// `string::uppercase(field)` - `snake_case` alias of [`upper`].
 pub fn string_upper(field_name: &str) -> Expression {
     Expression::function(format!("string::uppercase({field_name})"))
 }

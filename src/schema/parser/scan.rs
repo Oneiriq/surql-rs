@@ -392,9 +392,9 @@ pub(super) struct Head<'a> {
     pub rest: &'a str,
 }
 
-/// Read the `DEFINE <kind> [OVERWRITE | IF NOT EXISTS] <name> [ON [TABLE]
-/// <table>]` head of a statement, so clause scanning starts after the
-/// name. A field called `default` or `reference` must not read as a clause.
+/// Read the head of a statement, so clause scanning starts after the name:
+/// `DEFINE <kind> [OVERWRITE | IF NOT EXISTS] <name> [ON [TABLE] <table>]`.
+/// A field called `default` or `reference` must not read as a clause.
 ///
 /// `kind` is the word after `DEFINE` (`FIELD`, `INDEX`, ...) and `on_table`
 /// says whether the kind names a table after `ON`. `None` when the text

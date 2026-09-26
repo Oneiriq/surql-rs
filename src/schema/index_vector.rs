@@ -105,8 +105,8 @@ impl std::fmt::Display for HnswDistanceType {
 /// Deliberately its own enum rather than a reuse of [`HnswDistanceType`]:
 /// the engine's DISKANN set both adds metrics HNSW lacks (`INNER_PRODUCT`,
 /// `COSINE_NORMALIZED`) and refuses every HNSW metric outside it
-/// ("DISKANN supports EUCLIDEAN, COSINE, INNER_PRODUCT, and
-/// COSINE_NORMALIZED"), so an out-of-set metric is unrepresentable here.
+/// ("DISKANN supports EUCLIDEAN, COSINE, `INNER_PRODUCT`, and
+/// `COSINE_NORMALIZED`"), so an out-of-set metric is unrepresentable here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DiskAnnDistanceType {

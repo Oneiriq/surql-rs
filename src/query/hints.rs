@@ -273,7 +273,7 @@ impl FetchHint {
         })
     }
 
-    /// Validate internal consistency (Batch strategy requires a batch_size).
+    /// Validate internal consistency (Batch strategy requires a `batch_size`).
     pub fn validate(&self) -> Result<()> {
         if self.strategy == FetchStrategy::Batch && self.batch_size.is_none() {
             return Err(SurqlError::Validation {
