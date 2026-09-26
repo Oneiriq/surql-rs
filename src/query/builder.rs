@@ -5,6 +5,16 @@
 //! a new [`Query`] (via `Clone` + field updates), so prior states remain
 //! valid and reusable.
 //!
+//! ## Escaping
+//!
+//! Names (tables, fields, edges, aliases) are validated as identifiers or
+//! field paths, record-id targets are parsed and re-rendered through
+//! [`RecordID`](crate::types::RecordID), and every data value is rendered
+//! as a literal. A `serde_json::Value` is always data, whatever its shape;
+//! raw SurrealQL enters only through the explicitly raw inputs: projections
+//! passed to [`Query::select`], `WHERE` fragments passed as strings,
+//! [`Query::join`], [`Query::traverse`], and [`Expression`]s.
+//!
 //! ## Examples
 //!
 //! ```
@@ -26,13 +36,15 @@
 use serde_json::Value;
 
 use crate::error::{Result, SurqlError};
-use crate::types::escape::is_identifier;
-use crate::types::operators::{quote_value_public, Operator, OperatorExpr};
+use crate::types::operators::{quote_object_key, quote_value_public, Operator, OperatorExpr};
 
 use super::expressions::Expression;
 use super::helpers::{DataMap, ReturnFormat, VectorDistanceType};
-use super::hints::{render_hints, QueryHint};
+use super::hints::{check_hints, render_hints, QueryHint};
 use super::references::reverse_reference_projection;
+use super::validate::{quote_field_path, render_target, validate_field_path, validate_finite};
+
+pub(crate) use super::validate::{validate_identifier, validate_set_target};
 
 /// SurrealQL operation kind held by [`Query`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -193,6 +205,10 @@ impl WhereCondition for &Condition {
 /// Most methods return a new [`Query`] instance; the receiver is taken by
 /// value (`self`) to encourage chained usage. Existing bindings remain
 /// valid because the struct derives [`Clone`].
+///
+/// The fields are public, and [`Query::to_surql`] re-checks every name and
+/// target it renders, so a query assembled by hand is held to the same rules
+/// as one built through the methods.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Query {
     /// Which SurrealQL verb this query will emit (once set).
@@ -217,9 +233,11 @@ pub struct Query {
     pub insert_data: Option<DataMap>,
     /// Data for `UPDATE SET` / `UPSERT CONTENT`.
     pub update_data: Option<DataMap>,
-    /// Expression-valued `UPDATE ... SET` assignments (e.g. `n = n + 1`), whose
-    /// right-hand side may reference the row's current fields. Rendered after
-    /// `update_data` in the same `SET` clause.
+    /// Assignments added with [`Query::set`] / [`Query::set_expr`]. In an
+    /// `UPDATE` they render as `SET` assignments after `update_data`, and
+    /// their right-hand side may reference the row's current fields (e.g.
+    /// `n = n + 1`). In a `CREATE` / `UPSERT` / `RELATE` they join the
+    /// `CONTENT` object, replacing a same-named key of the data map.
     pub update_set_exprs: Vec<(String, Expression)>,
     /// Source record id for `RELATE`.
     pub relate_from: Option<String>,
@@ -253,71 +271,49 @@ pub struct Query {
     pub fulltext_reference: Option<u8>,
     /// Full-text query text (inlined as a quoted, escaped literal).
     pub fulltext_query: Option<String>,
-    /// Optimization hints appended as a `/* ... */` prefix.
+    /// Hints rendered as a `/* ... */` comment prefix (see
+    /// [`hints`](super::hints): the server ignores them).
     pub hints: Vec<QueryHint>,
 }
 
-pub(crate) fn validate_identifier(name: &str, context: &str) -> Result<()> {
-    if name.is_empty() {
-        let capitalized = capitalize(context);
-        return Err(SurqlError::Validation {
-            reason: format!("{capitalized} cannot be empty"),
-        });
-    }
-    if !is_identifier(name) {
-        return Err(SurqlError::Validation {
-            reason: format!(
-                "Invalid {context}: {name:?}. Must contain only alphanumeric \
-                 characters and underscores, and cannot start with a digit"
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Validate a `SET` assignment target, which may be a dotted path into
-/// a nested object (`metadata.processing`) — SurrealDB assigns nested
-/// fields natively, and the schema layer already accepts dot notation
-/// for field definitions. Each segment validates as an identifier.
-pub(crate) fn validate_set_target(field: &str) -> Result<()> {
-    if field.is_empty() {
-        return Err(SurqlError::Validation {
-            reason: "Field name cannot be empty".to_string(),
-        });
-    }
-    for segment in field.split('.') {
-        validate_identifier(segment, "field name")?;
-    }
-    Ok(())
-}
-
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-pub(crate) fn table_part(target: &str) -> &str {
-    target.split_once(':').map_or(target, |(t, _)| t)
-}
-
-fn render_data_object(data: &DataMap) -> String {
-    let parts: Vec<String> = data
-        .iter()
-        .map(|(k, v)| format!("{k}: {}", quote_value_public(v)))
+/// Render the `CONTENT` object of a `CREATE` / `UPSERT` / `RELATE`: the
+/// data map's entries followed by the `set` / `set_expr` assignments, which
+/// replace a same-named data key. Keys are quoted as object keys; an
+/// assignment key must be a plain field name (a dotted path means a nested
+/// assignment, which only `UPDATE ... SET` can express).
+fn render_content(data: Option<&DataMap>, exprs: &[(String, Expression)]) -> Result<String> {
+    let mut parts: Vec<String> = data
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !exprs.iter().any(|(field, _)| field == *k))
+        .map(|(k, v)| format!("{}: {}", quote_object_key(k), quote_value_public(v)))
         .collect();
-    format!("{{{}}}", parts.join(", "))
+    for (field, expr) in exprs {
+        validate_identifier(field, "content field name")?;
+        parts.push(format!("{}: {}", quote_object_key(field), expr.to_surql()));
+    }
+    Ok(format!("{{{}}}", parts.join(", ")))
 }
 
-fn render_vector(vector: &[f64]) -> String {
+fn render_vector(vector: &[f64]) -> Result<String> {
+    validate_finite(vector, "vector values")?;
     let inner = vector
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    format!("[{inner}]")
+    Ok(format!("[{inner}]"))
+}
+
+fn render_where(conditions: &[String]) -> Option<String> {
+    (!conditions.is_empty()).then(|| {
+        let joined = conditions
+            .iter()
+            .map(|c| format!("({c})"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!("WHERE {joined}")
+    })
 }
 
 impl Query {
@@ -331,6 +327,9 @@ impl Query {
     // -----------------------------------------------------------------------
 
     /// Start a `SELECT` query. Pass `None` for `SELECT *`.
+    ///
+    /// The projection list is raw SurrealQL (it may hold expressions such
+    /// as `count()`), so it must not carry untrusted text.
     pub fn select(self, fields: Option<Vec<String>>) -> Self {
         let fields = fields.unwrap_or_else(|| vec!["*".to_string()]);
         Self {
@@ -379,12 +378,11 @@ impl Query {
     /// Set the target table.
     ///
     /// Accepts either a bare table (`"user"`) or a record id
-    /// (`"user:alice"`). In the latter case only the table part is
-    /// validated against the identifier regex.
+    /// (`"user:alice"`). A table must be an identifier; a record id is
+    /// parsed and re-rendered so its key is escaped (`"user:a-b"` renders
+    /// `user:⟨a-b⟩`).
     pub fn from_table(self, table: impl Into<String>) -> Result<Self> {
-        let table = table.into();
-        let part = table_part(&table);
-        validate_identifier(part, "table name")?;
+        let table = render_target(&table.into())?;
         Ok(Self {
             table_name: Some(table),
             ..self
@@ -419,8 +417,11 @@ impl Query {
     // ORDER BY / GROUP BY / LIMIT / OFFSET
     // -----------------------------------------------------------------------
 
-    /// Append an `ORDER BY` entry. `direction` must be `ASC` or `DESC`.
+    /// Append an `ORDER BY` entry. `field` must be a field path and
+    /// `direction` must be `ASC` or `DESC`.
     pub fn order_by(self, field: impl Into<String>, direction: impl Into<String>) -> Result<Self> {
+        let field = field.into();
+        validate_field_path(&field, "order field")?;
         let direction = direction.into().to_ascii_uppercase();
         if direction != "ASC" && direction != "DESC" {
             return Err(SurqlError::Validation {
@@ -428,17 +429,15 @@ impl Query {
             });
         }
         let mut order_fields = self.order_fields;
-        order_fields.push(OrderField {
-            field: field.into(),
-            direction,
-        });
+        order_fields.push(OrderField { field, direction });
         Ok(Self {
             order_fields,
             ..self
         })
     }
 
-    /// Append one or more `GROUP BY` fields.
+    /// Append one or more `GROUP BY` fields. Each must be a field path;
+    /// [`Query::to_surql`] reports one that is not.
     pub fn group_by<I, S>(self, fields: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -491,6 +490,9 @@ impl Query {
     // -----------------------------------------------------------------------
 
     /// Build an `INSERT` query (emits `CREATE <table> CONTENT {...}`).
+    ///
+    /// Add expression-valued fields (`time::now()`, a record reference) with
+    /// [`Query::set_expr`]; the data map's values are always literals.
     pub fn insert(self, table: impl Into<String>, data: DataMap) -> Result<Self> {
         let table = table.into();
         validate_identifier(&table, "table name")?;
@@ -505,10 +507,10 @@ impl Query {
         })
     }
 
-    /// Build an `UPDATE` query.
+    /// Build an `UPDATE` query. `target` is a table or a record id (see
+    /// [`Query::from_table`]).
     pub fn update(self, target: impl Into<String>, data: DataMap) -> Result<Self> {
-        let target = target.into();
-        validate_identifier(table_part(&target), "table name")?;
+        let target = render_target(&target.into())?;
         for key in data.keys() {
             validate_identifier(key, "field name")?;
         }
@@ -526,8 +528,7 @@ impl Query {
     /// data map. Combine with [`where_`](Self::where_) for a guarded, atomic
     /// read-modify-write — `UPDATE t SET n = n + 1 WHERE ...` in one statement.
     pub fn update_set(self, target: impl Into<String>) -> Result<Self> {
-        let target = target.into();
-        validate_identifier(table_part(&target), "table name")?;
+        let target = render_target(&target.into())?;
         Ok(Self {
             operation: Some(Operation::Update),
             table_name: Some(target),
@@ -535,8 +536,9 @@ impl Query {
         })
     }
 
-    /// Add a literal-valued assignment to an `UPDATE ... SET`
-    /// (`set("updated_at", now)` ⇒ `updated_at = '<now>'`).
+    /// Add a literal-valued assignment (`set("updated_at", now)` ⇒
+    /// `updated_at = '<now>'`): a `SET` assignment in an `UPDATE`, a
+    /// `CONTENT` field in a `CREATE` / `UPSERT` / `RELATE`.
     pub fn set(mut self, field: impl Into<String>, value: impl Into<Value>) -> Result<Self> {
         let field = field.into();
         validate_set_target(&field)?;
@@ -545,9 +547,23 @@ impl Query {
         Ok(self)
     }
 
-    /// Add an expression-valued assignment to an `UPDATE ... SET`, where the new
-    /// value may reference the row's current fields
-    /// (`set_expr("n", field("n") + 1)` ⇒ `n = n + 1`).
+    /// Add an expression-valued assignment, where the new value may be a
+    /// function call, a record reference, or (in an `UPDATE`) reference the
+    /// row's current fields (`set_expr("n", field("n") + 1)` ⇒ `n = n + 1`).
+    ///
+    /// In an `UPDATE` it renders as a `SET` assignment; in a `CREATE` /
+    /// `UPSERT` / `RELATE` it joins the `CONTENT` object, which is how a raw
+    /// value such as `time::now()` gets into inserted data:
+    ///
+    /// ```
+    /// use surql::query::builder::Query;
+    /// use surql::query::expressions::time_now;
+    ///
+    /// let q = Query::new()
+    ///     .insert("event", Default::default()).unwrap()
+    ///     .set_expr("created_at", time_now()).unwrap();
+    /// assert_eq!(q.to_surql().unwrap(), "CREATE event CONTENT {created_at: time::now()}");
+    /// ```
     pub fn set_expr(mut self, field: impl Into<String>, expr: Expression) -> Result<Self> {
         let field = field.into();
         validate_set_target(&field)?;
@@ -555,10 +571,10 @@ impl Query {
         Ok(self)
     }
 
-    /// Build an `UPSERT` query.
+    /// Build an `UPSERT` query. `target` is a table or a record id (see
+    /// [`Query::from_table`]).
     pub fn upsert(self, target: impl Into<String>, data: DataMap) -> Result<Self> {
-        let target = target.into();
-        validate_identifier(table_part(&target), "table name")?;
+        let target = render_target(&target.into())?;
         for key in data.keys() {
             validate_identifier(key, "field name")?;
         }
@@ -570,10 +586,10 @@ impl Query {
         })
     }
 
-    /// Build a `DELETE` query.
+    /// Build a `DELETE` query. `target` is a table or a record id (see
+    /// [`Query::from_table`]).
     pub fn delete(self, target: impl Into<String>) -> Result<Self> {
-        let target = target.into();
-        validate_identifier(table_part(&target), "table name")?;
+        let target = render_target(&target.into())?;
         Ok(Self {
             operation: Some(Operation::Delete),
             table_name: Some(target),
@@ -585,7 +601,8 @@ impl Query {
     // RELATE / traversal / join
     // -----------------------------------------------------------------------
 
-    /// Build a `RELATE` query.
+    /// Build a `RELATE` query. `from_record` / `to_record` are record ids
+    /// (see [`Query::from_table`]).
     pub fn relate(
         self,
         edge_table: impl Into<String>,
@@ -594,12 +611,9 @@ impl Query {
         data: Option<DataMap>,
     ) -> Result<Self> {
         let edge_table = edge_table.into();
-        let from_record = from_record.into();
-        let to_record = to_record.into();
-
         validate_identifier(&edge_table, "edge table name")?;
-        validate_identifier(table_part(&from_record), "from table name")?;
-        validate_identifier(table_part(&to_record), "to table name")?;
+        let from_record = render_target(&from_record.into())?;
+        let to_record = render_target(&to_record.into())?;
         if let Some(d) = &data {
             for key in d.keys() {
                 validate_identifier(key, "field name")?;
@@ -617,6 +631,8 @@ impl Query {
     }
 
     /// Append a graph traversal path (e.g. `"->likes->post"`).
+    ///
+    /// The path is raw SurrealQL and must not carry untrusted text.
     pub fn traverse(self, path: impl Into<String>) -> Self {
         Self {
             graph_traversal: Some(path.into()),
@@ -630,7 +646,8 @@ impl Query {
     /// [`DEFINE FIELD ... REFERENCE`](crate::schema::reference): it walks
     /// incoming links back to the records that point at each selected row.
     /// `fields` narrows the returned shape via the `.{ a, b }` destructuring
-    /// form; pass `None` for whole records.
+    /// form; pass `None` for whole records. The table, fields, and alias are
+    /// quoted as identifiers.
     ///
     /// ## Examples
     ///
@@ -671,6 +688,8 @@ impl Query {
     }
 
     /// Append a raw `JOIN` clause.
+    ///
+    /// The clause is raw SurrealQL and must not carry untrusted text.
     pub fn join(self, join_clause: impl Into<String>) -> Self {
         let mut joins = self.join_clauses;
         joins.push(join_clause.into());
@@ -684,7 +703,8 @@ impl Query {
     // Vector search
     // -----------------------------------------------------------------------
 
-    /// Configure MTREE vector search.
+    /// Configure MTREE vector search. `field` must be a field path, and the
+    /// vector and threshold must be finite.
     pub fn vector_search(
         self,
         field: impl Into<String>,
@@ -693,6 +713,8 @@ impl Query {
         distance: VectorDistanceType,
         threshold: Option<f64>,
     ) -> Result<Self> {
+        let field = field.into();
+        validate_field_path(&field, "vector search field")?;
         if k < 1 {
             return Err(SurqlError::Validation {
                 reason: format!("k must be at least 1, got {k}"),
@@ -703,8 +725,10 @@ impl Query {
                 reason: "Vector cannot be empty".into(),
             });
         }
+        validate_finite(&vector, "vector values")?;
+        validate_finite(threshold.as_slice(), "vector threshold")?;
         Ok(Self {
-            vector_field: Some(field.into()),
+            vector_field: Some(field),
             vector_value: vector,
             vector_k: Some(k),
             vector_distance: Some(distance),
@@ -737,6 +761,8 @@ impl Query {
         k: i64,
         ef: i64,
     ) -> Result<Self> {
+        let field = field.into();
+        validate_field_path(&field, "vector search field")?;
         if k < 1 {
             return Err(SurqlError::Validation {
                 reason: format!("k must be at least 1, got {k}"),
@@ -752,8 +778,9 @@ impl Query {
                 reason: "Vector cannot be empty".into(),
             });
         }
+        validate_finite(&vector, "vector values")?;
         Ok(Self {
-            vector_field: Some(field.into()),
+            vector_field: Some(field),
             vector_value: vector,
             vector_k: Some(k),
             vector_distance: None,
@@ -764,23 +791,26 @@ impl Query {
     }
 
     /// Append `vector::similarity::<metric>(field, [..]) AS alias` to the
-    /// projected field list.
+    /// projected field list. `field` and `alias` must be field paths and the
+    /// vector must be finite.
     pub fn similarity_score(
         self,
         field: &str,
         vector: &[f64],
         metric: VectorDistanceType,
         alias: impl Into<String>,
-    ) -> Self {
-        let vector_str = render_vector(vector);
+    ) -> Result<Self> {
+        validate_field_path(field, "similarity field")?;
         let alias = alias.into();
+        validate_field_path(&alias, "similarity alias")?;
+        let vector_str = render_vector(vector)?;
         let expr = format!(
             "vector::similarity::{}({field}, {vector_str}) AS {alias}",
             metric.as_func_suffix()
         );
         let mut fields = self.fields;
         fields.push(expr);
-        Self { fields, ..self }
+        Ok(Self { fields, ..self })
     }
 
     // -----------------------------------------------------------------------
@@ -794,7 +824,8 @@ impl Query {
     /// [`search_score`](Self::search_score) (or `search::highlight`) call, so a
     /// row's BM25 relevance can be projected and ordered on. Requires a BM25
     /// `SEARCH` index on `field` (see [`bm25_index`](crate::schema::bm25_index)).
-    /// The query text is inlined as a quoted, escaped literal.
+    /// `field` must be a field path; the query text is inlined as a quoted,
+    /// escaped literal.
     ///
     /// ## Examples
     ///
@@ -827,6 +858,7 @@ impl Query {
                 reason: "Full-text search field cannot be empty".into(),
             });
         }
+        validate_field_path(&field, "full-text search field")?;
         let query = query.into();
         if query.is_empty() {
             return Err(SurqlError::Validation {
@@ -844,8 +876,9 @@ impl Query {
     /// Append `search::score(<reference>) AS <alias>` to the projected fields —
     /// the BM25 relevance for the match registered at `reference` by
     /// [`fulltext_search`](Self::fulltext_search). Order by `alias` to rank.
+    /// The alias is quoted as an identifier path.
     pub fn search_score(self, reference: u8, alias: impl Into<String>) -> Self {
-        let alias = alias.into();
+        let alias = quote_field_path(&alias.into());
         let expr = format!("search::score({reference}) AS {alias}");
         let mut fields = self.fields;
         fields.push(expr);
@@ -916,6 +949,10 @@ impl Query {
     // -----------------------------------------------------------------------
 
     /// Render the full SurrealQL statement.
+    ///
+    /// Re-checks every name and target it renders and returns
+    /// [`SurqlError::Validation`] for one that is not acceptable (a
+    /// `group_by` field that is not a field path, a hand-set target, ...).
     pub fn to_surql(&self) -> Result<String> {
         let op = self.operation.ok_or_else(|| SurqlError::Query {
             reason: "Query operation not specified".into(),
@@ -933,25 +970,26 @@ impl Query {
         if self.hints.is_empty() {
             Ok(base)
         } else {
+            check_hints(&self.hints)?;
             let hint_str = render_hints(&self.hints);
             Ok(format!("{hint_str}\n{base}"))
         }
     }
 
-    /// Convenience wrapper for doc-tests: render after forcing a table. Not
-    /// part of the stable API.
-    #[doc(hidden)]
-    pub fn to_surql_or_panic_with_table(self, table: &str) -> String {
-        self.from_table(table)
-            .expect("valid table")
-            .to_surql()
-            .expect("valid select")
+    /// The rendered target: the stored table or record id, re-checked.
+    fn require_table(&self, op: Operation) -> Result<String> {
+        let table = self
+            .table_name
+            .as_deref()
+            .ok_or_else(|| SurqlError::Query {
+                reason: format!("Table name required for {} query", op.as_str()),
+            })?;
+        render_target(table)
     }
 
-    fn require_table(&self, op: Operation) -> Result<&str> {
-        self.table_name.as_deref().ok_or_else(|| SurqlError::Query {
-            reason: format!("Table name required for {} query", op.as_str()),
-        })
+    fn return_clause(&self) -> Option<String> {
+        self.return_format
+            .map(|fmt| format!("RETURN {}", fmt.to_surql()))
     }
 
     fn build_select(&self) -> Result<String> {
@@ -981,12 +1019,14 @@ impl Query {
             self.vector_k,
             self.vector_value.is_empty(),
         ) {
-            let vector_str = render_vector(&self.vector_value);
+            validate_field_path(field, "vector search field")?;
+            let vector_str = render_vector(&self.vector_value)?;
             // An integer second operand selects the index; a metric name
             // makes the engine compare every row.
             let operator = match (self.vector_ef, self.vector_distance, self.vector_threshold) {
                 (Some(ef), _, _) => Some(format!("<|{k},{ef}|>")),
                 (None, Some(distance), Some(t)) => {
+                    validate_finite(&[t], "vector threshold")?;
                     Some(format!("<|{k},{},{t}|>", distance.to_surql()))
                 }
                 (None, Some(distance), None) => Some(format!("<|{k},{}|>", distance.to_surql())),
@@ -1001,6 +1041,7 @@ impl Query {
             self.fulltext_reference,
             &self.fulltext_query,
         ) {
+            validate_field_path(field, "full-text search field")?;
             let quoted = quote_value_public(&Value::String(query.clone()));
             where_parts.push(format!("{field} @{reference}@ {quoted}"));
         }
@@ -1014,17 +1055,28 @@ impl Query {
         if self.group_all_flag {
             parts.push("GROUP ALL".to_string());
         } else if !self.group_fields.is_empty() {
+            for field in &self.group_fields {
+                validate_field_path(field, "group field")?;
+            }
             parts.push(format!("GROUP BY {}", self.group_fields.join(", ")));
         }
 
         if !self.order_fields.is_empty() {
-            let rendered = self
-                .order_fields
-                .iter()
-                .map(|o| format!("{} {}", o.field, o.direction))
-                .collect::<Vec<_>>()
-                .join(", ");
-            parts.push(format!("ORDER BY {rendered}"));
+            let mut rendered = Vec::with_capacity(self.order_fields.len());
+            for o in &self.order_fields {
+                validate_field_path(&o.field, "order field")?;
+                let direction = match o.direction.to_ascii_uppercase().as_str() {
+                    "ASC" => "ASC",
+                    "DESC" => "DESC",
+                    other => {
+                        return Err(SurqlError::Validation {
+                            reason: format!("Invalid direction: {other}. Must be ASC or DESC"),
+                        })
+                    }
+                };
+                rendered.push(format!("{} {direction}", o.field));
+            }
+            parts.push(format!("ORDER BY {}", rendered.join(", ")));
         }
 
         if let Some(n) = self.limit_value {
@@ -1043,11 +1095,9 @@ impl Query {
             reason: "Insert data required for INSERT query".into(),
         })?;
 
-        let data_str = render_data_object(data);
+        let data_str = render_content(Some(data), &self.update_set_exprs)?;
         let mut parts = vec![format!("CREATE {table} CONTENT {data_str}")];
-        if let Some(fmt) = self.return_format {
-            parts.push(format!("RETURN {}", fmt.to_surql()));
-        }
+        parts.extend(self.return_clause());
         Ok(parts.join(" "))
     }
 
@@ -1055,17 +1105,14 @@ impl Query {
         let table = self.require_table(Operation::Update)?;
 
         let mut assignments: Vec<String> = Vec::new();
-        if let Some(data) = self.update_data.as_ref() {
-            assignments.extend(
-                data.iter()
-                    .map(|(k, v)| format!("{k} = {}", quote_value_public(v))),
-            );
+        for (k, v) in self.update_data.iter().flatten() {
+            validate_set_target(k)?;
+            assignments.push(format!("{k} = {}", quote_value_public(v)));
         }
-        assignments.extend(
-            self.update_set_exprs
-                .iter()
-                .map(|(k, expr)| format!("{k} = {}", expr.to_surql())),
-        );
+        for (k, expr) in &self.update_set_exprs {
+            validate_set_target(k)?;
+            assignments.push(format!("{k} = {}", expr.to_surql()));
+        }
         if assignments.is_empty() {
             return Err(SurqlError::Query {
                 reason: "Update data required for UPDATE query".into(),
@@ -1074,36 +1121,16 @@ impl Query {
         let set_str = assignments.join(", ");
 
         let mut parts = vec![format!("UPDATE {table} SET {set_str}")];
-        if !self.conditions.is_empty() {
-            let joined = self
-                .conditions
-                .iter()
-                .map(|c| format!("({c})"))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            parts.push(format!("WHERE {joined}"));
-        }
-        if let Some(fmt) = self.return_format {
-            parts.push(format!("RETURN {}", fmt.to_surql()));
-        }
+        parts.extend(render_where(&self.conditions));
+        parts.extend(self.return_clause());
         Ok(parts.join(" "))
     }
 
     fn build_delete(&self) -> Result<String> {
         let table = self.require_table(Operation::Delete)?;
         let mut parts = vec![format!("DELETE {table}")];
-        if !self.conditions.is_empty() {
-            let joined = self
-                .conditions
-                .iter()
-                .map(|c| format!("({c})"))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            parts.push(format!("WHERE {joined}"));
-        }
-        if let Some(fmt) = self.return_format {
-            parts.push(format!("RETURN {}", fmt.to_surql()));
-        }
+        parts.extend(render_where(&self.conditions));
+        parts.extend(self.return_clause());
         Ok(parts.join(" "))
     }
 
@@ -1113,42 +1140,36 @@ impl Query {
             reason: "Data required for UPSERT query".into(),
         })?;
 
-        let data_str = render_data_object(data);
+        let data_str = render_content(Some(data), &self.update_set_exprs)?;
         let mut parts = vec![format!("UPSERT {table} CONTENT {data_str}")];
-        if !self.conditions.is_empty() {
-            let joined = self
-                .conditions
-                .iter()
-                .map(|c| format!("({c})"))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            parts.push(format!("WHERE {joined}"));
-        }
-        if let Some(fmt) = self.return_format {
-            parts.push(format!("RETURN {}", fmt.to_surql()));
-        }
+        parts.extend(render_where(&self.conditions));
+        parts.extend(self.return_clause());
         Ok(parts.join(" "))
     }
 
     fn build_relate(&self) -> Result<String> {
-        let table = self.require_table(Operation::Relate)?;
-        let from = self
-            .relate_from
+        let table = self
+            .table_name
             .as_deref()
             .ok_or_else(|| SurqlError::Query {
-                reason: "From and to records required for RELATE query".into(),
+                reason: "Table name required for RELATE query".into(),
             })?;
-        let to = self.relate_to.as_deref().ok_or_else(|| SurqlError::Query {
-            reason: "From and to records required for RELATE query".into(),
-        })?;
+        validate_identifier(table, "edge table name")?;
+        let (Some(from), Some(to)) = (self.relate_from.as_deref(), self.relate_to.as_deref())
+        else {
+            return Err(SurqlError::Query {
+                reason: "From and to records required for RELATE query".into(),
+            });
+        };
+        let from = render_target(from)?;
+        let to = render_target(to)?;
 
         let mut parts = vec![format!("RELATE {from}->{table}->{to}")];
-        if let Some(data) = &self.relate_data {
-            parts.push(format!("CONTENT {}", render_data_object(data)));
+        if self.relate_data.is_some() || !self.update_set_exprs.is_empty() {
+            let content = render_content(self.relate_data.as_ref(), &self.update_set_exprs)?;
+            parts.push(format!("CONTENT {content}"));
         }
-        if let Some(fmt) = self.return_format {
-            parts.push(format!("RETURN {}", fmt.to_surql()));
-        }
+        parts.extend(self.return_clause());
         Ok(parts.join(" "))
     }
 }
@@ -1651,9 +1672,147 @@ mod tests {
                 &[0.1, 0.2],
                 VectorDistanceType::Cosine,
                 "score",
-            );
+            )
+            .unwrap();
         let sql = q.to_surql().unwrap();
         assert!(sql.contains("vector::similarity::cosine(embedding, [0.1, 0.2]) AS score"));
+    }
+
+    #[test]
+    fn similarity_score_validates_names_and_values() {
+        let base = Query::new().select(None).from_table("chunk").unwrap();
+        let cosine = VectorDistanceType::Cosine;
+        assert!(base
+            .clone()
+            .similarity_score("e) AS x FROM user; --", &[0.1], cosine, "s")
+            .is_err());
+        assert!(base
+            .clone()
+            .similarity_score("e", &[0.1], cosine, "s FROM user; --")
+            .is_err());
+        assert!(base
+            .clone()
+            .similarity_score("e", &[f64::NAN], cosine, "s")
+            .is_err());
+    }
+
+    #[test]
+    fn non_finite_vectors_and_thresholds_are_refused() {
+        let base = Query::new().select(None).from_table("doc").unwrap();
+        let cosine = VectorDistanceType::Cosine;
+        assert!(base
+            .clone()
+            .vector_search("e", vec![f64::INFINITY], 1, cosine, None)
+            .is_err());
+        assert!(base
+            .clone()
+            .vector_search("e", vec![0.1], 1, cosine, Some(f64::NAN))
+            .is_err());
+        assert!(base
+            .clone()
+            .vector_search_indexed("e", vec![f64::NEG_INFINITY], 1, 8)
+            .is_err());
+        // Hand-set values are re-checked when rendering.
+        let mut q = base.vector_search("e", vec![0.1], 1, cosine, None).unwrap();
+        q.vector_value = vec![f64::NAN];
+        assert!(q.to_surql().is_err());
+    }
+
+    #[test]
+    fn set_expr_adds_raw_values_to_content() {
+        use crate::query::expressions::time_now;
+        use crate::types::record_ref;
+
+        let q = Query::new()
+            .insert("post", data(&[("title", Value::from("hi"))]))
+            .unwrap()
+            .set_expr("created_at", time_now())
+            .unwrap()
+            .set_expr("author", record_ref("user", "alice").into())
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "CREATE post CONTENT {title: 'hi', created_at: time::now(), \
+             author: type::record('user', 'alice')}"
+        );
+        // An assignment replaces the same-named data key.
+        let q = Query::new()
+            .upsert("post:1", data(&[("n", Value::from(1))]))
+            .unwrap()
+            .set_expr("n", time_now())
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "UPSERT post:1 CONTENT {n: time::now()}"
+        );
+        // RELATE takes them as edge content, with or without a data map.
+        let q = Query::new()
+            .relate("likes", "user:a", "post:1", None)
+            .unwrap()
+            .set_expr("at", time_now())
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "RELATE user:a->likes->post:1 CONTENT {at: time::now()}"
+        );
+        // A nested path cannot be a CONTENT key.
+        let q = Query::new()
+            .insert("post", DataMap::new())
+            .unwrap()
+            .set("meta.n", 1)
+            .unwrap();
+        assert!(q.to_surql().is_err());
+    }
+
+    #[test]
+    fn hand_set_names_are_rechecked_when_rendering() {
+        let mut q = Query::new().select(None).from_table("user").unwrap();
+        q.table_name = Some("user; DELETE user".into());
+        assert!(q.to_surql().is_err());
+
+        let mut q = Query::new()
+            .select(None)
+            .from_table("user")
+            .unwrap()
+            .order_by("name", "ASC")
+            .unwrap();
+        q.order_fields[0].field = "name; DELETE user".into();
+        assert!(q.to_surql().is_err());
+        q.order_fields[0].field = "name".into();
+        q.order_fields[0].direction = "ASC; DELETE user".into();
+        assert!(q.to_surql().is_err());
+
+        let mut q = Query::new()
+            .relate("likes", "user:a", "post:1", None)
+            .unwrap();
+        q.relate_to = Some("post:1; DELETE post".into());
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "RELATE user:a->likes->post:⟨1; DELETE post⟩"
+        );
+        q.table_name = Some("likes; DELETE".into());
+        assert!(q.to_surql().is_err());
+    }
+
+    #[test]
+    fn index_hints_are_checked_when_rendering() {
+        let q = Query::new()
+            .select(None)
+            .from_table("user")
+            .unwrap()
+            .hint(QueryHint::Index(IndexHint::new(
+                "user",
+                "x */ DELETE user; /*",
+            )));
+        assert!(matches!(q.to_surql(), Err(SurqlError::Validation { .. })));
+    }
+
+    #[test]
+    fn record_targets_are_normalised() {
+        let q = Query::new().delete("user:a-b").unwrap();
+        assert_eq!(q.to_surql().unwrap(), "DELETE user:⟨a-b⟩");
+        assert!(Query::new().delete("user:[1, 2]").is_err());
+        assert!(Query::new().from_table("user; DELETE user").is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1797,6 +1956,107 @@ mod tests {
     // -----------------------------------------------------------------------
     // Validation
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn expression_shaped_insert_data_stays_data() {
+        let q = Query::new()
+            .insert(
+                "post",
+                data(&[(
+                    "body",
+                    serde_json::json!({"expression": "1}; DELETE user; --"}),
+                )]),
+            )
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "CREATE post CONTENT {body: { expression: '1}; DELETE user; --' }}"
+        );
+    }
+
+    #[test]
+    fn data_keys_set_directly_are_quoted() {
+        let q = Query {
+            operation: Some(Operation::Insert),
+            table_name: Some("user".into()),
+            insert_data: Some(data(&[("x: 1}; DELETE user; --", Value::from(1))])),
+            ..Query::default()
+        };
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "CREATE user CONTENT {'x: 1}; DELETE user; --': 1}"
+        );
+        let q = Query {
+            operation: Some(Operation::Update),
+            table_name: Some("user".into()),
+            update_data: Some(data(&[("x = 1; DELETE user; --", Value::from(1))])),
+            ..Query::default()
+        };
+        assert!(matches!(q.to_surql(), Err(SurqlError::Validation { .. })));
+    }
+
+    #[test]
+    fn record_targets_cannot_carry_a_second_statement() {
+        let q = Query::new()
+            .delete("user:x; REMOVE TABLE user; --")
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "DELETE user:⟨x; REMOVE TABLE user; --⟩"
+        );
+        let q = Query::new()
+            .update_set("user:a; REMOVE TABLE user")
+            .unwrap()
+            .set("n", 1)
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "UPDATE user:⟨a; REMOVE TABLE user⟩ SET n = 1"
+        );
+        let q = Query::new()
+            .relate(
+                "likes",
+                "user:a->likes->post:b; REMOVE TABLE post",
+                "post:c",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            q.to_surql().unwrap(),
+            "RELATE user:⟨a->likes->post:b; REMOVE TABLE post⟩->likes->post:c"
+        );
+    }
+
+    #[test]
+    fn identifier_sinks_reject_injection() {
+        let base = Query::new().select(None).from_table("user").unwrap();
+        assert!(base.clone().order_by("name; DELETE user", "ASC").is_err());
+        assert!(base
+            .clone()
+            .group_by(["status; DELETE user"])
+            .to_surql()
+            .is_err());
+        assert!(base
+            .clone()
+            .fulltext_search("content; DELETE user", 1, "x")
+            .is_err());
+        assert!(base
+            .clone()
+            .vector_search(
+                "e; DELETE user",
+                vec![0.1],
+                1,
+                VectorDistanceType::Cosine,
+                None
+            )
+            .is_err());
+        let sql = base
+            .clone()
+            .search_score(1, "s FROM user; DELETE user; --")
+            .to_surql()
+            .unwrap();
+        assert!(sql.contains("AS `s FROM user; DELETE user; --`"), "{sql}");
+    }
 
     #[test]
     fn invalid_table_name_rejected() {

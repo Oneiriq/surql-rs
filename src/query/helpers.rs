@@ -156,8 +156,8 @@ pub type DataMap = BTreeMap<String, Value>;
 /// ```
 /// use surql::query::helpers::select;
 ///
-/// let q = select(None);
-/// assert_eq!(q.to_surql_or_panic_with_table("user"), "SELECT * FROM user");
+/// let q = select(None).from_table("user").unwrap();
+/// assert_eq!(q.to_surql().unwrap(), "SELECT * FROM user");
 /// ```
 pub fn select(fields: Option<Vec<String>>) -> Query {
     Query::new().select(fields)
@@ -246,6 +246,7 @@ pub fn vector_search_query(
 /// Create a vector similarity search query that also projects the score.
 ///
 /// Combines [`Query::similarity_score`] with [`Query::vector_search`].
+// Positional to match `similarity_search_query` in the sibling ports.
 #[allow(clippy::too_many_arguments)]
 pub fn similarity_search_query(
     table: impl Into<String>,
@@ -261,7 +262,7 @@ pub fn similarity_search_query(
     Query::new()
         .select(fields)
         .from_table(table)?
-        .similarity_score(&target_field, &vector, distance, alias)
+        .similarity_score(&target_field, &vector, distance, alias)?
         .vector_search(target_field, vector, k, distance, threshold)
 }
 
