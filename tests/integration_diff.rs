@@ -18,13 +18,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use surql::connection::{ConnectionConfig, DatabaseClient};
-use surql::migration::diff::{diff_edges, diff_events, diff_fields, diff_indexes, diff_tables};
+use surql::migration::diff::{
+    diff_edges, diff_events, diff_fields, diff_indexes, diff_schemas, diff_tables, SchemaSnapshot,
+};
 use surql::migration::{DiffOperation, SchemaDiff};
 use surql::schema::edge::typed_edge;
 use surql::schema::parser::parse_table_full;
 use surql::schema::{
-    event, index, int_field, record_field, string_field, table_schema, unique_index, ChangeFeed,
-    FieldDefinition, IndexDefinition, IndexType, ReferenceAction, TableDefinition,
+    bm25_index, event, index, int_field, record_field, standard_analyzer, string_field,
+    table_schema, unique_index, ChangeFeed, FieldDefinition, IndexDefinition, IndexType,
+    ReferenceAction, TableDefinition,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -535,4 +538,60 @@ async fn an_edge_changing_endpoint_is_migrated_both_ways() {
     apply(&client, &backward(&diffs)).await;
     let echo = table_echo(&client, "likes").await.expect("edge");
     assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
+}
+
+/// A whole-schema migration applies in one script and rolls back in one:
+/// over a table that already holds rows, a full-text index builds only once
+/// its analyzer exists, and an edge that becomes a table of the same name
+/// must be removed before the table is defined.
+#[tokio::test]
+async fn a_schema_migration_orders_dependencies() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let body = string_field("body").build_unchecked().unwrap();
+    let doc_v1 = table_schema("doc").with_fields([body.clone()]);
+    let doc_v2 = table_schema("doc")
+        .with_fields([body])
+        .with_indexes([bm25_index("body_ft", ["body"], "words")]);
+    let person = table_schema("person");
+    let tagged_edge = typed_edge("tagged", "person", "doc");
+    let tagged_table =
+        table_schema("tagged").with_fields([int_field("n").build_unchecked().unwrap()]);
+
+    let db = SchemaSnapshot {
+        tables: vec![doc_v1, person.clone()],
+        edges: vec![tagged_edge],
+        ..SchemaSnapshot::default()
+    };
+    let code = SchemaSnapshot {
+        tables: vec![doc_v2, person, tagged_table],
+        analyzers: vec![standard_analyzer("words")],
+        ..SchemaSnapshot::default()
+    };
+    apply(
+        &client,
+        &forward(&diff_schemas(&db, &SchemaSnapshot::default())),
+    )
+    .await;
+    client
+        .query("CREATE doc:1 SET body = 'hello world';")
+        .await
+        .expect("a row for the index to build over");
+
+    let diffs = diff_schemas(&code, &db);
+    apply(&client, &forward(&diffs)).await;
+    let echo = table_echo(&client, "tagged").await.expect("table");
+    assert!(!echo.contains("RELATION"), "{echo}");
+    let stored = read_table(&client, "doc").await;
+    assert!(
+        stored.indexes.iter().any(|i| i.name == "body_ft"),
+        "{stored:?}"
+    );
+
+    apply(&client, &backward(&diffs)).await;
+    let echo = table_echo(&client, "tagged").await.expect("edge");
+    assert!(echo.contains("TYPE RELATION IN person OUT doc"), "{echo}");
+    let stored = read_table(&client, "doc").await;
+    assert!(stored.indexes.is_empty(), "{stored:?}");
 }

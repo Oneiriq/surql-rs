@@ -701,18 +701,57 @@ pub fn diff_edges(code: &[EdgeDefinition], db: &[EdgeDefinition]) -> Vec<SchemaD
 /// Diff two complete snapshots and return every change required to make
 /// `db` look like `code`.
 ///
-/// The returned diffs are ordered: tables, edges, buckets, analyzers, then
-/// sequences, functions, then params.
+/// The diffs come in the order a migration can apply them, and a rollback
+/// (which runs the backward statements in reverse) can undo them:
+///
+/// 1. functions, params, sequences, analyzers, and buckets being added or
+///    changed, so the tables that use them find them defined: a full-text
+///    index cannot build over existing rows until its analyzer exists, and
+///    a field backfill can call a function or read a param;
+/// 2. every table and edge being dropped, before anything is defined, so a
+///    name that turns from an edge into a table (or back) is free again;
+/// 3. the remaining table changes, then the remaining edge changes;
+/// 4. the database-level objects being dropped, last and in the reverse
+///    kind order, once nothing that used them is left (the engine refuses
+///    to remove an analyzer a full-text index still names).
 #[must_use]
 pub fn diff_schemas(code: &SchemaSnapshot, db: &SchemaSnapshot) -> Vec<SchemaDiff> {
-    let mut out = diff_tables(&code.tables, &db.tables);
-    out.extend(diff_edges(&code.edges, &db.edges));
-    out.extend(diff_buckets(&code.buckets, &db.buckets));
-    out.extend(diff_analyzers(&code.analyzers, &db.analyzers));
-    out.extend(diff_sequences(&code.sequences, &db.sequences));
-    out.extend(diff_functions(&code.functions, &db.functions));
-    out.extend(diff_params(&code.params, &db.params));
+    let objects = [
+        diff_functions(&code.functions, &db.functions),
+        diff_params(&code.params, &db.params),
+        diff_sequences(&code.sequences, &db.sequences),
+        diff_analyzers(&code.analyzers, &db.analyzers),
+        diff_buckets(&code.buckets, &db.buckets),
+    ];
+    let mut out = Vec::new();
+    let mut object_drops = Vec::new();
+    for diffs in objects {
+        let (drops, rest): (Vec<SchemaDiff>, Vec<SchemaDiff>) =
+            diffs.into_iter().partition(|d| is_object_drop(d.operation));
+        out.extend(rest);
+        object_drops.push(drops);
+    }
+    let (table_drops, table_rest): (Vec<SchemaDiff>, Vec<SchemaDiff>) =
+        diff_tables(&code.tables, &db.tables)
+            .into_iter()
+            .chain(diff_edges(&code.edges, &db.edges))
+            .partition(|d| d.operation == DiffOperation::DropTable);
+    out.extend(table_drops);
+    out.extend(table_rest);
+    out.extend(object_drops.into_iter().rev().flatten());
     out
+}
+
+/// Whether `operation` removes a database-level object.
+fn is_object_drop(operation: DiffOperation) -> bool {
+    matches!(
+        operation,
+        DiffOperation::DropFunction
+            | DiffOperation::DropParam
+            | DiffOperation::DropSequence
+            | DiffOperation::DropAnalyzer
+            | DiffOperation::DropBucket
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2835,6 +2874,79 @@ mod tests {
         assert!(ops.contains(&DiffOperation::AddTable));
         assert!(ops.contains(&DiffOperation::DropTable));
         assert!(ops.contains(&DiffOperation::ModifyField));
+    }
+
+    fn operations(diffs: &[SchemaDiff]) -> Vec<DiffOperation> {
+        diffs.iter().map(|d| d.operation).collect()
+    }
+
+    /// An index that names an analyzer (or a backfill that calls a function)
+    /// needs it defined first.
+    #[test]
+    fn diff_schemas_defines_objects_before_the_tables_that_use_them() {
+        use crate::schema::{bm25_index, standard_analyzer, FunctionDefinition};
+        let doc = tbl("doc").with_indexes([bm25_index("body_ft", ["body"], "words")]);
+        let code = SchemaSnapshot {
+            tables: vec![doc],
+            analyzers: vec![standard_analyzer("words")],
+            functions: vec![FunctionDefinition::new("greet", "RETURN 'hi'")],
+            ..SchemaSnapshot::default()
+        };
+        let ops = operations(&diff_schemas(&code, &SchemaSnapshot::default()));
+        assert_eq!(
+            ops,
+            vec![
+                DiffOperation::AddFunction,
+                DiffOperation::AddAnalyzer,
+                DiffOperation::AddTable,
+                DiffOperation::AddIndex,
+            ]
+        );
+    }
+
+    /// An edge turning into a table of the same name is removed before the
+    /// table is defined, whichever pass each half comes from.
+    #[test]
+    fn diff_schemas_drops_before_it_defines() {
+        let code = SchemaSnapshot::from_parts([tbl("x")], []);
+        let db = SchemaSnapshot::from_parts([], [relation_edge("x")]);
+        let diffs = diff_schemas(&code, &db);
+        assert_eq!(
+            operations(&diffs),
+            vec![DiffOperation::DropTable, DiffOperation::AddTable]
+        );
+        assert_eq!(diffs[0].forward_sql, "REMOVE TABLE x;");
+
+        let back = diff_schemas(&db, &code);
+        assert_eq!(
+            operations(&back),
+            vec![DiffOperation::DropTable, DiffOperation::AddTable]
+        );
+        assert!(back[1].forward_sql.contains("TYPE RELATION"));
+    }
+
+    /// Objects go once nothing that used them is left: the engine refuses to
+    /// remove an analyzer a full-text index still names.
+    #[test]
+    fn diff_schemas_removes_objects_after_the_tables_that_used_them() {
+        use crate::schema::{bm25_index, standard_analyzer};
+        let doc = tbl("doc").with_indexes([bm25_index("body_ft", ["body"], "words")]);
+        let db = SchemaSnapshot {
+            tables: vec![doc.clone()],
+            analyzers: vec![standard_analyzer("words")],
+            buckets: vec![crate::schema::memory_bucket("files")],
+            ..SchemaSnapshot::default()
+        };
+        let code = SchemaSnapshot::from_parts([tbl("doc")], []);
+        let ops = operations(&diff_schemas(&code, &db));
+        assert_eq!(
+            ops,
+            vec![
+                DiffOperation::DropIndex,
+                DiffOperation::DropBucket,
+                DiffOperation::DropAnalyzer,
+            ]
+        );
     }
 
     // ----- pair-wise helpers -----
