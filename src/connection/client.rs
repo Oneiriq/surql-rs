@@ -35,6 +35,8 @@ use tokio::time::sleep;
 use crate::connection::auth::{AuthType, Credentials, ScopeCredentials, TokenAuth};
 use crate::connection::config::ConnectionConfig;
 use crate::error::{Result, SurqlError};
+use crate::types::escape::{is_identifier, quote_ident};
+use crate::types::RecordID;
 
 /// Async SurrealDB client with connection + retry management.
 ///
@@ -482,14 +484,33 @@ impl DatabaseClient {
     /// so callers only need `serde::de::DeserializeOwned`; the 3.x
     /// SDK's typed `select` would force a `SurrealValue` bound on
     /// `T`, which would be a breaking change for existing users.
+    ///
+    /// # Targets
+    ///
+    /// This and the other typed CRUD methods take `target` as either a
+    /// table name (`"user"`) or a `table:key` record id (`"user:alice"`),
+    /// never as SurrealQL. A record key is always read as a literal string
+    /// key (an integer when it is all digits; `⟨…⟩` and backtick quoting
+    /// are understood), so a key built from user input cannot end the
+    /// statement: `"user:x; REMOVE TABLE user"` names the record whose key
+    /// is `x; REMOVE TABLE user`. Record-key expressions (`user:ulid()`,
+    /// ranges, array or object keys) are not supported here; write the
+    /// statement with [`DatabaseClient::query_with_vars`] instead.
+    ///
+    /// # Errors
+    ///
+    /// [`SurqlError::Validation`] when `target` is neither a table name nor
+    /// a `table:key` record id.
     pub async fn select<T: DeserializeOwned>(&self, target: &str) -> Result<Vec<T>> {
         self.require_connected()?;
-        let surql = format!("SELECT * FROM {target};");
+        let surql = format!("SELECT * FROM {};", render_target(target)?);
         let raw = self.query(&surql).await?;
         flatten_rows_typed(&raw)
     }
 
     /// Typed `CREATE`. Returns the created record.
+    ///
+    /// `target` follows the rules on [`DatabaseClient::select`].
     pub async fn create<T>(&self, target: &str, data: T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -500,7 +521,7 @@ impl DatabaseClient {
         })?;
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         vars.insert("data".into(), content);
-        let surql = format!("CREATE {target} CONTENT $data;");
+        let surql = format!("CREATE {} CONTENT $data;", render_target(target)?);
         let raw = self.query_with_vars(&surql, vars).await?;
         first_row_typed(&raw)?.ok_or_else(|| SurqlError::Query {
             reason: format!("CREATE on {target} returned no record"),
@@ -508,6 +529,8 @@ impl DatabaseClient {
     }
 
     /// Typed `UPDATE`. Returns the updated record.
+    ///
+    /// `target` follows the rules on [`DatabaseClient::select`].
     pub async fn update<T>(&self, target: &str, data: T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -518,7 +541,7 @@ impl DatabaseClient {
         })?;
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         vars.insert("data".into(), content);
-        let surql = format!("UPDATE {target} CONTENT $data;");
+        let surql = format!("UPDATE {} CONTENT $data;", render_target(target)?);
         let raw = self.query_with_vars(&surql, vars).await?;
         first_row_typed(&raw)?.ok_or_else(|| SurqlError::Query {
             reason: format!("UPDATE on {target} returned no record"),
@@ -529,7 +552,8 @@ impl DatabaseClient {
     ///
     /// The input (`D`) is a partial patch; the output (`T`) is the full
     /// merged record. Pass a `serde_json::Value` or a dedicated patch
-    /// struct for `D`.
+    /// struct for `D`. `target` follows the rules on
+    /// [`DatabaseClient::select`].
     pub async fn merge<D, T>(&self, target: &str, data: D) -> Result<T>
     where
         D: Serialize + Send + Sync + 'static,
@@ -541,7 +565,7 @@ impl DatabaseClient {
         })?;
         let mut vars: BTreeMap<String, Value> = BTreeMap::new();
         vars.insert("patch".into(), patch);
-        let surql = format!("UPDATE {target} MERGE $patch;");
+        let surql = format!("UPDATE {} MERGE $patch;", render_target(target)?);
         let raw = self.query_with_vars(&surql, vars).await?;
         first_row_typed(&raw)?.ok_or_else(|| SurqlError::Query {
             reason: format!("MERGE on {target} returned no record"),
@@ -549,9 +573,11 @@ impl DatabaseClient {
     }
 
     /// Typed `DELETE`. Returns the deleted records.
+    ///
+    /// `target` follows the rules on [`DatabaseClient::select`].
     pub async fn delete<T: DeserializeOwned>(&self, target: &str) -> Result<Vec<T>> {
         self.require_connected()?;
-        let surql = format!("DELETE {target} RETURN BEFORE;");
+        let surql = format!("DELETE {} RETURN BEFORE;", render_target(target)?);
         let raw = self.query(&surql).await?;
         flatten_rows_typed(&raw)
     }
@@ -773,6 +799,25 @@ fn statement_results(mut response: IndexedResults) -> Result<Value> {
         out.push(raw.into_json_value());
     }
     Ok(Value::Array(out))
+}
+
+/// Render a typed-CRUD or `LIVE SELECT` target as SurrealQL.
+///
+/// The target is data, never SurrealQL: a table name renders through
+/// [`quote_ident`], anything with a `:` is parsed as a [`RecordID`], whose
+/// `Display` quotes the key so it cannot end the statement, and anything
+/// else is refused.
+pub(crate) fn render_target(target: &str) -> Result<String> {
+    let target = target.trim();
+    if is_identifier(target) {
+        return Ok(quote_ident(target));
+    }
+    if target.contains(':') {
+        return RecordID::<()>::parse(target).map(|id| id.to_string());
+    }
+    Err(SurqlError::Validation {
+        reason: format!("invalid target {target:?}: expected a table name or a table:id record id"),
+    })
 }
 
 /// A config duration in seconds as a [`Duration`], refusing what
@@ -1117,6 +1162,36 @@ mod tests {
     }
 
     #[test]
+    fn render_target_accepts_tables_and_record_ids_only() {
+        assert_eq!(render_target("user").unwrap(), "user");
+        assert_eq!(render_target(" user ").unwrap(), "user");
+        assert_eq!(render_target("select").unwrap(), "`select`");
+        assert_eq!(render_target("user:alice").unwrap(), "user:alice");
+        assert_eq!(render_target("post:42").unwrap(), "post:42");
+        assert_eq!(render_target("user:⟨a-b⟩").unwrap(), "user:⟨a-b⟩");
+        assert_eq!(
+            render_target("user:x; REMOVE TABLE user").unwrap(),
+            "user:⟨x; REMOVE TABLE user⟩"
+        );
+        assert_eq!(
+            render_target("user:x⟩; REMOVE TABLE user").unwrap(),
+            "user:`x⟩; REMOVE TABLE user`"
+        );
+        for bad in [
+            "",
+            "user; REMOVE TABLE user",
+            "user WHERE true",
+            "1user:a",
+            ":a",
+        ] {
+            assert!(
+                matches!(render_target(bad), Err(SurqlError::Validation { .. })),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn seconds_refuses_what_duration_cannot_hold() {
         assert_eq!(seconds(1.5).unwrap(), Duration::from_millis(1500));
         for bad in [f64::INFINITY, f64::NAN, 1e300, -1.0] {
@@ -1235,5 +1310,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, serde_json::json!([[{ "count": 1 }]]));
+    }
+
+    /// Regression: typed CRUD targets were spliced into the statement
+    /// verbatim, so a record key taken from user input ended the
+    /// statement and ran another.
+    #[tokio::test]
+    async fn crud_targets_cannot_inject_statements() {
+        let client = DatabaseClient::new(root_mem_config("inject")).unwrap();
+        client.connect().await.unwrap();
+        client.query("CREATE user:a SET n = 1;").await.unwrap();
+        let _ = client.select::<Value>("user:x; REMOVE TABLE user").await;
+        let _ = client.delete::<Value>("user:x; REMOVE TABLE user").await;
+        let rows: Vec<Value> = client.select("user").await.unwrap();
+        assert_eq!(rows.len(), 1, "the injected REMOVE TABLE ran");
     }
 }

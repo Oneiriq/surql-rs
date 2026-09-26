@@ -145,6 +145,14 @@ let id = manager.spawn::<User, _>(&client, "user", |event| async move {
 manager.kill(id).await;
 ```
 
+The target is a table name or a `table:id` record id, never SurrealQL,
+under the same rules as the typed CRUD methods (`select`, `create`,
+`update`, `merge`, `delete`): a record key is always a literal key, so
+`"user:x; REMOVE TABLE user"` names the record whose key is
+`x; REMOVE TABLE user`, and anything that is neither shape is refused
+with `SurqlError::Validation`. Key expressions such as `user:ulid()` or
+ranges belong in a hand-written query with bound variables.
+
 `manager.count`, `manager.ids`, and `manager.drain_all` give you the
 operational surface needed to enumerate or tear down every active
 subscription on a graceful exit.

@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
-use crate::connection::client::DatabaseClient;
+use crate::connection::client::{render_target, DatabaseClient};
 use crate::error::{Result, SurqlError};
 use crate::query::builder::{Condition, WhereCondition};
 
@@ -92,7 +92,9 @@ where
     /// Start a `LIVE SELECT * FROM <target>` subscription.
     ///
     /// Fails with [`SurqlError::Streaming`] if the client's protocol
-    /// does not support live queries (i.e. `http://` or `https://`).
+    /// does not support live queries (i.e. `http://` or `https://`), and
+    /// with [`SurqlError::Validation`] when `target` is not a table name
+    /// or `table:id` record id (the rules on [`DatabaseClient::select`]).
     pub async fn start(client: &DatabaseClient, target: &str) -> Result<Self> {
         Self::start_where(client, target, Vec::<Condition>::new()).await
     }
@@ -133,7 +135,7 @@ where
             });
         }
 
-        let surql = render_live_select(target, conditions);
+        let surql = render_live_select(target, conditions)?;
         // Clone BEFORE issuing the statement, and issue it through the
         // clone this struct keeps: the subscription belongs to whichever
         // session ran it.
@@ -154,24 +156,26 @@ where
 }
 
 /// Render the statement, split out so its shape is testable without a
-/// connection.
-fn render_live_select<C, I>(target: &str, conditions: I) -> String
+/// connection. The target is a table name or record id, validated and
+/// quoted like the typed CRUD targets (see [`DatabaseClient::select`]).
+fn render_live_select<C, I>(target: &str, conditions: I) -> Result<String>
 where
     C: WhereCondition,
     I: IntoIterator<Item = C>,
 {
+    let target = render_target(target)?;
     let clauses: Vec<String> = conditions
         .into_iter()
         .map(|c| format!("({})", c.to_condition()))
         .collect();
-    if clauses.is_empty() {
+    Ok(if clauses.is_empty() {
         format!("LIVE SELECT * FROM {target};")
     } else {
         format!(
             "LIVE SELECT * FROM {target} WHERE {};",
             clauses.join(" AND ")
         )
-    }
+    })
 }
 
 impl<T> Stream for LiveQuery<T>
@@ -458,11 +462,11 @@ mod tests {
         use crate::types::operators::eq;
 
         assert_eq!(
-            render_live_select("file_event", Vec::<Condition>::new()),
+            render_live_select("file_event", Vec::<Condition>::new()).unwrap(),
             "LIVE SELECT * FROM file_event;",
         );
         assert_eq!(
-            render_live_select("file_event", [eq("tenant_id", "acme")]),
+            render_live_select("file_event", [eq("tenant_id", "acme")]).unwrap(),
             "LIVE SELECT * FROM file_event WHERE (tenant_id = 'acme');",
         );
         // Parenthesised and AND-joined, matching Query.
@@ -473,8 +477,22 @@ mod tests {
                     Condition::from(eq("tenant_id", "acme")),
                     Condition::from("dispatched = false"),
                 ],
-            ),
+            )
+            .unwrap(),
             "LIVE SELECT * FROM file_event WHERE (tenant_id = 'acme') AND (dispatched = false);",
+        );
+    }
+
+    /// Regression: the target was spliced in verbatim, so a table name
+    /// taken from input could close the `LIVE SELECT` and run another
+    /// statement.
+    #[test]
+    fn live_select_target_cannot_inject_statements() {
+        let err = render_live_select("user; REMOVE TABLE user", Vec::<Condition>::new());
+        assert!(matches!(err, Err(SurqlError::Validation { .. })));
+        assert_eq!(
+            render_live_select("user:x; REMOVE TABLE user", Vec::<Condition>::new()).unwrap(),
+            "LIVE SELECT * FROM user:⟨x; REMOVE TABLE user⟩;",
         );
     }
 

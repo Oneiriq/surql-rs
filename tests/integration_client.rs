@@ -366,3 +366,29 @@ async fn statement_error_text_never_triggers_a_replay() {
     assert_eq!(count, json!([[{ "count": 1 }]]));
     client.disconnect().await.unwrap();
 }
+
+/// Typed CRUD targets are data: a record key from user input cannot end the
+/// statement and run another.
+#[tokio::test]
+async fn crud_target_cannot_inject_statements() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    client
+        .query("CREATE user:a SET name = 'a', age = 1;")
+        .await
+        .expect("seed");
+    let none: Vec<User> = client
+        .select("user:x; REMOVE TABLE user")
+        .await
+        .expect("a strange key is still just a key");
+    assert!(none.is_empty());
+    assert!(client
+        .select::<User>("user; REMOVE TABLE user")
+        .await
+        .is_err());
+    let rows: Vec<User> = client.select("user").await.expect("table still there");
+    assert_eq!(rows.len(), 1);
+    client.disconnect().await.unwrap();
+}
