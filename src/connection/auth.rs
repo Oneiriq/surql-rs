@@ -364,21 +364,36 @@ mod tests {
     /// so logging one (or anything holding one) printed the secret.
     #[test]
     fn debug_redacts_every_secret() {
+        // Drawn at run time: a secret that is a literal is one more place a
+        // credential scanner has to be told the value is not real.
+        let secret = ulid::Ulid::generate().to_string();
         let shown = [
-            format!("{:?}", TokenAuth::new("eyJhbGciOiJIUzI1NiJ9.secret")),
-            format!("{:?}", RootCredentials::new("root", "secret")),
-            format!("{:?}", NamespaceCredentials::new("ns", "u", "secret")),
-            format!("{:?}", DatabaseCredentials::new("ns", "db", "u", "secret")),
+            format!(
+                "{:?}",
+                TokenAuth::new(format!("eyJhbGciOiJIUzI1NiJ9.{secret}"))
+            ),
+            format!("{:?}", RootCredentials::new("root", secret.as_str())),
+            format!(
+                "{:?}",
+                NamespaceCredentials::new("ns", "u", secret.as_str())
+            ),
+            format!(
+                "{:?}",
+                DatabaseCredentials::new("ns", "db", "u", secret.as_str())
+            ),
             format!(
                 "{:?}",
                 ScopeCredentials::new("ns", "db", "user")
                     .with("email", "a@example.com")
-                    .with("password", "secret")
+                    .with("password", secret.as_str())
             ),
         ];
-        for s in &shown {
-            assert!(!s.contains("secret"), "{s}");
-            assert!(!s.contains("a@example.com"), "{s}");
+        for (i, s) in shown.iter().enumerate() {
+            assert!(!s.contains(&secret), "Debug output {i} shows the secret");
+            assert!(
+                !s.contains("a@example.com"),
+                "Debug output {i} shows a variable"
+            );
         }
         assert!(shown[4].contains("password"), "variable names stay visible");
     }

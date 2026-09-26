@@ -1,11 +1,20 @@
 //! Unit tests for [`DatabaseClient`], most against an embedded `mem://`
 //! engine.
 
+use std::sync::OnceLock;
+
 use surrealdb::types::{AuthError, NotAllowedError};
 
 use super::*;
 use crate::connection::auth::RootCredentials;
 use crate::connection::auth_manager::AuthManager;
+
+/// The root password of every embedded engine in this file, drawn once per
+/// run so no credential here is a literal.
+fn test_password() -> &'static str {
+    static PASSWORD: OnceLock<String> = OnceLock::new();
+    PASSWORD.get_or_init(|| ulid::Ulid::generate().to_string())
+}
 
 #[test]
 fn new_validates_config() {
@@ -18,16 +27,17 @@ fn new_validates_config() {
 /// the SDK handle); a client is routinely logged.
 #[test]
 fn debug_redacts_the_config_secrets() {
+    let url_secret = ulid::Ulid::generate().to_string();
     let client = DatabaseClient::new(ConnectionConfig {
-        db_url: "ws://svc:urlsecret@db.example/rpc".into(),
+        db_url: format!("ws://svc:{url_secret}@db.example/rpc"),
         db_user: Some("svc".into()),
-        db_pass: Some("hunter2".into()),
+        db_pass: Some(test_password().to_owned()),
         ..Default::default()
     })
     .unwrap();
     let shown = format!("{client:?}");
-    assert!(!shown.contains("hunter2"), "{shown}");
-    assert!(!shown.contains("urlsecret"), "{shown}");
+    assert!(!shown.contains(test_password()), "Debug shows the password");
+    assert!(!shown.contains(&url_secret), "Debug shows URL userinfo");
 }
 
 #[test]
@@ -124,10 +134,13 @@ fn first_row_typed_returns_none_for_empty_array() {
 
 #[test]
 fn payload_str_round_trip() {
-    let creds = RootCredentials::new("root", "secret");
+    let creds = RootCredentials::new("root", test_password());
     let m = creds.to_signin_payload();
     assert_eq!(payload_str(&m, "username").unwrap(), "root");
-    assert_eq!(payload_str(&m, "password").unwrap(), "secret");
+    assert!(
+        payload_str(&m, "password").is_ok_and(|p| p == test_password()),
+        "the password round-trips"
+    );
     assert!(payload_str(&m, "missing").is_err());
 }
 
@@ -228,10 +241,11 @@ async fn expired_session_heals_on_a_config_credentialed_client() {
     let client = DatabaseClient::new(root_mem_config("heal")).unwrap();
     client.connect().await.unwrap();
     client
-        .query(
-            "DEFINE USER OVERWRITE root ON ROOT PASSWORD 'root' ROLES OWNER \
+        .query(&format!(
+            "DEFINE USER OVERWRITE root ON ROOT PASSWORD {} ROLES OWNER \
              DURATION FOR SESSION 1s;",
-        )
+            crate::types::escape::quote_str(test_password())
+        ))
         .await
         .unwrap();
     client.connect().await.unwrap();
@@ -267,7 +281,7 @@ async fn replay_guard_truth_table() {
     );
 
     let token = service
-        .signin(&RootCredentials::new("root", "root"))
+        .signin(&RootCredentials::new("root", test_password()))
         .await
         .unwrap();
     assert!(
@@ -402,7 +416,7 @@ fn root_mem_config(ns: &str) -> ConnectionConfig {
         .namespace(ns)
         .database(ns)
         .username("root")
-        .password("root")
+        .password(test_password())
         .retry_max_attempts(1)
         .build()
         .unwrap()

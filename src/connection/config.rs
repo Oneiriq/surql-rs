@@ -898,23 +898,33 @@ mod tests {
     /// them.
     #[test]
     fn debug_redacts_secrets() {
+        // Drawn at run time so no credential in the test is a literal, and
+        // the assertions name the leak without printing it.
+        let password = ulid::Ulid::generate().to_string();
+        let url_secret = ulid::Ulid::generate().to_string();
         let cfg = ConnectionConfig {
-            db_url: "wss://svc:urlsecret@db.example:8000/rpc".into(),
+            db_url: format!("wss://svc:{url_secret}@db.example:8000/rpc"),
             db_user: Some("svc".into()),
-            db_pass: Some("hunter2".into()),
+            db_pass: Some(password.clone()),
             ..Default::default()
         };
         let shown = format!("{cfg:?}");
-        assert!(!shown.contains("hunter2"), "{shown}");
-        assert!(!shown.contains("urlsecret"), "{shown}");
-        assert!(shown.contains("db.example:8000/rpc"), "{shown}");
-        let builder = format!("{:?}", ConnectionConfig::builder().password("hunter2"));
-        assert!(!builder.contains("hunter2"), "{builder}");
+        assert!(!shown.contains(&password), "Debug shows the password");
+        assert!(!shown.contains(&url_secret), "Debug shows URL userinfo");
+        assert!(
+            shown.contains("db.example:8000/rpc"),
+            "the host stays visible"
+        );
+        let builder = format!("{:?}", ConnectionConfig::builder().password(&password));
+        assert!(
+            !builder.contains(&password),
+            "builder Debug shows the password"
+        );
         let named = NamedConnectionConfig {
             name: "primary".into(),
             config: cfg,
         };
-        assert!(!format!("{named:?}").contains("hunter2"));
+        assert!(!format!("{named:?}").contains(&password));
     }
 
     #[test]
