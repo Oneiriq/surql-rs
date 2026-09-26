@@ -7,8 +7,8 @@ use crate::types::escape::{quote_str, unquote_str};
 ///
 /// A database server reformats expressions when it echoes them back, so the
 /// comparison folds what the engine is free to change: runs of whitespace
-/// become one space and the ends are trimmed, one level of wrapping
-/// parentheses goes, `IS NONE` / `IS NOT NONE` read as `= NONE` /
+/// become one space and the ends are trimmed, wrapping parentheses go (at
+/// any depth), `IS NONE` / `IS NOT NONE` read as `= NONE` /
 /// `!= NONE`, a cast loses the space after it (`<string> id`), and a string
 /// literal takes one quote style (the engine prints `"it's"` for what code
 /// wrote as `'it\'s'`).
@@ -35,7 +35,9 @@ pub fn normalize_expression(expr: &str) -> String {
         })
         .collect();
     trim_code_ends(&mut pieces);
-    if strip_wrapping_parens(&mut pieces) {
+    // Every layer, not one: normalising must be idempotent, or code and
+    // echo nested to different depths never compare equal.
+    while strip_wrapping_parens(&mut pieces) {
         trim_code_ends(&mut pieces);
     }
     pieces

@@ -133,3 +133,15 @@ fn validate_default_value_rejects_unsafe() {
     assert!(validate_default_value("a; DROP TABLE u").is_err());
     assert!(validate_default_value("SELECT * FROM u").is_err());
 }
+
+#[test]
+fn normalize_expression_strips_every_layer_of_wrapping_parentheses() {
+    // Found by the `migration` fuzz target: one layer per call left
+    // `(())` at `()`, so normalising twice changed the result.
+    assert_eq!(normalize_expression("((a = 1))"), "a = 1");
+    for expr in ["(())", "((($x IS NONE)))", "(a) AND (b)", "('(')"] {
+        let once = normalize_expression(expr);
+        assert_eq!(normalize_expression(&once), once, "{expr}");
+    }
+    assert_eq!(normalize_expression("(a) AND (b)"), "(a) AND (b)");
+}
