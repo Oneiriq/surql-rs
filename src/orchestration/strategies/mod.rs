@@ -10,6 +10,7 @@
 //! runtime by wrapping it in `Arc<dyn DeploymentStrategy>`.
 
 pub mod canary;
+mod concurrent;
 pub mod parallel;
 pub mod rolling;
 pub mod sequential;

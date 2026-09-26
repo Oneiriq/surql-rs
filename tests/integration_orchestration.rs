@@ -166,20 +166,16 @@ async fn sequential_deploy_applies_migration_against_live_surrealdb() {
     ensure_migration_table(&client).await.unwrap();
     let _ = client.disconnect().await;
 
-    let results = deploy_to_environments(
-        registry.clone(),
-        vec![database.clone()],
-        migrations,
-        StrategyKind::Sequential,
-        1,
-        10.0,
-        1,
-        true,
-        false,
-        false,
-    )
-    .await
-    .expect("sequential deploy succeeds");
+    let plan = DeploymentPlan::builder(registry.clone())
+        .environment(database.clone())
+        .migrations(migrations)
+        .strategy(StrategyKind::Sequential)
+        .max_concurrent(1)
+        .auto_rollback(false)
+        .build();
+    let results = deploy_to_environments(&plan)
+        .await
+        .expect("sequential deploy succeeds");
 
     assert_eq!(results.len(), 1);
     let result = results.get(&database).expect("result present");
@@ -290,6 +286,45 @@ async fn failed_migration_marks_environment_failed_and_stops() {
     assert!(result.error.as_deref().unwrap_or("").contains("boom"));
     assert!(applied_versions(&cfg).await.is_empty());
     assert!(!table_names(&cfg).await.contains(&"after_boom".to_string()));
+}
+
+#[tokio::test]
+async fn concurrent_strategies_deploy_each_environment_once() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    seed_migrations(tmp.path(), "fanned_out");
+    let migrations = discover_migrations(tmp.path()).expect("discover");
+    for kind in [
+        StrategyKind::Parallel,
+        StrategyKind::Rolling,
+        StrategyKind::Canary,
+    ] {
+        let db_a = unique_db("it_orch_fan_a");
+        let db_b = unique_db("it_orch_fan_b");
+        let (Some(cfg_a), Some(cfg_b)) = (integration_config(&db_a), integration_config(&db_b))
+        else {
+            eprintln!("SURREAL_URL not set; skipping");
+            return;
+        };
+        let registry = EnvironmentRegistry::new();
+        register(&registry, "a", &cfg_a).await;
+        register(&registry, "b", &cfg_b).await;
+        let plan = DeploymentPlan::builder(registry.clone())
+            .environments(["a", "b", "a", "b"])
+            .migrations(migrations.clone())
+            .strategy(kind)
+            .batch_size(1)
+            .canary_percentage(50.0)
+            .max_concurrent(4)
+            .verify_health(false)
+            .build();
+        let results = deploy_to_environments(&plan).await.expect("deploy");
+        assert_eq!(results.len(), 2, "{kind:?}: {results:?}");
+        for (name, cfg) in [("a", &cfg_a), ("b", &cfg_b)] {
+            assert_eq!(results[name].status, DeploymentStatus::Success, "{kind:?}");
+            assert_eq!(results[name].applied_versions, vec!["20260101_000001"]);
+            assert_eq!(applied_versions(cfg).await, vec!["20260101_000001"]);
+        }
+    }
 }
 
 #[tokio::test]

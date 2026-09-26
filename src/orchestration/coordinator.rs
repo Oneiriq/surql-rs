@@ -103,6 +103,8 @@ impl StrategyKind {
 /// Port of `surql.orchestration.coordinator.DeploymentPlan`. Cloneable
 /// so strategies can pass copies into spawned tasks without borrowing
 /// the coordinator.
+// The four flags are independent switches; enums would only rename them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct DeploymentPlan {
     /// Registry used for environment lookup.
@@ -137,17 +139,19 @@ impl DeploymentPlan {
     /// Start a builder for a deployment plan.
     pub fn builder(registry: EnvironmentRegistry) -> DeploymentPlanBuilder {
         DeploymentPlanBuilder {
-            registry,
-            environments: Vec::new(),
-            migrations: Vec::new(),
-            strategy: StrategyKind::Sequential,
-            batch_size: 1,
-            canary_percentage: 10.0,
-            max_concurrent: 5,
-            verify_health: true,
-            auto_rollback: true,
-            dry_run: false,
-            approved: false,
+            plan: DeploymentPlan {
+                registry,
+                environments: Vec::new(),
+                migrations: Vec::new(),
+                strategy: StrategyKind::Sequential,
+                batch_size: 1,
+                canary_percentage: 10.0,
+                max_concurrent: 5,
+                verify_health: true,
+                auto_rollback: true,
+                dry_run: false,
+                approved: false,
+            },
         }
     }
 }
@@ -155,17 +159,7 @@ impl DeploymentPlan {
 /// Builder for [`DeploymentPlan`].
 #[derive(Debug, Clone)]
 pub struct DeploymentPlanBuilder {
-    registry: EnvironmentRegistry,
-    environments: Vec<String>,
-    migrations: Vec<Migration>,
-    strategy: StrategyKind,
-    batch_size: usize,
-    canary_percentage: f64,
-    max_concurrent: usize,
-    verify_health: bool,
-    auto_rollback: bool,
-    dry_run: bool,
-    approved: bool,
+    plan: DeploymentPlan,
 }
 
 impl DeploymentPlanBuilder {
@@ -175,85 +169,73 @@ impl DeploymentPlanBuilder {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.environments = envs.into_iter().map(Into::into).collect();
+        self.plan.environments = envs.into_iter().map(Into::into).collect();
         self
     }
 
     /// Append a target environment name.
     pub fn environment(mut self, name: impl Into<String>) -> Self {
-        self.environments.push(name.into());
+        self.plan.environments.push(name.into());
         self
     }
 
     /// Replace the migration set.
     pub fn migrations(mut self, migrations: Vec<Migration>) -> Self {
-        self.migrations = migrations;
+        self.plan.migrations = migrations;
         self
     }
 
     /// Override the strategy label (informational).
     pub fn strategy(mut self, kind: StrategyKind) -> Self {
-        self.strategy = kind;
+        self.plan.strategy = kind;
         self
     }
 
     /// Override the rolling batch size.
     pub fn batch_size(mut self, value: usize) -> Self {
-        self.batch_size = value.max(1);
+        self.plan.batch_size = value.max(1);
         self
     }
 
     /// Override the canary percentage.
     pub fn canary_percentage(mut self, value: f64) -> Self {
-        self.canary_percentage = value;
+        self.plan.canary_percentage = value;
         self
     }
 
     /// Override the parallel max concurrency.
     pub fn max_concurrent(mut self, value: usize) -> Self {
-        self.max_concurrent = value.max(1);
+        self.plan.max_concurrent = value.max(1);
         self
     }
 
     /// Toggle pre-flight health checks.
     pub fn verify_health(mut self, value: bool) -> Self {
-        self.verify_health = value;
+        self.plan.verify_health = value;
         self
     }
 
     /// Toggle auto-rollback on any failure.
     pub fn auto_rollback(mut self, value: bool) -> Self {
-        self.auto_rollback = value;
+        self.plan.auto_rollback = value;
         self
     }
 
     /// Toggle dry-run (no migrations executed).
     pub fn dry_run(mut self, value: bool) -> Self {
-        self.dry_run = value;
+        self.plan.dry_run = value;
         self
     }
 
     /// Record the operator's approval for environments that require it.
     pub fn approved(mut self, value: bool) -> Self {
-        self.approved = value;
+        self.plan.approved = value;
         self
     }
 
     /// Finalise into a [`DeploymentPlan`].
     pub fn build(self) -> DeploymentPlan {
-        DeploymentPlan {
-            registry: self.registry,
-            environments: self.environments,
-            migrations: self.migrations,
-            strategy: self.strategy,
-            batch_size: self.batch_size,
-            canary_percentage: self.canary_percentage,
-            max_concurrent: self.max_concurrent,
-            verify_health: self.verify_health,
-            auto_rollback: self.auto_rollback,
-            dry_run: self.dry_run,
-            approved: self.approved,
-        }
+        self.plan
     }
 }
 
@@ -428,46 +410,28 @@ impl MigrationCoordinator {
 
 /// Convenience wrapper for the common `deploy(...)` invocation.
 ///
-/// Matches the Python `deploy_to_environments` free function — builds a
-/// [`DeploymentPlan`] from the supplied arguments, instantiates a
-/// coordinator with the requested strategy, and executes the deploy.
+/// Counterpart of the Python `deploy_to_environments` free function: runs
+/// `plan` through a coordinator built for the plan's own
+/// [`strategy`](DeploymentPlan::strategy),
+/// [`batch_size`](DeploymentPlan::batch_size),
+/// [`canary_percentage`](DeploymentPlan::canary_percentage), and
+/// [`max_concurrent`](DeploymentPlan::max_concurrent).
 ///
 /// # Errors
 ///
 /// Propagates errors from [`MigrationCoordinator::with_strategy_label`]
 /// and [`MigrationCoordinator::deploy`].
-#[allow(clippy::too_many_arguments)]
 pub async fn deploy_to_environments(
-    registry: EnvironmentRegistry,
-    environments: Vec<String>,
-    migrations: Vec<Migration>,
-    strategy: StrategyKind,
-    batch_size: usize,
-    canary_percentage: f64,
-    max_concurrent: usize,
-    verify_health: bool,
-    auto_rollback: bool,
-    dry_run: bool,
+    plan: &DeploymentPlan,
 ) -> Result<HashMap<String, DeploymentResult>> {
     let coordinator = MigrationCoordinator::with_strategy_label(
-        registry.clone(),
-        strategy,
-        batch_size,
-        canary_percentage,
-        max_concurrent,
+        plan.registry.clone(),
+        plan.strategy,
+        plan.batch_size,
+        plan.canary_percentage,
+        plan.max_concurrent,
     )?;
-    let plan = DeploymentPlan::builder(registry)
-        .environments(environments)
-        .migrations(migrations)
-        .strategy(strategy)
-        .batch_size(batch_size)
-        .canary_percentage(canary_percentage)
-        .max_concurrent(max_concurrent)
-        .verify_health(verify_health)
-        .auto_rollback(auto_rollback)
-        .dry_run(dry_run)
-        .build();
-    coordinator.deploy(&plan).await
+    coordinator.deploy(plan).await
 }
 
 #[cfg(test)]
