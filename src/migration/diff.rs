@@ -48,19 +48,20 @@ use crate::migration::diff_objects::{diff_functions, diff_params, diff_sequences
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::{EdgeDefinition, EdgeMode};
-use crate::schema::fields::{FieldDefinition, FieldType};
+use crate::schema::fields::{render_field_path, render_table_list, FieldDefinition, FieldType};
 use crate::schema::function::FunctionDefinition;
 use crate::schema::index_vector::{
     DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE, DISKANN_DEFAULT_L_BUILD,
 };
 use crate::schema::param::ParamDefinition;
+use crate::schema::permissions::render_permissions_clause;
 use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::{
     DiskAnnDistanceType, EventDefinition, HnswDistanceType, IndexDefinition, IndexType,
     MTreeDistanceType, MTreeVectorType, TableDefinition,
 };
 use crate::schema::view::ViewDefinition;
-use crate::types::escape::{quote_str, unquote_str};
+use crate::types::escape::{quote_ident, quote_str, unquote_str};
 
 /// Full schema snapshot passed to [`diff_schemas`].
 ///
@@ -659,7 +660,7 @@ pub fn diff_permissions(
     code: Option<&BTreeMap<String, String>>,
     db: Option<&BTreeMap<String, String>>,
 ) -> Vec<SchemaDiff> {
-    if permissions_equal(code, db) {
+    if table_permissions_equal(code, db) {
         return Vec::new();
     }
     vec![generate_modify_permissions_diff(table, code, db)]
@@ -794,7 +795,7 @@ fn diff_table_pair_inner(code: &TableDefinition, db: &TableDefinition) -> Vec<Sc
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
     out.extend(diff_table_body(code, db));
-    if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
+    if !table_permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
         // The full definition replaces: a permissions-only DEFINE
         // TABLE would silently reset the table's mode.
         out.push(modify_permissions_full(
@@ -827,7 +828,7 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
     out.extend(diff_fields(&code.name, &code.fields, &db.fields));
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
-    if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
+    if !table_permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
         out.push(modify_permissions_full(
             &code.name,
             edge_define_sql(code, true),
@@ -918,7 +919,7 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
     // statement; a separate permissions statement would re-define the
     // table it just created.
     let forward_sql = table.to_surql();
-    let backward_sql = format!("REMOVE TABLE {};", table.name);
+    let backward_sql = remove_table_sql(&table.name);
     let mut out = vec![SchemaDiff {
         operation: DiffOperation::AddTable,
         table: table.name.clone(),
@@ -965,7 +966,7 @@ fn generate_drop_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         analyzer: None,
         object: None,
         description: format!("Drop table {}", table.name),
-        forward_sql: format!("REMOVE TABLE {};", table.name),
+        forward_sql: remove_table_sql(&table.name),
         backward_sql: restore.join("\n"),
         details: BTreeMap::new(),
     }]
@@ -997,13 +998,14 @@ fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
         if validate_default_value(default).is_ok() {
             let backfill = format!(
                 "UPDATE {table} SET {name} = {default} WHERE {name} IS NONE;",
-                name = field.name,
+                table = quote_ident(table),
+                name = render_field_path(&field.name),
             );
             forward_sql.push('\n');
             forward_sql.push_str(&backfill);
         }
     }
-    let backward_sql = format!("REMOVE FIELD {} ON TABLE {};", field.name, table);
+    let backward_sql = remove_field_sql(table, &field.name);
     let mut details = BTreeMap::new();
     details.insert(
         "type".to_string(),
@@ -1026,7 +1028,7 @@ fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
 }
 
 fn generate_drop_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
-    let forward_sql = format!("REMOVE FIELD {} ON TABLE {};", field.name, table);
+    let forward_sql = remove_field_sql(table, &field.name);
     let backward_sql = field_to_sql(table, field);
     SchemaDiff {
         operation: DiffOperation::DropField,
@@ -1101,7 +1103,7 @@ fn generate_modify_field_diff(
 
 fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
     let forward_sql = index_to_sql(table, idx, false);
-    let backward_sql = format!("REMOVE INDEX {} ON TABLE {};", idx.name, table);
+    let backward_sql = remove_index_sql(table, &idx.name);
     SchemaDiff {
         operation: DiffOperation::AddIndex,
         table: table.to_string(),
@@ -1119,7 +1121,7 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
 }
 
 fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
-    let forward_sql = format!("REMOVE INDEX {} ON TABLE {};", idx.name, table);
+    let forward_sql = remove_index_sql(table, &idx.name);
     // The same renderer as the add, so a UNIQUE (or full-text, or vector)
     // index comes back as the kind it was.
     let backward_sql = index_to_sql(table, idx, false);
@@ -1166,7 +1168,7 @@ fn generate_modify_index_diff(
 
 fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
     let forward_sql = event_to_sql(table, ev, false);
-    let backward_sql = format!("REMOVE EVENT {} ON TABLE {};", ev.name, table);
+    let backward_sql = remove_event_sql(table, &ev.name);
     SchemaDiff {
         operation: DiffOperation::AddEvent,
         table: table.to_string(),
@@ -1184,7 +1186,7 @@ fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
 }
 
 fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
-    let forward_sql = format!("REMOVE EVENT {} ON TABLE {};", ev.name, table);
+    let forward_sql = remove_event_sql(table, &ev.name);
     let backward_sql = event_to_sql(table, ev, false);
     SchemaDiff {
         operation: DiffOperation::DropEvent,
@@ -1254,7 +1256,7 @@ fn generate_add_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
     // separate permissions statement would re-define the table it just
     // created, and its OVERWRITE form would reset `TYPE RELATION`.
     let forward_sql = edge_define_sql(edge, false);
-    let backward_sql = format!("REMOVE TABLE {};", edge.name);
+    let backward_sql = remove_table_sql(&edge.name);
 
     let mut out = vec![SchemaDiff {
         operation: DiffOperation::AddTable,
@@ -1296,19 +1298,19 @@ fn edge_define_sql(edge: &EdgeDefinition, overwrite: bool) -> String {
     };
     canonical.unwrap_or_else(|_| {
         let guard = if overwrite { " OVERWRITE" } else { "" };
-        let mut sql = format!("DEFINE TABLE{guard} {} TYPE RELATION", edge.name);
+        let mut sql = format!(
+            "DEFINE TABLE{guard} {} TYPE RELATION",
+            quote_ident(&edge.name)
+        );
         if let Some(from) = edge.from_table.as_deref() {
             sql.push_str(" FROM ");
-            sql.push_str(from);
+            sql.push_str(&render_table_list(from));
         }
         if let Some(to) = edge.to_table.as_deref() {
             sql.push_str(" TO ");
-            sql.push_str(to);
+            sql.push_str(&render_table_list(to));
         }
-        if let Some(rules) = permission_rules(edge.permissions.as_ref()) {
-            sql.push_str(" PERMISSIONS ");
-            sql.push_str(&rules);
-        }
+        sql.push_str(&render_permissions_clause(edge.permissions.as_ref()));
         sql.push(';');
         sql
     })
@@ -1334,7 +1336,7 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         analyzer: None,
         object: None,
         description: format!("Drop edge {}", edge.name),
-        forward_sql: format!("REMOVE TABLE {};", edge.name),
+        forward_sql: remove_table_sql(&edge.name),
         backward_sql: restore.join("\n"),
         details: BTreeMap::new(),
     }]
@@ -1348,19 +1350,45 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
 /// exists, and the `OVERWRITE` form resets every clause it does not repeat.
 /// An absent or empty map is the engine's default for a table, `NONE`.
 fn render_permission_statements(table: &str, perms: Option<&BTreeMap<String, String>>) -> String {
-    let rules = permission_rules(perms).unwrap_or_else(|| "NONE".to_owned());
-    format!("ALTER TABLE {table} PERMISSIONS {rules};")
+    let clause = render_permissions_clause(perms);
+    let clause = if clause.is_empty() {
+        " PERMISSIONS NONE".to_owned()
+    } else {
+        clause
+    };
+    format!("ALTER TABLE {}{clause};", quote_ident(table))
 }
 
-/// The `FOR <action> WHERE <rule>` clauses of a permission map, or `None`
-/// when there are none.
-fn permission_rules(perms: Option<&BTreeMap<String, String>>) -> Option<String> {
-    let perms = perms.filter(|p| !p.is_empty())?;
-    let clauses: Vec<String> = perms
-        .iter()
-        .map(|(action, condition)| format!("FOR {action} WHERE {condition}"))
-        .collect();
-    Some(clauses.join(" "))
+/// `REMOVE TABLE <name>;`, the name quoted as the `DEFINE` renderers quote it.
+fn remove_table_sql(name: &str) -> String {
+    format!("REMOVE TABLE {};", quote_ident(name))
+}
+
+/// `REMOVE FIELD <path> ON TABLE <table>;`
+fn remove_field_sql(table: &str, field: &str) -> String {
+    format!(
+        "REMOVE FIELD {} ON TABLE {};",
+        render_field_path(field),
+        quote_ident(table)
+    )
+}
+
+/// `REMOVE INDEX <name> ON TABLE <table>;`
+fn remove_index_sql(table: &str, index: &str) -> String {
+    format!(
+        "REMOVE INDEX {} ON TABLE {};",
+        quote_ident(index),
+        quote_ident(table)
+    )
+}
+
+/// `REMOVE EVENT <name> ON TABLE <table>;`
+fn remove_event_sql(table: &str, event: &str) -> String {
+    format!(
+        "REMOVE EVENT {} ON TABLE {};",
+        quote_ident(event),
+        quote_ident(table)
+    )
 }
 
 fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
@@ -1370,50 +1398,26 @@ fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
 }
 
 /// Render an index's `DEFINE INDEX` statement, in its `OVERWRITE` form when
-/// `overwrite` is set. Every direction of the diff goes through here, so an
-/// index is always re-created as the kind it was.
+/// `overwrite` is set, through the canonical renderer. Every direction of
+/// the diff goes through here, so an index is always re-created as the kind
+/// it was, with the tail the engine echoes and its names quoted.
 fn index_to_sql(table: &str, idx: &IndexDefinition, overwrite: bool) -> String {
-    let guard = if overwrite { " OVERWRITE" } else { "" };
-    match idx.index_type {
-        IndexType::Mtree => mtree_index_to_sql(table, idx, guard),
-        IndexType::Hnsw => hnsw_index_to_sql(table, idx, guard),
-        // A DISKANN index renders through the canonical serializer, which
-        // already spells the full DIST/TYPE/DEGREE/L_BUILD/ALPHA tail the
-        // engine echoes; a full-text index does too, because it carries an
-        // analyzer / BM25 / highlights clause the plain path below would drop.
-        IndexType::Diskann | IndexType::Search => {
-            if overwrite {
-                idx.to_surql_overwrite(table)
-            } else {
-                idx.to_surql_with_options(table, false)
-            }
-        }
-        IndexType::Unique | IndexType::Standard => {
-            let columns = idx.columns.join(", ");
-            let unique = if idx.index_type == IndexType::Unique {
-                " UNIQUE"
-            } else {
-                ""
-            };
-            format!(
-                "DEFINE INDEX{guard} {name} ON TABLE {table} COLUMNS {columns}{unique};",
-                name = idx.name
-            )
-        }
+    if overwrite {
+        idx.to_surql_overwrite(table)
+    } else {
+        idx.to_surql(table)
     }
 }
 
 /// Render an event's `DEFINE EVENT` statement, in its `OVERWRITE` form when
-/// `overwrite` is set. The action is wrapped in a block so a multi-statement
-/// action stays one clause.
+/// `overwrite` is set, through the canonical renderer, which keeps a
+/// multi-statement action inside one `{ ... }` block.
 fn event_to_sql(table: &str, ev: &EventDefinition, overwrite: bool) -> String {
-    let guard = if overwrite { " OVERWRITE" } else { "" };
-    format!(
-        "DEFINE EVENT{guard} {name} ON TABLE {table} WHEN {cond} THEN {{ {act} }};",
-        name = ev.name,
-        cond = ev.condition,
-        act = ev.action,
-    )
+    if overwrite {
+        ev.to_surql_overwrite(table)
+    } else {
+        ev.to_surql(table)
+    }
 }
 
 /// Whether two field definitions render the same stored field.
@@ -1451,10 +1455,7 @@ pub fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
         && expr_eq(a.default.as_deref(), b.default.as_deref())
         && expr_eq(a.value.as_deref(), b.value.as_deref())
         && expr_eq(a.computed.as_deref(), b.computed.as_deref())
-        && permissions_equal(
-            field_permissions(a.permissions.as_ref()).as_ref(),
-            field_permissions(b.permissions.as_ref()).as_ref(),
-        )
+        && field_permissions_equal(a.permissions.as_ref(), b.permissions.as_ref())
 }
 
 /// The record target a field actually renders: only `record<...>` and
@@ -1466,12 +1467,75 @@ fn rendered_target(field: &FieldDefinition) -> Option<&str> {
     }
 }
 
-/// A field's permission rules without the ones that restate the field
-/// default, `FULL`.
-fn field_permissions(perms: Option<&BTreeMap<String, String>>) -> Option<BTreeMap<String, String>> {
+/// Whether two table (or edge) permission maps grant the same thing.
+///
+/// As [`permissions_equal`], with an action whose rule is `NONE` counting as
+/// left out: `NONE` is a table's default, and the engine's echo, as the
+/// schema parser reads it, drops it.
+///
+/// ## Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use surql::migration::diff::table_permissions_equal;
+///
+/// let code = BTreeMap::from([
+///     ("select".to_owned(), "true".to_owned()),
+///     ("delete".to_owned(), "NONE".to_owned()),
+/// ]);
+/// let echo = BTreeMap::from([("select".to_owned(), "true".to_owned())]);
+/// assert!(table_permissions_equal(Some(&code), Some(&echo)));
+/// ```
+#[must_use]
+pub fn table_permissions_equal(
+    a: Option<&BTreeMap<String, String>>,
+    b: Option<&BTreeMap<String, String>>,
+) -> bool {
+    permissions_equal(
+        without_default(a, "NONE").as_ref(),
+        without_default(b, "NONE").as_ref(),
+    )
+}
+
+/// Whether two field permission maps grant the same thing.
+///
+/// As [`permissions_equal`], with an action whose rule is `FULL` counting as
+/// left out: `FULL` is a field's default, which the engine spells out for
+/// every action a rule set leaves unnamed.
+///
+/// ## Examples
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use surql::migration::diff::field_permissions_equal;
+///
+/// let code = BTreeMap::from([("update".to_owned(), "$auth.admin".to_owned())]);
+/// let echo = BTreeMap::from([
+///     ("select, create".to_owned(), "FULL".to_owned()),
+///     ("update".to_owned(), "$auth.admin".to_owned()),
+/// ]);
+/// assert!(field_permissions_equal(Some(&code), Some(&echo)));
+/// ```
+#[must_use]
+pub fn field_permissions_equal(
+    a: Option<&BTreeMap<String, String>>,
+    b: Option<&BTreeMap<String, String>>,
+) -> bool {
+    permissions_equal(
+        without_default(a, "FULL").as_ref(),
+        without_default(b, "FULL").as_ref(),
+    )
+}
+
+/// `perms` split into one entry per action, without the actions whose rule
+/// is the `default` posture.
+fn without_default(
+    perms: Option<&BTreeMap<String, String>>,
+    default: &str,
+) -> Option<BTreeMap<String, String>> {
     let kept: BTreeMap<String, String> = expand_actions(perms?)
         .into_iter()
-        .filter(|(_, rule)| !rule.trim().eq_ignore_ascii_case("FULL"))
+        .filter(|(_, rule)| !rule.trim().eq_ignore_ascii_case(default))
         .collect();
     (!kept.is_empty()).then_some(kept)
 }
@@ -1483,17 +1547,30 @@ fn expand_actions(map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (key, value) in map {
         for action in key.split(',') {
-            out.insert(action.trim().to_owned(), value.clone());
+            out.insert(action.trim().to_ascii_lowercase(), value.clone());
         }
     }
     out
+}
+
+/// A permission rule as a comparable string: the fixed postures in one case,
+/// anything else through [`normalize_expression`].
+fn normalize_rule(rule: &str) -> String {
+    let trimmed = rule.trim();
+    if trimmed.eq_ignore_ascii_case("NONE") || trimmed.eq_ignore_ascii_case("FULL") {
+        trimmed.to_ascii_uppercase()
+    } else {
+        normalize_expression(trimmed)
+    }
 }
 
 /// Whether two per-action permission maps grant the same thing.
 ///
 /// Comma-grouped keys (`"select, create"`) are split into one entry per
 /// action, the shape the engine echoes, and each rule compares through
-/// [`normalize_expression`]. An absent map equals an empty one.
+/// [`normalize_expression`] (the `NONE` / `FULL` postures in any case). An
+/// absent map equals an empty one. No action is treated as a default here;
+/// [`table_permissions_equal`] and [`field_permissions_equal`] add that.
 ///
 /// ## Examples
 ///
@@ -1525,7 +1602,7 @@ pub fn permissions_equal(
             }
             for (k, vx) in x {
                 let Some(vy) = y.get(k) else { return false };
-                if normalize_expression(vx) != normalize_expression(vy) {
+                if normalize_rule(vx) != normalize_rule(vy) {
                     return false;
                 }
             }
@@ -1653,44 +1730,6 @@ fn event_body(action: &str) -> String {
         .and_then(|rest| rest.strip_suffix('}'))
         .unwrap_or(trimmed);
     normalize_expression(inner.trim().trim_end_matches(';'))
-}
-
-fn mtree_index_to_sql(table: &str, idx: &IndexDefinition, guard: &str) -> String {
-    let field = idx.columns.first().map_or("", String::as_str);
-    let dim = idx.dimension.unwrap_or(0);
-    let distance = idx.distance.unwrap_or(MTreeDistanceType::Euclidean);
-    let vtype = idx.vector_type.unwrap_or(MTreeVectorType::F64);
-    format!(
-        "DEFINE INDEX{guard} {name} ON TABLE {table} COLUMNS {field} MTREE DIMENSION {dim} \
-         DIST {distance} TYPE {vtype};",
-        name = idx.name,
-        distance = distance.as_str(),
-        vtype = vtype.as_str(),
-    )
-}
-
-fn hnsw_index_to_sql(table: &str, idx: &IndexDefinition, guard: &str) -> String {
-    let field = idx.columns.first().map_or("", String::as_str);
-    let dim = idx.dimension.unwrap_or(0);
-    let distance = idx.hnsw_distance.unwrap_or(HnswDistanceType::Euclidean);
-    // The engine's own default when TYPE is left out, and what the canonical
-    // renderer (which leaves it out) therefore produces.
-    let vtype = idx.vector_type.unwrap_or(MTreeVectorType::F32);
-    let mut sql = format!(
-        "DEFINE INDEX{guard} {name} ON TABLE {table} COLUMNS {field} HNSW DIMENSION {dim} \
-         DIST {distance} TYPE {vtype}",
-        name = idx.name,
-        distance = distance.as_str(),
-        vtype = vtype.as_str(),
-    );
-    if let Some(efc) = idx.efc {
-        sql.push_str(&format!(" EFC {efc}"));
-    }
-    if let Some(m) = idx.m {
-        sql.push_str(&format!(" M {m}"));
-    }
-    sql.push(';');
-    sql
 }
 
 pub(super) fn index_by_name<'a, T, F>(items: &'a [T], key: F) -> BTreeMap<&'a str, &'a T>
@@ -1960,7 +1999,7 @@ mod tests {
             diffs[0].backward_sql,
             "DEFINE TABLE likes TYPE RELATION FROM user TO post PERMISSIONS FOR select WHERE true;\n\
              DEFINE FIELD weight ON TABLE likes TYPE int;\n\
-             DEFINE INDEX pair ON TABLE likes COLUMNS in, out UNIQUE;"
+             DEFINE INDEX pair ON TABLE likes COLUMNS `in`, `out` UNIQUE;"
         );
     }
 
@@ -2550,6 +2589,54 @@ mod tests {
         let empty: BTreeMap<String, String> = BTreeMap::new();
         assert!(diff_permissions("t", Some(&empty), None).is_empty());
         assert!(diff_permissions("t", None, Some(&empty)).is_empty());
+    }
+
+    /// `NONE` is a table's default, so an action set to it is an action left
+    /// out; `FULL` is a posture, rendered as the keyword.
+    #[test]
+    fn table_permission_postures() {
+        let explicit_none = BTreeMap::from([("delete".to_owned(), "none".to_owned())]);
+        assert!(diff_permissions("t", Some(&explicit_none), None).is_empty());
+
+        let full = BTreeMap::from([("select, create".to_owned(), "FULL".to_owned())]);
+        let diffs = diff_permissions("t", Some(&full), None);
+        assert_eq!(
+            diffs[0].forward_sql,
+            "ALTER TABLE t PERMISSIONS FOR select, create FULL;"
+        );
+        let echo = BTreeMap::from([
+            ("select".to_owned(), "full".to_owned()),
+            ("create".to_owned(), "FULL".to_owned()),
+        ]);
+        assert!(diff_permissions("t", Some(&full), Some(&echo)).is_empty());
+    }
+
+    /// A name the engine would read as a keyword is quoted in every
+    /// statement the diff renders, the removals included.
+    #[test]
+    fn removals_quote_names_like_the_definitions_do() {
+        let table = tbl("select").with_fields([f("address.city", FieldType::String)]);
+        let dropped = diff_tables(&[], std::slice::from_ref(&table));
+        assert_eq!(dropped[0].forward_sql, "REMOVE TABLE `select`;");
+        let fields = diff_fields("select", &[], &table.fields);
+        assert_eq!(
+            fields[0].forward_sql,
+            "REMOVE FIELD address.city ON TABLE `select`;"
+        );
+        let indexes = diff_indexes("select", &[], &[index("value", ["a"])]);
+        assert_eq!(
+            indexes[0].forward_sql,
+            "REMOVE INDEX `value` ON TABLE `select`;"
+        );
+        let defaulted = f("n", FieldType::Int).with_default("0");
+        let added = diff_fields("select", &[defaulted], &[]);
+        assert!(
+            added[0]
+                .forward_sql
+                .ends_with("UPDATE `select` SET n = 0 WHERE n IS NONE;"),
+            "{}",
+            added[0].forward_sql
+        );
     }
 
     // ----- diff_edges: ADD / DROP / MODIFY -----

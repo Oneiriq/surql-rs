@@ -22,12 +22,12 @@ use surql::migration::diff::{
     diff_edges, diff_events, diff_fields, diff_indexes, diff_schemas, diff_tables, SchemaSnapshot,
 };
 use surql::migration::{DiffOperation, SchemaDiff};
-use surql::schema::edge::typed_edge;
-use surql::schema::parser::parse_table_full;
+use surql::schema::edge::{typed_edge, EdgeDefinition};
+use surql::schema::parser::{parse_edge_info, parse_table_full};
 use surql::schema::{
-    bm25_index, event, index, int_field, record_field, standard_analyzer, string_field,
-    table_schema, unique_index, ChangeFeed, FieldDefinition, IndexDefinition, IndexType,
-    ReferenceAction, TableDefinition,
+    bm25_index, event, index, int_field, record_field, search_index, standard_analyzer,
+    string_field, table_schema, unique_index, ChangeFeed, FieldDefinition, IndexDefinition,
+    IndexType, ReferenceAction, TableDefinition,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +114,12 @@ async fn read_table(client: &DatabaseClient, table: &str) -> TableDefinition {
     parse_table_full(table, &define, &table_info(client, table).await).expect("parse table")
 }
 
+/// Read one edge back through both `INFO` levels.
+async fn read_edge(client: &DatabaseClient, edge: &str) -> EdgeDefinition {
+    let define = table_echo(client, edge).await.expect("edge exists");
+    parse_edge_info(edge, &table_info(client, edge).await, Some(&define)).expect("parse edge")
+}
+
 /// Adding an edge that carries permissions is one statement the engine
 /// accepts; it used to be a bare `DEFINE TABLE e PERMISSIONS ...` after the
 /// `DEFINE TABLE e TYPE RELATION ...`, which the engine refuses because the
@@ -141,6 +147,9 @@ async fn an_added_edge_with_permissions_applies_and_rolls_back() {
     assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
     assert!(echo.contains("FOR select WHERE $auth.id = in"), "{echo}");
     assert!(echo.contains("FOR create WHERE true"), "{echo}");
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&likes), &[stored]);
+    assert!(residual.is_empty(), "{residual:#?}");
 
     apply(&client, &backward(&diffs)).await;
     assert!(table_echo(&client, "likes").await.is_none());
@@ -212,6 +221,16 @@ async fn a_reference_action_change_is_migrated_both_ways() {
         .unwrap();
     let new = record_field("owner", Some("user"))
         .reference(ReferenceAction::Reject)
+        .build_unchecked()
+        .unwrap();
+    field_change_round_trips(old, new).await;
+}
+
+#[tokio::test]
+async fn a_field_permission_change_is_migrated_both_ways() {
+    let old = string_field("title").build_unchecked().unwrap();
+    let new = string_field("title")
+        .permissions([("update", "$auth.admin = true")])
         .build_unchecked()
         .unwrap();
     field_change_round_trips(old, new).await;
@@ -303,11 +322,7 @@ async fn a_dropped_table_rolls_back_whole() {
     assert!(echo.contains("CHANGEFEED 1d"), "{echo}");
     assert!(echo.contains("FOR select WHERE true"), "{echo}");
     let stored = read_table(&client, "doc").await;
-    let residual: Vec<SchemaDiff> = diff_fields("doc", &doc.fields, &stored.fields)
-        .into_iter()
-        .chain(diff_indexes("doc", &doc.indexes, &stored.indexes))
-        .chain(diff_events("doc", &doc.events, &stored.events))
-        .collect();
+    let residual = diff_tables(std::slice::from_ref(&doc), &[stored]);
     assert!(
         residual.is_empty(),
         "the rollback lost something: {residual:#?}"
@@ -348,16 +363,8 @@ async fn a_dropped_edge_rolls_back_whole() {
     let echo = table_echo(&client, "likes").await.expect("edge restored");
     assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
     assert!(echo.contains("FOR select WHERE true"), "{echo}");
-    let stored = read_table(&client, "likes").await;
-    let fields: Vec<FieldDefinition> = stored
-        .fields
-        .into_iter()
-        .filter(|f| f.name != "in" && f.name != "out")
-        .collect();
-    let residual: Vec<SchemaDiff> = diff_fields("likes", &likes.fields, &fields)
-        .into_iter()
-        .chain(diff_indexes("likes", &likes.indexes, &stored.indexes))
-        .collect();
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&likes), &[stored]);
     assert!(
         residual.is_empty(),
         "the rollback lost something: {residual:#?}"
@@ -432,9 +439,10 @@ async fn an_index_turning_unique_is_migrated_both_ways() {
     assert!(residual.is_empty(), "{residual:#?}");
 }
 
-/// An index the engine stores with its defaults filled in reads back equal
-/// to the code that left them out: here an HNSW index without tuning, which
-/// the engine echoes as `DIST EUCLIDEAN TYPE F32 EFC 150 M 12`.
+/// Indexes the engine stores with its defaults filled in read back equal to
+/// the code that left them out: an HNSW index without tuning, which the
+/// engine echoes as `DIST EUCLIDEAN TYPE F32 EFC 150 M 12`, and a full-text
+/// index without BM25, which the engine scores with BM25 anyway.
 #[tokio::test]
 async fn index_defaults_read_back_without_drift() {
     let Some(client) = connected_client().await else {
@@ -444,10 +452,11 @@ async fn index_defaults_read_back_without_drift() {
         dimension: Some(4),
         ..IndexDefinition::new("h", ["v"]).with_type(IndexType::Hnsw)
     };
-    let code = [bare_hnsw];
+    let code = [bare_hnsw, search_index("s", ["body"])];
     let mut ddl = vec![
         "DEFINE TABLE doc SCHEMAFULL;".to_owned(),
         "DEFINE FIELD v ON doc TYPE array<float>;".to_owned(),
+        "DEFINE FIELD body ON doc TYPE string;".to_owned(),
     ];
     ddl.extend(code.iter().map(|idx| idx.to_surql("doc")));
     apply(&client, &ddl).await;
@@ -529,15 +538,16 @@ async fn an_edge_changing_endpoint_is_migrated_both_ways() {
         echo.contains("TYPE RELATION IN person OUT comment"),
         "{echo}"
     );
-    let stored = read_table(&client, "likes").await;
-    assert!(
-        stored.fields.iter().any(|f| f.name == "weight"),
-        "{stored:?}"
-    );
+    // The fields survive the OVERWRITE, and the stored edge reads back as
+    // exactly the new definition.
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&new), &[stored]);
+    assert!(residual.is_empty(), "{residual:#?}");
 
     apply(&client, &backward(&diffs)).await;
-    let echo = table_echo(&client, "likes").await.expect("edge");
-    assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&old), &[stored]);
+    assert!(residual.is_empty(), "{residual:#?}");
 }
 
 /// A whole-schema migration applies in one script and rolls back in one:

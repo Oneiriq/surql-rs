@@ -25,6 +25,7 @@ use crate::schema::bucket::BucketDefinition;
 use crate::schema::function::FunctionDefinition;
 use crate::schema::param::ParamDefinition;
 use crate::schema::sequence::SequenceDefinition;
+use crate::types::escape::{quote_ident, quote_str};
 
 /// The three [`DiffOperation`] variants one kind of object uses.
 #[derive(Debug, Clone, Copy)]
@@ -308,6 +309,7 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
             backward_sql: backward,
             details: BTreeMap::new(),
         };
+    let remove = |name: &str| format!("REMOVE ANALYZER IF EXISTS {};", quote_ident(name));
     for name in sorted_keys(&code_map) {
         let analyzer = code_map[name];
         match db_map.get(name) {
@@ -315,7 +317,7 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
                 DiffOperation::AddAnalyzer,
                 name,
                 analyzer.to_surql(),
-                format!("REMOVE ANALYZER IF EXISTS {name};"),
+                remove(name),
             )),
             Some(db_analyzer) if *db_analyzer != analyzer => out.push(analyzer_diff(
                 DiffOperation::ModifyAnalyzer,
@@ -331,7 +333,7 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
             out.push(analyzer_diff(
                 DiffOperation::DropAnalyzer,
                 name,
-                format!("REMOVE ANALYZER IF EXISTS {name};"),
+                remove(name),
                 db_map[name].to_surql(),
             ));
         }
@@ -339,16 +341,22 @@ pub fn diff_analyzers(code: &[AnalyzerDefinition], db: &[AnalyzerDefinition]) ->
     out
 }
 
-fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
-    // `to_surql` only fails validation; an invalid bucket still yields a
-    // best-effort render so callers can surface it via dry-run (matching the
-    // "infallible diff constructor" contract of the other generators).
-    let forward_sql = bucket.to_surql().unwrap_or_else(|_| {
+/// `DEFINE BUCKET` for `bucket`. `to_surql` only fails validation; an
+/// invalid bucket still yields a best-effort render, its name and backend
+/// quoted, so callers can surface it via dry-run (matching the "infallible
+/// diff constructor" contract of the other generators).
+fn bucket_define_sql(bucket: &BucketDefinition) -> String {
+    bucket.to_surql().unwrap_or_else(|_| {
         format!(
-            "DEFINE BUCKET {} BACKEND \"{}\";",
-            bucket.name, bucket.backend
+            "DEFINE BUCKET {} BACKEND {};",
+            quote_ident(&bucket.name),
+            quote_str(&bucket.backend)
         )
-    });
+    })
+}
+
+fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
+    let forward_sql = bucket_define_sql(bucket);
     let backward_sql = bucket.to_remove_surql();
     let mut details = BTreeMap::new();
     details.insert(
@@ -373,12 +381,7 @@ fn generate_add_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
 
 fn generate_drop_bucket_diff(bucket: &BucketDefinition) -> SchemaDiff {
     let forward_sql = bucket.to_remove_surql();
-    let backward_sql = bucket.to_surql().unwrap_or_else(|_| {
-        format!(
-            "DEFINE BUCKET {} BACKEND \"{}\";",
-            bucket.name, bucket.backend
-        )
-    });
+    let backward_sql = bucket_define_sql(bucket);
     SchemaDiff {
         operation: DiffOperation::DropBucket,
         table: String::new(),
@@ -481,6 +484,36 @@ mod tests {
         assert_eq!(
             diffs[0].details.get("new_backend"),
             Some(&serde_json::json!("s3://x"))
+        );
+    }
+
+    /// An invalid bucket still renders, but never splices its name or
+    /// backend into the statement raw.
+    #[test]
+    fn the_fallback_bucket_statement_quotes_what_it_splices() {
+        let bad = BucketDefinition::new("my-files", "x\"; REMOVE TABLE user; --")
+            .with_permissions("bogus");
+        let diffs = diff_buckets(std::slice::from_ref(&bad), &[]);
+        assert_eq!(
+            diffs[0].forward_sql,
+            r#"DEFINE BUCKET `my-files` BACKEND 'x"; REMOVE TABLE user; --';"#
+        );
+        let dropped = diff_buckets(&[], std::slice::from_ref(&bad));
+        assert_eq!(dropped[0].backward_sql, diffs[0].forward_sql);
+    }
+
+    #[test]
+    fn analyzer_removals_quote_the_name() {
+        let code = vec![crate::schema::standard_analyzer("my-words")];
+        let added = diff_analyzers(&code, &[]);
+        assert_eq!(
+            added[0].backward_sql,
+            "REMOVE ANALYZER IF EXISTS `my-words`;"
+        );
+        let dropped = diff_analyzers(&[], &code);
+        assert_eq!(
+            dropped[0].forward_sql,
+            "REMOVE ANALYZER IF EXISTS `my-words`;"
         );
     }
 
