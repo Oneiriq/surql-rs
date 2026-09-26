@@ -62,7 +62,8 @@ pub fn quote_str(s: &str) -> String {
 /// Render `s` as a SurrealQL identifier (a table, field, or edge name).
 ///
 /// Bare when it is identifier-shaped and not a reserved word, backtick-quoted
-/// otherwise.
+/// otherwise. This is also the form a record id's table half needs:
+/// `select:abc` is a parse error where `` `select`:abc `` is not.
 ///
 /// ## Examples
 ///
@@ -75,7 +76,9 @@ pub fn quote_str(s: &str) -> String {
 /// assert_eq!(quote_ident("a`b"), r"`a\`b`");
 /// ```
 pub fn quote_ident(s: &str) -> String {
-    if is_identifier(s) && !is_reserved_word(s) && !is_float_keyword(s) {
+    let bare =
+        is_identifier(s) && !is_reserved_word(s) && !is_engine_reserved(s) && !is_float_keyword(s);
+    if bare {
         s.to_owned()
     } else {
         quoted(s, '`', '`')
@@ -191,6 +194,22 @@ fn is_float_keyword(s: &str) -> bool {
     s == "NaN" || s == "Infinity"
 }
 
+/// Words the engine's parser may read as a keyword where an identifier is
+/// expected (`RESERVED_KEYWORD` in surrealdb-core's lexer). The crate's own
+/// [`is_reserved_word`] list exists to warn about field names and is not the
+/// same set, so both are consulted.
+const ENGINE_RESERVED: &[&str] = &[
+    "ALTER", "BEGIN", "BREAK", "CANCEL", "COMMIT", "CONTINUE", "CREATE", "DEFINE", "DELETE", "FOR",
+    "IF", "INFO", "INSERT", "KILL", "LIVE", "OPTION", "REBUILD", "RETURN", "RELATE", "REMOVE",
+    "SELECT", "LET", "SHOW", "SLEEP", "THROW", "UPDATE", "UPSERT", "USE", "DIFF", "RAND", "NONE",
+    "NULL", "AFTER", "BEFORE", "VALUE", "BY", "ALL", "TRUE", "FALSE", "WHERE", "TABLE", "TB",
+    "SEQUENCE", "FUNCTION",
+];
+
+fn is_engine_reserved(s: &str) -> bool {
+    ENGINE_RESERVED.iter().any(|k| k.eq_ignore_ascii_case(s))
+}
+
 fn quoted(s: &str, open: char, close: char) -> String {
     let mut out = String::with_capacity(s.len() + 2 * open.len_utf8());
     out.push(open);
@@ -240,7 +259,17 @@ mod tests {
         assert_eq!(quote_ident("SELECT"), "`SELECT`");
         assert_eq!(quote_ident("none"), "`none`");
         assert_eq!(quote_ident("NaN"), "`NaN`");
+        assert_eq!(quote_ident("Infinity"), "`Infinity`");
         assert_eq!(quote_ident(""), "``");
+    }
+
+    #[test]
+    fn quote_ident_quotes_engine_only_keywords() {
+        for word in [
+            "upsert", "Option", "RAND", "tb", "sequence", "function", "rebuild",
+        ] {
+            assert_eq!(quote_ident(word), format!("`{word}`"));
+        }
     }
 
     #[test]

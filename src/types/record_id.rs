@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::escape::{is_identifier, quote_record_key, unescape};
+use super::escape::{is_identifier, quote_ident, quote_record_key, unescape};
 use crate::error::{Result, SurqlError};
 
 /// Value held by a [`RecordID`].
@@ -206,7 +206,9 @@ impl<T> RecordID<T> {
             });
         };
 
+        // A reserved-word table renders backtick-quoted (`` `select`:abc ``).
         let table = table.trim();
+        let table = delimited(table, '`', '`').map_or_else(|| table.to_owned(), unescape);
         let id_str = id_str.trim();
 
         if table.is_empty() {
@@ -258,15 +260,18 @@ impl<T> RecordID<T> {
 impl<T> fmt::Display for RecordID<T> {
     /// Render the record id in SurrealQL `table:id` form.
     ///
-    /// Integer ids render bare. String ids render through
+    /// The table renders through [`quote_ident`], so a reserved word such as
+    /// `select` or a float keyword such as `NaN` is backtick-quoted. Integer
+    /// ids render bare. String ids render through
     /// [`quote_record_key`](super::escape::quote_record_key): bare when
     /// identifier-shaped, wrapped in unicode angle brackets (U+27E8 / U+27E9)
     /// otherwise, and backtick-quoted when the id itself contains `⟩`. A
     /// digit-only string id is bracketed so it keeps naming the string key.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let table = quote_ident(&self.table);
         match &self.id {
-            RecordIdValue::Int(n) => write!(f, "{}:{n}", self.table),
-            RecordIdValue::String(s) => write!(f, "{}:{}", self.table, quote_record_key(s)),
+            RecordIdValue::Int(n) => write!(f, "{table}:{n}"),
+            RecordIdValue::String(s) => write!(f, "{table}:{}", quote_record_key(s)),
         }
     }
 }
@@ -335,6 +340,18 @@ mod tests {
     fn closing_bracket_in_id_cannot_end_the_key() {
         let id = RecordID::<()>::new("user", "x⟩; DELETE user; --").unwrap();
         assert_eq!(id.to_string(), "user:`x⟩; DELETE user; --`");
+    }
+
+    #[test]
+    fn reserved_and_float_tables_are_quoted() {
+        let id = RecordID::<()>::new("select", "abc").unwrap();
+        assert_eq!(id.to_string(), "`select`:abc");
+        let id = RecordID::<()>::new("NaN", "+").unwrap();
+        assert_eq!(id.to_string(), "`NaN`:⟨+⟩");
+        assert_eq!(
+            RecordID::<()>::parse("`select`:abc").unwrap().table(),
+            "select"
+        );
     }
 
     #[test]
