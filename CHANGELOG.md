@@ -118,7 +118,8 @@ Problems the pass found but did not fix are listed on the
     `UNIQUE` index comes back unique); index, event and edge-shape changes
     are detected and re-defined with `OVERWRITE`; field nullability,
     record target and permission changes are detected; normalisation
-    leaves string literals alone.
+    leaves string literals alone and is idempotent (it peeled one layer of
+    parentheses per call).
   - `diff_schemas` orders object adds (functions, params, sequences,
     analyzers, buckets) first, then every drop, then table and edge
     changes, then object drops. **Breaking** (output order; and
