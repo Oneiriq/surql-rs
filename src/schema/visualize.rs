@@ -14,6 +14,15 @@
 //! customise colours, fonts, and styling. Omit the theme (pass `None`) for
 //! default rendering.
 //!
+//! Names are data, not syntax: a table, field, or edge name may hold any
+//! character the database accepts, so every generator escapes what it
+//! interpolates. Mermaid entity names and relationship labels are
+//! double-quoted and attribute names reduced to the grammar's identifier
+//! shape (the real name rides along as the attribute comment); GraphViz IDs
+//! are always quoted, record labels escape `{ } | < >`, and HTML labels are
+//! HTML-escaped; ASCII output escapes control characters so a name cannot
+//! carry terminal escape sequences.
+//!
 //! ## Examples
 //!
 //! ```
@@ -37,7 +46,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::hash::BuildHasher;
 
 use crate::error::Result;
 
@@ -84,26 +93,97 @@ fn get_field_constraint(field_name: &str, table: &TableDefinition) -> &'static s
     ""
 }
 
-fn sorted_by_key<V, S: std::hash::BuildHasher>(map: &HashMap<String, V, S>) -> Vec<(&String, &V)> {
+fn sorted_by_key<V, S: BuildHasher>(map: &HashMap<String, V, S>) -> Vec<(&String, &V)> {
     let mut entries: Vec<_> = map.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     entries
+}
+
+/// Replace every control character (line breaks included) with a space.
+fn without_controls(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
 // Mermaid
 // ---------------------------------------------------------------------------
 
+/// Text for a Mermaid double-quoted string (entity name, relationship label,
+/// attribute comment). Mermaid has no escape inside those strings, and its
+/// parser (checked against 11.x) rejects `"`, `\`, `%` in entity names and
+/// `~~` in comments, and decodes `#...;` entity codes, so those characters
+/// are swapped for look-alikes and line breaks for spaces.
+fn mermaid_text(text: &str) -> String {
+    without_controls(text)
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            '\\' => '\u{FF3C}',
+            '%' => '\u{FF05}',
+            '#' => '\u{FF03}',
+            '~' => '\u{FF5E}',
+            _ => c,
+        })
+        .collect()
+}
+
+/// A Mermaid double-quoted name (entity or relationship label).
+fn mermaid_name(name: &str) -> String {
+    format!("\"{}\"", mermaid_text(name))
+}
+
+/// A field name reduced to the Mermaid attribute-name shape: a leading ASCII
+/// letter or `_`, then letters, digits, `_` and `-`.
+fn mermaid_ident(name: &str) -> String {
+    let ident: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if ident.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        ident
+    } else {
+        format!("f_{ident}")
+    }
+}
+
+/// One `type name [KEY] ["comment"]` attribute line. A name the grammar
+/// cannot take verbatim (`address.city`, `tags[*]`) is rewritten, and the
+/// real name rides along as the comment, which must come last.
+fn mermaid_attribute_line(type_name: &str, name: &str, constraint: &str) -> String {
+    let ident = mermaid_ident(name);
+    let mut line = format!("        {type_name} {ident}");
+    if !constraint.is_empty() {
+        line.push(' ');
+        line.push_str(constraint);
+    }
+    if ident != name {
+        line.push(' ');
+        line.push_str(&mermaid_name(name));
+    }
+    line
+}
+
 /// Generate a Mermaid ER diagram.
 ///
 /// Mirrors `MermaidGenerator.generate`. When `theme` is `Some`, a
 /// `%%{init: ...}%%` directive with that theme name prefaces the output;
 /// when `None`, the diagram begins directly with `erDiagram`.
+///
+/// Entity names and relationship labels are always double-quoted; attribute
+/// names that are not plain identifiers (`address.city`, `tags[*]`) are
+/// rewritten with the original kept as the attribute comment.
 #[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn generate_mermaid(
-    tables: &HashMap<String, TableDefinition>,
-    edges: &HashMap<String, EdgeDefinition>,
+pub fn generate_mermaid<S: BuildHasher>(
+    tables: &HashMap<String, TableDefinition, S>,
+    edges: &HashMap<String, EdgeDefinition, S>,
     include_fields: bool,
     include_edges: bool,
     theme: Option<&MermaidTheme>,
@@ -118,21 +198,15 @@ pub fn generate_mermaid(
 
     // Table entities (sorted by name).
     for (table_name, table) in sorted_by_key(tables) {
-        lines.push(format!("    {table_name} {{"));
+        lines.push(format!("    {} {{", mermaid_name(table_name)));
         if include_fields {
             // Always emit the implicit id field.
             lines.push("        string id PK".to_string());
             for field in &table.fields {
-                let constraint = get_field_constraint(&field.name, table);
-                let constraint_str = if constraint.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {constraint}")
-                };
-                lines.push(format!(
-                    "        {ty} {name}{constraint_str}",
-                    ty = field.field_type.as_str(),
-                    name = field.name,
+                lines.push(mermaid_attribute_line(
+                    field.field_type.as_str(),
+                    &field.name,
+                    get_field_constraint(&field.name, table),
                 ));
             }
         }
@@ -142,12 +216,12 @@ pub fn generate_mermaid(
     // Edge entities (also tables in SurrealDB) — only if they have fields.
     for (edge_name, edge) in sorted_by_key(edges) {
         if include_fields && !edge.fields.is_empty() {
-            lines.push(format!("    {edge_name} {{"));
+            lines.push(format!("    {} {{", mermaid_name(edge_name)));
             for field in &edge.fields {
-                lines.push(format!(
-                    "        {ty} {name}",
-                    ty = field.field_type.as_str(),
-                    name = field.name,
+                lines.push(mermaid_attribute_line(
+                    field.field_type.as_str(),
+                    &field.name,
+                    "",
                 ));
             }
             lines.push("    }".to_string());
@@ -170,7 +244,10 @@ pub fn generate_mermaid(
 
             let cardinality = infer_mermaid_cardinality(edge);
             lines.push(format!(
-                "    {from_table} {cardinality} {to_table} : {edge_name}"
+                "    {} {cardinality} {} : {}",
+                mermaid_name(from_table),
+                mermaid_name(to_table),
+                mermaid_name(edge_name),
             ));
         }
     }
@@ -191,16 +268,68 @@ fn infer_mermaid_cardinality(edge: &EdgeDefinition) -> &'static str {
 // GraphViz
 // ---------------------------------------------------------------------------
 
+/// A DOT quoted string (ID or attribute value): `"` and `\` escaped, so a
+/// name can neither end the string nor turn into an escape sequence, and
+/// keywords such as `node` / `edge` / `graph` stay plain IDs.
+fn dot_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in without_controls(text).chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Text inside a record label, with the record metacharacters escaped. The
+/// result still goes through [`dot_quoted`]-style quoting by the caller, so
+/// `"` is escaped here as well.
+fn record_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in without_controls(text).chars() {
+        if matches!(c, '\\' | '"' | '{' | '}' | '|' | '<' | '>') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Text inside an HTML-like label.
+fn html_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in without_controls(text).chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn is_record_shape(shape: &str) -> bool {
+    shape.eq_ignore_ascii_case("record") || shape.eq_ignore_ascii_case("mrecord")
+}
+
 /// Generate a GraphViz DOT-format diagram.
 ///
 /// Mirrors `GraphVizGenerator.generate`. When `theme` is `None`, a
 /// backward-compatible rendering matching Python's default (no gradients,
 /// plain `node [shape=record]`) is produced.
+///
+/// Every node ID is a quoted DOT string, so names that are DOT keywords or
+/// contain punctuation stay node names; record labels escape `{ } | < >`
+/// and HTML labels are HTML-escaped.
 #[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn generate_graphviz(
-    tables: &HashMap<String, TableDefinition>,
-    edges: &HashMap<String, EdgeDefinition>,
+pub fn generate_graphviz<S: BuildHasher>(
+    tables: &HashMap<String, TableDefinition, S>,
+    edges: &HashMap<String, EdgeDefinition, S>,
     include_fields: bool,
     include_edges: bool,
     theme: Option<&GraphVizTheme>,
@@ -216,28 +345,29 @@ pub fn generate_graphviz(
     // rounded filled style is the "rich" default. Minimal theme sets
     // node_style='filled' which triggers the rich path too.
     let rich = theme.use_gradients || theme.node_style != "filled,rounded";
+    let record_shape = !rich || is_record_shape(theme.node_shape);
     if rich {
         if theme.bg_color != "transparent" {
-            lines.push(format!("    bgcolor=\"{}\";", theme.bg_color));
+            lines.push(format!("    bgcolor={};", dot_quoted(theme.bg_color)));
         }
-        lines.push(format!("    fontname=\"{}\";", theme.font_name));
+        lines.push(format!("    fontname={};", dot_quoted(theme.font_name)));
 
         let mut node_attrs = Vec::<String>::new();
-        node_attrs.push(format!("shape={}", theme.node_shape));
+        node_attrs.push(format!("shape={}", dot_quoted(theme.node_shape)));
         if !theme.node_style.is_empty() {
-            node_attrs.push(format!("style=\"{}\"", theme.node_style));
+            node_attrs.push(format!("style={}", dot_quoted(theme.node_style)));
         }
-        node_attrs.push(format!("fontname=\"{}\"", theme.font_name));
+        node_attrs.push(format!("fontname={}", dot_quoted(theme.font_name)));
         node_attrs.push("pad=\"0.5\"".to_string());
         node_attrs.push("margin=\"0.2\"".to_string());
         lines.push(format!("    node [{}];", node_attrs.join(", ")));
 
         let mut edge_attrs = Vec::<String>::new();
-        edge_attrs.push(format!("color=\"{}\"", theme.edge_color));
+        edge_attrs.push(format!("color={}", dot_quoted(theme.edge_color)));
         if !theme.edge_style.is_empty() {
-            edge_attrs.push(format!("style={}", theme.edge_style));
+            edge_attrs.push(format!("style={}", dot_quoted(theme.edge_style)));
         }
-        edge_attrs.push(format!("fontname=\"{}\"", theme.font_name));
+        edge_attrs.push(format!("fontname={}", dot_quoted(theme.font_name)));
         lines.push(format!("    edge [{}];", edge_attrs.join(", ")));
     } else {
         lines.push("    node [shape=record];".to_string());
@@ -247,15 +377,16 @@ pub fn generate_graphviz(
 
     // Table nodes (sorted).
     for (table_name, table) in sorted_by_key(tables) {
-        let label = build_graphviz_table_label(table_name, table, include_fields, theme);
-        lines.push(format!("    {table_name} [label={label}];"));
+        let label =
+            build_graphviz_table_label(table_name, table, include_fields, record_shape, theme);
+        lines.push(format!("    {} [label={label}];", dot_quoted(table_name)));
     }
 
     // Edge nodes (only if they have fields and include_fields).
     for (edge_name, edge) in sorted_by_key(edges) {
         if include_fields && !edge.fields.is_empty() {
             let label = build_graphviz_edge_label(edge_name, edge, theme);
-            lines.push(format!("    {edge_name} [label={label}];"));
+            lines.push(format!("    {} [label={label}];", dot_quoted(edge_name)));
         }
     }
 
@@ -264,17 +395,20 @@ pub fn generate_graphviz(
     // Relationships.
     if include_edges {
         for (edge_name, edge) in sorted_by_key(edges) {
-            let from_table = edge.from_table.as_deref().unwrap_or("unknown");
-            let to_table = edge.to_table.as_deref().unwrap_or("unknown");
-            if !tables.contains_key(from_table) {
+            let (Some(from_table), Some(to_table)) =
+                (edge.from_table.as_deref(), edge.to_table.as_deref())
+            else {
                 continue;
-            }
-            if !tables.contains_key(to_table) {
+            };
+            if !tables.contains_key(from_table) || !tables.contains_key(to_table) {
                 continue;
             }
             let edge_style = graphviz_edge_style(edge, theme);
             lines.push(format!(
-                "    {from_table} -> {to_table} [label=\"{edge_name}\"{edge_style}];"
+                "    {} -> {} [label={}{edge_style}];",
+                dot_quoted(from_table),
+                dot_quoted(to_table),
+                dot_quoted(edge_name),
             ));
         }
     }
@@ -283,14 +417,28 @@ pub fn generate_graphviz(
     lines.join("\n")
 }
 
+/// A record label: `"{title|row\l|row\l}"` with every piece escaped.
+fn record_label(title: &str, rows: &[String]) -> String {
+    let mut parts = Vec::with_capacity(rows.len() + 1);
+    parts.push(record_text(title));
+    parts.extend(rows.iter().cloned());
+    format!("\"{{{}}}\"", parts.join("|"))
+}
+
 fn build_graphviz_table_label(
     table_name: &str,
     table: &TableDefinition,
     include_fields: bool,
+    record_shape: bool,
     theme: &GraphVizTheme,
 ) -> String {
     if !include_fields {
-        return format!("\"{table_name}\"");
+        // A record-shaped node parses even a bare label as record syntax.
+        return if record_shape {
+            format!("\"{}\"", record_text(table_name))
+        } else {
+            dot_quoted(table_name)
+        };
     }
 
     if theme.use_gradients {
@@ -298,69 +446,60 @@ fn build_graphviz_table_label(
     }
 
     // Plain record label: "{name|id : string (PK)\\l|field : ty\\l|...}"
-    let mut parts: Vec<String> = Vec::with_capacity(table.fields.len() + 2);
-    parts.push(table_name.to_string());
-    parts.push("id : string (PK)\\l".to_string());
-    for field in &table.fields {
+    let mut rows = vec!["id : string (PK)\\l".to_string()];
+    rows.extend(table.fields.iter().map(|field| {
         let constraint = get_field_constraint(&field.name, table);
         let constraint_str = if constraint.is_empty() {
             String::new()
         } else {
             format!(" ({constraint})")
         };
-        parts.push(format!(
+        format!(
             "{name} : {ty}{constraint_str}\\l",
-            name = field.name,
+            name = record_text(&field.name),
             ty = field.field_type.as_str(),
-        ));
-    }
-    format!("\"{{{}}}\"", parts.join("|"))
+        )
+    }));
+    record_label(table_name, &rows)
+}
+
+/// The `<TABLE>` wrapper of an HTML-like label around a header and rows.
+fn html_label(header_bg: &str, title: &str, rows: &[String]) -> String {
+    format!(
+        "<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\" CELLPADDING=\"4\">\
+         <TR><TD BGCOLOR=\"{bg}\" COLSPAN=\"2\"><FONT COLOR=\"#FFFFFF\"><B>{title}</B></FONT></TD></TR>\
+         {rows}</TABLE>>",
+        bg = html_text(header_bg),
+        title = html_text(title),
+        rows = rows.concat(),
+    )
 }
 
 fn build_graphviz_html_label(table_name: &str, table: &TableDefinition) -> String {
     let palette = modern_color_scheme();
-    let mut html = String::from("<");
-    html.push_str("<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\" CELLPADDING=\"4\">");
-    // Header row.
-    write!(
-        html,
-        "<TR><TD BGCOLOR=\"{bg}\" COLSPAN=\"2\"><FONT COLOR=\"#FFFFFF\"><B>{name}</B></FONT></TD></TR>",
-        bg = modern_color_scheme().primary,
-        name = table_name,
-    )
-    .expect("write to String cannot fail");
-
-    // Implicit id row.
-    write!(
-        html,
+    let mut rows = vec![format!(
         "<TR><TD ALIGN=\"LEFT\">id</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{muted}\">string</FONT> <FONT COLOR=\"{err}\">PK</FONT></TD></TR>",
         muted = palette.muted,
         err = palette.error,
-    )
-    .expect("write to String cannot fail");
-
-    // Field rows.
-    for field in &table.fields {
+    )];
+    rows.extend(table.fields.iter().map(|field| {
         let constraint = get_field_constraint(&field.name, table);
-        let type_color = field_type_color(field.field_type);
-        write!(
-            html,
-            "<TR><TD ALIGN=\"LEFT\">{name}</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{tc}\">{ty}</FONT>",
-            name = field.name,
-            tc = type_color,
+        let key = if constraint.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " <FONT COLOR=\"{cc}\">{constraint}</FONT>",
+                cc = constraint_color(constraint),
+            )
+        };
+        format!(
+            "<TR><TD ALIGN=\"LEFT\">{name}</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{tc}\">{ty}</FONT>{key}</TD></TR>",
+            name = html_text(&field.name),
+            tc = field_type_color(field.field_type),
             ty = field.field_type.as_str(),
         )
-        .expect("write to String cannot fail");
-        if !constraint.is_empty() {
-            let cc = constraint_color(constraint);
-            write!(html, " <FONT COLOR=\"{cc}\">{constraint}</FONT>")
-                .expect("write to String cannot fail");
-        }
-        html.push_str("</TD></TR>");
-    }
-
-    html.push_str("</TABLE>>");
-    html
+    }));
+    html_label(palette.primary, table_name, &rows)
 }
 
 fn build_graphviz_edge_label(
@@ -369,41 +508,34 @@ fn build_graphviz_edge_label(
     theme: &GraphVizTheme,
 ) -> String {
     if theme.use_gradients {
-        let mut html = String::from("<");
-        html.push_str("<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\" CELLPADDING=\"4\">");
-        write!(
-            html,
-            "<TR><TD BGCOLOR=\"{bg}\" COLSPAN=\"2\"><FONT COLOR=\"#FFFFFF\"><B>{name}</B></FONT></TD></TR>",
-            bg = theme.node_color,
-            name = edge_name,
-        )
-        .expect("write to String cannot fail");
-        for field in &edge.fields {
-            let type_color = field_type_color(field.field_type);
-            write!(
-                html,
-                "<TR><TD ALIGN=\"LEFT\">{name}</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{tc}\">{ty}</FONT></TD></TR>",
-                name = field.name,
-                tc = type_color,
-                ty = field.field_type.as_str(),
-            )
-            .expect("write to String cannot fail");
-        }
-        html.push_str("</TABLE>>");
-        return html;
+        let rows: Vec<String> = edge
+            .fields
+            .iter()
+            .map(|field| {
+                format!(
+                    "<TR><TD ALIGN=\"LEFT\">{name}</TD><TD ALIGN=\"LEFT\"><FONT COLOR=\"{tc}\">{ty}</FONT></TD></TR>",
+                    name = html_text(&field.name),
+                    tc = field_type_color(field.field_type),
+                    ty = field.field_type.as_str(),
+                )
+            })
+            .collect();
+        return html_label(theme.node_color, edge_name, &rows);
     }
 
     // Plain record label for edge.
-    let mut parts: Vec<String> = Vec::with_capacity(edge.fields.len() + 1);
-    parts.push(edge_name.to_string());
-    for field in &edge.fields {
-        parts.push(format!(
-            "{name} : {ty}\\l",
-            name = field.name,
-            ty = field.field_type.as_str(),
-        ));
-    }
-    format!("\"{{{}}}\"", parts.join("|"))
+    let rows: Vec<String> = edge
+        .fields
+        .iter()
+        .map(|field| {
+            format!(
+                "{name} : {ty}\\l",
+                name = record_text(&field.name),
+                ty = field.field_type.as_str(),
+            )
+        })
+        .collect();
+    record_label(edge_name, &rows)
 }
 
 fn graphviz_edge_style(edge: &EdgeDefinition, theme: &GraphVizTheme) -> String {
@@ -411,7 +543,7 @@ fn graphviz_edge_style(edge: &EdgeDefinition, theme: &GraphVizTheme) -> String {
         if from == to {
             if theme.use_gradients {
                 let secondary = modern_color_scheme().secondary;
-                return format!(", style=dashed, color=\"{secondary}\"");
+                return format!(", style=dashed, color={}", dot_quoted(secondary));
             }
             return ", style=dashed".to_string();
         }
@@ -446,15 +578,31 @@ fn constraint_color(constraint: &str) -> &'static str {
 // ASCII
 // ---------------------------------------------------------------------------
 
+/// A name as it may reach a terminal: control characters (ESC included) are
+/// written as `\u{..}` escapes, so a stored name cannot recolour, retitle,
+/// or rewrite the user's terminal.
+fn terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Generate an ASCII-art diagram (with optional Unicode box drawing).
 ///
 /// Mirrors `ASCIIGenerator.generate`. When `theme` is `None`, basic ASCII
-/// characters are used and no colours / icons are applied.
+/// characters are used and no colours / icons are applied. Control
+/// characters in names are escaped, and box widths are measured in
+/// terminal cells, so wide (CJK) names stay aligned.
 #[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn generate_ascii(
-    tables: &HashMap<String, TableDefinition>,
-    edges: &HashMap<String, EdgeDefinition>,
+pub fn generate_ascii<S: BuildHasher>(
+    tables: &HashMap<String, TableDefinition, S>,
+    edges: &HashMap<String, EdgeDefinition, S>,
     include_fields: bool,
     include_edges: bool,
     theme: Option<&ASCIITheme>,
@@ -471,9 +619,12 @@ pub fn generate_ascii(
         lines.push("Relationships:".to_string());
         lines.push("-".repeat(40));
         for (edge_name, edge) in sorted_by_key(edges) {
-            let from_table = edge.from_table.as_deref().unwrap_or("?");
-            let to_table = edge.to_table.as_deref().unwrap_or("?");
-            lines.push(format!("  {from_table} --[{edge_name}]--> {to_table}"));
+            let from_table = terminal_text(edge.from_table.as_deref().unwrap_or("?"));
+            let to_table = terminal_text(edge.to_table.as_deref().unwrap_or("?"));
+            lines.push(format!(
+                "  {from_table} --[{}]--> {to_table}",
+                terminal_text(edge_name)
+            ));
         }
     }
 
@@ -595,10 +746,6 @@ fn constraint_icon(constraint: &str, theme: Option<&ASCIITheme>) -> &'static str
     }
 }
 
-fn repeat_str(s: &str, n: usize) -> String {
-    s.repeat(n)
-}
-
 fn center_pad(width: usize, visible_len: usize) -> (usize, usize) {
     let padding = width.saturating_sub(visible_len);
     let left = padding / 2;
@@ -613,6 +760,7 @@ fn build_ascii_table_box(
     theme: Option<&ASCIITheme>,
 ) -> Vec<String> {
     let chars = select_box_chars(theme);
+    let table_name = terminal_text(table_name);
 
     // Build field lines.
     let mut field_lines: Vec<String> = Vec::new();
@@ -638,33 +786,27 @@ fn build_ascii_table_box(
             };
             field_lines.push(format!(
                 "{name} : {ty}{constraint_str}",
-                name = field.name,
+                name = terminal_text(&field.name),
                 ty = field.field_type.as_str(),
             ));
         }
     }
 
-    // Compute width.
-    let min_width = std::cmp::max(table_name.chars().count() + 4, 20);
+    // Compute width in terminal cells.
+    let min_width = std::cmp::max(display_width(&table_name) + 4, 20);
     let content_width = field_lines
         .iter()
         .map(|l| display_width(l))
         .max()
         .unwrap_or(0);
     let width = std::cmp::max(min_width, content_width + 2);
+    let rule = |left: &str, right: &str| format!("{left}{}{right}", chars.h.repeat(width));
 
-    let mut out: Vec<String> = Vec::new();
-    out.push(format!(
-        "{}{}{}",
-        chars.tl,
-        repeat_str(chars.h, width),
-        chars.tr
-    ));
+    let mut out: Vec<String> = vec![rule(chars.tl, chars.tr)];
 
     // Header row: centred, optional bold.
-    let styled_name = colorize(table_name, "header", theme);
-    let visible = display_width(&styled_name);
-    let (left, right) = center_pad(width, visible);
+    let styled_name = colorize(&table_name, "header", theme);
+    let (left, right) = center_pad(width, display_width(&styled_name));
     out.push(format!(
         "{v}{l}{name}{r}{v}",
         v = chars.v,
@@ -674,27 +816,19 @@ fn build_ascii_table_box(
     ));
 
     if include_fields {
-        out.push(format!(
-            "{}{}{}",
-            chars.ml,
-            repeat_str(chars.h, width),
-            chars.mr
-        ));
+        out.push(rule(chars.ml, chars.mr));
         for line in &field_lines {
-            let visible_len = display_width(line);
             // Leading space + content + trailing padding = width.
-            let padding = width.saturating_sub(visible_len + 1);
-            let padded = format!(" {line}{}", " ".repeat(padding));
-            out.push(format!("{v}{padded}{v}", v = chars.v));
+            let padding = width.saturating_sub(display_width(line) + 1);
+            out.push(format!(
+                "{v} {line}{pad}{v}",
+                v = chars.v,
+                pad = " ".repeat(padding)
+            ));
         }
     }
 
-    out.push(format!(
-        "{}{}{}",
-        chars.bl,
-        repeat_str(chars.h, width),
-        chars.br
-    ));
+    out.push(rule(chars.bl, chars.br));
     out
 }
 
@@ -748,20 +882,20 @@ impl<'a> From<&'a ASCIITheme> for ThemeOption<'a> {
 ///
 /// Mirrors `visualize_schema` in Python: picks the right generator based on
 /// `output_format`, resolves a [`ThemeOption`] into the matching sub-theme,
-/// and passes through `include_fields` / `include_edges`.
+/// and passes through `include_fields` / `include_edges`. The edge map takes
+/// the table map's hasher, which keeps a bare `None` inferable.
 ///
 /// Returns [`SurqlError::Validation`](crate::error::SurqlError::Validation)
 /// only if a [`ThemeOption::Named`] theme name is unknown.
-#[allow(clippy::implicit_hasher)]
-pub fn visualize_schema(
-    tables: &HashMap<String, TableDefinition>,
-    edges: Option<&HashMap<String, EdgeDefinition>>,
+pub fn visualize_schema<S: BuildHasher + Default>(
+    tables: &HashMap<String, TableDefinition, S>,
+    edges: Option<&HashMap<String, EdgeDefinition, S>>,
     output_format: OutputFormat,
     include_fields: bool,
     include_edges: bool,
     theme: Option<&ThemeOption<'_>>,
 ) -> Result<String> {
-    let empty_edges: HashMap<String, EdgeDefinition> = HashMap::new();
+    let empty_edges: HashMap<String, EdgeDefinition, S> = HashMap::default();
     let edges = edges.unwrap_or(&empty_edges);
 
     // Resolve a named theme once so the borrowed references below stay alive.
@@ -960,7 +1094,7 @@ mod tests {
     #[test]
     fn mermaid_includes_table_and_id_pk() {
         let out = generate_mermaid(&minimal_tables(), &HashMap::new(), true, true, None);
-        assert!(out.contains("    user {"));
+        assert!(out.contains("    \"user\" {"));
         assert!(out.contains("        string id PK"));
         assert!(out.contains("        string email UK"));
         assert!(out.contains("    }"));
@@ -970,7 +1104,7 @@ mod tests {
     fn mermaid_without_fields_omits_fields() {
         let out = generate_mermaid(&minimal_tables(), &HashMap::new(), false, true, None);
         assert!(!out.contains("string id PK"));
-        assert!(out.contains("    user {\n    }"));
+        assert!(out.contains("    \"user\" {\n    }"));
     }
 
     #[test]
@@ -984,7 +1118,7 @@ mod tests {
         let mut edges = HashMap::new();
         edges.insert("likes".to_string(), likes_edge());
         let out = generate_mermaid(&two_tables(), &edges, true, true, None);
-        assert!(out.contains("user ||--o{ post : likes"));
+        assert!(out.contains("\"user\" ||--o{ \"post\" : \"likes\""));
     }
 
     #[test]
@@ -992,7 +1126,7 @@ mod tests {
         let mut edges = HashMap::new();
         edges.insert("knows".to_string(), knows_edge_self());
         let out = generate_mermaid(&minimal_tables(), &edges, true, true, None);
-        assert!(out.contains("user }o--o{ user : knows"));
+        assert!(out.contains("\"user\" }o--o{ \"user\" : \"knows\""));
     }
 
     #[test]
@@ -1006,7 +1140,7 @@ mod tests {
         let mut edges = HashMap::new();
         edges.insert("likes".to_string(), likes_edge());
         let out = generate_mermaid(&two_tables(), &edges, true, true, None);
-        assert!(out.contains("    likes {"));
+        assert!(out.contains("    \"likes\" {"));
         assert!(out.contains("        int weight"));
     }
 
@@ -1077,7 +1211,7 @@ mod tests {
     #[test]
     fn graphviz_record_field_plain_label() {
         let out = generate_graphviz(&two_tables(), &HashMap::new(), true, true, None);
-        assert!(out.contains("post [label=\"{post|id : string (PK)\\l"));
+        assert!(out.contains("\"post\" [label=\"{post|id : string (PK)\\l"));
         assert!(out.contains("author : record (FK)\\l"));
     }
 
@@ -1086,7 +1220,7 @@ mod tests {
         let mut edges = HashMap::new();
         edges.insert("likes".to_string(), likes_edge());
         let out = generate_graphviz(&two_tables(), &edges, true, true, None);
-        assert!(out.contains("user -> post [label=\"likes\"];"));
+        assert!(out.contains("\"user\" -> \"post\" [label=\"likes\"];"));
     }
 
     #[test]
@@ -1094,7 +1228,7 @@ mod tests {
         let mut edges = HashMap::new();
         edges.insert("knows".to_string(), knows_edge_self());
         let out = generate_graphviz(&minimal_tables(), &edges, true, true, None);
-        assert!(out.contains("user -> user [label=\"knows\", style=dashed];"));
+        assert!(out.contains("\"user\" -> \"user\" [label=\"knows\", style=dashed];"));
     }
 
     #[test]
@@ -1116,7 +1250,7 @@ mod tests {
     #[test]
     fn graphviz_include_fields_false_emits_plain_label() {
         let out = generate_graphviz(&minimal_tables(), &HashMap::new(), false, true, None);
-        assert!(out.contains("user [label=\"user\"];"));
+        assert!(out.contains("\"user\" [label=\"user\"];"));
     }
 
     #[test]
@@ -1125,7 +1259,7 @@ mod tests {
         edges.insert("likes".to_string(), likes_edge());
         let out = generate_graphviz(&two_tables(), &edges, true, true, None);
         // Plain record label for edge when no gradients.
-        assert!(out.contains("likes [label=\"{likes|weight : int\\l}\"];"));
+        assert!(out.contains("\"likes\" [label=\"{likes|weight : int\\l}\"];"));
     }
 
     #[test]
@@ -1383,6 +1517,135 @@ mod tests {
         let out = generate_mermaid(&tables, &HashMap::new(), true, true, None);
         assert!(out.contains("string email UK"));
         assert!(out.contains("string username UK"));
+    }
+
+    // ---------- Hostile names ----------
+
+    fn named_table(name: &str, fields: &[&str]) -> HashMap<String, TableDefinition> {
+        let fields = fields
+            .iter()
+            .map(|f| crate::schema::fields::FieldDefinition::new(*f, FieldType::String));
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), table_schema(name).with_fields(fields));
+        m
+    }
+
+    #[test]
+    fn mermaid_nested_field_names_are_sanitised_with_the_real_name_as_comment() {
+        let tables = named_table("user", &["address.city", "tags[*]", "ok_name"]);
+        let out = generate_mermaid(&tables, &HashMap::new(), true, true, None);
+        assert!(
+            out.contains("        string address_city \"address.city\""),
+            "{out}"
+        );
+        assert!(out.contains("        string tags___ \"tags[*]\""), "{out}");
+        assert!(out.contains("        string ok_name\n"), "{out}");
+    }
+
+    #[test]
+    fn mermaid_entity_names_are_quoted_and_cannot_inject_lines() {
+        let tables = named_table("my \"odd\"\n    x ||--o{ y : z", &[]);
+        let out = generate_mermaid(&tables, &HashMap::new(), false, true, None);
+        assert_eq!(out.lines().count(), 3, "{out}");
+        assert!(
+            out.contains("    \"my 'odd'     x ||--o{ y : z\" {"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn mermaid_names_avoid_characters_the_parser_rejects() {
+        let tables = named_table("a\\b%%c#quot;d", &["n~~e"]);
+        let out = generate_mermaid(&tables, &HashMap::new(), true, false, None);
+        assert!(
+            out.contains("    \"a\u{FF3C}b\u{FF05}\u{FF05}c\u{FF03}quot;d\" {"),
+            "{out}"
+        );
+        assert!(
+            out.contains("        string n__e \"n\u{FF5E}\u{FF5E}e\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn graphviz_dot_keywords_are_quoted_ids() {
+        let mut tables = named_table("node", &[]);
+        tables.extend(named_table("Edge", &[]));
+        tables.extend(named_table("graph", &[]));
+        let out = generate_graphviz(&tables, &HashMap::new(), true, true, None);
+        for name in ["node", "Edge", "graph"] {
+            assert!(out.contains(&format!("    \"{name}\" [label=")), "{out}");
+            assert!(!out.contains(&format!("    {name} [label=")), "{out}");
+        }
+    }
+
+    #[test]
+    fn graphviz_ids_escape_quotes_and_backslashes() {
+        let tables = named_table("a\"b\\c", &[]);
+        let out = generate_graphviz(&tables, &HashMap::new(), false, true, None);
+        assert!(out.contains("    \"a\\\"b\\\\c\" [label="), "{out}");
+    }
+
+    #[test]
+    fn graphviz_record_label_metacharacters_are_escaped() {
+        let tables = named_table("a|b", &["x{y}", "p<q>"]);
+        let out = generate_graphviz(&tables, &HashMap::new(), true, true, None);
+        assert!(out.contains("{a\\|b|id : string (PK)\\l"), "{out}");
+        assert!(out.contains("x\\{y\\} : string\\l"), "{out}");
+        assert!(out.contains("p\\<q\\> : string\\l"), "{out}");
+    }
+
+    #[test]
+    fn graphviz_html_labels_are_html_escaped() {
+        let tables = named_table("R&D", &["a<b"]);
+        let theme = modern_theme().graphviz;
+        let out = generate_graphviz(&tables, &HashMap::new(), true, true, Some(&theme));
+        assert!(out.contains("<B>R&amp;D</B>"), "{out}");
+        assert!(out.contains(">a&lt;b</TD>"), "{out}");
+        assert!(!out.contains("<B>R&D</B>"), "{out}");
+    }
+
+    #[test]
+    fn graphviz_edge_names_are_escaped_in_relationship_labels() {
+        let mut edges = HashMap::new();
+        edges.insert(
+            "say \"hi\"".to_string(),
+            edge_schema("say \"hi\"")
+                .with_from_table("user")
+                .with_to_table("post"),
+        );
+        let out = generate_graphviz(&two_tables(), &edges, true, true, None);
+        assert!(
+            out.contains("\"user\" -> \"post\" [label=\"say \\\"hi\\\"\"];"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn ascii_box_width_uses_display_width_for_wide_names() {
+        let name = "用户表用户表用户表用户表";
+        let out = generate_ascii(&named_table(name, &[]), &HashMap::new(), false, true, None);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(display_width)
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}\n{out}");
+    }
+
+    #[test]
+    fn ascii_control_bytes_in_names_are_escaped() {
+        let tables = named_table("evil\u{1b}[31m", &["f\u{7}ld"]);
+        let mut edges = HashMap::new();
+        edges.insert(
+            "e\u{1b}]0;x".to_string(),
+            edge_schema("e\u{1b}]0;x")
+                .with_from_table("a\rb")
+                .with_to_table("c"),
+        );
+        let out = generate_ascii(&tables, &edges, true, true, None);
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains("evil\\u{1b}[31m"), "{out}");
     }
 
     #[test]
