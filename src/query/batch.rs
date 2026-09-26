@@ -34,12 +34,13 @@
 //! # Ok(()) }
 //! ```
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::error::{Result, SurqlError};
-use crate::types::operators::quote_value_public;
+use crate::types::operators::{quote_object_key, quote_value_public};
+use crate::types::record_id::RecordID;
 
-use super::builder::{table_part, validate_identifier};
+use super::validate::{record_in_table, render_target, validate_identifier, validate_set_target};
 
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 use crate::connection::transaction::Transaction;
@@ -52,18 +53,25 @@ use crate::query::executor::flatten_rows;
 // SurrealQL rendering helpers
 // ---------------------------------------------------------------------------
 
-/// Render one dict-style `Value` as a SurrealQL object literal, validating
-/// every field name against the identifier pattern. Used by `*_many` helpers
-/// and `build_upsert_query`.
-fn format_item_for_surql(item: &Value) -> Result<String> {
-    let obj = item.as_object().ok_or_else(|| SurqlError::Validation {
+/// The item as a JSON object, or a validation error.
+fn as_object(item: &Value) -> Result<&Map<String, Value>> {
+    item.as_object().ok_or_else(|| SurqlError::Validation {
         reason: "Batch items must be JSON objects".to_string(),
-    })?;
+    })
+}
 
+/// Render a JSON object as a SurrealQL object literal, validating every
+/// field name against the identifier pattern. Keys are quoted as object keys
+/// and values rendered as literals, at any depth.
+fn render_object(obj: &Map<String, Value>) -> Result<String> {
     let mut parts: Vec<String> = Vec::with_capacity(obj.len());
     for (key, value) in obj {
         validate_identifier(key, "field name")?;
-        parts.push(format!("{key}: {}", quote_value_public(value)));
+        parts.push(format!(
+            "{}: {}",
+            quote_object_key(key),
+            quote_value_public(value)
+        ));
     }
     Ok(format!("{{ {} }}", parts.join(", ")))
 }
@@ -75,71 +83,144 @@ fn format_item_for_surql(item: &Value) -> Result<String> {
 /// is enabled.
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 fn format_items_array(items: &[Value]) -> Result<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(items.len());
-    for item in items {
-        lines.push(format_item_for_surql(item)?);
-    }
+    let lines = items
+        .iter()
+        .map(|item| as_object(item).and_then(render_object))
+        .collect::<Result<Vec<_>>>()?;
     Ok(format!("[\n  {}\n]", lines.join(",\n  ")))
 }
 
-/// Render a `SET a = v1, b = v2` fragment for `RELATE` edge data.
-fn render_set_clause(data: &serde_json::Map<String, Value>) -> Result<String> {
+/// Render a `SET a = v1, b = v2` fragment for `RELATE` edge data. Each key
+/// is a `SET` target (a field path).
+fn render_set_clause(data: &Map<String, Value>) -> Result<String> {
     let mut parts: Vec<String> = Vec::with_capacity(data.len());
     for (key, value) in data {
-        validate_identifier(key, "field name")?;
+        validate_set_target(key)?;
         parts.push(format!("{key} = {}", quote_value_public(value)));
     }
     Ok(parts.join(", "))
 }
 
 // ---------------------------------------------------------------------------
-// Pure query builders (available without the `client` feature)
+// Upsert planning
 // ---------------------------------------------------------------------------
 
-/// Render one item as the SurrealQL UPSERT statement that
-/// [`upsert_many`] / [`upsert_many_in_tx`] / [`build_upsert_query`]
-/// all emit. The `id` field — when present — is stripped from the
-/// payload and used as the UPSERT target so v3 does not double-write it.
+/// One item of an upsert batch, resolved: the record or table it targets,
+/// the fields it writes, and the `WHERE` its conflict fields add.
 ///
-/// Returns a tuple of `(target, payload_literal)`; the caller appends
-/// the WHERE clause and `;` suffix.
-fn render_upsert_statement(table: &str, item: &Value) -> Result<(String, String)> {
-    // Walk the item once: pluck `id` for the target, validate every
-    // other key, and accumulate the payload literal.
-    let obj = item.as_object().ok_or_else(|| SurqlError::Validation {
-        reason: "Batch items must be JSON objects".to_string(),
-    })?;
+/// Every upsert path ([`build_upsert_query`], [`upsert_many`],
+/// [`upsert_many_in_tx`]) renders from this one plan, so they target the
+/// same records.
+struct UpsertPlan {
+    target: String,
+    payload: Map<String, Value>,
+    condition: Option<String>,
+}
 
-    let id_target = obj.get("id").and_then(Value::as_str);
-    let target = match id_target {
-        Some(id) => {
-            validate_identifier(table_part(id), "record ID table")?;
-            id.to_string()
+impl UpsertPlan {
+    /// `UPSERT <target> CONTENT <content> [WHERE <condition>]`.
+    fn statement(&self, content: &str) -> String {
+        match &self.condition {
+            Some(condition) => {
+                format!("UPSERT {} CONTENT {content} WHERE {condition}", self.target)
+            }
+            None => format!("UPSERT {} CONTENT {content}", self.target),
         }
-        None => table.to_string(),
+    }
+}
+
+/// Validate the table and conflict field names shared by a batch.
+fn validate_upsert_args<'a>(
+    table: &str,
+    conflict_fields: Option<&'a [String]>,
+) -> Result<&'a [String]> {
+    validate_identifier(table, "table name")?;
+    let fields = conflict_fields.unwrap_or(&[]);
+    for f in fields {
+        validate_identifier(f, "conflict field name")?;
+    }
+    Ok(fields)
+}
+
+/// Resolve one upsert item.
+///
+/// The target comes from the item's `id`: a bare string is a key of `table`
+/// (`"alice"` is `table:alice`), a qualified string must name a record of
+/// `table`, and an integer is an integer key. Without an `id` the statement
+/// targets the whole table, which is only an upsert when `conflict_fields`
+/// narrows it with a `WHERE`; otherwise `UPSERT <table>` matches nothing and
+/// inserts a fresh record on every run, so such an item is refused.
+fn plan_upsert(table: &str, item: &Value, conflict_fields: &[String]) -> Result<UpsertPlan> {
+    let obj = as_object(item)?;
+    let target = match obj.get("id") {
+        None if conflict_fields.is_empty() => {
+            return Err(SurqlError::Validation {
+                reason: "Upsert items need an `id` or conflict_fields: without either, \
+                         UPSERT inserts a new record on every run"
+                    .to_string(),
+            })
+        }
+        None => table.to_owned(),
+        Some(Value::String(id)) if id.contains(':') => record_in_table(table, id)?,
+        Some(Value::String(id)) => RecordID::<()>::new(table, id.as_str())?.to_string(),
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(n) => RecordID::<()>::new(table, n)?.to_string(),
+            None => {
+                return Err(SurqlError::Validation {
+                    reason: format!("Upsert item id must be an integer or a string, got {n}"),
+                })
+            }
+        },
+        Some(other) => {
+            return Err(SurqlError::Validation {
+                reason: format!("Upsert item id must be an integer or a string, got {other}"),
+            })
+        }
     };
 
-    let mut parts: Vec<String> = Vec::with_capacity(obj.len());
-    for (key, value) in obj {
-        if key == "id" {
-            continue;
-        }
+    // v3 rejects a CONTENT that repeats the target's id, so `id` is the
+    // target only.
+    let payload: Map<String, Value> = obj
+        .iter()
+        .filter(|(key, _)| key.as_str() != "id")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for key in payload.keys() {
         validate_identifier(key, "field name")?;
-        parts.push(format!("{key}: {}", quote_value_public(value)));
     }
-    let payload = format!("{{ {} }}", parts.join(", "));
-    Ok((target, payload))
+
+    let condition = (!conflict_fields.is_empty()).then(|| {
+        conflict_fields
+            .iter()
+            .map(|f| {
+                let v = obj.get(f).unwrap_or(&Value::Null);
+                format!("{f} = {}", quote_value_public(v))
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    });
+
+    Ok(UpsertPlan {
+        target,
+        payload,
+        condition,
+    })
 }
+
+// ---------------------------------------------------------------------------
+// Pure query builders (available without the `client` feature)
+// ---------------------------------------------------------------------------
 
 /// Build a multi-statement `UPSERT <target> CONTENT { … }` SurrealQL
 /// string without executing it.
 ///
-/// One statement per item, joined by `;`. Items with an `id` field are
-/// upserted by record id (the `id` is stripped from the CONTENT payload
-/// so v3 does not reject the duplicate); items without one are upserted
-/// into the bare table.
+/// One statement per item, joined by `;`. Each item needs an `id` (the
+/// upsert target; it is stripped from the CONTENT payload so v3 does not
+/// reject the duplicate) or non-empty `conflict_fields`: a bare id is a key
+/// of `table`, a qualified id must name a record of `table`, and an integer
+/// id is an integer key.
 ///
-/// When `conflict_fields` is `Some`, appends a `WHERE` clause of the
+/// When `conflict_fields` is non-empty, appends a `WHERE` clause of the
 /// form `field = <value> [AND …]` to each statement. The conflict
 /// values are inlined rather than parameterised because callers that
 /// pass the rendered string to [`Transaction::execute`] cannot bind
@@ -162,61 +243,39 @@ pub fn build_upsert_query(
     if items.is_empty() {
         return Ok(String::new());
     }
-
-    validate_identifier(table, "table name")?;
-    if let Some(fields) = conflict_fields {
-        for f in fields {
-            validate_identifier(f, "conflict field name")?;
-        }
-    }
-
-    let mut statements: Vec<String> = Vec::with_capacity(items.len());
-    for item in items {
-        let (target, payload) = render_upsert_statement(table, item)?;
-        let stmt = if let Some(fields) = conflict_fields.filter(|f| !f.is_empty()) {
-            let obj = item
-                .as_object()
-                .expect("validated by render_upsert_statement");
-            let conditions = fields
-                .iter()
-                .map(|f| {
-                    let v = obj.get(f).cloned().unwrap_or(Value::Null);
-                    format!("{f} = {}", quote_value_public(&v))
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            format!("UPSERT {target} CONTENT {payload} WHERE {conditions};")
-        } else {
-            format!("UPSERT {target} CONTENT {payload};")
-        };
-        statements.push(stmt);
-    }
-
+    let fields = validate_upsert_args(table, conflict_fields)?;
+    let statements = items
+        .iter()
+        .map(|item| {
+            let plan = plan_upsert(table, item, fields)?;
+            Ok(format!(
+                "{};",
+                plan.statement(&render_object(&plan.payload)?)
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(statements.join("\n"))
 }
 
 /// Build a `RELATE <from>-><edge>-><to> [SET ...]` SurrealQL string.
 ///
 /// The `from_id` / `to_id` values should be complete record IDs
-/// (`"user:alice"`). The table portion of each is validated against the
-/// identifier regex to guard against injection.
+/// (`"user:alice"`). Each is parsed and re-rendered, so its key is escaped
+/// and cannot extend the statement; the edge must be an identifier.
 pub fn build_relate_query(
     from_id: &str,
     edge: &str,
     to_id: &str,
-    data: Option<&serde_json::Map<String, Value>>,
+    data: Option<&Map<String, Value>>,
 ) -> Result<String> {
     validate_identifier(edge, "edge table name")?;
-    validate_identifier(table_part(from_id), "from record table")?;
-    validate_identifier(table_part(to_id), "to record table")?;
+    let from = render_target(from_id)?;
+    let to = render_target(to_id)?;
 
-    let mut stmt = format!("RELATE {from_id}->{edge}->{to_id}");
-    if let Some(data) = data {
-        if !data.is_empty() {
-            let set_clause = render_set_clause(data)?;
-            stmt.push_str(" SET ");
-            stmt.push_str(&set_clause);
-        }
+    let mut stmt = format!("RELATE {from}->{edge}->{to}");
+    if let Some(data) = data.filter(|d| !d.is_empty()) {
+        stmt.push_str(" SET ");
+        stmt.push_str(&render_set_clause(data)?);
     }
     stmt.push(';');
     Ok(stmt)
@@ -228,13 +287,13 @@ pub fn build_relate_query(
 
 /// Batch upsert multiple records in **autocommit** mode.
 ///
-/// Emits one `UPSERT <target> CONTENT $data` statement per item, with
-/// the payload bound as a `$data` variable so the query plan can be
-/// cached. Items with an `id` field are upserted by record id (the
-/// `id` is stripped from the payload because v3 rejects
-/// `UPSERT person:alice CONTENT {id: 'person:alice', ...}` —
-/// the target is already pinned); items without one are upserted into
-/// the bare table.
+/// Emits one `UPSERT <target> CONTENT $data [WHERE …]` statement per item,
+/// with the payload bound as a `$data` variable so the query plan can be
+/// cached. Items resolve exactly as in [`build_upsert_query`]: each needs an
+/// `id` (stripped from the payload, because v3 rejects
+/// `UPSERT person:alice CONTENT {id: 'person:alice', ...}` — the target is
+/// already pinned) or non-empty `conflict_fields`, which add the same
+/// `WHERE` clause as the other upsert paths.
 ///
 /// ## Atomicity
 ///
@@ -244,10 +303,6 @@ pub fn build_relate_query(
 /// success window is unacceptable, use [`upsert_many_in_tx`] instead —
 /// it queues the same per-record `UPSERT` statements on an active
 /// [`Transaction`] so the whole batch rolls back if any record fails.
-///
-/// `conflict_fields` is accepted for cross-port signature parity. It is
-/// validated against the identifier regex; conflict resolution against
-/// the target still happens through the explicit `id` on each item.
 ///
 /// Returns the upserted rows. An empty `items` slice short-circuits to
 /// `Ok(vec![])` without contacting the database.
@@ -261,26 +316,14 @@ pub async fn upsert_many(
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    validate_identifier(table, "table name")?;
-    if let Some(fields) = conflict_fields {
-        for f in fields {
-            validate_identifier(f, "conflict field name")?;
-        }
-    }
+    let fields = validate_upsert_args(table, conflict_fields)?;
 
     let mut rows: Vec<Value> = Vec::with_capacity(items.len());
-    for item in items {
-        let (target, payload, payload_for_bind) = prepare_tx_upsert(table, item)?;
-        // Validate the target table-part (guards against id values like
-        // `drop_table:1` smuggling through).
-        validate_identifier(table_part(&target), "record ID table")?;
-
-        // Autocommit path uses parameter binding so the v3 query planner
-        // can reuse the prepared statement across the batch.
-        let _ = payload; // payload literal is unused on this path.
+    for item in &items {
+        let plan = plan_upsert(table, item, fields)?;
+        let surql = plan.statement("$data");
         let mut vars = std::collections::BTreeMap::new();
-        vars.insert("data".to_owned(), payload_for_bind);
-        let surql = format!("UPSERT {target} CONTENT $data");
+        vars.insert("data".to_owned(), Value::Object(plan.payload));
         let raw = client.query_with_vars(&surql, vars).await?;
         rows.extend(flatten_rows(&raw));
     }
@@ -348,86 +391,15 @@ pub async fn upsert_many_in_tx(
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    validate_identifier(table, "table name")?;
-    if let Some(fields) = conflict_fields {
-        for f in fields {
-            validate_identifier(f, "conflict field name")?;
-        }
-    }
+    let fields = validate_upsert_args(table, conflict_fields)?;
 
     let mut results: Vec<Value> = Vec::with_capacity(items.len());
-    for item in items {
-        let (target, payload, payload_for_bind) = prepare_tx_upsert(table, &item)?;
-        let _ = payload_for_bind; // bound path is unused inside a transaction.
-                                  // Validate the target table-part (guards against id values like
-                                  // `drop_table:1` smuggling through).
-        validate_identifier(table_part(&target), "record ID table")?;
-
-        let stmt = if let Some(fields) = conflict_fields.filter(|f| !f.is_empty()) {
-            let obj = item.as_object().expect("validated by prepare_tx_upsert");
-            let conditions = fields
-                .iter()
-                .map(|f| {
-                    let v = obj.get(f).cloned().unwrap_or(Value::Null);
-                    format!("{f} = {}", quote_value_public(&v))
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            format!("UPSERT {target} CONTENT {payload} WHERE {conditions}")
-        } else {
-            format!("UPSERT {target} CONTENT {payload}")
-        };
+    for item in &items {
+        let plan = plan_upsert(table, item, fields)?;
+        let stmt = plan.statement(&render_object(&plan.payload)?);
         results.push(txn.execute(&stmt).await?);
     }
     Ok(results)
-}
-
-/// Owned-by-call-site helper used by both [`upsert_many`] (which binds
-/// the payload as `$data`) and [`upsert_many_in_tx`] (which inlines the
-/// rendered literal). Returns a tuple of
-/// `(target, inline_payload_literal, payload_for_$data_binding)`.
-///
-/// The function accepts both an owned and a borrowed `item` because the
-/// autocommit path consumes the value (it becomes the bind variable) and
-/// the transaction path only borrows it (the literal is rendered from
-/// the borrowed value). To keep one call site, the autocommit caller
-/// passes the owned `item` directly; the transaction caller passes a
-/// borrow.
-#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
-fn prepare_tx_upsert<I>(table: &str, item: I) -> Result<(String, String, Value)>
-where
-    I: PreparedUpsertItem,
-{
-    item.prepare(table)
-}
-
-#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
-trait PreparedUpsertItem {
-    fn prepare(self, table: &str) -> Result<(String, String, Value)>;
-}
-
-#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
-impl PreparedUpsertItem for Value {
-    fn prepare(self, table: &str) -> Result<(String, String, Value)> {
-        let (target, payload) = render_upsert_statement(table, &self)?;
-        // For autocommit binding: clone the item and strip the `id`
-        // field so v3 does not reject the duplicate.
-        let mut bind = self;
-        if let Some(obj) = bind.as_object_mut() {
-            obj.remove("id");
-        }
-        Ok((target, payload, bind))
-    }
-}
-
-#[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
-impl PreparedUpsertItem for &Value {
-    fn prepare(self, table: &str) -> Result<(String, String, Value)> {
-        let (target, payload) = render_upsert_statement(table, self)?;
-        // Transaction path doesn't bind, so the `Value::Null` here is
-        // just a placeholder — callers should ignore it.
-        Ok((target, payload, Value::Null))
-    }
 }
 
 /// Batch insert multiple records via `INSERT INTO <table> [...]`.
@@ -460,7 +432,7 @@ pub struct RelateItem {
     /// Target record ID (e.g. `"person:bob"`).
     pub to: String,
     /// Optional edge properties.
-    pub data: Option<serde_json::Map<String, Value>>,
+    pub data: Option<Map<String, Value>>,
 }
 
 impl RelateItem {
@@ -474,7 +446,7 @@ impl RelateItem {
     }
 
     /// Attach edge data to this relation.
-    pub fn with_data(mut self, data: serde_json::Map<String, Value>) -> Self {
+    pub fn with_data(mut self, data: Map<String, Value>) -> Self {
         self.data = Some(data);
         self
     }
@@ -482,8 +454,9 @@ impl RelateItem {
 
 /// Batch create graph relations via a series of `RELATE` statements.
 ///
-/// `from_table` and `to_table` are used for validation only; the actual
-/// query uses the full record IDs present in each [`RelateItem`].
+/// Each [`RelateItem`]'s `from` must be a record of `from_table` and its
+/// `to` a record of `to_table`; a bare key (`"alice"`) is taken as a key of
+/// that table.
 ///
 /// All statements are sent in a single query and the aggregated rows are
 /// returned.
@@ -499,18 +472,13 @@ pub async fn relate_many(
         return Ok(Vec::new());
     }
 
-    validate_identifier(from_table, "from table name")?;
     validate_identifier(edge, "edge table name")?;
-    validate_identifier(to_table, "to table name")?;
 
     let mut stmts: Vec<String> = Vec::with_capacity(relations.len());
     for rel in &relations {
-        stmts.push(build_relate_query(
-            &rel.from,
-            edge,
-            &rel.to,
-            rel.data.as_ref(),
-        )?);
+        let from = record_in_table(from_table, &rel.from)?;
+        let to = record_in_table(to_table, &rel.to)?;
+        stmts.push(build_relate_query(&from, edge, &to, rel.data.as_ref())?);
     }
     let surql = stmts.join("\n");
     let raw = client.query(&surql).await?;
@@ -521,7 +489,8 @@ pub async fn relate_many(
 /// statements.
 ///
 /// IDs may be bare (`"alice"`) or fully qualified (`"user:alice"`); bare
-/// IDs are prefixed with `<table>:` automatically.
+/// IDs are keys of `table` (digits name the integer key, as they do in
+/// SurrealQL), and a qualified ID must name a record of `table`.
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub async fn delete_many(
     client: &DatabaseClient,
@@ -534,15 +503,8 @@ pub async fn delete_many(
     validate_identifier(table, "table name")?;
 
     let mut rows: Vec<Value> = Vec::new();
-    for record_id in ids {
-        if record_id.contains(':') {
-            validate_identifier(table_part(&record_id), "record ID table")?;
-        }
-        let target = if record_id.contains(':') {
-            record_id.clone()
-        } else {
-            format!("{table}:{record_id}")
-        };
+    for record_id in &ids {
+        let target = record_in_table(table, record_id)?;
         let surql = format!("DELETE {target} RETURN BEFORE;");
         let raw = client.query(&surql).await?;
         rows.extend(flatten_rows(&raw));
@@ -577,10 +539,11 @@ mod tests {
     }
 
     #[test]
-    fn build_upsert_query_targets_bare_table_when_no_id_field() {
-        let items = vec![json!({"name": "Alice"})];
-        let sql = build_upsert_query("user", &items, None).unwrap();
-        assert!(sql.starts_with("UPSERT user CONTENT"));
+    fn build_upsert_query_targets_the_table_when_conflict_fields_match() {
+        let items = vec![json!({"email": "a@x.com", "name": "Alice"})];
+        let fields = vec!["email".to_string()];
+        let sql = build_upsert_query("user", &items, Some(&fields)).unwrap();
+        assert!(sql.starts_with("UPSERT user CONTENT"), "{sql}");
     }
 
     #[test]
@@ -639,16 +602,79 @@ mod tests {
     }
 
     #[test]
-    fn format_item_for_surql_handles_nested_array() {
+    fn build_relate_query_cannot_carry_a_second_statement() {
+        let sql = build_relate_query(
+            "person:a->knows->person:b; REMOVE TABLE person; --",
+            "knows",
+            "person:c",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "RELATE person:⟨a->knows->person:b; REMOVE TABLE person; --⟩->knows->person:c;"
+        );
+    }
+
+    #[test]
+    fn build_upsert_query_requires_an_id_or_conflict_fields() {
+        let err = build_upsert_query("user", &[json!({"name": "Alice"})], None).unwrap_err();
+        assert!(matches!(err, SurqlError::Validation { .. }));
+        let fields: Vec<String> = Vec::new();
+        assert!(build_upsert_query("user", &[json!({"name": "Alice"})], Some(&fields)).is_err());
+    }
+
+    #[test]
+    fn build_upsert_query_prefixes_bare_and_numeric_ids() {
+        let sql = build_upsert_query("user", &[json!({"id": "alice", "n": 1})], None).unwrap();
+        assert_eq!(sql, "UPSERT user:alice CONTENT { n: 1 };");
+        let sql = build_upsert_query("user", &[json!({"id": 42, "n": 1})], None).unwrap();
+        assert_eq!(sql, "UPSERT user:42 CONTENT { n: 1 };");
+        let sql = build_upsert_query("user", &[json!({"id": "a-b; DELETE user"})], None).unwrap();
+        assert_eq!(sql, "UPSERT user:⟨a-b; DELETE user⟩ CONTENT {  };");
+    }
+
+    #[test]
+    fn build_upsert_query_rejects_an_id_in_another_table() {
+        assert!(build_upsert_query("user", &[json!({"id": "admin:root"})], None).is_err());
+        assert!(build_upsert_query("user", &[json!({"id": true})], None).is_err());
+    }
+
+    #[test]
+    fn build_upsert_query_applies_conflict_fields_to_id_targets() {
+        let fields = vec!["email".to_string()];
+        let sql = build_upsert_query(
+            "user",
+            &[json!({"id": "user:a", "email": "a@x.com"})],
+            Some(&fields),
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "UPSERT user:a CONTENT { email: 'a@x.com' } WHERE email = 'a@x.com';"
+        );
+    }
+
+    #[test]
+    fn relate_set_clause_takes_field_paths_only() {
+        let mut data = serde_json::Map::new();
+        data.insert("meta.since".into(), json!(1));
+        let sql = build_relate_query("person:a", "knows", "person:b", Some(&data)).unwrap();
+        assert_eq!(sql, "RELATE person:a->knows->person:b SET meta.since = 1;");
+        data.insert("x = 1, y".into(), json!(1));
+        assert!(build_relate_query("person:a", "knows", "person:b", Some(&data)).is_err());
+    }
+
+    #[test]
+    fn render_object_handles_nested_array() {
         let item = json!({"tags": ["a", "b"]});
-        let rendered = format_item_for_surql(&item).unwrap();
+        let rendered = render_object(as_object(&item).unwrap()).unwrap();
         assert_eq!(rendered, "{ tags: ['a', 'b'] }");
     }
 
     #[test]
-    fn format_item_for_surql_rejects_non_object() {
-        let item = json!([1, 2, 3]);
-        let err = format_item_for_surql(&item).unwrap_err();
+    fn as_object_rejects_non_object() {
+        let err = as_object(&json!([1, 2, 3])).unwrap_err();
         assert!(matches!(err, SurqlError::Validation { .. }));
     }
 }
