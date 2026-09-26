@@ -58,6 +58,63 @@ fn flatten_rows_typed_handles_wrapped_and_flat_shapes() {
     assert_eq!(rows[0].name, "carol");
 }
 
+/// Regression: rows were flattened recursively, so a row with a `result`
+/// field was replaced by that field's value (and vanished when it was
+/// null), and array-valued rows were spliced into their elements.
+#[test]
+fn flatten_rows_typed_spreads_exactly_one_level() {
+    let raw = serde_json::json!([
+        [
+            { "id": "job:1", "result": "ok" },
+            { "id": "job:2", "result": null },
+            { "result": 5 }
+        ],
+        null
+    ]);
+    let rows: Vec<Value> = flatten_rows_typed(&raw).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!({ "id": "job:1", "result": "ok" }),
+            serde_json::json!({ "id": "job:2", "result": null }),
+            serde_json::json!({ "result": 5 }),
+        ]
+    );
+
+    // `SELECT VALUE tags FROM post`: every row is itself an array.
+    let raw = serde_json::json!([[[1, 2], [3]]]);
+    let rows: Vec<Vec<i64>> = flatten_rows_typed(&raw).unwrap();
+    assert_eq!(rows, vec![vec![1, 2], vec![3]]);
+
+    // The legacy envelope is unwrapped at statement level only, and only
+    // when it has nothing but envelope keys.
+    let raw = serde_json::json!([
+        { "result": [{ "n": 1 }], "status": "OK", "time": "1ms" },
+        { "result": 2, "note": "a row, not an envelope" }
+    ]);
+    let rows: Vec<Value> = flatten_rows_typed(&raw).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!({ "n": 1 }),
+            serde_json::json!({ "result": 2, "note": "a row, not an envelope" }),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn select_keeps_rows_with_a_result_field() {
+    let client = DatabaseClient::new(root_mem_config("rows")).unwrap();
+    client.connect().await.unwrap();
+    client
+        .query("CREATE job:1 SET result = 'ok'; CREATE job:2 SET result = NULL;")
+        .await
+        .unwrap();
+    let rows: Vec<Value> = client.select("job").await.unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(Value::is_object), "{rows:?}");
+}
+
 #[test]
 fn first_row_typed_returns_none_for_empty_array() {
     let raw = serde_json::json!([[]]);

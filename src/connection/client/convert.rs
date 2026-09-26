@@ -56,42 +56,48 @@ pub(super) fn seconds(secs: f64) -> Result<Duration> {
     })
 }
 
-/// Flatten every row in the raw `query()` response into a typed vector.
+/// Every row of a raw `query()` response, typed.
+///
+/// The response holds one entry per statement. Each statement's result is
+/// spread exactly one level: an array contributes its elements as rows
+/// (whatever they are, arrays included), `null` contributes nothing, and
+/// any other value is one row. The legacy `{"result": …}` envelope is
+/// unwrapped at statement level only, and only when the object has no
+/// keys besides `result`, `status`, `time` and `type`: a row that merely
+/// has a `result` field is a row.
 pub(super) fn flatten_rows_typed<T: DeserializeOwned>(raw: &Value) -> Result<Vec<T>> {
-    let mut out: Vec<T> = Vec::new();
-    collect_rows(raw, &mut out)?;
-    Ok(out)
+    let statements = match raw {
+        Value::Array(statements) => statements.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    statements
+        .iter()
+        .map(unwrap_envelope)
+        .flat_map(|statement| match statement {
+            Value::Array(rows) => rows.as_slice(),
+            Value::Null => &[],
+            row => std::slice::from_ref(row),
+        })
+        .map(|row| {
+            serde_json::from_value(row.clone()).map_err(|e| SurqlError::Serialization {
+                reason: e.to_string(),
+            })
+        })
+        .collect()
 }
 
-fn collect_rows<T: DeserializeOwned>(value: &Value, out: &mut Vec<T>) -> Result<()> {
-    match value {
-        Value::Null => Ok(()),
-        Value::Array(items) => {
-            for item in items {
-                collect_rows(item, out)?;
-            }
-            Ok(())
+/// The `result` of a legacy `{"result", "status", "time", "type"}`
+/// statement envelope, or `statement` itself when it is not one.
+fn unwrap_envelope(statement: &Value) -> &Value {
+    match statement {
+        Value::Object(obj)
+            if obj
+                .keys()
+                .all(|k| matches!(k.as_str(), "result" | "status" | "time" | "type")) =>
+        {
+            obj.get("result").unwrap_or(statement)
         }
-        Value::Object(obj) => {
-            if let Some(inner) = obj.get("result") {
-                return collect_rows(inner, out);
-            }
-            let row: T = serde_json::from_value(Value::Object(obj.clone())).map_err(|e| {
-                SurqlError::Serialization {
-                    reason: e.to_string(),
-                }
-            })?;
-            out.push(row);
-            Ok(())
-        }
-        other => {
-            let row: T =
-                serde_json::from_value(other.clone()).map_err(|e| SurqlError::Serialization {
-                    reason: e.to_string(),
-                })?;
-            out.push(row);
-            Ok(())
-        }
+        other => other,
     }
 }
 
