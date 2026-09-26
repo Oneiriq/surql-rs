@@ -5,8 +5,16 @@
 //! diffing compare code against database for analyzers the way it
 //! already does for tables.
 
+use super::scan::{clause, clauses, define_head, split_top_level, Shape};
 use crate::error::{Result, SurqlError};
 use crate::schema::analyzer::{AnalyzerDefinition, TokenFilter, Tokenizer};
+
+const ANALYZER_CLAUSES: &[(&str, Shape)] = &[
+    ("FUNCTION", Shape::Expr),
+    ("TOKENIZERS", Shape::Expr),
+    ("FILTERS", Shape::Expr),
+    ("COMMENT", Shape::Str),
+];
 
 fn invalid(name: &str, detail: &str) -> SurqlError {
     SurqlError::Validation {
@@ -58,60 +66,39 @@ fn parse_filter(name: &str, raw: &str) -> Result<TokenFilter> {
 }
 
 /// Parse one `DEFINE ANALYZER` definition string.
+///
+/// Clauses are read after the `DEFINE ANALYZER <name>` head and outside
+/// quotes, so an analyzer named `blog_filters` or a `COMMENT 'FILTERS x'`
+/// cannot open a clause. The engine echoes keywords in upper case
+/// (`TOKENIZERS BLANK,CLASS FILTERS LOWERCASE, SNOWBALL(ENGLISH)`); both
+/// cases read the same.
 pub fn parse_analyzer(name: &str, definition: &str) -> Result<AnalyzerDefinition> {
     let mut analyzer = AnalyzerDefinition::new(name);
-    let upper = definition.to_uppercase();
-
-    let clause = |keyword: &str| -> Option<String> {
-        let start = upper.find(keyword)? + keyword.len();
-        let rest = &definition[start..];
-        let end = ["TOKENIZERS", "FILTERS", "COMMENT"]
-            .iter()
-            .filter_map(|k| upper[start..].find(k))
-            .min()
-            .unwrap_or(rest.len());
-        Some(rest[..end].trim().trim_end_matches(';').trim().to_owned())
+    let body = define_head(definition, "ANALYZER", false).map_or(definition, |head| head.rest);
+    let found = clauses(body, ANALYZER_CLAUSES);
+    // Filters carry parenthesised arguments with commas inside, so the
+    // split respects depth.
+    let list = |keyword: &str| -> Vec<&str> {
+        clause(&found, keyword)
+            .map(|body| {
+                split_top_level(body, ',')
+                    .into_iter()
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
     };
 
-    if let Some(list) = clause("TOKENIZERS") {
-        let tokenizers = list
-            .split(',')
-            .map(|t| parse_tokenizer(name, t.trim()))
-            .collect::<Result<Vec<_>>>()?;
-        analyzer = analyzer.with_tokenizers(tokenizers);
-    }
-    if let Some(list) = clause("FILTERS") {
-        // Filters carry parenthesised arguments with commas inside, so
-        // the split respects depth.
-        let mut filters = Vec::new();
-        let mut depth = 0usize;
-        let mut current = String::new();
-        for ch in list.chars() {
-            match ch {
-                '(' => {
-                    depth += 1;
-                    current.push(ch);
-                }
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    current.push(ch);
-                }
-                ',' if depth == 0 => {
-                    filters.push(current.trim().to_owned());
-                    current.clear();
-                }
-                _ => current.push(ch),
-            }
-        }
-        if !current.trim().is_empty() {
-            filters.push(current.trim().to_owned());
-        }
-        let filters = filters
-            .iter()
-            .map(|f| parse_filter(name, f))
-            .collect::<Result<Vec<_>>>()?;
-        analyzer = analyzer.with_filters(filters);
-    }
+    let tokenizers = list("TOKENIZERS")
+        .into_iter()
+        .map(|t| parse_tokenizer(name, t))
+        .collect::<Result<Vec<_>>>()?;
+    let filters = list("FILTERS")
+        .into_iter()
+        .map(|f| parse_filter(name, f))
+        .collect::<Result<Vec<_>>>()?;
+    analyzer = analyzer.with_tokenizers(tokenizers).with_filters(filters);
     Ok(analyzer)
 }
 
@@ -139,6 +126,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.filters, vec![TokenFilter::edge_ngram(2, 10)]);
+    }
+
+    #[test]
+    fn a_multibyte_name_does_not_panic() {
+        // `ŉ` upper-cases to the three-byte `ʼN`, which used to shift the
+        // byte offsets used to slice the original string.
+        let db = crate::schema::parser::parse_db_info(&serde_json::json!({
+            "az": { "a": "DEFINE ANALYZER `ŉŉŉŉŉŉŉŉŉŉŉŉ` TOKENIZERS blank" }
+        }))
+        .unwrap();
+        assert_eq!(db.analyzers["a"].tokenizers, vec![Tokenizer::Blank]);
+    }
+
+    #[test]
+    fn keywords_inside_the_name_or_a_comment_are_not_clauses() {
+        // Exact 3.0.5 echo.
+        let parsed = parse_analyzer(
+            "blog_filters",
+            "DEFINE ANALYZER blog_filters TOKENIZERS BLANK,CLASS FILTERS LOWERCASE, \
+             SNOWBALL(ENGLISH), EDGENGRAM(2,10) COMMENT 'FILTERS x'",
+        )
+        .unwrap();
+        assert_eq!(parsed.tokenizers, vec![Tokenizer::Blank, Tokenizer::Class]);
+        assert_eq!(
+            parsed.filters,
+            vec![
+                TokenFilter::Lowercase,
+                TokenFilter::snowball("english"),
+                TokenFilter::edge_ngram(2, 10),
+            ]
+        );
     }
 
     #[test]

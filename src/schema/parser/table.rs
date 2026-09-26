@@ -5,59 +5,168 @@
 //! submodule stays under the 1000-LOC budget; see parent [`super`] for
 //! the public entry points.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
 use serde_json::Value;
 
 use super::event::parse_events;
 use super::field::parse_fields;
 use super::index::parse_indexes;
 use super::permissions::parse_table_permissions;
+use super::scan::{clauses, define_head, tokens, unquote_ident, Shape, Token};
 use super::view::parse_view;
-use super::{expect_object, pick_map, regex_case_insensitive, value_to_string_map};
+use super::{expect_object, pick_map, value_to_string_map};
 use crate::error::{Result, SurqlError};
 use crate::schema::changefeed::ChangeFeed;
 use crate::schema::table::{TableDefinition, TableMode};
 
-/// Matches `CHANGEFEED <duration> [INCLUDE ORIGINAL]`, the form the engine
-/// both accepts and echoes.
-fn changefeed_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex_case_insensitive(r"\bCHANGEFEED\s+(\S+?)\s*(\bINCLUDE\s+ORIGINAL\b)?(?:\s|;|$)")
-    })
+// --- Statement reader --------------------------------------------------------
+
+/// The endpoints of a `TYPE RELATION` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Relation {
+    /// Tables named after `IN` / `FROM`.
+    pub from: Vec<String>,
+    /// Tables named after `OUT` / `TO`.
+    pub to: Vec<String>,
+}
+
+/// The parts of a `DEFINE TABLE` statement the parsers read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct TableStatement<'a> {
+    /// `Some` for a `TYPE RELATION` table.
+    pub relation: Option<Relation>,
+    /// Whether the `DROP` flag is set.
+    pub drop: bool,
+    /// Whether the table is `SCHEMAFULL`.
+    pub schemafull: bool,
+    /// The `CHANGEFEED` clause body.
+    pub changefeed: Option<&'a str>,
+    /// The `AS` clause body of a view, starting at `SELECT`.
+    pub view: Option<&'a str>,
+    /// The `PERMISSIONS` clause body.
+    pub permissions: Option<&'a str>,
+}
+
+/// Clauses that can follow the table mode. The engine echoes them in this
+/// order, `PERMISSIONS` last.
+const TAIL_CLAUSES: &[(&str, Shape)] = &[
+    ("COMMENT", Shape::Str),
+    ("GRAPHQL_ALIAS", Shape::Str),
+    ("GRAPHQL_DEPRECATED", Shape::Str),
+    ("AS", Shape::Select),
+    ("CHANGEFEED", Shape::Expr),
+    ("PERMISSIONS", Shape::Expr),
+];
+
+/// Read a `DEFINE TABLE` statement.
+///
+/// The engine echoes `DEFINE TABLE <name> TYPE <NORMAL | ANY | RELATION IN a
+/// | b OUT c [ENFORCED]> [DROP] <SCHEMAFULL | SCHEMALESS> [COMMENT …] [AS
+/// SELECT …] [CHANGEFEED …] PERMISSIONS …`; the flags are read word by word,
+/// so a table named after a keyword (`IN schemafull`) stays a name, and the
+/// rest is split into clauses outside quotes and brackets.
+pub(super) fn read_table(definition: &str) -> TableStatement<'_> {
+    let rest = define_head(definition, "TABLE", false).map_or(definition, |head| head.rest);
+    let toks = tokens(rest);
+    let mut out = TableStatement::default();
+    let mut i = 0;
+    while let Some(token) = toks.get(i) {
+        if token.is("TYPE") || token.is("NORMAL") || token.is("ANY") || token.is("ENFORCED") {
+            i += 1;
+        } else if token.is("RELATION") {
+            out.relation.get_or_insert_with(Relation::default);
+            i += 1;
+        } else if out.relation.is_some() && (token.is("IN") || token.is("FROM")) {
+            let (names, next) = read_names(&toks, i + 1);
+            if let Some(relation) = out.relation.as_mut() {
+                relation.from = names;
+            }
+            i = next;
+        } else if out.relation.is_some() && (token.is("OUT") || token.is("TO")) {
+            let (names, next) = read_names(&toks, i + 1);
+            if let Some(relation) = out.relation.as_mut() {
+                relation.to = names;
+            }
+            i = next;
+        } else if token.is("DROP") {
+            out.drop = true;
+            i += 1;
+        } else if token.is("SCHEMAFULL") {
+            out.schemafull = true;
+            i += 1;
+        } else if token.is("SCHEMALESS") {
+            out.schemafull = false;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let tail = toks.get(i).and_then(|t| rest.get(t.start..)).unwrap_or("");
+    let found = clauses(tail, TAIL_CLAUSES);
+    let last = |keyword: &str| {
+        found
+            .iter()
+            .rev()
+            .find(|c| c.keyword == keyword)
+            .map(|c| c.body)
+    };
+    out.changefeed = last("CHANGEFEED");
+    out.view = last("AS");
+    out.permissions = last("PERMISSIONS");
+    out
+}
+
+/// Read an `a | b | c` table list starting at token `at`, returning the
+/// unquoted names and the index of the first token after the list.
+fn read_names(toks: &[Token<'_>], at: usize) -> (Vec<String>, usize) {
+    let mut raw = String::new();
+    let mut i = at;
+    while let Some(token) = toks.get(i) {
+        let continues = raw.is_empty() || raw.ends_with('|') || token.text.starts_with('|');
+        if !continues {
+            break;
+        }
+        raw.push(' ');
+        raw.push_str(token.text.trim_end_matches(';'));
+        i += 1;
+    }
+    let names = raw
+        .split('|')
+        .map(|name| unquote_ident(name.trim()))
+        .filter(|name| !name.is_empty())
+        .collect();
+    (names, i)
 }
 
 // --- Public parsers ----------------------------------------------------------
 
 /// Parse the `CHANGEFEED` clause out of a `DEFINE TABLE` statement.
 ///
-/// Returns `None` for a table with no change feed.
+/// Returns `None` for a table with no change feed. The clause is found
+/// outside quotes, so a `COMMENT 'no changefeed needed'` is not one.
 pub fn parse_changefeed(definition: &str) -> Option<ChangeFeed> {
-    let caps = changefeed_regex().captures(definition)?;
-    let duration = caps.get(1)?.as_str().trim_end_matches(';');
+    let body = read_table(definition).changefeed?;
+    let toks = tokens(body);
+    let duration = toks.first()?.text.trim_end_matches(';');
     if duration.is_empty() {
         return None;
     }
-    Some(ChangeFeed::new(duration).include_original(caps.get(2).is_some()))
+    let include_original = toks
+        .windows(2)
+        .any(|pair| matches!(pair, [a, b] if a.is("INCLUDE") && b.is("ORIGINAL")));
+    Some(ChangeFeed::new(duration).include_original(include_original))
 }
 
 /// Parse the `DEFINE TABLE` statement into a [`TableMode`].
 ///
-/// An empty input defaults to [`TableMode::Schemaless`], mirroring the Python
-/// module's fallback.
+/// The `DROP` flag wins, since the engine echoes it next to the schema
+/// mode (`TYPE ANY DROP SCHEMALESS`). An empty input defaults to
+/// [`TableMode::Schemaless`], mirroring the Python module's fallback.
 pub fn parse_table_mode(definition: &str) -> TableMode {
-    if definition.is_empty() {
-        return TableMode::Schemaless;
-    }
-    let upper = definition.to_uppercase();
-    if upper.contains("SCHEMAFULL") {
-        TableMode::Schemafull
-    } else if upper.contains("SCHEMALESS") {
-        TableMode::Schemaless
-    } else if upper.contains("DROP") {
+    let table = read_table(definition);
+    if table.drop {
         TableMode::Drop
+    } else if table.schemafull {
+        TableMode::Schemafull
     } else {
         TableMode::Schemaless
     }
@@ -188,6 +297,36 @@ mod tests {
     fn no_changefeed_is_none() {
         assert!(parse_changefeed("DEFINE TABLE evt SCHEMAFULL PERMISSIONS NONE").is_none());
         assert!(parse_changefeed("").is_none());
+    }
+
+    #[test]
+    fn a_comment_mentioning_changefeed_is_not_one() {
+        assert!(parse_changefeed(
+            "DEFINE TABLE t2 TYPE NORMAL SCHEMAFULL COMMENT 'no changefeed needed' PERMISSIONS NONE"
+        )
+        .is_none());
+        let cf = parse_changefeed(
+            "DEFINE TABLE t4 TYPE NORMAL SCHEMAFULL COMMENT \"it's\" CHANGEFEED 1d PERMISSIONS FULL",
+        )
+        .expect("changefeed");
+        assert_eq!(cf.duration, "1d");
+    }
+
+    #[test]
+    fn drop_is_read_next_to_the_schema_mode() {
+        // Exact 3.0.5 echo of `DEFINE TABLE t3 DROP SCHEMALESS`.
+        assert_eq!(
+            parse_table_mode("DEFINE TABLE t3 TYPE ANY DROP SCHEMALESS PERMISSIONS FULL"),
+            TableMode::Drop
+        );
+        assert_eq!(
+            parse_table_mode("DEFINE TABLE schemafull_log TYPE NORMAL SCHEMALESS PERMISSIONS NONE"),
+            TableMode::Schemaless
+        );
+        assert_eq!(
+            parse_table_mode("DEFINE TABLE t TYPE NORMAL SCHEMAFULL COMMENT 'DROP me'"),
+            TableMode::Schemafull
+        );
     }
 
     #[test]

@@ -5,58 +5,27 @@
 //! `parser.rs` so each parser submodule stays under the repo's 1000-LOC
 //! budget; see parent [`super`] for the public entry points.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
-
-use super::regex_case_insensitive;
+use super::permissions::{parse_permissions_body, Owner};
+use super::scan::{clause, clauses, define_head, unquote_ident, Clause, Shape};
 use crate::schema::fields::{FieldDefinition, FieldType};
 use crate::schema::reference::ReferenceAction;
 
-// --- Regex accessors ---------------------------------------------------------
-
-pub(super) fn type_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+(\w+)"))
-}
-
-fn readonly_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bREADONLY\b"))
-}
-
-fn flexible_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bFLEXIBLE\b"))
-}
-
-fn record_target_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"record\s*<\s*(\w+)\s*>"))
-}
-
-/// Matches the `REFERENCE` marker and its optional `ON DELETE <action>` tail.
-/// A bare `REFERENCE` means `ON DELETE IGNORE`, which is also what the engine
-/// echoes back from `INFO FOR TABLE`.
-fn reference_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bREFERENCE\b(?:\s+ON\s+DELETE\s+(\w+))?"))
-}
-
-/// Matches `TYPE option<inner>` where `inner` is a bare type word or a
-/// single-level generic like `record<blob>` — exactly the shapes the
-/// emitter produces. The inner text is captured for type resolution.
-fn option_type_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+option\s*<\s*(\w+(?:\s*<\s*\w+\s*>)?)\s*>"))
-}
-
-/// Matches the engine's echo form for optional fields: `TYPE none | inner`.
-/// The 3.x server reports `option<T>` this way in `INFO FOR TABLE`.
-fn none_union_type_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bTYPE\s+none\s*\|\s*(\w+(?:\s*<\s*\w+\s*>)?)"))
-}
+/// The clauses of a `DEFINE FIELD` statement. The engine echoes them as
+/// `TYPE … [FLEXIBLE] [DEFAULT …] [READONLY] [VALUE …] [ASSERT …]
+/// [COMPUTED …] [REFERENCE …] [COMMENT …] PERMISSIONS …`; this crate renders
+/// a different order, and both are read the same way.
+const FIELD_CLAUSES: &[(&str, Shape)] = &[
+    ("TYPE", Shape::Expr),
+    ("FLEXIBLE", Shape::Flag),
+    ("DEFAULT", Shape::Expr),
+    ("READONLY", Shape::Flag),
+    ("VALUE", Shape::Expr),
+    ("ASSERT", Shape::Expr),
+    ("COMPUTED", Shape::Expr),
+    ("REFERENCE", Shape::Flag),
+    ("COMMENT", Shape::Str),
+    ("PERMISSIONS", Shape::Expr),
+];
 
 // --- Public parsers ----------------------------------------------------------
 
@@ -72,72 +41,202 @@ pub fn parse_fields(fd: &std::collections::BTreeMap<String, String>) -> Vec<Fiel
 
 /// Resolve the `REFERENCE` clause. A bare `REFERENCE` and an explicit
 /// `REFERENCE ON DELETE IGNORE` both yield [`ReferenceAction::Ignore`].
-fn extract_reference(definition: &str) -> Option<ReferenceAction> {
-    let caps = reference_regex().captures(definition)?;
-    Some(
-        caps.get(1)
-            .and_then(|m| ReferenceAction::from_keyword(m.as_str()))
-            .unwrap_or(ReferenceAction::Ignore),
-    )
+fn extract_reference(found: &[Clause<'_>]) -> Option<ReferenceAction> {
+    let body = clause(found, "REFERENCE")?;
+    let action = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .get(2)
+        .and_then(|word| ReferenceAction::from_keyword(word));
+    Some(action.unwrap_or(ReferenceAction::Ignore))
 }
 
-fn extract_computed(definition: &str) -> Option<String> {
-    extract_clause(definition, "COMPUTED", &terminators_excluding("COMPUTED"))
+/// An expression clause's body, `None` when absent or empty.
+fn expression(found: &[Clause<'_>], keyword: &str) -> Option<String> {
+    clause(found, keyword)
+        .filter(|body| !body.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse one `DEFINE FIELD` statement.
 ///
+/// Clauses are read after the `DEFINE FIELD <name> ON <table>` head and
+/// outside quotes and brackets, so a field named `default`, a default of
+/// `'no comment'`, or an assertion over `(SELECT VALUE name FROM tag)`
+/// all keep their meaning. Field `PERMISSIONS` read back into the same
+/// per-action map [`FieldDefinition::permissions`] renders from, keeping
+/// only actions that differ from the field default (`FULL`).
+///
 /// Returns `None` when the definition string is empty.
 pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
-    if definition.is_empty() {
+    if definition.trim().is_empty() {
         return None;
     }
-    let (field_type, nullable) = extract_field_type(definition);
+    let body = define_head(definition, "FIELD", true).map_or(definition, |head| head.rest);
+    let found = clauses(body, FIELD_CLAUSES);
+    let has = |keyword: &str| clause(&found, keyword).is_some();
+    let kind = clause(&found, "TYPE").map(parse_kind).unwrap_or_default();
     Some(FieldDefinition {
         name: name.to_string(),
-        field_type,
-        assertion: extract_assertion(definition),
-        default: extract_default(definition),
-        value: extract_value(definition),
-        permissions: None,
-        readonly: extract_readonly(definition),
-        flexible: extract_flexible(definition),
-        target_table: extract_target_table(definition),
-        nullable,
-        reference: extract_reference(definition),
-        computed: extract_computed(definition),
+        field_type: kind.field_type,
+        assertion: expression(&found, "ASSERT"),
+        default: expression(&found, "DEFAULT"),
+        value: expression(&found, "VALUE"),
+        permissions: clause(&found, "PERMISSIONS")
+            .and_then(|perms| parse_permissions_body(perms, Owner::Field)),
+        readonly: has("READONLY"),
+        flexible: has("FLEXIBLE"),
+        target_table: kind.target_table,
+        nullable: kind.nullable,
+        reference: extract_reference(&found),
+        computed: expression(&found, "COMPUTED"),
     })
 }
 
-// --- Field extractors --------------------------------------------------------
+// --- Field type --------------------------------------------------------------
 
-/// Resolve the field type and whether it is `option<...>`-wrapped.
+/// What a `TYPE` clause says about a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kind {
+    field_type: FieldType,
+    nullable: bool,
+    target_table: Option<String>,
+}
+
+impl Default for Kind {
+    fn default() -> Self {
+        Self {
+            field_type: FieldType::Any,
+            nullable: false,
+            target_table: None,
+        }
+    }
+}
+
+/// Split a type at top-level `|`, ignoring the `|` inside `record<a | b>`.
+fn split_union(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (at, c) in text.char_indices() {
+        match c {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
+                parts.push(text.get(start..at).unwrap_or("").trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(text.get(start..).unwrap_or("").trim());
+    parts
+}
+
+/// The text between a generic's outer `<` and its last `>`.
+fn generic_inner(text: &str) -> Option<&str> {
+    let open = text.find('<')?;
+    let close = text.rfind('>')?;
+    text.get(open + 1..close).map(str::trim)
+}
+
+/// Resolve a `TYPE` clause body: the base type, whether it accepts `NONE`,
+/// and the linked table of a `record<t>` / `array<record<t>>`.
 ///
-/// `option<inner>` is checked first — the plain `TYPE \w+` regex would
-/// capture the word `option` and fall through to [`FieldType::Any`],
-/// which would break the code/database round-trip and make migration
-/// diffing flap on every nullable field.
-fn extract_field_type(definition: &str) -> (FieldType, bool) {
-    if let Some(caps) = none_union_type_regex().captures(definition) {
-        let inner = caps[1].to_ascii_lowercase();
-        let word = inner.split('<').next().unwrap_or("").trim().to_string();
-        return (field_type_from_word(&word), true);
+/// The engine echoes `option<T>` as `none | T`; the code side renders
+/// `option<T>`. Both read as nullable `T`, nested generics included
+/// (`option<array<record<t>>>` is a nullable array linked to `t`). A union of
+/// several non-`none` types has no [`FieldType`] and reads as
+/// [`FieldType::Any`].
+fn parse_kind(text: &str) -> Kind {
+    let mut nullable = false;
+    let mut members: Vec<&str> = split_union(text);
+    let mut rounds = 0;
+    loop {
+        members.retain(|m| {
+            let none = m.eq_ignore_ascii_case("none");
+            nullable |= none;
+            !none && !m.is_empty()
+        });
+        let unwrapped = match members.as_slice() {
+            [only] if starts_with_word(only, "option") => generic_inner(only),
+            _ => None,
+        };
+        match unwrapped {
+            Some(inner) if rounds < 8 => {
+                nullable = true;
+                members = split_union(inner);
+                rounds += 1;
+            }
+            _ => break,
+        }
     }
-    if let Some(caps) = option_type_regex().captures(definition) {
-        let inner = caps[1].to_ascii_lowercase();
-        let word = inner.split('<').next().unwrap_or("").trim().to_string();
-        return (field_type_from_word(&word), true);
+    let [only] = members.as_slice() else {
+        return Kind {
+            nullable,
+            ..Kind::default()
+        };
+    };
+    let base = only
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let field_type = field_type_from_word(&base);
+    let target_table = match field_type {
+        FieldType::Record => generic_inner(only).and_then(record_targets),
+        FieldType::Array => generic_inner(only)
+            .and_then(|inner| split_generic_args(inner).into_iter().next())
+            .filter(|item| starts_with_word(item, "record"))
+            .and_then(generic_inner)
+            .and_then(record_targets),
+        _ => None,
+    };
+    Kind {
+        field_type,
+        nullable,
+        target_table,
     }
-    let Some(caps) = type_regex().captures(definition) else {
-        return (FieldType::Any, false);
-    };
-    let Some(m) = caps.get(1) else {
-        return (FieldType::Any, false);
-    };
-    (
-        field_type_from_word(&m.as_str().to_ascii_lowercase()),
-        false,
-    )
+}
+
+/// `true` when `text` starts with the word `word` followed by `<`.
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.get(..word.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(word))
+        && text
+            .get(word.len()..)
+            .is_some_and(|rest| rest.trim_start().starts_with('<'))
+}
+
+/// Split generic arguments (`record<t>, 10`) at top-level commas.
+fn split_generic_args(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (at, c) in text.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(text.get(start..at).unwrap_or("").trim());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(text.get(start..).unwrap_or("").trim());
+    parts
+}
+
+/// The tables of a `record<a | b>`, unquoted and joined the way they render.
+fn record_targets(inner: &str) -> Option<String> {
+    let names: Vec<String> = inner
+        .split('|')
+        .map(|name| unquote_ident(name.trim()))
+        .filter(|name| !name.is_empty())
+        .collect();
+    (!names.is_empty()).then(|| names.join(" | "))
 }
 
 fn field_type_from_word(word: &str) -> FieldType {
@@ -160,143 +259,102 @@ fn field_type_from_word(word: &str) -> FieldType {
     }
 }
 
-/// Extract the target table from a `record<table>` TYPE clause, if present.
-fn extract_target_table(definition: &str) -> Option<String> {
-    record_target_regex()
-        .captures(definition)
-        .map(|caps| caps[1].to_string())
-}
-
-/// Locate the case-insensitive keyword `kw` in `text` only at word boundaries
-/// (ASCII boundaries). Returns the byte offset at which the keyword starts.
-///
-/// When `require_whitespace_left` is true, the keyword must be preceded by
-/// whitespace or sit at byte 0 (a `$`-prefixed identifier like `$value` does
-/// not satisfy this, and therefore will not be mis-identified as a clause
-/// terminator).
-fn find_keyword(text: &str, kw: &str, require_whitespace_left: bool) -> Option<usize> {
-    let text_upper = text.to_ascii_uppercase();
-    let kw_upper = kw.to_ascii_uppercase();
-    let bytes = text_upper.as_bytes();
-    let needle = kw_upper.as_bytes();
-    if needle.is_empty() {
-        return None;
-    }
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if bytes[i..i + needle.len()] == *needle {
-            // `$` blocks a match: `$value` must never read as the
-            // VALUE keyword, or every ASSERT mentioning it grows a
-            // phantom VALUE clause.
-            let left_ok = if require_whitespace_left {
-                i == 0 || bytes[i - 1].is_ascii_whitespace()
-            } else {
-                i == 0 || (!is_ident_byte(bytes[i - 1]) && bytes[i - 1] != b'$')
-            };
-            let right_ok =
-                i + needle.len() == bytes.len() || !is_ident_byte(bytes[i + needle.len()]);
-            if left_ok && right_ok {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Extract the body of a `KEYWORD <body> [TERMINATOR | ;]` clause.
-///
-/// `terminators` lists other keywords that would end the clause; any such
-/// occurrence after the `keyword` anchor truncates the body. A trailing
-/// semicolon is always stripped.
-fn extract_clause(definition: &str, keyword: &str, terminators: &[&str]) -> Option<String> {
-    let start = find_keyword(definition, keyword, false)?;
-    let after_kw = start + keyword.len();
-    // Require at least one whitespace after the keyword (matches `\s+`).
-    let rest_start = definition[after_kw..]
-        .find(|c: char| !c.is_whitespace())
-        .map(|off| after_kw + off)?;
-    // Ensure we actually consumed whitespace between the keyword and the body.
-    if rest_start == after_kw {
-        return None;
-    }
-    let tail = &definition[rest_start..];
-
-    let mut end = tail.len();
-    for term in terminators {
-        if let Some(pos) = find_keyword(tail, term, true) {
-            if pos < end {
-                end = pos;
-            }
-        }
-    }
-    if let Some(pos) = tail.find(';') {
-        if pos < end {
-            end = pos;
-        }
-    }
-
-    let body = tail[..end].trim();
-    if body.is_empty() {
-        return None;
-    }
-    Some(body.to_string())
-}
-
-/// Clause keywords that can follow any of `ASSERT` / `DEFAULT` / `VALUE` /
-/// `COMPUTED` and therefore terminate its body. `REFERENCE` is in the list
-/// because the engine echoes it *after* `ASSERT`
-/// (`... ASSERT true REFERENCE ON DELETE REJECT ...`), which would otherwise
-/// swallow the whole reference clause into the assertion.
-const CLAUSE_TERMINATORS: &[&str] = &[
-    "ASSERT",
-    "DEFAULT",
-    "VALUE",
-    "COMPUTED",
-    "READONLY",
-    "FLEXIBLE",
-    "REFERENCE",
-    "PERMISSIONS",
-    "COMMENT",
-];
-
-/// [`CLAUSE_TERMINATORS`] minus the clause being extracted.
-fn terminators_excluding(keyword: &str) -> Vec<&'static str> {
-    CLAUSE_TERMINATORS
-        .iter()
-        .copied()
-        .filter(|k| *k != keyword)
-        .collect()
-}
-
-fn extract_assertion(definition: &str) -> Option<String> {
-    extract_clause(definition, "ASSERT", &terminators_excluding("ASSERT"))
-}
-
-fn extract_default(definition: &str) -> Option<String> {
-    extract_clause(definition, "DEFAULT", &terminators_excluding("DEFAULT"))
-}
-
-fn extract_value(definition: &str) -> Option<String> {
-    extract_clause(definition, "VALUE", &terminators_excluding("VALUE"))
-}
-
-fn extract_readonly(definition: &str) -> bool {
-    readonly_regex().is_match(definition)
-}
-
-fn extract_flexible(definition: &str) -> bool {
-    flexible_regex().is_match(definition)
-}
-
 #[cfg(test)]
 mod echo_tests {
+    use std::collections::BTreeMap;
+
     use crate::schema::fields::FieldType;
     use crate::schema::reference::ReferenceAction;
+
+    #[test]
+    fn a_field_named_after_a_clause_keyword_reads_its_real_clauses() {
+        let f = super::parse_field(
+            "reference",
+            "DEFINE FIELD reference ON invoice TYPE string PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert!(f.reference.is_none());
+        assert_eq!(f.field_type, FieldType::String);
+        let f = super::parse_field(
+            "default",
+            "DEFINE FIELD default ON card TYPE bool DEFAULT false",
+        )
+        .unwrap();
+        assert_eq!(f.default.as_deref(), Some("false"));
+        let f = super::parse_field(
+            "value",
+            "DEFINE FIELD `value` ON user TYPE int VALUE 1 PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(f.value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn nested_and_quoted_keywords_stay_in_their_clause() {
+        let f = super::parse_field(
+            "h",
+            "DEFINE FIELD h ON t4 TYPE string DEFAULT 'no comment' ASSERT $value INSIDE \
+             (SELECT VALUE name FROM tag) COMMENT 'c' PERMISSIONS FOR select NONE, \
+             FOR create, update FULL",
+        )
+        .unwrap();
+        assert_eq!(f.default.as_deref(), Some("'no comment'"));
+        assert_eq!(
+            f.assertion.as_deref(),
+            Some("$value INSIDE (SELECT VALUE name FROM tag)")
+        );
+        assert!(f.value.is_none());
+        let f = super::parse_field(
+            "i",
+            "DEFINE FIELD i ON t4 TYPE string READONLY ASSERT $value INSIDE ['readonly', 'x'] \
+             PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert!(f.readonly);
+        let f = super::parse_field(
+            "i",
+            "DEFINE FIELD i ON t4 TYPE string ASSERT $value INSIDE ['readonly', 'x']",
+        )
+        .unwrap();
+        assert!(!f.readonly);
+    }
+
+    #[test]
+    fn field_permissions_read_back_without_the_full_default() {
+        let f = super::parse_field(
+            "ssn",
+            "DEFINE FIELD ssn ON user TYPE string PERMISSIONS FOR select WHERE $auth.admin, \
+             FOR create, update FULL",
+        )
+        .unwrap();
+        let expected: BTreeMap<String, String> =
+            [("select".to_string(), "$auth.admin".to_string())].into();
+        assert_eq!(f.permissions, Some(expected));
+        let f =
+            super::parse_field("x", "DEFINE FIELD x ON t TYPE string PERMISSIONS FULL").unwrap();
+        assert!(f.permissions.is_none());
+    }
+
+    #[test]
+    fn nested_option_generics_read_as_nullable_links() {
+        let f = super::parse_field("f", "DEFINE FIELD f ON t TYPE option<array<record<user>>>")
+            .unwrap();
+        assert_eq!(f.field_type, FieldType::Array);
+        assert!(f.nullable);
+        assert_eq!(f.target_table.as_deref(), Some("user"));
+        let f = super::parse_field(
+            "f",
+            "DEFINE FIELD f ON t4 TYPE none | array<record<user>> PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert_eq!(f.field_type, FieldType::Array);
+        assert!(f.nullable);
+        assert_eq!(f.target_table.as_deref(), Some("user"));
+        let f = super::parse_field("g", "DEFINE FIELD g ON t4 TYPE array<string> | int").unwrap();
+        assert_eq!(f.field_type, FieldType::Any);
+        let f = super::parse_field("j", "DEFINE FIELD j ON t4 TYPE record<user | post>").unwrap();
+        assert_eq!(f.target_table.as_deref(), Some("user | post"));
+    }
 
     /// The engine echoes a bare `REFERENCE` with its default action spelled
     /// out; the renderer does the same, so the pair compares equal.

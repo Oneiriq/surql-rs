@@ -5,10 +5,15 @@
 //! `DEFINE FUNCTION fn::greet($name: string) -> string { RETURN 'hi ' + $name }
 //! COMMENT 'greeter' PERMISSIONS FULL` — so the argument list is read
 //! depth-aware (a generic like `array<record<x>>` carries its own commas) and
-//! the body is taken from the outermost brace pair.
+//! the body is taken from the outermost brace pair, skipping any brace inside
+//! a string (`RETURN '{' + $x`).
 
-use super::find_keyword_unquoted as find_keyword;
+use super::scan::{clause, clauses, matching_close, string_literal, unquote_ident, Shape};
 use crate::schema::function::{FunctionArg, FunctionDefinition};
+
+/// The clauses that can follow a function body or a param value.
+pub(super) const TAIL_CLAUSES: &[(&str, Shape)] =
+    &[("COMMENT", Shape::Str), ("PERMISSIONS", Shape::Expr)];
 
 /// Parse one `DEFINE FUNCTION` statement.
 ///
@@ -24,7 +29,8 @@ pub fn parse_function(name: &str, definition: &str) -> Option<FunctionDefinition
     let (declared_name, args) = parse_signature(before)?;
     let returns = before
         .rfind("->")
-        .map(|at| before[at + 2..].trim().to_string())
+        .and_then(|at| before.get(at + 2..))
+        .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty());
 
     let mut function = FunctionDefinition::new(
@@ -37,51 +43,44 @@ pub fn parse_function(name: &str, definition: &str) -> Option<FunctionDefinition
     );
     function.args = args;
     function.returns = returns;
-    function.comment = extract_quoted_after(after, "COMMENT");
-    function.permissions = extract_permissions(after);
+    let (comment, permissions) = read_tail(after);
+    function.comment = comment;
+    function.permissions = permissions;
     Some(function)
 }
 
 /// Split at the outermost `{ ... }`, returning the body and the text on
-/// either side of it.
+/// either side of it. Braces inside quoted text do not count.
 fn split_body(definition: &str) -> Option<(String, &str, &str)> {
-    let bytes = definition.as_bytes();
     let open = definition.find('{')?;
-    let mut depth = 0i32;
-    for (i, b) in bytes.iter().enumerate().skip(open) {
-        match b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((
-                        definition[open + 1..i].trim().to_string(),
-                        &definition[..open],
-                        &definition[i + 1..],
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    let close = matching_close(definition, open)?;
+    Some((
+        definition.get(open + 1..close)?.trim().to_string(),
+        definition.get(..open)?,
+        definition.get(close + 1..)?,
+    ))
 }
 
 /// Read the `fn::<name>(<args>)` signature out of the text before the body.
 fn parse_signature(before: &str) -> Option<(String, Vec<FunctionArg>)> {
     let open = before.find('(')?;
-    let close = matching_paren(before, open)?;
-    let head = before[..open].trim();
+    let close = matching_close(before, open)?;
+    let head = before.get(..open)?.trim();
     let name = head
         .rsplit_once("fn::")
-        .map(|(_, n)| n.trim().to_string())
+        .map(|(_, n)| {
+            n.split("::")
+                .map(unquote_ident)
+                .collect::<Vec<_>>()
+                .join("::")
+        })
         .unwrap_or_default();
-    let args = split_top_level(&before[open + 1..close])
+    let args = split_args(before.get(open + 1..close)?)
         .into_iter()
         .filter_map(|arg| {
             let (raw_name, arg_type) = arg.split_once(':')?;
             Some(FunctionArg::new(
-                raw_name.trim().trim_start_matches('$'),
+                unquote_ident(raw_name.trim().trim_start_matches('$')),
                 arg_type.trim(),
             ))
         })
@@ -89,34 +88,16 @@ fn parse_signature(before: &str) -> Option<(String, Vec<FunctionArg>)> {
     Some((name, args))
 }
 
-/// Index of the `)` closing the `(` at `open`.
-fn matching_paren(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    for (i, b) in text.as_bytes().iter().enumerate().skip(open) {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Split an argument list on top-level commas, so `array<record<x>>` and
 /// nested generics survive.
-fn split_top_level(text: &str) -> Vec<String> {
+fn split_args(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut depth = 0i32;
+    let mut depth = 0usize;
     let mut current = String::new();
     for c in text.chars() {
         match c {
             '<' | '(' | '[' | '{' => depth += 1,
-            '>' | ')' | ']' | '}' => depth -= 1,
+            '>' | ')' | ']' | '}' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
                 push_trimmed(&mut out, &current);
                 current.clear();
@@ -137,29 +118,15 @@ fn push_trimmed(out: &mut Vec<String>, value: &str) {
     }
 }
 
-/// Read the quoted operand of `keyword` from the tail of a statement.
-pub(crate) fn extract_quoted_after(tail: &str, keyword: &str) -> Option<String> {
-    let at = find_keyword(tail, keyword)?;
-    let rest = tail[at + keyword.len()..].trim_start();
-    let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
-    let body = &rest[quote.len_utf8()..];
-    let end = body.find(quote)?;
-    Some(body[..end].to_string())
-}
-
-/// Read the `PERMISSIONS` clause body from the tail of a statement.
-pub(crate) fn extract_permissions(tail: &str) -> Option<String> {
-    let at = find_keyword(tail, "PERMISSIONS")?;
-    let mut rest = tail[at + "PERMISSIONS".len()..].trim();
-    if let Some(at) = find_keyword(rest, "COMMENT") {
-        rest = rest[..at].trim();
-    }
-    let rest = rest.trim_end_matches(';').trim();
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest.to_string())
-    }
+/// Read the `COMMENT` (unescaped) and `PERMISSIONS` clauses that follow a
+/// function body.
+fn read_tail(tail: &str) -> (Option<String>, Option<String>) {
+    let found = clauses(tail, TAIL_CLAUSES);
+    let comment = clause(&found, "COMMENT").and_then(string_literal);
+    let permissions = clause(&found, "PERMISSIONS")
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    (comment, permissions)
 }
 
 #[cfg(test)]
@@ -243,6 +210,27 @@ mod tests {
         .expect("function");
         assert_eq!(f.body, "IF $a { RETURN 1 } ELSE { RETURN 2 }");
         assert_eq!(f.permissions.as_deref(), Some("FULL"));
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_end_the_body() {
+        // Exact 3.0.5 echoes.
+        let f = parse_function(
+            "strip",
+            "DEFINE FUNCTION fn::strip($x: string) -> string { RETURN string::replace($x, '}', \
+             '') } COMMENT \"user's greeting\" PERMISSIONS WHERE $auth.admin = true",
+        )
+        .expect("function");
+        assert_eq!(f.body, "RETURN string::replace($x, '}', '')");
+        assert_eq!(f.comment.as_deref(), Some("user's greeting"));
+        assert_eq!(f.permissions.as_deref(), Some("WHERE $auth.admin = true"));
+        let f = parse_function(
+            "open",
+            r"DEFINE FUNCTION fn::open($x: string) { RETURN '{' + $x } COMMENT 'line1\nline2' PERMISSIONS FULL",
+        )
+        .expect("function");
+        assert_eq!(f.body, "RETURN '{' + $x");
+        assert_eq!(f.comment.as_deref(), Some("line1\nline2"));
     }
 
     #[test]

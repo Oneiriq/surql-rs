@@ -13,13 +13,22 @@
 //! - short-key maps (`{"fd": { "name": "..." }}`) as observed from SurrealDB.
 //!
 //! Input is always [`serde_json::Value`]; there is no tight coupling to the
-//! `surrealdb` crate.
+//! `surrealdb` crate. The definition strings inside it are server text, so
+//! the parsers never panic on them and never slice by an unchecked offset.
+//!
+//! Every statement is read after its `DEFINE <kind> <name> [ON <table>]`
+//! head, and a word only opens a clause outside quotes, backticked names,
+//! and brackets: a field named `default`, a comment mentioning
+//! `PERMISSIONS`, or an assertion over a subquery all keep their meaning.
 //!
 //! The implementation is split into cohesive submodules so no file exceeds
 //! the repository's 1000-LOC budget:
 //!
+//! - `scan` — the quote-, bracket-, and name-aware scanner the others use.
+//! - `permissions` — table, edge, and field `PERMISSIONS` clauses.
 //! - `field` — `DEFINE FIELD` parsing.
-//! - `index` — `DEFINE INDEX` parsing (UNIQUE / SEARCH / MTREE / HNSW).
+//! - `index` — `DEFINE INDEX` parsing (UNIQUE / FULLTEXT / MTREE / HNSW /
+//!   DISKANN).
 //! - `event` — `DEFINE EVENT` parsing.
 //! - `access` — `DEFINE ACCESS` parsing (JWT + RECORD).
 //! - `function` — `DEFINE FUNCTION` parsing.
@@ -57,7 +66,6 @@
 
 use std::collections::BTreeMap;
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -81,6 +89,7 @@ mod function;
 mod index;
 mod param;
 mod permissions;
+mod scan;
 mod sequence;
 mod table;
 mod view;
@@ -99,64 +108,6 @@ pub use permissions::parse_table_permissions;
 pub use sequence::parse_sequence;
 pub use table::{parse_changefeed, parse_table_full, parse_table_info, parse_table_mode};
 pub use view::parse_view;
-
-// --- Shared regex helper -----------------------------------------------------
-
-/// Build a case-insensitive [`Regex`] from a body pattern. Shared across
-/// the parser submodules.
-pub(super) fn regex_case_insensitive(pattern: &str) -> Regex {
-    Regex::new(&format!("(?i){pattern}")).expect("valid regex pattern")
-}
-
-// --- Shared keyword scanning -------------------------------------------------
-
-/// Find `keyword` case-insensitively at a word boundary, skipping anything
-/// inside a quoted run.
-///
-/// Clause keywords are also ordinary English words, so a definition whose
-/// value or comment happens to contain `COMMENT` or `PERMISSIONS` must not be
-/// cut there. Returns the byte offset at which the keyword starts.
-pub(super) fn find_keyword_unquoted(text: &str, keyword: &str) -> Option<usize> {
-    let haystack = text.to_ascii_uppercase();
-    let needle = keyword.to_ascii_uppercase();
-    let bytes = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() || needle.len() > bytes.len() {
-        return None;
-    }
-    let mut quote: Option<u8> = None;
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        let b = bytes[i];
-        match quote {
-            Some(q) => {
-                if b == q {
-                    quote = None;
-                }
-                i += 1;
-                continue;
-            }
-            None if b == b'\'' || b == b'"' => {
-                quote = Some(b);
-                i += 1;
-                continue;
-            }
-            None => {}
-        }
-        if bytes[i..i + needle.len()] == *needle
-            && (i == 0 || !is_word_byte(bytes[i - 1]))
-            && (i + needle.len() == bytes.len() || !is_word_byte(bytes[i + needle.len()]))
-        {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
 
 // --- Shared JSON helpers -----------------------------------------------------
 
@@ -183,34 +134,26 @@ fn type_name_of(value: &Value) -> &'static str {
     }
 }
 
-/// Coerce a map-of-string JSON value into a `BTreeMap<String, String>`.
+/// Coerce a map of JSON values into a `BTreeMap<String, String>`.
 ///
 /// Non-string values are skipped so callers can tolerate server responses that
 /// stash additional metadata under the same key.
-pub(super) fn value_to_string_map(value: &Value) -> BTreeMap<String, String> {
-    value
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
+pub(super) fn value_to_string_map(
+    map: &serde_json::Map<String, Value>,
+) -> BTreeMap<String, String> {
+    map.iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
 }
 
 /// Pick the first populated child object from `info` under any of `keys`.
 pub(super) fn pick_map<'a>(
     info: &'a serde_json::Map<String, Value>,
     keys: &[&str],
-) -> Option<&'a Value> {
-    for k in keys {
-        if let Some(v) = info.get(*k) {
-            if v.as_object().is_some_and(|m| !m.is_empty()) {
-                return Some(v);
-            }
-        }
-    }
-    None
+) -> Option<&'a serde_json::Map<String, Value>> {
+    keys.iter()
+        .filter_map(|k| info.get(*k).and_then(Value::as_object))
+        .find(|m| !m.is_empty())
 }
 
 // --- Parser state output -----------------------------------------------------
@@ -581,15 +524,26 @@ mod tests {
 
     #[test]
     fn parse_access_jwt_with_url_and_issuer() {
+        // The engine's grammar: `URL` replaces `ALGORITHM ... KEY`, and
+        // `WITH ISSUER` names the issuing key (3.0.5 echo).
         let acc = parse_access(
             "api",
-            "DEFINE ACCESS api ON DATABASE TYPE JWT ALGORITHM RS256 URL 'https://auth.example.com/jwks' WITH ISSUER 'https://auth.example.com';",
+            "DEFINE ACCESS api ON DATABASE TYPE JWT URL 'https://auth.example.com/jwks' \
+             WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 1h, FOR SESSION NONE",
         )
         .unwrap();
         let jwt = acc.jwt.unwrap();
-        assert_eq!(jwt.algorithm, "RS256");
         assert_eq!(jwt.url.as_deref(), Some("https://auth.example.com/jwks"));
-        assert_eq!(jwt.issuer.as_deref(), Some("https://auth.example.com"));
+        assert!(jwt.key.is_none());
+        assert_eq!(jwt.issuer.as_deref(), Some("[REDACTED]"));
+        let code = jwt_access(
+            "api",
+            JwtConfig::new("RS256")
+                .with_url("https://auth.example.com/jwks")
+                .with_issuer("private-key"),
+        );
+        let parsed = parse_access("api", &code.to_surql().unwrap()).unwrap();
+        assert_eq!(parsed, code);
     }
 
     #[test]

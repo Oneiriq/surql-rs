@@ -4,11 +4,11 @@
 //! `INFO FOR DB` response. The engine echoes
 //! `DEFINE PARAM $P VALUE 'hello' COMMENT 'a param' PERMISSIONS FULL`, so the
 //! `VALUE` body runs up to whichever of `COMMENT` / `PERMISSIONS` comes
-//! first — found outside quotes, because a value may itself contain either
-//! word.
+//! first — found outside quotes and brackets, because a value may itself
+//! contain either word (`VALUE { comment: 'x' }`).
 
-use super::find_keyword_unquoted;
-use super::function::{extract_permissions, extract_quoted_after};
+use super::function::TAIL_CLAUSES;
+use super::scan::{clause, clauses, find_keyword, string_literal, unquote_ident, Shape};
 use crate::schema::param::ParamDefinition;
 
 /// Parse one `DEFINE PARAM` statement.
@@ -20,30 +20,25 @@ pub fn parse_param(name: &str, definition: &str) -> Option<ParamDefinition> {
     if definition.is_empty() {
         return None;
     }
-    let at = find_keyword_unquoted(definition, "VALUE")?;
-    let head = &definition[..at];
-    let tail = &definition[at + "VALUE".len()..];
-
-    let mut value_end = tail.len();
-    for keyword in ["COMMENT", "PERMISSIONS"] {
-        if let Some(at) = find_keyword_unquoted(tail, keyword) {
-            value_end = value_end.min(at);
-        }
-    }
-    let value = tail[..value_end].trim().trim_end_matches(';').trim();
-    if value.is_empty() {
-        return None;
-    }
+    let at = find_keyword(definition, "VALUE")?;
+    let head = definition.get(..at)?;
+    let rest = definition.get(at..)?;
+    let keywords: Vec<(&str, Shape)> = std::iter::once(("VALUE", Shape::Expr))
+        .chain(TAIL_CLAUSES.iter().copied())
+        .collect();
+    let found = clauses(rest, &keywords);
+    let value = clause(&found, "VALUE").filter(|v| !v.is_empty())?;
 
     let declared = head
-        .rsplit('$')
-        .next()
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        .rsplit_once('$')
+        .map(|(_, n)| unquote_ident(n.trim()))
+        .filter(|n| !n.is_empty());
 
     let mut param = ParamDefinition::new(declared.unwrap_or_else(|| name.to_string()), value);
-    param.comment = extract_quoted_after(&tail[value_end..], "COMMENT");
-    param.permissions = extract_permissions(&tail[value_end..]);
+    param.comment = clause(&found, "COMMENT").and_then(string_literal);
+    param.permissions = clause(&found, "PERMISSIONS")
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
     Some(param)
 }
 
@@ -90,6 +85,27 @@ mod tests {
         .expect("param");
         assert_eq!(p.value, "'leave a comment about permissions'");
         assert_eq!(p.permissions.as_deref(), Some("FULL"));
+    }
+
+    #[test]
+    fn an_object_value_with_clause_named_keys_survives() {
+        // Exact 3.0.5 echo.
+        let p = parse_param(
+            "obj",
+            "DEFINE PARAM $obj VALUE { comment: 'x', permissions: 'y' } COMMENT 'o' \
+             PERMISSIONS FULL",
+        )
+        .expect("param");
+        assert_eq!(p.value, "{ comment: 'x', permissions: 'y' }");
+        assert_eq!(p.comment.as_deref(), Some("o"));
+        assert_eq!(p.permissions.as_deref(), Some("FULL"));
+        let p = parse_param(
+            "s",
+            "DEFINE PARAM $s VALUE \"it's\" PERMISSIONS WHERE $auth.admin = true",
+        )
+        .expect("param");
+        assert_eq!(p.value, "\"it's\"");
+        assert_eq!(p.permissions.as_deref(), Some("WHERE $auth.admin = true"));
     }
 
     #[test]
