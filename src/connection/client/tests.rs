@@ -492,6 +492,29 @@ async fn statement_errors_never_trigger_a_replay() {
     assert_eq!(count, serde_json::json!([[{ "count": 1 }]]));
 }
 
+/// The replay re-checks the authority under the identity lock: once a
+/// signin on any clone has taken the session, a replay already on its
+/// way declines instead of signing the config credentials back in over
+/// the new identity.
+#[tokio::test]
+async fn replay_declines_once_the_session_changed_hands() {
+    let service = DatabaseClient::new(root_mem_config("handover")).unwrap();
+    service.connect().await.unwrap();
+    assert!(
+        service.replay_session().await.unwrap(),
+        "config authority replays"
+    );
+    define_member_access(&service).await;
+    service
+        .clone()
+        .signup(&ScopeCredentials::new("handover", "handover", "member").with("name", "m"))
+        .await
+        .unwrap();
+    assert!(!service.replay_session().await.unwrap());
+    let seen = service.query("SELECT * FROM secret;").await.unwrap();
+    assert_eq!(seen, serde_json::json!([[]]), "still the member's session");
+}
+
 /// Regression: typed CRUD targets were spliced into the statement
 /// verbatim, so a record key taken from user input ended the
 /// statement and ran another.

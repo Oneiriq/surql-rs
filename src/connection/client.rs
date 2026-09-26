@@ -30,7 +30,7 @@ use surrealdb::opt::auth::{
 use surrealdb::opt::Config as SdkConfig;
 use surrealdb::types::SurrealValue;
 use surrealdb::{IndexedResults, Surreal};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 
 use crate::connection::auth::{AuthType, Credentials, ScopeCredentials, TokenAuth};
@@ -87,6 +87,14 @@ pub struct DatabaseClient {
     /// credentials after any of them would swap that identity for the
     /// service's own.
     config_authority: Arc<AtomicBool>,
+    /// Serialises every change of the shared session's identity (connect,
+    /// replay, signin, signup, authenticate, invalidate, disconnect), so
+    /// the replay's authority check and its signin form one step: a signin
+    /// on another clone lands either before the check (no replay) or after
+    /// the replay (its identity wins), never in between, where the replay
+    /// would put the config's authority back under it. Queries do not
+    /// take it.
+    identity: Arc<Mutex<()>>,
     /// Whether this client is a [`DatabaseClient::caller_session`], whose
     /// authority is a caller's token that only the caller layer may renew.
     /// Such a client never replays and refuses `connect`, which would sign
@@ -115,6 +123,7 @@ impl DatabaseClient {
             connected: Arc::new(RwLock::new(false)),
             engine_connected: Arc::new(RwLock::new(false)),
             config_authority: Arc::new(AtomicBool::new(false)),
+            identity: Arc::new(Mutex::new(())),
             caller_bound: false,
         })
     }
@@ -171,9 +180,16 @@ impl DatabaseClient {
         let mut last_err: Option<SurqlError> = None;
 
         for attempt in 1..=attempts {
-            match self.connect_once().await {
-                Ok(()) => {
+            let outcome = {
+                let _identity = self.identity.lock().await;
+                let outcome = self.connect_once().await;
+                if outcome.is_ok() {
                     self.config_authority.store(true, Ordering::SeqCst);
+                }
+                outcome
+            };
+            match outcome {
+                Ok(()) => {
                     *self.connected.write().await = true;
                     return Ok(());
                 }
@@ -201,6 +217,7 @@ impl DatabaseClient {
             }
             *guard = false;
         }
+        let _identity = self.identity.lock().await;
         self.leave_config_authority();
         // The SDK exposes `invalidate` to clear auth, but there is no
         // explicit disconnect on `Surreal<Any>` beyond dropping the
@@ -218,6 +235,7 @@ impl DatabaseClient {
     /// [`DatabaseClient::connect`].
     pub async fn signin<C: Credentials + ?Sized>(&self, creds: &C) -> Result<TokenAuth> {
         self.require_connected()?;
+        let _identity = self.identity.lock().await;
         self.leave_config_authority();
         let payload = creds.to_signin_payload();
         let token = match creds.auth_type() {
@@ -292,6 +310,7 @@ impl DatabaseClient {
     /// [`DatabaseClient::connect`].
     pub async fn signup(&self, creds: &ScopeCredentials) -> Result<TokenAuth> {
         self.require_connected()?;
+        let _identity = self.identity.lock().await;
         self.leave_config_authority();
         let mut params = serde_json::Map::new();
         for (k, v) in &creds.variables {
@@ -317,6 +336,7 @@ impl DatabaseClient {
     /// [`DatabaseClient::connect`].
     pub async fn authenticate(&self, token: &str) -> Result<()> {
         self.require_connected()?;
+        let _identity = self.identity.lock().await;
         self.leave_config_authority();
         self.inner
             .authenticate(Token::from(token))
@@ -365,6 +385,7 @@ impl DatabaseClient {
             // config's, and being caller-bound keeps it that way: no
             // replay, no connect.
             config_authority: Arc::new(AtomicBool::new(false)),
+            identity: Arc::new(Mutex::new(())),
             caller_bound: true,
         };
         session
@@ -390,6 +411,7 @@ impl DatabaseClient {
     /// ends until the next [`DatabaseClient::connect`].
     pub async fn invalidate(&self) -> Result<()> {
         self.require_connected()?;
+        let _identity = self.identity.lock().await;
         self.leave_config_authority();
         self.inner
             .invalidate()
@@ -464,13 +486,15 @@ impl DatabaseClient {
         let retry_vars = self.can_replay_session().then(|| vars.clone());
         let response = match self.send_query(surql, vars).await {
             Err(err) if request_says_session_expired(&err) => {
-                // Re-checked after the failure: a signin on another clone
-                // while the request was in flight changed whose session
-                // this is.
-                let Some(vars) = retry_vars.filter(|_| self.can_replay_session()) else {
+                // The replay re-checks the authority: a signin on another
+                // clone while the request was in flight changed whose
+                // session this is.
+                let Some(vars) = retry_vars else {
                     return Err(query_err(&err));
                 };
-                self.replay_session().await?;
+                if !self.replay_session().await? {
+                    return Err(query_err(&err));
+                }
                 self.send_query(surql, vars).await
             }
             other => other,
@@ -632,13 +656,21 @@ impl DatabaseClient {
         self.config_authority.store(false, Ordering::SeqCst);
     }
 
-    /// Re-establish the configured session on the live engine.
-    /// [`DatabaseClient::connect_once`] with the engine already up is
-    /// exactly that: credential signin plus namespace selection, no
-    /// engine reconnect and no flag transitions, so concurrent requests
-    /// on other clones never observe a disconnected client.
-    async fn replay_session(&self) -> Result<()> {
-        self.connect_once().await
+    /// Re-establish the configured session on the live engine, if the
+    /// session still holds the config's authority; `Ok(false)` when it no
+    /// longer does. [`DatabaseClient::connect_once`] with the engine
+    /// already up is exactly the replay: credential signin plus namespace
+    /// selection, no engine reconnect and no flag transitions, so
+    /// concurrent requests on other clones never observe a disconnected
+    /// client. The check and the signin run under the identity lock, so no
+    /// identity change on another clone can slip between them.
+    async fn replay_session(&self) -> Result<bool> {
+        let _identity = self.identity.lock().await;
+        if !self.can_replay_session() {
+            return Ok(false);
+        }
+        self.connect_once().await?;
+        Ok(true)
     }
 
     async fn connect_once(&self) -> Result<()> {
