@@ -15,7 +15,7 @@ use crate::error::Result;
 #[cfg(not(feature = "cache-redis"))]
 use crate::error::SurqlError;
 
-use super::backend::CacheBackend;
+use super::backend::{escape_glob, CacheBackend};
 use super::config::{CacheBackendKind, CacheConfig};
 use super::memory::MemoryCache;
 use super::stats::{CacheStats, CacheStatsSnapshot};
@@ -60,9 +60,11 @@ impl CacheManager {
             CacheBackendKind::Redis => {
                 #[cfg(feature = "cache-redis")]
                 {
+                    // The manager applies `key_prefix` to every key, so
+                    // the backend adds none of its own.
                     Arc::new(super::redis::RedisCache::new(
                         &config.redis_url,
-                        config.key_prefix.clone(),
+                        "",
                         config.default_ttl_secs,
                     )?)
                 }
@@ -265,21 +267,32 @@ impl CacheManager {
         Ok(count)
     }
 
-    /// Invalidate every entry whose prefixed key matches a glob pattern.
+    /// Invalidate every entry whose key matches a glob pattern.
+    ///
+    /// The pattern is matched against the key as given to
+    /// [`CacheManager::set`], under the configured prefix (applied as a
+    /// literal): `*` matches any run of characters, `?` one character, and
+    /// `\` makes the next character literal.
     pub async fn invalidate_pattern(&self, pattern: &str) -> Result<usize> {
         if !self.inner.config.enabled {
             return Ok(0);
         }
-        let prefixed = self.build_key([pattern]);
-        self.inner.backend.clear(Some(&prefixed)).await
+        let scoped = format!("{}{pattern}", escape_glob(&self.inner.config.key_prefix));
+        self.inner.backend.clear(Some(&scoped)).await
     }
 
-    /// Clear every cache entry.
+    /// Clear every entry stored under this manager's key prefix, and
+    /// reset the statistics.
+    ///
+    /// With an empty prefix this clears the whole backend, which a Redis
+    /// backend refuses rather than delete every key in its database.
     pub async fn clear(&self) -> Result<usize> {
         if !self.inner.config.enabled {
             return Ok(0);
         }
-        let n = self.inner.backend.clear(None).await?;
+        let prefix = &self.inner.config.key_prefix;
+        let scope = (!prefix.is_empty()).then(|| format!("{}*", escape_glob(prefix)));
+        let n = self.inner.backend.clear(scope.as_deref()).await?;
         self.inner.table_keys.lock().await.clear();
         self.inner.stats.reset();
         Ok(n)

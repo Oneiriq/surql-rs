@@ -1,29 +1,40 @@
 //! Redis-backed cache implementation.
 //!
-//! Port of `surql/cache/backends.py::RedisCache`. Uses `redis` 0.27 with
+//! Port of `surql/cache/backends.py::RedisCache`. Uses `redis` 1.x with
 //! the `tokio-comp` feature. Values are JSON-encoded on the wire; keys
 //! are prefixed per configuration.
 //!
 //! This backend is gated behind the `cache-redis` feature.
 
 use async_trait::async_trait;
-use redis::{AsyncCommands, Client};
+use redis::aio::MultiplexedConnection;
+use redis::{AsyncCommands, Client, RedisError};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::error::{Result, SurqlError};
 
-use super::backend::CacheBackend;
+use super::backend::{escape_glob, CacheBackend};
 
 /// Redis-backed cache.
 ///
 /// The underlying connection is lazily established on first use and
-/// reused across subsequent operations.
+/// reused across subsequent operations. A connection that breaks (the
+/// server restarts, the socket drops) is discarded on the error that
+/// reveals it, and the next operation connects afresh.
+///
+/// Every key is stored under `prefix`, and [`CacheBackend::clear`] only
+/// ever touches keys under it. With an empty prefix the cache shares the
+/// whole Redis database with everything else in it, so `clear(None)` is
+/// refused rather than deleting every key there. A [`CacheManager`]
+/// applies its own `key_prefix`, so the backend it builds carries none.
+///
+/// [`CacheManager`]: super::manager::CacheManager
 pub struct RedisCache {
     client: Client,
     prefix: String,
     default_ttl_secs: u64,
-    connection: Mutex<Option<redis::aio::MultiplexedConnection>>,
+    connection: Mutex<Option<MultiplexedConnection>>,
 }
 
 impl std::fmt::Debug for RedisCache {
@@ -55,7 +66,29 @@ impl RedisCache {
         format!("{}{}", self.prefix, key)
     }
 
-    async fn connection(&self) -> Result<redis::aio::MultiplexedConnection> {
+    /// The Redis `MATCH` pattern for a [`CacheBackend::clear`] pattern:
+    /// the prefix as a literal, then the pattern with its `[` and `]`
+    /// made literal (Redis would read them as a character class).
+    fn match_pattern(&self, pattern: &str) -> String {
+        let mut out = escape_glob(&self.prefix);
+        let mut chars = pattern.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    out.push('\\');
+                    out.push(chars.next().unwrap_or('\\'));
+                }
+                '[' | ']' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    async fn connection(&self) -> Result<MultiplexedConnection> {
         let mut guard = self.connection.lock().await;
         if let Some(conn) = guard.as_ref() {
             return Ok(conn.clone());
@@ -70,19 +103,28 @@ impl RedisCache {
         *guard = Some(conn.clone());
         Ok(conn)
     }
+
+    /// Map a failed command, first discarding the cached connection when
+    /// the error means it is broken: a multiplexed connection never
+    /// reconnects by itself, so keeping it would fail every later call.
+    async fn command_failed(&self, command: &str, err: &RedisError) -> SurqlError {
+        if err.is_unrecoverable_error() || err.is_io_error() || err.is_connection_dropped() {
+            *self.connection.lock().await = None;
+        }
+        SurqlError::Database {
+            reason: format!("redis {command} failed: {err}"),
+        }
+    }
 }
 
 #[async_trait]
 impl CacheBackend for RedisCache {
     async fn get(&self, key: &str) -> Result<Option<Value>> {
         let mut conn = self.connection().await?;
-        let prefixed = self.prefixed(key);
-        let raw: Option<String> = conn
-            .get(&prefixed)
-            .await
-            .map_err(|e| SurqlError::Database {
-                reason: format!("redis GET failed: {e}"),
-            })?;
+        let raw: Option<String> = match conn.get(self.prefixed(key)).await {
+            Ok(raw) => raw,
+            Err(e) => return Err(self.command_failed("GET", &e).await),
+        };
         let Some(raw) = raw else { return Ok(None) };
         match serde_json::from_str::<Value>(&raw) {
             Ok(v) => Ok(Some(v)),
@@ -95,60 +137,58 @@ impl CacheBackend for RedisCache {
         let prefixed = self.prefixed(key);
         let serialised = serde_json::to_string(&value)?;
         let ttl = ttl_secs.unwrap_or(self.default_ttl_secs);
-        if ttl == 0 {
-            conn.set::<_, _, ()>(&prefixed, serialised)
-                .await
-                .map_err(|e| SurqlError::Database {
-                    reason: format!("redis SET failed: {e}"),
-                })?;
+        let outcome = if ttl == 0 {
+            conn.set::<_, _, ()>(&prefixed, serialised).await
         } else {
-            conn.set_ex::<_, _, ()>(&prefixed, serialised, ttl)
-                .await
-                .map_err(|e| SurqlError::Database {
-                    reason: format!("redis SETEX failed: {e}"),
-                })?;
+            conn.set_ex::<_, _, ()>(&prefixed, serialised, ttl).await
+        };
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.command_failed("SET", &e).await),
         }
-        Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let mut conn = self.connection().await?;
-        let prefixed = self.prefixed(key);
-        conn.del::<_, ()>(&prefixed)
-            .await
-            .map_err(|e| SurqlError::Database {
-                reason: format!("redis DEL failed: {e}"),
-            })?;
-        Ok(())
+        match conn.del::<_, ()>(self.prefixed(key)).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.command_failed("DEL", &e).await),
+        }
     }
 
     async fn clear(&self, pattern: Option<&str>) -> Result<usize> {
-        let mut conn = self.connection().await?;
         let redis_pattern = match pattern {
-            None => format!("{}*", self.prefix),
-            Some(p) => self.prefixed(p),
+            None if self.prefix.is_empty() => {
+                return Err(SurqlError::Validation {
+                    reason: "refusing to clear a Redis cache with an empty key prefix: it \
+                             would delete every key in the database"
+                        .into(),
+                })
+            }
+            None => self.match_pattern("*"),
+            Some(p) => self.match_pattern(p),
         };
+        let mut conn = self.connection().await?;
 
         let mut count = 0usize;
         let mut cursor: u64 = 0;
         loop {
-            let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            let scanned: std::result::Result<(u64, Vec<String>), RedisError> = redis::cmd("SCAN")
                 .arg(cursor)
                 .arg("MATCH")
                 .arg(&redis_pattern)
                 .arg("COUNT")
                 .arg(100)
                 .query_async(&mut conn)
-                .await
-                .map_err(|e| SurqlError::Database {
-                    reason: format!("redis SCAN failed: {e}"),
-                })?;
+                .await;
+            let (new_cursor, keys) = match scanned {
+                Ok(page) => page,
+                Err(e) => return Err(self.command_failed("SCAN", &e).await),
+            };
             if !keys.is_empty() {
-                conn.del::<_, ()>(keys.as_slice())
-                    .await
-                    .map_err(|e| SurqlError::Database {
-                        reason: format!("redis DEL failed: {e}"),
-                    })?;
+                if let Err(e) = conn.del::<_, ()>(keys.as_slice()).await {
+                    return Err(self.command_failed("DEL", &e).await);
+                }
                 count += keys.len();
             }
             if new_cursor == 0 {
@@ -161,14 +201,10 @@ impl CacheBackend for RedisCache {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         let mut conn = self.connection().await?;
-        let prefixed = self.prefixed(key);
-        let present: bool = conn
-            .exists(&prefixed)
-            .await
-            .map_err(|e| SurqlError::Database {
-                reason: format!("redis EXISTS failed: {e}"),
-            })?;
-        Ok(present)
+        match conn.exists(self.prefixed(key)).await {
+            Ok(present) => Ok(present),
+            Err(e) => Err(self.command_failed("EXISTS", &e).await),
+        }
     }
 
     async fn close(&self) -> Result<()> {
@@ -192,6 +228,29 @@ mod tests {
     fn invalid_url_surfaces_database_error() {
         let err = RedisCache::new("not-a-url", "p:", 30).unwrap_err();
         assert!(matches!(err, SurqlError::Database { .. }));
+    }
+
+    /// Regression: the prefix went into `SCAN MATCH` unescaped, so
+    /// `app[1]:` matched `app1:*` and cleared another application's keys.
+    #[test]
+    fn match_pattern_keeps_the_prefix_literal() {
+        let cache = RedisCache::new("redis://127.0.0.1:6379", "app[1]*?:", 30).unwrap();
+        assert_eq!(cache.match_pattern("*"), r"app\[1\]\*\?:*");
+        assert_eq!(
+            cache.match_pattern("user:[a]?"),
+            r"app\[1\]\*\?:user:\[a\]?"
+        );
+        assert_eq!(cache.match_pattern(r"a\*b"), r"app\[1\]\*\?:a\*b");
+    }
+
+    /// Regression: with an empty prefix, `clear(None)` sent `SCAN MATCH *`
+    /// and deleted every key in the Redis database. Refused before any
+    /// connection is attempted.
+    #[tokio::test]
+    async fn clear_all_refuses_an_empty_prefix() {
+        let cache = RedisCache::new("redis://127.0.0.1:1", "", 30).unwrap();
+        let err = cache.clear(None).await.unwrap_err();
+        assert!(matches!(err, SurqlError::Validation { .. }), "{err}");
     }
 
     #[test]

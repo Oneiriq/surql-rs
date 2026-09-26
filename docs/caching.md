@@ -110,6 +110,17 @@ let manager = configure_cache(config)?;
 `RedisCache` lazily opens its connection on the first `get` / `set`.
 Values are JSON-encoded on the wire so the backend can be shared with
 non-Rust consumers that adhere to the same prefix and value contract.
+A connection the server drops is discarded on the error that reveals
+it, and the next call connects afresh.
+
+The manager applies `key_prefix` to every key, so the `RedisCache` it
+builds carries no prefix of its own and `surql:users:active` is stored
+under exactly that name. A standalone `RedisCache::new(url, prefix,
+ttl)` stores every key under `prefix`, and its `clear(None)` deletes
+only keys under it. With an empty prefix that would be every key in the
+Redis database, so `clear(None)` refuses; likewise `CacheManager::clear`
+with an empty `key_prefix` on Redis. Always give a Redis-backed cache a
+prefix.
 The `Debug` output of `CacheConfig`, `CacheManager` and `RedisCache`
 redacts the credentials a `redis://user:password@host` URL carries.
 
@@ -131,9 +142,16 @@ manager.clear().await?;
 `invalidate_table` deletes every key the manager has associated with
 the given table; associations are recorded when callers tag a
 `get_or_set` invocation with the relevant table list. `invalidate_key`
-removes a single key, `invalidate_pattern` accepts the backend's
-native wildcard form (Redis `KEYS` style), and `clear` drops every
-entry.
+removes a single key, and `clear` drops every entry under the manager's
+`key_prefix`.
+
+`invalidate_pattern` takes a glob matched against the keys as you pass
+them to `set` (the prefix is applied for you, literally): `*` matches
+any run of characters, `?` a single character, and `\` makes the next
+character literal. Every other character, including `[`, `]`, `<`, `>`
+and non-ASCII letters, matches only itself, on both backends, so
+`invalidate_pattern("café:*")` removes the `café:` entries and nothing
+else.
 
 ## Installing a custom backend
 
