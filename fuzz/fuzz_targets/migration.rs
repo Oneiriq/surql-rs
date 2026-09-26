@@ -1,7 +1,8 @@
 //! Migration files and the text tools that read them take arbitrary input.
 //!
-//! Loading a migration file, squash optimisation, the rollback analyser,
-//! filename parsing and expression normalisation must return rather than
+//! Loading a migration file (whose statement splitter is the lexer the
+//! rollback analyser also uses), squash optimisation, filename parsing and
+//! expression normalisation must return rather than
 //! panic or hang. Squash optimisation accounts for every statement it is
 //! given, and normalising an expression twice changes nothing.
 
@@ -13,8 +14,8 @@ use libfuzzer_sys::fuzz_target;
 use surql::migration::diff::normalize_expression;
 use surql::migration::squash::optimize_statements;
 use surql::migration::{
-    analyze_statements, get_description_from_filename, get_version_from_filename,
-    load_migration, validate_migration_name,
+    get_description_from_filename, get_version_from_filename, load_migration,
+    validate_migration_name,
 };
 
 fn scratch_file() -> PathBuf {
@@ -39,7 +40,6 @@ fuzz_target!(|input: (String, String)| {
         kept.len(),
         statements.len()
     );
-    let _ = analyze_statements("v1", &statements);
 
     let once = normalize_expression(&text);
     assert_eq!(normalize_expression(&once), once, "{text:?}");

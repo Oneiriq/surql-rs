@@ -39,7 +39,7 @@ git push --no-verify
 | `ident` | `quote_ident` / `quote_str` read back unchanged and stay one statement |
 | `value` | any JSON rendered by `quote_value_public` is one inert literal equal to the input |
 | `schema_info` | every `schema::parser` entry point returns on arbitrary definition text |
-| `migration` | migration files, squash optimisation, the rollback analyser and filename parsing return on arbitrary text; normalisation is stable |
+| `migration` | migration files, squash optimisation and filename parsing return on arbitrary text; normalisation is stable |
 
 libFuzzer needs Linux (or Docker) and the unstable sanitizer flags. Recent nightlies have rejected `diskann-wide` (a surrealdb-core dependency) with E0283 inference errors, so run cargo-fuzz on a stable toolchain with `RUSTC_BOOTSTRAP=1`. `-a` keeps debug assertions and overflow checks on in the optimised build:
 
