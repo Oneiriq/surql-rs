@@ -18,12 +18,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use surql::connection::{ConnectionConfig, DatabaseClient};
-use surql::migration::diff::{diff_edges, diff_fields};
+use surql::migration::diff::{diff_edges, diff_events, diff_fields, diff_indexes, diff_tables};
 use surql::migration::{DiffOperation, SchemaDiff};
 use surql::schema::edge::typed_edge;
 use surql::schema::parser::parse_table_full;
 use surql::schema::{
-    record_field, string_field, FieldDefinition, ReferenceAction, TableDefinition,
+    event, int_field, record_field, string_field, table_schema, unique_index, ChangeFeed,
+    FieldDefinition, ReferenceAction, TableDefinition,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -249,5 +250,143 @@ async fn literal_defaults_compare_by_content() {
     apply(&client, &forward(&diffs)).await;
     let stored = read_table(&client, "doc").await;
     let residual = diff_fields("doc", std::slice::from_ref(&respaced), &stored.fields);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// Whether a second row with the same `email` is refused.
+async fn email_is_unique(client: &DatabaseClient, table: &str) -> bool {
+    client
+        .query(&format!(
+            "DELETE {table}; CREATE {table}:a SET email = 'x@example.com';"
+        ))
+        .await
+        .expect("first row");
+    client
+        .query(&format!("CREATE {table}:b SET email = 'x@example.com';"))
+        .await
+        .is_err()
+}
+
+/// Dropping a table and rolling back restores all of it: its fields, a
+/// UNIQUE index that still bites, its events, its permissions, and its
+/// change feed. The rollback used to be a bare `DEFINE TABLE doc SCHEMAFULL`.
+#[tokio::test]
+async fn a_dropped_table_rolls_back_whole() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let doc = table_schema("doc")
+        .with_fields([
+            string_field("email").build_unchecked().unwrap(),
+            int_field("n").default("0").build_unchecked().unwrap(),
+        ])
+        .with_indexes([unique_index("email_idx", ["email"])])
+        .with_events([event("audit", "$event = 'CREATE'", "CREATE log SET n = 1")])
+        .with_permissions([("select", "true")])
+        .with_changefeed(ChangeFeed::new("1d"));
+    apply(
+        &client,
+        &forward(&diff_tables(std::slice::from_ref(&doc), &[])),
+    )
+    .await;
+
+    let diffs = diff_tables(&[], std::slice::from_ref(&doc));
+    apply(&client, &forward(&diffs)).await;
+    assert!(table_echo(&client, "doc").await.is_none());
+
+    apply(&client, &backward(&diffs)).await;
+    let echo = table_echo(&client, "doc").await.expect("table restored");
+    assert!(echo.contains("SCHEMAFULL"), "{echo}");
+    assert!(echo.contains("CHANGEFEED 1d"), "{echo}");
+    assert!(echo.contains("FOR select WHERE true"), "{echo}");
+    let stored = read_table(&client, "doc").await;
+    let residual: Vec<SchemaDiff> = diff_fields("doc", &doc.fields, &stored.fields)
+        .into_iter()
+        .chain(diff_indexes("doc", &doc.indexes, &stored.indexes))
+        .chain(diff_events("doc", &doc.events, &stored.events))
+        .collect();
+    assert!(
+        residual.is_empty(),
+        "the rollback lost something: {residual:#?}"
+    );
+    assert!(email_is_unique(&client, "doc").await);
+}
+
+/// Dropping an edge and rolling back restores the edge, which used to have
+/// no rollback at all.
+#[tokio::test]
+async fn a_dropped_edge_rolls_back_whole() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE person SCHEMAFULL;".into(),
+            "DEFINE TABLE post SCHEMAFULL;".into(),
+        ],
+    )
+    .await;
+    let likes = typed_edge("likes", "person", "post")
+        .with_fields([int_field("weight").build_unchecked().unwrap()])
+        .with_indexes([unique_index("pair", ["in", "out"])])
+        .with_permissions([("select", "true")]);
+    apply(
+        &client,
+        &forward(&diff_edges(std::slice::from_ref(&likes), &[])),
+    )
+    .await;
+
+    let diffs = diff_edges(&[], std::slice::from_ref(&likes));
+    apply(&client, &forward(&diffs)).await;
+    assert!(table_echo(&client, "likes").await.is_none());
+
+    apply(&client, &backward(&diffs)).await;
+    let echo = table_echo(&client, "likes").await.expect("edge restored");
+    assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
+    assert!(echo.contains("FOR select WHERE true"), "{echo}");
+    let stored = read_table(&client, "likes").await;
+    let fields: Vec<FieldDefinition> = stored
+        .fields
+        .into_iter()
+        .filter(|f| f.name != "in" && f.name != "out")
+        .collect();
+    let residual: Vec<SchemaDiff> = diff_fields("likes", &likes.fields, &fields)
+        .into_iter()
+        .chain(diff_indexes("likes", &likes.indexes, &stored.indexes))
+        .collect();
+    assert!(
+        residual.is_empty(),
+        "the rollback lost something: {residual:#?}"
+    );
+}
+
+/// Dropping a UNIQUE index and rolling back brings back a UNIQUE index, not
+/// a plain one.
+#[tokio::test]
+async fn a_dropped_unique_index_rolls_back_unique() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let idx = unique_index("email_idx", ["email"]);
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            "DEFINE FIELD email ON doc TYPE string;".into(),
+            idx.to_surql("doc"),
+        ],
+    )
+    .await;
+
+    let diffs = diff_indexes("doc", &[], std::slice::from_ref(&idx));
+    apply(&client, &forward(&diffs)).await;
+    assert!(!email_is_unique(&client, "doc").await);
+
+    client.query("DELETE doc;").await.expect("clear rows");
+    apply(&client, &backward(&diffs)).await;
+    assert!(email_is_unique(&client, "doc").await);
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", std::slice::from_ref(&idx), &stored.indexes);
     assert!(residual.is_empty(), "{residual:#?}");
 }

@@ -847,6 +847,15 @@ fn generate_add_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
 }
 
 fn generate_drop_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
+    // REMOVE TABLE takes the fields, indexes, and events with it, so the
+    // rollback re-creates all of them, not just the table's shell.
+    let mut restore = vec![table.to_surql()];
+    restore.extend(member_statements(
+        &table.name,
+        &table.fields,
+        &table.indexes,
+        &table.events,
+    ));
     vec![SchemaDiff {
         operation: DiffOperation::DropTable,
         table: table.name.clone(),
@@ -858,9 +867,25 @@ fn generate_drop_table_diffs(table: &TableDefinition) -> Vec<SchemaDiff> {
         object: None,
         description: format!("Drop table {}", table.name),
         forward_sql: format!("REMOVE TABLE {};", table.name),
-        backward_sql: format!("DEFINE TABLE {} {};", table.name, table.mode.as_str()),
+        backward_sql: restore.join("\n"),
         details: BTreeMap::new(),
     }]
+}
+
+/// The statements that define a table's fields, indexes, and events, as the
+/// add diffs render them.
+fn member_statements(
+    table: &str,
+    fields: &[FieldDefinition],
+    indexes: &[IndexDefinition],
+    events: &[EventDefinition],
+) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| field_to_sql(table, field))
+        .chain(indexes.iter().map(|idx| index_to_sql(table, idx, false)))
+        .chain(events.iter().map(|ev| event_to_sql(table, ev, false)))
+        .collect()
 }
 
 fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
@@ -976,29 +1001,7 @@ fn generate_modify_field_diff(
 }
 
 fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
-    let forward_sql = match idx.index_type {
-        IndexType::Mtree => mtree_index_to_sql(table, idx),
-        IndexType::Hnsw => hnsw_index_to_sql(table, idx),
-        // A DISKANN index renders through the canonical serializer, which
-        // already spells the full DIST/TYPE/DEGREE/L_BUILD/ALPHA tail the
-        // engine echoes; a full-text index does too, because it carries an
-        // analyzer / BM25 / highlights clause the bare `as_str` path below
-        // would drop.
-        IndexType::Diskann | IndexType::Search => idx.to_surql_with_options(table, false),
-        _ => {
-            let columns = idx.columns.join(", ");
-            let mut sql = format!(
-                "DEFINE INDEX {name} ON TABLE {table} COLUMNS {columns}",
-                name = idx.name
-            );
-            if idx.index_type.as_str() != "INDEX" {
-                sql.push(' ');
-                sql.push_str(idx.index_type.as_str());
-            }
-            sql.push(';');
-            sql
-        }
-    };
+    let forward_sql = index_to_sql(table, idx, false);
     let backward_sql = format!("REMOVE INDEX {} ON TABLE {};", idx.name, table);
     SchemaDiff {
         operation: DiffOperation::AddIndex,
@@ -1018,18 +1021,9 @@ fn generate_add_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
 
 fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
     let forward_sql = format!("REMOVE INDEX {} ON TABLE {};", idx.name, table);
-    let backward_sql = match idx.index_type {
-        IndexType::Mtree => mtree_index_to_sql(table, idx),
-        IndexType::Hnsw => hnsw_index_to_sql(table, idx),
-        IndexType::Diskann | IndexType::Search => idx.to_surql_with_options(table, false),
-        _ => {
-            let columns = idx.columns.join(", ");
-            format!(
-                "DEFINE INDEX {name} ON TABLE {table} COLUMNS {columns};",
-                name = idx.name
-            )
-        }
-    };
+    // The same renderer as the add, so a UNIQUE (or full-text, or vector)
+    // index comes back as the kind it was.
+    let backward_sql = index_to_sql(table, idx, false);
     SchemaDiff {
         operation: DiffOperation::DropIndex,
         table: table.to_string(),
@@ -1047,17 +1041,7 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
 }
 
 fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
-    // Best-effort validation; on failure we still emit the diff so callers
-    // can surface the unsafe SQL via dry-run, matching the "infallible diff
-    // constructor" contract of this module.
-    let _ = validate_event_expression(&ev.condition, "condition");
-    let _ = validate_event_expression(&ev.action, "action");
-    let forward_sql = format!(
-        "DEFINE EVENT {name} ON TABLE {table} WHEN {cond} THEN {{ {act} }};",
-        name = ev.name,
-        cond = ev.condition,
-        act = ev.action,
-    );
+    let forward_sql = event_to_sql(table, ev, false);
     let backward_sql = format!("REMOVE EVENT {} ON TABLE {};", ev.name, table);
     SchemaDiff {
         operation: DiffOperation::AddEvent,
@@ -1076,15 +1060,8 @@ fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
 }
 
 fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
-    let _ = validate_event_expression(&ev.condition, "condition");
-    let _ = validate_event_expression(&ev.action, "action");
     let forward_sql = format!("REMOVE EVENT {} ON TABLE {};", ev.name, table);
-    let backward_sql = format!(
-        "DEFINE EVENT {name} ON TABLE {table} WHEN {cond} THEN {{ {act} }};",
-        name = ev.name,
-        cond = ev.condition,
-        act = ev.action,
-    );
+    let backward_sql = event_to_sql(table, ev, false);
     SchemaDiff {
         operation: DiffOperation::DropEvent,
         table: table.to_string(),
@@ -1190,6 +1167,15 @@ fn edge_define_sql(edge: &EdgeDefinition, overwrite: bool) -> String {
 }
 
 fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
+    // As for a table: the rollback re-creates the edge and everything the
+    // REMOVE took with it.
+    let mut restore = vec![edge_define_sql(edge, false)];
+    restore.extend(member_statements(
+        &edge.name,
+        &edge.fields,
+        &edge.indexes,
+        &edge.events,
+    ));
     vec![SchemaDiff {
         operation: DiffOperation::DropTable,
         table: edge.name.clone(),
@@ -1201,7 +1187,7 @@ fn generate_drop_edge_diffs(edge: &EdgeDefinition) -> Vec<SchemaDiff> {
         object: None,
         description: format!("Drop edge {}", edge.name),
         forward_sql: format!("REMOVE TABLE {};", edge.name),
-        backward_sql: String::new(),
+        backward_sql: restore.join("\n"),
         details: BTreeMap::new(),
     }]
 }
@@ -1233,6 +1219,53 @@ fn field_to_sql(table: &str, field: &FieldDefinition) -> String {
     // The canonical renderer, so clause ordering (FLEXIBLE after
     // TYPE, VALUE placement) has exactly one implementation.
     field.to_surql(table)
+}
+
+/// Render an index's `DEFINE INDEX` statement, in its `OVERWRITE` form when
+/// `overwrite` is set. Every direction of the diff goes through here, so an
+/// index is always re-created as the kind it was.
+fn index_to_sql(table: &str, idx: &IndexDefinition, overwrite: bool) -> String {
+    let guard = if overwrite { " OVERWRITE" } else { "" };
+    match idx.index_type {
+        IndexType::Mtree => mtree_index_to_sql(table, idx, guard),
+        IndexType::Hnsw => hnsw_index_to_sql(table, idx, guard),
+        // A DISKANN index renders through the canonical serializer, which
+        // already spells the full DIST/TYPE/DEGREE/L_BUILD/ALPHA tail the
+        // engine echoes; a full-text index does too, because it carries an
+        // analyzer / BM25 / highlights clause the plain path below would drop.
+        IndexType::Diskann | IndexType::Search => {
+            if overwrite {
+                idx.to_surql_overwrite(table)
+            } else {
+                idx.to_surql_with_options(table, false)
+            }
+        }
+        IndexType::Unique | IndexType::Standard => {
+            let columns = idx.columns.join(", ");
+            let unique = if idx.index_type == IndexType::Unique {
+                " UNIQUE"
+            } else {
+                ""
+            };
+            format!(
+                "DEFINE INDEX{guard} {name} ON TABLE {table} COLUMNS {columns}{unique};",
+                name = idx.name
+            )
+        }
+    }
+}
+
+/// Render an event's `DEFINE EVENT` statement, in its `OVERWRITE` form when
+/// `overwrite` is set. The action is wrapped in a block so a multi-statement
+/// action stays one clause.
+fn event_to_sql(table: &str, ev: &EventDefinition, overwrite: bool) -> String {
+    let guard = if overwrite { " OVERWRITE" } else { "" };
+    format!(
+        "DEFINE EVENT{guard} {name} ON TABLE {table} WHEN {cond} THEN {{ {act} }};",
+        name = ev.name,
+        cond = ev.condition,
+        act = ev.action,
+    )
 }
 
 /// Whether two field definitions render the same stored field.
@@ -1354,43 +1387,37 @@ pub fn permissions_equal(
     }
 }
 
-fn mtree_index_to_sql(table: &str, idx: &IndexDefinition) -> String {
+fn mtree_index_to_sql(table: &str, idx: &IndexDefinition, guard: &str) -> String {
     let field = idx.columns.first().map_or("", String::as_str);
     let dim = idx.dimension.unwrap_or(0);
     let distance = idx.distance.unwrap_or(MTreeDistanceType::Euclidean);
     let vtype = idx.vector_type.unwrap_or(MTreeVectorType::F64);
-    let mut sql = format!(
-        "DEFINE INDEX {name} ON TABLE {table} COLUMNS {field} MTREE DIMENSION {dim}",
+    format!(
+        "DEFINE INDEX{guard} {name} ON TABLE {table} COLUMNS {field} MTREE DIMENSION {dim} \
+         DIST {distance} TYPE {vtype};",
         name = idx.name,
-    );
-    sql.push_str(" DIST ");
-    sql.push_str(distance.as_str());
-    sql.push_str(" TYPE ");
-    sql.push_str(vtype.as_str());
-    sql.push(';');
-    sql
+        distance = distance.as_str(),
+        vtype = vtype.as_str(),
+    )
 }
 
-fn hnsw_index_to_sql(table: &str, idx: &IndexDefinition) -> String {
+fn hnsw_index_to_sql(table: &str, idx: &IndexDefinition, guard: &str) -> String {
     let field = idx.columns.first().map_or("", String::as_str);
     let dim = idx.dimension.unwrap_or(0);
     let distance = idx.hnsw_distance.unwrap_or(HnswDistanceType::Euclidean);
     let vtype = idx.vector_type.unwrap_or(MTreeVectorType::F64);
     let mut sql = format!(
-        "DEFINE INDEX {name} ON TABLE {table} COLUMNS {field} HNSW DIMENSION {dim}",
+        "DEFINE INDEX{guard} {name} ON TABLE {table} COLUMNS {field} HNSW DIMENSION {dim} \
+         DIST {distance} TYPE {vtype}",
         name = idx.name,
+        distance = distance.as_str(),
+        vtype = vtype.as_str(),
     );
-    sql.push_str(" DIST ");
-    sql.push_str(distance.as_str());
-    sql.push_str(" TYPE ");
-    sql.push_str(vtype.as_str());
     if let Some(efc) = idx.efc {
-        use std::fmt::Write as _;
-        let _ = write!(sql, " EFC {efc}");
+        sql.push_str(&format!(" EFC {efc}"));
     }
     if let Some(m) = idx.m {
-        use std::fmt::Write as _;
-        let _ = write!(sql, " M {m}");
+        sql.push_str(&format!(" M {m}"));
     }
     sql.push(';');
     sql
@@ -1623,6 +1650,57 @@ mod tests {
         assert_eq!(diffs[0].operation, DiffOperation::DropTable);
         assert_eq!(diffs[0].forward_sql, "REMOVE TABLE old;");
         assert_eq!(diffs[0].backward_sql, "DEFINE TABLE old SCHEMALESS;");
+    }
+
+    /// REMOVE TABLE takes everything on the table with it, so the rollback
+    /// re-creates everything, as the add would have.
+    #[test]
+    fn a_dropped_table_rolls_back_to_its_whole_definition() {
+        use crate::schema::ChangeFeed;
+        let doc = tbl("doc")
+            .with_fields([f("email", FieldType::String)])
+            .with_indexes([unique_index("email_idx", ["email"])])
+            .with_events([event("audit", "true", "CREATE log")])
+            .with_permissions([("select", "true")])
+            .with_changefeed(ChangeFeed::new("1d"));
+        let diffs = diff_tables(&[], std::slice::from_ref(&doc));
+        assert_eq!(diffs.len(), 1);
+        let restore: Vec<String> = diff_tables(std::slice::from_ref(&doc), &[])
+            .iter()
+            .map(|d| d.forward_sql.clone())
+            .collect();
+        assert_eq!(diffs[0].backward_sql, restore.join("\n"));
+        assert!(diffs[0].backward_sql.contains(
+            "DEFINE TABLE doc SCHEMAFULL CHANGEFEED 1d PERMISSIONS FOR select WHERE true;"
+        ));
+        assert!(diffs[0]
+            .backward_sql
+            .contains("DEFINE INDEX email_idx ON TABLE doc COLUMNS email UNIQUE;"));
+    }
+
+    #[test]
+    fn a_dropped_edge_rolls_back_to_its_whole_definition() {
+        let likes = relation_edge("likes")
+            .with_fields([f("weight", FieldType::Int)])
+            .with_indexes([unique_index("pair", ["in", "out"])])
+            .with_permissions([("select", "true")]);
+        let diffs = diff_edges(&[], std::slice::from_ref(&likes));
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE TABLE likes TYPE RELATION FROM user TO post PERMISSIONS FOR select WHERE true;\n\
+             DEFINE FIELD weight ON TABLE likes TYPE int;\n\
+             DEFINE INDEX pair ON TABLE likes COLUMNS in, out UNIQUE;"
+        );
+    }
+
+    #[test]
+    fn a_dropped_unique_index_comes_back_unique() {
+        let diffs = diff_indexes("user", &[], &[unique_index("email_idx", ["email"])]);
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE INDEX email_idx ON TABLE user COLUMNS email UNIQUE;"
+        );
     }
 
     // ----- diff_tables: MODIFY (no-op when identical) -----
