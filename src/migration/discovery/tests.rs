@@ -300,6 +300,88 @@ fn checksum_ignores_line_endings_and_byte_order_mark() {
     assert_ne!(content_checksum(unix), content_checksum("SELECT 3;"));
 }
 
+fn history_row(version: &str, checksum: &str) -> MigrationHistory {
+    MigrationHistory {
+        version: version.into(),
+        description: String::new(),
+        applied_at: chrono::Utc::now(),
+        checksum: checksum.into(),
+        execution_time_ms: None,
+    }
+}
+
+#[test]
+fn an_edited_applied_migration_is_modified() {
+    let dir = unique_temp_dir("modified");
+    let path = dir.join("20260101_000000_a.surql");
+    fs::write(&path, "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n").unwrap();
+    let applied = load_migration(&path).unwrap();
+    let recorded = applied.checksum.clone().unwrap();
+
+    let history = [history_row("20260101_000000", &recorded)];
+    assert!(modified_migrations(std::slice::from_ref(&applied), &history).is_empty());
+
+    fs::write(&path, "-- @up\nSELECT 3;\n-- @down\nSELECT 2;\n").unwrap();
+    let edited = load_migration(&path).unwrap();
+    let modified = modified_migrations(std::slice::from_ref(&edited), &history);
+    assert_eq!(modified.len(), 1);
+    assert_eq!(modified[0].version, "20260101_000000");
+    assert_eq!(modified[0].recorded_checksum, recorded);
+    assert_eq!(modified[0].current_checksum, edited.checksum.unwrap());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Rows recorded before checksums ignored line endings hold the SHA-256
+/// of the raw bytes, and a checkout on another platform has the other
+/// line ending, so any of those variants is the same file.
+#[test]
+fn rows_hashed_from_raw_bytes_still_match() {
+    let dir = unique_temp_dir("legacy");
+    let path = dir.join("20260101_000000_a.surql");
+    let unix = "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n";
+    fs::write(&path, unix).unwrap();
+    let on_disk = [load_migration(&path).unwrap()];
+
+    let windows = unix.replace('\n', "\r\n");
+    for raw in [
+        unix.to_string(),
+        windows.clone(),
+        format!("\u{FEFF}{unix}"),
+        format!("\u{FEFF}{windows}"),
+    ] {
+        let history = [history_row("20260101_000000", &sha256_hex(raw.as_bytes()))];
+        assert!(
+            modified_migrations(&on_disk, &history).is_empty(),
+            "{raw:?} should match"
+        );
+    }
+
+    let other = [history_row(
+        "20260101_000000",
+        &sha256_hex(b"-- @up\nSELECT 9;\n"),
+    )];
+    assert_eq!(modified_migrations(&on_disk, &other).len(), 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rows_without_a_checksum_or_a_file_are_not_compared() {
+    let dir = unique_temp_dir("unknown");
+    let path = dir.join("20260101_000000_a.surql");
+    fs::write(&path, "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n").unwrap();
+    let on_disk = [load_migration(&path).unwrap()];
+
+    assert!(modified_migrations(&on_disk, &[history_row("20260101_000000", "")]).is_empty());
+    assert!(modified_migrations(&on_disk, &[history_row("20250101_000000", "x")]).is_empty());
+    let mut unhashed = on_disk[0].clone();
+    unhashed.checksum = None;
+    assert!(modified_migrations(&[unhashed], &[history_row("20260101_000000", "x")]).is_empty());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// A `DEFINE FUNCTION` body and a `FOR` loop both hold semicolons
 /// inside braces; splitting there shatters one statement into
 /// fragments that individually fail to parse. The reference

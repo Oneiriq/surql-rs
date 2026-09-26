@@ -64,6 +64,7 @@ surql
 |   |- up        [--target VERSION] [--dry-run]
 |   |- down      [--target VERSION] [--dry-run]
 |   |- status
+|   |- rehash    [<VERSION>...]
 |   |- history
 |   |- create    <description> [--schema-dir PATH]
 |   |- validate  [<VERSION>]
@@ -129,9 +130,15 @@ group.
   and including `--target`.
 
 Both stop at the first migration that fails, print the status table, and
-exit with code `1` naming the failed version.
+exit with code `1` naming the failed version. `up` (and `--dry-run`)
+refuses to start while an applied migration's file differs from the
+checksum recorded when it was applied, warning about each one.
 - `surql migrate status` - show applied vs pending counts for the
-  configured migrations directory.
+  configured migrations directory; an applied migration whose file was
+  edited since is shown as `modified`, with a warning.
+- `surql migrate rehash [<VERSION>...]` - record the current checksum of
+  modified migrations (all of them, or the listed versions), accepting
+  an edit that needs no applying. Runs nothing against the schema.
 - `surql migrate history` - dump the `_migration_history` rows.
 - `surql migrate create <description> [--schema-dir PATH]` - scaffold
   a blank migration file with `-- @metadata` / `-- @up` / `-- @down`

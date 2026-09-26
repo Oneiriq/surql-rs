@@ -175,6 +175,35 @@ pub async fn remove_migration_record(client: &DatabaseClient, version: &str) -> 
     Ok(())
 }
 
+/// Replace the checksum recorded for an applied migration.
+///
+/// Used to accept an edit to an applied migration file that does not need
+/// applying (a comment, formatting): the history then matches the file
+/// again. Does nothing when `version` is not recorded.
+///
+/// # Errors
+///
+/// Returns [`SurqlError::MigrationHistory`] if the `UPDATE` fails.
+pub async fn update_migration_checksum(
+    client: &DatabaseClient,
+    version: &str,
+    checksum: &str,
+) -> Result<()> {
+    ensure_migration_table(client).await?;
+    let surql =
+        format!("UPDATE {MIGRATION_TABLE_NAME} SET checksum = $checksum WHERE version = $version;");
+    let mut vars: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    vars.insert("version".into(), Value::String(version.to_string()));
+    vars.insert("checksum".into(), Value::String(checksum.to_string()));
+    client
+        .query_with_vars(&surql, vars)
+        .await
+        .map_err(|e| SurqlError::MigrationHistory {
+            reason: format!("failed to update the checksum of migration {version}: {e}"),
+        })?;
+    Ok(())
+}
+
 /// Fetch every applied migration, ordered by `applied_at` ascending.
 ///
 /// # Errors

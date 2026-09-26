@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Result, SurqlError};
 use crate::migration::lexer;
-use crate::migration::models::{Migration, MigrationMetadata};
+use crate::migration::models::{Migration, MigrationHistory, MigrationMetadata, ModifiedMigration};
 
 /// Discover all migration files in a directory.
 ///
@@ -513,6 +513,93 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
             let _ = write!(out, "{byte:02x}");
             out
         })
+}
+
+/// The applied migrations of `on_disk` whose file no longer matches the
+/// checksum `history` recorded when it was applied.
+///
+/// A migration counts as unchanged when the recorded checksum is its
+/// current one, or the checksum its file had before checksums ignored
+/// line endings: the raw bytes, with or without a byte-order mark and with
+/// `\n` or `\r\n` line endings. Those are what earlier releases (and the
+/// Python port) recorded, so their rows keep matching on any checkout.
+///
+/// Migrations without a history row of their own, rows without a checksum
+/// and migrations without one (built by hand rather than loaded) are not
+/// compared.
+///
+/// ## Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// use chrono::Utc;
+/// use surql::migration::{modified_migrations, Migration, MigrationHistory};
+///
+/// let migration = Migration {
+///     version: "v1".into(),
+///     description: "d".into(),
+///     path: PathBuf::from("does-not-exist.surql"),
+///     up: vec![],
+///     down: vec![],
+///     checksum: Some("new".into()),
+///     depends_on: vec![],
+///     squashed_from: vec![],
+/// };
+/// let row = MigrationHistory {
+///     version: "v1".into(),
+///     description: "d".into(),
+///     applied_at: Utc::now(),
+///     checksum: "old".into(),
+///     execution_time_ms: None,
+/// };
+/// let modified = modified_migrations(&[migration], &[row]);
+/// assert_eq!(modified[0].recorded_checksum, "old");
+/// ```
+pub fn modified_migrations(
+    on_disk: &[Migration],
+    history: &[MigrationHistory],
+) -> Vec<ModifiedMigration> {
+    on_disk
+        .iter()
+        .filter_map(|migration| {
+            let current = migration.checksum.as_deref()?;
+            let row = history.iter().find(|h| h.version == migration.version)?;
+            let recorded = row.checksum.as_str();
+            if recorded.is_empty() || recorded == current || legacy_match(migration, recorded) {
+                return None;
+            }
+            Some(ModifiedMigration {
+                version: migration.version.clone(),
+                description: migration.description.clone(),
+                path: migration.path.clone(),
+                recorded_checksum: recorded.to_string(),
+                current_checksum: current.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// `true` when `recorded` is a checksum an earlier release would have
+/// recorded for `migration`'s file: SHA-256 of its raw bytes, taken on a
+/// checkout with either line ending and with or without a byte-order mark.
+fn legacy_match(migration: &Migration, recorded: &str) -> bool {
+    let Ok(raw) = fs::read_to_string(&migration.path) else {
+        return false;
+    };
+    let unix = raw
+        .strip_prefix(BYTE_ORDER_MARK)
+        .unwrap_or(&raw)
+        .replace("\r\n", "\n");
+    let windows = unix.replace('\n', "\r\n");
+    let bom = BYTE_ORDER_MARK.to_string();
+    [
+        raw.clone(),
+        windows.clone(),
+        format!("{bom}{unix}"),
+        format!("{bom}{windows}"),
+    ]
+    .iter()
+    .any(|text| sha256_hex(text.as_bytes()) == recorded)
 }
 
 fn resolve_identity(

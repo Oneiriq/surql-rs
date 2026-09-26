@@ -29,9 +29,10 @@ pub use sequential::SequentialStrategy;
 
 use crate::connection::DatabaseClient;
 use crate::error::Result;
+use crate::migration::executor::refuse_modified;
 use crate::migration::{
-    execute_migration, get_applied_migrations, Migration, MigrationDirection, MigrationState,
-    MigrationStatus,
+    execute_migration, get_applied_migrations, modified_migrations, Migration, MigrationDirection,
+    MigrationHistory, MigrationState, MigrationStatus,
 };
 use crate::orchestration::coordinator::DeploymentPlan;
 use crate::orchestration::environment::EnvironmentConfig;
@@ -113,14 +114,20 @@ pub async fn deploy_to_environment(
         return failed(err.to_string(), Vec::new());
     }
 
-    let pending = match pending_migrations(&client, &plan.migrations).await {
-        Ok(pending) => pending,
+    let history = match get_applied_migrations(&client).await {
+        Ok(history) => history,
         Err(err) => {
             error!(environment = %env.name, error = %err, "deployment_history_failed");
             let _ = client.disconnect().await;
             return failed(format!("cannot read migration history: {err}"), Vec::new());
         }
     };
+    if let Err(err) = refuse_modified(&modified_migrations(&plan.migrations, &history)) {
+        warn!(environment = %env.name, error = %err, "deployment_refused_modified");
+        let _ = client.disconnect().await;
+        return failed(err.to_string(), Vec::new());
+    }
+    let pending = pending_migrations(&history, &plan.migrations);
     if !env.allow_destructive {
         let destructive = destructive_statements(&pending, MigrationDirection::Up);
         if !destructive.is_empty() {
@@ -172,24 +179,20 @@ pub async fn deploy_to_environment(
         .build()
 }
 
-/// The migrations of `migrations` that the environment's history does
+/// The migrations of `migrations` that the environment's `history` does
 /// not record, one per version, in ascending version order.
-async fn pending_migrations<'a>(
-    client: &DatabaseClient,
+fn pending_migrations<'a>(
+    history: &[MigrationHistory],
     migrations: &'a [Migration],
-) -> Result<Vec<&'a Migration>> {
-    let applied: HashSet<String> = get_applied_migrations(client)
-        .await?
-        .into_iter()
-        .map(|h| h.version)
-        .collect();
+) -> Vec<&'a Migration> {
+    let applied: HashSet<&str> = history.iter().map(|h| h.version.as_str()).collect();
     let mut seen: HashSet<&str> = HashSet::new();
     let mut pending: Vec<&Migration> = migrations
         .iter()
-        .filter(|m| !applied.contains(&m.version) && seen.insert(m.version.as_str()))
+        .filter(|m| !applied.contains(m.version.as_str()) && seen.insert(m.version.as_str()))
         .collect();
     pending.sort_by(|a, b| a.version.cmp(&b.version));
-    Ok(pending)
+    pending
 }
 
 /// The failure reason of one `execute_migration` call, or `None` when the

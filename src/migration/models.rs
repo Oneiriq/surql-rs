@@ -161,6 +161,25 @@ pub struct MigrationHistory {
     pub execution_time_ms: Option<u64>,
 }
 
+/// An applied migration whose file changed after it was applied.
+///
+/// The database ran the file as it was then, so its current content is
+/// not what the schema reflects. Returned by
+/// [`modified_migrations`](crate::migration::modified_migrations).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModifiedMigration {
+    /// Migration version.
+    pub version: String,
+    /// Migration description, from the file.
+    pub description: String,
+    /// Path to the migration file on disk.
+    pub path: PathBuf,
+    /// Checksum recorded in the history table when it was applied.
+    pub recorded_checksum: String,
+    /// Checksum of the file as it is now.
+    pub current_checksum: String,
+}
+
 /// Execution plan for a set of migrations.
 ///
 /// Represents the ordered list of migrations to execute and their direction.

@@ -556,3 +556,74 @@ async fn allow_destructive_false_refuses_destructive_migration() {
     );
     assert!(table_names(&cfg).await.contains(&"precious".to_string()));
 }
+
+#[tokio::test]
+async fn an_edited_applied_migration_fails_the_deployment() {
+    let database = unique_db("it_orch_modified");
+    let Some(cfg) = integration_config(&database) else {
+        eprintln!("SURREAL_URL not set; skipping");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_migration(
+        tmp.path(),
+        "20260101_000001_first.surql",
+        &migration_file(
+            "20260101_000001",
+            "DEFINE TABLE first;",
+            "REMOVE TABLE first;",
+        ),
+    );
+
+    let registry = EnvironmentRegistry::new();
+    let env = EnvironmentConfig::builder("prod", cfg.clone())
+        .build()
+        .expect("env");
+    registry.register(env).await;
+    let plan = |dir: &std::path::Path| {
+        DeploymentPlan::builder(registry.clone())
+            .environment("prod")
+            .migrations(discover_migrations(dir).expect("discover"))
+            .verify_health(false)
+            .build()
+    };
+    let results = coordinator(&registry)
+        .deploy(&plan(tmp.path()))
+        .await
+        .expect("deploy");
+    assert_eq!(results["prod"].status, DeploymentStatus::Success);
+
+    write_migration(
+        tmp.path(),
+        "20260101_000001_first.surql",
+        &migration_file(
+            "20260101_000001",
+            "DEFINE TABLE first SCHEMAFULL;",
+            "REMOVE TABLE first;",
+        ),
+    );
+    write_migration(
+        tmp.path(),
+        "20260101_000002_second.surql",
+        &migration_file(
+            "20260101_000002",
+            "DEFINE TABLE second;",
+            "REMOVE TABLE second;",
+        ),
+    );
+    let results = coordinator(&registry)
+        .deploy(&plan(tmp.path()))
+        .await
+        .expect("deploy");
+    let result = &results["prod"];
+    assert_eq!(result.status, DeploymentStatus::Failed, "{result:?}");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("20260101_000001"),
+        "{result:?}"
+    );
+    assert!(!table_names(&cfg).await.contains(&"second".to_string()));
+}

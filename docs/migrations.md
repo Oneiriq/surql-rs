@@ -20,8 +20,9 @@ The `version` pattern is `YYYYMMDD_HHMMSS`. Descriptions are slug-cased by
 the generator. Every file is validated on load and includes a SHA-256
 checksum; the checksum ignores a leading byte-order mark and `\r\n`
 versus `\n` line endings, so a file hashes the same on every platform.
-(Checksums are recorded in the history table but not yet compared
-against the files on disk.)
+The checksum is recorded in the history table when the migration is
+applied, and compared with the file from then on (see
+[Edited migrations](#edited-migrations)).
 
 Sections are split into statements on `;`, but only on a `;` that is
 code: one inside a `--`, `//`, `#` or `/* */` comment, a `'…'` or `"…"`
@@ -87,6 +88,33 @@ fails without running its down body. A failed migration is reported as a
 A migration with no `down` statements (a squashed or a blank one) is
 refused when rolling back, rather than deleting its history row while
 the schema stays.
+
+### Edited migrations
+
+A migration's file can change after it was applied, and the database
+keeps the schema the old text produced. `get_migration_status` lists such
+migrations in `report.modified` (the CLI's `migrate status` marks them
+`modified`), and `migrate_up`, `surql migrate up` and orchestration
+deploys refuse to run while there are any, naming each one: migrations
+written after the edit may assume a schema the database does not have.
+
+Either revert the edit, or, when it needs no applying (a comment, a
+formatting change), accept it by recording the file's current checksum:
+
+```rust
+use surql::migration::{get_modified_migrations, rehash_migrations};
+
+for m in get_modified_migrations(&client, Path::new("migrations")).await? {
+    println!("{} ({}) changed since it was applied", m.version, m.path.display());
+}
+// Every modified migration, or pass the versions to accept.
+rehash_migrations(&client, Path::new("migrations"), &[]).await?;
+```
+
+History rows written before checksums ignored line endings, or by the
+Python port, hold the SHA-256 of the file's raw bytes. Those still match
+on any checkout (either line ending, with or without a byte-order mark),
+so upgrading does not report every existing migration as modified.
 
 `create_rollback_plan` rolls back every applied migration newer than the
 target, most recently applied first, and classifies the plan by what its

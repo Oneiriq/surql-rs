@@ -56,7 +56,7 @@ pub use diff::{
 };
 pub use discovery::{
     discover_migrations, get_description_from_filename, get_version_from_filename, load_migration,
-    validate_migration_name,
+    modified_migrations, validate_migration_name,
 };
 pub use generator::{
     create_blank_migration, generate_initial_migration, generate_migration,
@@ -71,7 +71,7 @@ pub use hooks::{
 };
 pub use models::{
     DiffOperation, Migration, MigrationDirection, MigrationHistory, MigrationMetadata,
-    MigrationPlan, MigrationState, MigrationStatus, SchemaDiff,
+    MigrationPlan, MigrationState, MigrationStatus, ModifiedMigration, SchemaDiff,
 };
 pub use squash::{
     filter_migrations_by_version, generate_squashed_migration_content, optimize_statements,
@@ -88,14 +88,15 @@ pub use watcher::{is_schema_file, SchemaWatcher, WatcherConfig};
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use executor::{
     create_migration_plan, execute_migration, execute_migration_plan,
-    get_applied_migrations_ordered, get_migration_status, get_pending_migrations, migrate_down,
-    migrate_up, validate_migrations, version_is_applied, MigrateUpOptions, MigrationStatusReport,
+    get_applied_migrations_ordered, get_migration_status, get_modified_migrations,
+    get_pending_migrations, migrate_down, migrate_up, rehash_migrations, validate_migrations,
+    version_is_applied, MigrateUpOptions, MigrationStatusReport,
 };
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use history::{
     auto_snapshot_after_apply, create_migration_table, ensure_migration_table,
     get_applied_migrations, get_migration_history, is_migration_applied, record_migration,
-    remove_migration_record, MIGRATION_TABLE_NAME,
+    remove_migration_record, update_migration_checksum, MIGRATION_TABLE_NAME,
 };
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use rollback::{

@@ -3,15 +3,6 @@
 Open problems that are understood but not yet fixed, each with the fix it
 would take. Fixed issues move to the [changelog](changelog.md).
 
-## Migrations
-
-- **Checksums are not compared against history.** Editing a migration
-  after it was applied goes unnoticed. The fix is for `migrate status` and
-  `migrate up` to report a file whose checksum differs from its history
-  row. Checksums now ignore line endings and a byte-order mark, so rows
-  recorded for CRLF or BOM files before that change would need to be
-  accepted or re-hashed.
-
 ## Queries
 
 - **Deeply nested values cannot be inlined.** Values are rendered into

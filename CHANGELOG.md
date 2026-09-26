@@ -150,7 +150,15 @@ Problems the pass found but did not fix are listed on the
   - Two migrations generated in the same second no longer overwrite each
     other, and squash refuses to overwrite its output; a byte-order mark
     no longer hides the metadata block; checksums ignore line endings and
-    the BOM (**Breaking**: such files' checksums change).
+    the BOM (history rows recorded from the raw bytes still match).
+  - **An applied migration edited afterwards is caught.** Its checksum was
+    recorded but never compared, so the edit went unnoticed and the
+    database kept the old schema. `get_migration_status` now lists such
+    migrations in `modified` (`migrate status` shows them as `modified`),
+    and `migrate_up`, `surql migrate up` and orchestration deploys refuse
+    to run while any exist. Rows recorded from a file's raw bytes (earlier
+    releases, surql-py) match on either line ending, with or without a
+    byte-order mark. **Breaking**
   - The schema watcher no longer spins after it is dropped or panics
     outside a runtime, and reports over a bounded channel. **Breaking**
   - Non-ASCII staged files are detected; a corrupt newest snapshot is an
@@ -240,6 +248,11 @@ Problems the pass found but did not fix are listed on the
   `INFO` parsers return on arbitrary text.
 - CI jobs for the MSRV, the `client-wasm` build and the no-features
   build; the pre-push hook runs every CI gate.
+- `modified_migrations`, `get_modified_migrations`, `rehash_migrations`,
+  `update_migration_checksum` and `ModifiedMigration`;
+  `MigrationStatusReport` gains `modified` (**Breaking** for struct
+  literals); `surql migrate rehash [<VERSION>...]` accepts an edit to an
+  applied migration by recording its current checksum.
 
 ### Removed
 
