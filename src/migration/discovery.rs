@@ -30,17 +30,23 @@
 //!   line (trailing whitespace tolerated).
 //! * Inside `-- @metadata`, each `-- key: value` line sets a field. Unknown
 //!   keys are ignored.
-//! * `-- @up` and `-- @down` bodies are split on `;` with empty segments
-//!   discarded; a trailing `;` on each statement is preserved.
+//! * `-- @up` and `-- @down` bodies are split into statements on `;`. A `;`
+//!   inside a comment (`--`, `//`, `#`, `/* */`), a string literal, a quoted
+//!   identifier, or a `{ }` / `( )` / `[ ]` block does not end a statement.
+//!   Each statement keeps its text verbatim, trailing `;` included; pieces
+//!   holding only whitespace and comments are discarded.
 //! * `@up` and `@down` are both required; `@metadata` is optional (version
 //!   and description fall back to the filename when absent).
+//! * A leading UTF-8 byte-order mark is ignored.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sha2_lite::sha256_hex;
+use sha2::{Digest, Sha256};
 
 use crate::error::{Result, SurqlError};
+use crate::migration::lexer;
 use crate::migration::models::{Migration, MigrationMetadata};
 
 /// Discover all migration files in a directory.
@@ -128,7 +134,8 @@ pub fn discover_migrations(directory: &Path) -> Result<Vec<Migration>> {
 ///
 /// Reads the file at `path`, parses the `@metadata`, `@up` and `@down`
 /// sections, and returns a [`Migration`] with a SHA-256 checksum of the
-/// file content.
+/// file content. The checksum ignores a byte-order mark and `\r\n` versus
+/// `\n` line endings, so a checkout on any platform hashes the same.
 ///
 /// # Errors
 ///
@@ -179,7 +186,7 @@ pub fn load_migration(path: &Path) -> Result<Migration> {
         .map(|m| m.depends_on.clone())
         .unwrap_or_default();
 
-    let checksum = sha256_hex(content.as_bytes());
+    let checksum = content_checksum(&content);
 
     Ok(Migration {
         version,
@@ -294,6 +301,9 @@ enum Section {
 }
 
 fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration> {
+    // An editor-added byte-order mark would otherwise hide the first
+    // line's `-- @metadata` marker.
+    let content = content.strip_prefix(BYTE_ORDER_MARK).unwrap_or(content);
     let mut section = Section::None;
 
     let mut metadata_version: Option<String> = None;
@@ -361,8 +371,8 @@ fn parse_migration_content(content: &str, path: &Path) -> Result<ParsedMigration
         });
     }
 
-    let up = split_statements(&up_lines);
-    let down = split_statements(&down_lines);
+    let up = lexer::split_statements(&up_lines.join("\n"));
+    let down = lexer::split_statements(&down_lines.join("\n"));
 
     let metadata = if saw_metadata {
         let version = metadata_version.ok_or_else(|| SurqlError::MigrationLoad {
@@ -409,54 +419,25 @@ fn parse_metadata_line(line: &str) -> Option<(String, String)> {
     Some((key.trim().to_string(), value.trim().to_string()))
 }
 
-/// Split a migration section into statements on `;`, respecting the
-/// nesting a statement may legitimately contain. A `DEFINE FUNCTION`
-/// body and a `FOR` loop both carry semicolons inside `{ }`, string
-/// literals may carry anything at all, and splitting inside either
-/// shatters one statement into fragments that individually fail to
-/// parse. Only a semicolon at depth zero, outside every quote, ends a
-/// statement.
-fn split_statements(lines: &[String]) -> Vec<String> {
-    let joined = lines.join("\n");
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
+const BYTE_ORDER_MARK: char = '\u{FEFF}';
 
-    for ch in joined.chars() {
-        current.push(ch);
-        if let Some(open) = quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == open {
-                quote = None;
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' | '`' => quote = Some(ch),
-            '{' | '(' => depth += 1,
-            '}' | ')' => depth = depth.saturating_sub(1),
-            ';' if depth == 0 => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() && trimmed != ";" {
-                    statements.push(trimmed);
-                }
-                current.clear();
-            }
-            _ => {}
-        }
-    }
+/// SHA-256 of a migration file's text with a byte-order mark and `\r\n`
+/// line endings normalised away, so the same file checked out on Windows
+/// and Unix hashes the same.
+fn content_checksum(content: &str) -> String {
+    let content = content.strip_prefix(BYTE_ORDER_MARK).unwrap_or(content);
+    sha256_hex(content.replace("\r\n", "\n").as_bytes())
+}
 
-    let trailing = current.trim();
-    if !trailing.is_empty() {
-        statements.push(trailing.to_string());
-    }
-
-    statements
+/// Lowercase hex SHA-256 of `bytes`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            // Writing to a `String` cannot fail.
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn resolve_identity(
@@ -483,206 +464,6 @@ fn resolve_identity(
             ),
         })?;
     Ok((version, description))
-}
-
-// ---------------------------------------------------------------------------
-// Minimal SHA-256 implementation (vendored to avoid adding a runtime dep)
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::many_single_char_names)]
-pub(crate) mod sha2_lite {
-    // FIPS 180-4 SHA-256. Pure-safe Rust; no unsafe. Written for checksum
-    // use only: we do NOT rely on this for cryptographic security.
-    use std::fmt::Write as _;
-
-    const K: [u32; 64] = [
-        0x428a_2f98,
-        0x7137_4491,
-        0xb5c0_fbcf,
-        0xe9b5_dba5,
-        0x3956_c25b,
-        0x59f1_11f1,
-        0x923f_82a4,
-        0xab1c_5ed5,
-        0xd807_aa98,
-        0x1283_5b01,
-        0x2431_85be,
-        0x550c_7dc3,
-        0x72be_5d74,
-        0x80de_b1fe,
-        0x9bdc_06a7,
-        0xc19b_f174,
-        0xe49b_69c1,
-        0xefbe_4786,
-        0x0fc1_9dc6,
-        0x240c_a1cc,
-        0x2de9_2c6f,
-        0x4a74_84aa,
-        0x5cb0_a9dc,
-        0x76f9_88da,
-        0x983e_5152,
-        0xa831_c66d,
-        0xb003_27c8,
-        0xbf59_7fc7,
-        0xc6e0_0bf3,
-        0xd5a7_9147,
-        0x06ca_6351,
-        0x1429_2967,
-        0x27b7_0a85,
-        0x2e1b_2138,
-        0x4d2c_6dfc,
-        0x5338_0d13,
-        0x650a_7354,
-        0x766a_0abb,
-        0x81c2_c92e,
-        0x9272_2c85,
-        0xa2bf_e8a1,
-        0xa81a_664b,
-        0xc24b_8b70,
-        0xc76c_51a3,
-        0xd192_e819,
-        0xd699_0624,
-        0xf40e_3585,
-        0x106a_a070,
-        0x19a4_c116,
-        0x1e37_6c08,
-        0x2748_774c,
-        0x34b0_bcb5,
-        0x391c_0cb3,
-        0x4ed8_aa4a,
-        0x5b9c_ca4f,
-        0x682e_6ff3,
-        0x748f_82ee,
-        0x78a5_636f,
-        0x84c8_7814,
-        0x8cc7_0208,
-        0x90be_fffa,
-        0xa450_6ceb,
-        0xbef9_a3f7,
-        0xc671_78f2,
-    ];
-
-    const H0: [u32; 8] = [
-        0x6a09_e667,
-        0xbb67_ae85,
-        0x3c6e_f372,
-        0xa54f_f53a,
-        0x510e_527f,
-        0x9b05_688c,
-        0x1f83_d9ab,
-        0x5be0_cd19,
-    ];
-
-    pub fn sha256_hex(data: &[u8]) -> String {
-        let digest = sha256(data);
-        let mut s = String::with_capacity(64);
-        for byte in digest {
-            let _ = write!(s, "{:02x}", byte);
-        }
-        s
-    }
-
-    fn sha256(data: &[u8]) -> [u8; 32] {
-        let mut h = H0;
-
-        // Padding: append 0x80, then 0x00s, then 64-bit big-endian length in bits.
-        let bit_len = (data.len() as u64).wrapping_mul(8);
-        let mut padded = Vec::with_capacity(data.len() + 72);
-        padded.extend_from_slice(data);
-        padded.push(0x80);
-        while padded.len() % 64 != 56 {
-            padded.push(0);
-        }
-        padded.extend_from_slice(&bit_len.to_be_bytes());
-
-        for chunk in padded.as_chunks::<64>().0 {
-            process_chunk(chunk, &mut h);
-        }
-
-        let mut out = [0u8; 32];
-        for (i, word) in h.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
-        }
-        out
-    }
-
-    fn process_chunk(chunk: &[u8], h: &mut [u32; 8]) {
-        let mut w = [0u32; 64];
-        for (i, word) in w.iter_mut().enumerate().take(16) {
-            let j = i * 4;
-            *word = u32::from_be_bytes([chunk[j], chunk[j + 1], chunk[j + 2], chunk[j + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ (!e & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn sha256_empty_string() {
-            assert_eq!(
-                sha256_hex(b""),
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            );
-        }
-
-        #[test]
-        fn sha256_abc() {
-            assert_eq!(
-                sha256_hex(b"abc"),
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-            );
-        }
-
-        #[test]
-        fn sha256_longer_message() {
-            assert_eq!(
-                sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -830,7 +611,73 @@ mod tests {
     // --- load_migration ----------------------------------------------------
 
     fn split(text: &str) -> Vec<String> {
-        split_statements(&[text.to_string()])
+        lexer::split_statements(text)
+    }
+
+    #[test]
+    fn sha256_hex_matches_the_fips_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// A comment carrying a `;` and an apostrophe used to split the
+    /// statement after it inside its string literal; the executor then
+    /// re-joined the halves with `;\n`, silently changing the stored value.
+    #[test]
+    fn load_migration_keeps_literals_intact_around_comments() {
+        let dir = unique_temp_dir("load-comments");
+        let path = dir.join("20260102_120000_notes.surql");
+        let text = "-- @up\n\
+             DEFINE TABLE a SCHEMAFULL; -- step 1; see JIRA-12\n\
+             -- user's table\n\
+             CREATE user SET note = 'a;b';\n\
+             -- @down\n\
+             DELETE user;\n";
+        fs::write(&path, text).unwrap();
+
+        let m = load_migration(&path).unwrap();
+        assert_eq!(m.up.len(), 2, "{:#?}", m.up);
+        assert_eq!(m.up[0], "DEFINE TABLE a SCHEMAFULL;");
+        assert!(
+            m.up[1].ends_with("CREATE user SET note = 'a;b';"),
+            "{}",
+            m.up[1]
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_migration_ignores_a_byte_order_mark() {
+        let dir = unique_temp_dir("load-bom");
+        let path = dir.join("20260102_120000_bom.surql");
+        let text = "\u{FEFF}-- @metadata\n\
+             -- version: 20260102_120000\n\
+             -- description: with bom\n\
+             -- @up\n\
+             SELECT 1;\n\
+             -- @down\n\
+             SELECT 2;\n";
+        fs::write(&path, text).unwrap();
+
+        let m = load_migration(&path).unwrap();
+        assert_eq!(m.description, "with bom");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checksum_ignores_line_endings_and_byte_order_mark() {
+        let unix = "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n";
+        let windows = "\u{FEFF}-- @up\r\nSELECT 1;\r\n-- @down\r\nSELECT 2;\r\n";
+        assert_eq!(content_checksum(unix), content_checksum(windows));
+        assert_ne!(content_checksum(unix), content_checksum("SELECT 3;"));
     }
 
     /// A `DEFINE FUNCTION` body and a `FOR` loop both hold semicolons

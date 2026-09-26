@@ -47,6 +47,7 @@ use chrono::Utc;
 use crate::error::{Result, SurqlError};
 use crate::migration::diff::SchemaSnapshot;
 use crate::migration::discovery::load_migration;
+use crate::migration::lexer;
 use crate::migration::models::{Migration, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
 use crate::schema::edge::EdgeDefinition;
@@ -345,19 +346,13 @@ fn description_from_name(name: &str) -> String {
     }
 }
 
-/// Trim a statement and ensure it ends with `;`.
+/// Trim a statement and ensure it ends with `;` (on a line of its own when
+/// the statement ends in a line comment).
 ///
 /// Returns `None` when the trimmed input is empty.
 fn normalise_statement(stmt: &str) -> Option<String> {
     let trimmed = stmt.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.ends_with(';') {
-        Some(trimmed.to_string())
-    } else {
-        Some(format!("{trimmed};"))
-    }
+    (!trimmed.is_empty()).then(|| lexer::terminate_statement(trimmed))
 }
 
 /// Render the complete file content for a non-blank migration.
@@ -660,6 +655,14 @@ mod tests {
         assert_eq!(
             normalise_statement("  SELECT 1;\n").as_deref(),
             Some("SELECT 1;"),
+        );
+    }
+
+    #[test]
+    fn normalise_keeps_the_terminator_out_of_a_trailing_comment() {
+        assert_eq!(
+            normalise_statement("SELECT 1 -- note").as_deref(),
+            Some("SELECT 1 -- note\n;"),
         );
     }
 

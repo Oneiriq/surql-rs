@@ -40,6 +40,7 @@ pub mod generator;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod history;
 pub mod hooks;
+pub(crate) mod lexer;
 pub mod models;
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub mod rollback;

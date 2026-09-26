@@ -41,7 +41,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::sha2_lite;
+use crate::migration::discovery::sha256_hex;
 use crate::migration::models::Migration;
 use crate::schema::access::AccessDefinition;
 use crate::schema::bucket::BucketDefinition;
@@ -230,7 +230,7 @@ fn compute_checksum(
     });
     // `serde_json::to_vec` on a `Value` is infallible for owned data.
     let bytes = serde_json::to_vec(&payload).unwrap_or_default();
-    sha2_lite::sha256_hex(&bytes)
+    sha256_hex(&bytes)
 }
 
 // ---------------------------------------------------------------------------

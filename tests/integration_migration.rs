@@ -175,6 +175,39 @@ async fn migrate_down_returns_migration_to_pending() {
     assert_eq!(report.applied_count(), 0);
 }
 
+/// Comments carrying `;` and `'` used to derail the statement splitter,
+/// and the transaction then re-joined the fragments with `;\n`: the
+/// migration "succeeded" and stored `'a;\nb'`.
+#[tokio::test]
+async fn comments_do_not_change_what_a_migration_stores() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write_migration(
+        tmp.path(),
+        "20260101_000010_notes.surql",
+        "-- @up\n\
+         DEFINE TABLE note SCHEMALESS; -- step 1; see JIRA-12\n\
+         -- the user's note\n\
+         CREATE note:one SET text = 'a;b'; # trailing\n\
+         CREATE note:two SET text = \"it's; fine\" -- no terminator\n\
+         -- @down\n\
+         REMOVE TABLE note;\n",
+    );
+
+    let statuses = migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(statuses[0].state, MigrationState::Applied, "{statuses:?}");
+
+    let raw = client
+        .query("RETURN [note:one.text, note:two.text];")
+        .await
+        .unwrap();
+    assert_eq!(raw[0], serde_json::json!(["a;b", "it's; fine"]));
+}
+
 #[tokio::test]
 async fn migration_plan_execution_applies_all() {
     let Some(client) = connected_client(&unique_db()).await else {

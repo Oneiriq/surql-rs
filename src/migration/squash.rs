@@ -41,7 +41,8 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::{discover_migrations, sha2_lite};
+use crate::migration::discovery::{discover_migrations, sha256_hex};
+use crate::migration::lexer;
 use crate::migration::models::Migration;
 
 /// Error raised by the squash subsystem.
@@ -562,10 +563,7 @@ pub fn generate_squashed_migration_content(
             if stmt.is_empty() {
                 continue;
             }
-            buf.push_str(stmt);
-            if !stmt.ends_with(';') {
-                buf.push(';');
-            }
+            buf.push_str(&lexer::terminate_statement(stmt));
             buf.push('\n');
         }
     }
@@ -703,7 +701,7 @@ fn persist_squashed_migration(output_path: &Path, content: &str, version: &str) 
             output_path.display()
         ),
     })?;
-    let checksum = sha2_lite::sha256_hex(content.as_bytes());
+    let checksum = sha256_hex(content.as_bytes());
     tracing::info!(
         target: "surql::migration::squash",
         version = %version,
@@ -1019,6 +1017,27 @@ mod tests {
         assert!(content.contains("DEFINE TABLE user SCHEMAFULL;"));
         assert!(content.contains("-- squashed-from: v1,v2"));
         assert!(content.contains("-- version: 20260102_120000"));
+    }
+
+    /// A statement ending in a line comment used to get its `;` appended
+    /// inside the comment, gluing the next statement onto it on reload.
+    #[test]
+    fn generated_content_round_trips_a_trailing_comment() {
+        let dir = unique_temp_dir("trailing-comment");
+        let content = generate_squashed_migration_content(
+            &[
+                "DEFINE TABLE a SCHEMAFULL -- no terminator".to_string(),
+                "DEFINE TABLE b SCHEMAFULL;".to_string(),
+            ],
+            "20260102_120000",
+            "squashed",
+            &[],
+        );
+        let path = dir.join("20260102_120000_squashed.surql");
+        fs::write(&path, content).unwrap();
+        let m = crate::migration::discovery::load_migration(&path).unwrap();
+        assert_eq!(m.up.len(), 2, "{:#?}", m.up);
+        assert_eq!(m.up[1], "DEFINE TABLE b SCHEMAFULL;");
     }
 
     #[test]
