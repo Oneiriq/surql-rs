@@ -6,9 +6,9 @@
 //! [`diff_named`] captures that once, so a new kind is three lines rather
 //! than a copy of the walk.
 //!
-//! Lives beside [`super::diff`] rather than inside it because that module is
-//! already well past the repository's 1000-LOC budget. Everything here is
-//! re-exported from `migration::diff`, so existing paths keep resolving.
+//! Lives beside [`super::diff`] rather than inside it, which holds the
+//! table-scoped diffs. The bucket and analyzer diffs are re-exported from
+//! `migration::diff`, so those paths keep resolving too.
 //!
 //! Buckets and analyzers predate [`diff_named`] and keep their hand-written
 //! walks: a bucket modification renders `ALTER BUCKET` (a delta, not a
