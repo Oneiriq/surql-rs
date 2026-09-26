@@ -40,6 +40,15 @@ fn default_true() -> bool {
 
 impl<T> RecordResult<T> {
     /// Unwrap the record, panicking on `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the record is absent, like [`Option::unwrap`]; use
+    /// [`RecordResult::try_unwrap`] to get an error instead.
+    #[allow(
+        clippy::expect_used,
+        reason = "panicking on None is this method's documented contract"
+    )]
     pub fn unwrap(self) -> T {
         self.record
             .expect("RecordResult::unwrap called on a None record")
@@ -215,16 +224,24 @@ pub fn record<T>(rec: Option<T>, exists: bool) -> RecordResult<T> {
 
 /// Build a [`ListResult`] with `has_more` computed from the supplied
 /// pagination inputs (mirrors the Python port's heuristic).
+///
+/// With a known `total`, more pages exist while `offset + limit` (or
+/// `offset + items`, without a limit) is below it; a missing offset counts
+/// as zero. Without a total, a full page (`items == limit`) suggests more.
+/// A zero limit never reports more pages.
 pub fn records<T>(
     items: Vec<T>,
     total: Option<u64>,
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> ListResult<T> {
-    let has_more = match (total, limit, offset) {
-        (Some(t), Some(l), Some(o)) => o.saturating_add(l) < t,
-        (None, Some(l), _) => items.len() as u64 == l,
-        _ => false,
+    let offset_or_zero = offset.unwrap_or(0);
+    let returned = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    let has_more = match (total, limit) {
+        (_, Some(0)) | (None, None) => false,
+        (Some(t), Some(l)) => offset_or_zero.saturating_add(l) < t,
+        (Some(t), None) => offset_or_zero.saturating_add(returned) < t,
+        (None, Some(l)) => returned >= l,
     };
     ListResult {
         records: items,
@@ -278,6 +295,52 @@ pub fn paginated<T>(items: Vec<T>, page: u64, page_size: u64, total: u64) -> Pag
 // Raw extraction
 // ---------------------------------------------------------------------------
 
+/// Split a raw [`DatabaseClient::query`](crate::DatabaseClient::query)
+/// response into its rows.
+///
+/// The response is an array with one entry per statement, and each entry is
+/// one of:
+///
+/// - an array of rows, spread by exactly one level: a row that is itself an
+///   array (what `SELECT VALUE tags` returns) stays one row;
+/// - `null`, which contributes no rows;
+/// - the legacy `{"result": ...}` envelope (HTTP API, Python SDK), unwrapped
+///   the same way;
+/// - any other value, which is a single row.
+///
+/// The envelope is recognised at the statement level only, and only when
+/// `result` is its sole payload key, so a row that happens to carry a
+/// `result` field is kept whole. A bare row list (`[{...}, {...}]`, the flat
+/// Python `db.select` shape) reads as one row per entry.
+pub(crate) fn response_rows(raw: &Value) -> Vec<Value> {
+    match raw {
+        Value::Array(statements) => statements.iter().flat_map(statement_rows).collect(),
+        other => statement_rows(other),
+    }
+}
+
+fn statement_rows(result: &Value) -> Vec<Value> {
+    match result {
+        Value::Null => Vec::new(),
+        Value::Array(rows) => rows.clone(),
+        Value::Object(obj) if is_envelope(obj) => match obj.get("result") {
+            Some(Value::Array(rows)) => rows.clone(),
+            Some(Value::Null) | None => Vec::new(),
+            Some(single) => vec![single.clone()],
+        },
+        single => vec![single.clone()],
+    }
+}
+
+/// `{"result": ..., "status": ..., "time": ...}`: a statement envelope, not
+/// a row.
+fn is_envelope(obj: &Map<String, Value>) -> bool {
+    obj.contains_key("result")
+        && obj
+            .keys()
+            .all(|k| matches!(k.as_str(), "result" | "status" | "time" | "type"))
+}
+
 /// Extract the array of record dictionaries from a raw SurrealDB response.
 ///
 /// Handles the three response shapes the surql ecosystem produces:
@@ -285,59 +348,22 @@ pub fn paginated<T>(items: Vec<T>, page: u64, page_size: u64, total: u64) -> Pag
 /// - **Nested (Python SDK envelope)**: `[{"result": [...]}]`.
 /// - **Flat (Python `db.select`)**: `[{...}, {...}]`.
 /// - **Rust driver (one-array-per-statement)**: `[[{...}, {...}]]`.
+///
+/// The shape is decided per statement, so the forms may be mixed. A row
+/// that is not an object (`SELECT VALUE name` returns bare strings) is
+/// wrapped as `{"value": <row>}` rather than dropped.
 pub fn extract_result(result: &Value) -> Vec<Map<String, Value>> {
-    if let Value::Array(items) = result {
-        if items.is_empty() {
-            return Vec::new();
-        }
-        let is_nested = matches!(&items[0], Value::Object(o) if o.contains_key("result"));
-        if is_nested {
-            let mut out = Vec::new();
-            for item in items {
-                if let Value::Object(obj) = item {
-                    if let Some(inner) = obj.get("result") {
-                        push_value(&mut out, inner);
-                    }
-                }
+    response_rows(result)
+        .into_iter()
+        .map(|row| match row {
+            Value::Object(obj) => obj,
+            other => {
+                let mut wrapped = Map::new();
+                wrapped.insert("value".into(), other);
+                wrapped
             }
-            return out;
-        }
-        // Mix of nested arrays (Rust driver per-statement shape) and plain
-        // objects (Python `db.select` shape) - recurse and keep only object
-        // rows.
-        let mut out = Vec::new();
-        for item in items {
-            push_value(&mut out, item);
-        }
-        return out;
-    }
-    if let Value::Object(obj) = result {
-        if let Some(inner) = obj.get("result") {
-            let mut out = Vec::new();
-            push_value(&mut out, inner);
-            return out;
-        }
-    }
-    Vec::new()
-}
-
-fn push_value(out: &mut Vec<Map<String, Value>>, v: &Value) {
-    match v {
-        Value::Array(arr) => {
-            for a in arr {
-                if let Value::Object(o) = a {
-                    out.push(o.clone());
-                }
-            }
-        }
-        Value::Null => {}
-        Value::Object(o) => out.push(o.clone()),
-        other => {
-            let mut m = Map::new();
-            m.insert("value".into(), other.clone());
-            out.push(m);
-        }
-    }
+        })
+        .collect()
 }
 
 /// Extract the first record from a raw response, or `None` when empty.
@@ -455,6 +481,45 @@ mod tests {
         assert!(lr.has_more);
         let lr2 = records(vec![1, 2], None, Some(3), None);
         assert!(!lr2.has_more);
+    }
+
+    #[test]
+    fn records_has_more_edge_cases() {
+        // A zero limit returns nothing and never promises more.
+        assert!(!records(Vec::<i32>::new(), None, Some(0), None).has_more);
+        assert!(!records(Vec::<i32>::new(), Some(10), Some(0), Some(0)).has_more);
+        // A known total with no offset still reports the next page.
+        assert!(records(vec![1, 2, 3], Some(10), Some(3), None).has_more);
+        assert!(!records(vec![1, 2, 3], Some(3), Some(3), None).has_more);
+    }
+
+    #[test]
+    fn extract_decides_the_envelope_per_statement() {
+        // A plain row first, then a legacy envelope.
+        let v = json!([{"id": "u:1"}, {"result": [{"id": "u:2"}]}]);
+        let out = extract_result(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].get("id").unwrap(), &json!("u:2"));
+    }
+
+    #[test]
+    fn extract_keeps_scalar_rows() {
+        // `SELECT VALUE name FROM user` returns bare strings.
+        let v = json!([["alice", "bob"]]);
+        assert!(has_results(&v));
+        assert_eq!(
+            extract_many(&v),
+            vec![json!({"value": "alice"}), json!({"value": "bob"})]
+        );
+    }
+
+    #[test]
+    fn extract_keeps_rows_with_a_result_field() {
+        let v = json!([[{"id": "job:1", "result": "ok"}]]);
+        assert_eq!(
+            extract_many(&v),
+            vec![json!({"id": "job:1", "result": "ok"})]
+        );
     }
 
     #[test]

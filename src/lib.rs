@@ -41,17 +41,19 @@
 //!   [`RollingStrategy`](orchestration::RollingStrategy),
 //!   [`CanaryStrategy`](orchestration::CanaryStrategy)).
 
-#![warn(clippy::all)]
-#![warn(clippy::pedantic)]
-#![allow(clippy::module_name_repetitions)]
-#![allow(clippy::must_use_candidate)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::missing_panics_doc)]
-#![allow(clippy::doc_markdown)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::return_self_not_must_use)]
-#![deny(missing_docs)]
-#![forbid(unsafe_code)]
+// Lint levels live in Cargo.toml's `[lints]` table. On top of them, shipped
+// code may not panic: the crate's own unit tests (`cfg(test)`) may.
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 #[cfg(feature = "cache")]
 pub mod cache;
@@ -73,11 +75,9 @@ pub use error::{Result, SurqlError};
 #[cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 pub use connection::DatabaseClient;
 
-// Convenience re-exports for the query-UX surface (sub-feature 1: first-class
-// `type::record` / `type::thing` helpers).
+// Convenience re-exports for the first-class `type::record` helpers.
 pub use types::operators::{type_record, type_thing};
 
 // Result-extraction helpers hoisted into the crate root for ergonomic
-// `use surql::{extract_one, extract_scalar, extract_many, has_result};` usage
-// (sub-feature 3).
+// `use surql::{extract_one, extract_scalar, extract_many, has_result};` usage.
 pub use query::results::{extract_many, extract_one, extract_scalar, has_result};

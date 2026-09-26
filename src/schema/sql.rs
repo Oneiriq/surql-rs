@@ -26,8 +26,9 @@ use super::table::TableDefinition;
 
 /// Render all `DEFINE` statements required to create `table`.
 ///
-/// The first entry is the `DEFINE TABLE` line, followed by each field,
-/// index, event, and permission statement in Python-compatible order.
+/// The first entry is the `DEFINE TABLE` line, which carries the
+/// table-level `PERMISSIONS` inline, followed by each field, index, and
+/// event statement in Python-compatible order.
 ///
 /// `if_not_exists` adds the `IF NOT EXISTS` clause to every emitted
 /// `DEFINE` statement where SurrealDB supports it.

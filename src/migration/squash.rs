@@ -33,15 +33,18 @@
 //! assert!(result.original_count >= 2);
 //! ```
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::{discover_migrations, sha2_lite};
+use crate::migration::discovery::{compare_versions, discover_migrations, sha256_hex};
+use crate::migration::generator::{next_free_version, single_line};
+use crate::migration::lexer::{self, existence_clause, Clause, Token};
 use crate::migration::models::Migration;
 
 /// Error raised by the squash subsystem.
@@ -185,18 +188,14 @@ impl SquashOptions {
 // Parsed statements (statement-level optimiser)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Define,
     Remove,
-    Insert,
-    Update,
-    Delete,
-    Create,
-    Unknown,
+    Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ObjectType {
     Table,
     Field,
@@ -204,129 +203,119 @@ enum ObjectType {
     Event,
 }
 
+/// The schema object a `DEFINE` / `REMOVE` statement names. Names are
+/// rendered the way the engine prints them, so `` `user` `` and `user`
+/// are the same object; a table's `name` is the table itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObjectKey {
+    kind: ObjectType,
+    table: String,
+    name: String,
+}
+
 #[derive(Debug, Clone)]
 struct ParsedStatement {
-    statement: String,
     operation: Operation,
-    object_type: Option<ObjectType>,
-    table_name: Option<String>,
-    field_name: Option<String>,
-    index_name: Option<String>,
-}
-
-/// Composite key used to deduplicate repeated `DEFINE` statements.
-type DefineKey = (
-    Option<ObjectType>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
-fn tokens(upper: &str) -> Vec<&str> {
-    upper.split_whitespace().collect()
-}
-
-fn strip_trailing_punct(s: &str) -> &str {
-    s.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+    clause: Clause,
+    /// `None` for anything the optimiser does not understand: data
+    /// statements, other kinds of definition, and names it cannot read.
+    /// Such a statement is never removed, and nothing is moved across it.
+    object: Option<ObjectKey>,
 }
 
 fn parse_statement(statement: &str) -> ParsedStatement {
-    let original = statement.trim().to_string();
-    let upper = original.to_ascii_uppercase();
-
-    let op = if upper.starts_with("DEFINE") {
-        Operation::Define
-    } else if upper.starts_with("REMOVE") {
-        Operation::Remove
-    } else if upper.starts_with("INSERT") {
-        Operation::Insert
-    } else if upper.starts_with("UPDATE") {
-        Operation::Update
-    } else if upper.starts_with("DELETE") {
-        Operation::Delete
-    } else if upper.starts_with("CREATE") {
-        Operation::Create
-    } else {
-        return ParsedStatement {
-            statement: original,
-            operation: Operation::Unknown,
-            object_type: None,
-            table_name: None,
-            field_name: None,
-            index_name: None,
-        };
+    let toks = lexer::tokens(statement);
+    let operation = match toks.first() {
+        Some(t) if t.is_keyword("DEFINE") => Operation::Define,
+        Some(t) if t.is_keyword("REMOVE") => Operation::Remove,
+        _ => Operation::Other,
     };
-
-    let mut object_type: Option<ObjectType> = None;
-    let mut table_name: Option<String> = None;
-    let mut field_name: Option<String> = None;
-    let mut index_name: Option<String> = None;
-
-    // Tokenise the uppercased form for simple pattern matching. Python
-    // uses regexes with `IGNORECASE`; we use case-folded token walking
-    // which is easier to audit and avoids adding regex deps here.
-    let toks = tokens(&upper);
-    if matches!(op, Operation::Define | Operation::Remove) && toks.len() >= 3 {
-        // DEFINE/REMOVE <KIND> <NAME> [ON TABLE <table>]
-        match toks[1] {
-            "TABLE" => {
-                object_type = Some(ObjectType::Table);
-                table_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-            }
-            "FIELD" => {
-                object_type = Some(ObjectType::Field);
-                field_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-                if let Some(table) = extract_on_table(&toks) {
-                    table_name = Some(table);
-                }
-            }
-            "INDEX" => {
-                object_type = Some(ObjectType::Index);
-                index_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-                if let Some(table) = extract_on_table(&toks) {
-                    table_name = Some(table);
-                }
-            }
-            "EVENT" => {
-                object_type = Some(ObjectType::Event);
-                // Events reuse index_name for the identifier slot, matching py.
-                index_name = Some(strip_trailing_punct(toks[2]).to_ascii_lowercase());
-                if let Some(table) = extract_on_table(&toks) {
-                    table_name = Some(table);
-                }
-            }
-            _ => {}
-        }
-    }
-
+    let (clause, object) = match (operation, toks.split_first()) {
+        (Operation::Define | Operation::Remove, Some((_, rest))) => parse_object(rest),
+        _ => (Clause::Plain, None),
+    };
     ParsedStatement {
-        statement: original,
-        operation: op,
-        object_type,
-        table_name,
-        field_name,
-        index_name,
+        operation,
+        clause,
+        object,
     }
 }
 
-fn extract_on_table(toks: &[&str]) -> Option<String> {
-    for (i, tok) in toks.iter().enumerate() {
-        if *tok == "ON" && i + 2 < toks.len() && toks[i + 1] == "TABLE" && !toks[i + 2].is_empty() {
-            return Some(strip_trailing_punct(toks[i + 2]).to_ascii_lowercase());
-        }
-    }
-    None
+/// Parse `<KIND> [IF NOT EXISTS | IF EXISTS | OVERWRITE] <name> [ON [TABLE] <table>]`.
+fn parse_object(toks: &[Token<'_>]) -> (Clause, Option<ObjectKey>) {
+    let Some((kind_tok, rest)) = toks.split_first() else {
+        return (Clause::Plain, None);
+    };
+    let kind = if kind_tok.is_keyword("TABLE") {
+        ObjectType::Table
+    } else if kind_tok.is_keyword("FIELD") {
+        ObjectType::Field
+    } else if kind_tok.is_keyword("INDEX") {
+        ObjectType::Index
+    } else if kind_tok.is_keyword("EVENT") {
+        ObjectType::Event
+    } else {
+        return (Clause::Plain, None);
+    };
+    let (clause, rest) = existence_clause(rest);
+    let object = if kind == ObjectType::Table {
+        rest.first().and_then(Token::name).map(|table| ObjectKey {
+            kind,
+            name: table.clone(),
+            table,
+        })
+    } else {
+        parse_table_scoped(kind, rest)
+    };
+    (clause, object)
+}
+
+/// `<name> ON [TABLE] <table>`, where a field name may be a path such as
+/// `address.city` or `tags[*]`.
+fn parse_table_scoped(kind: ObjectType, toks: &[Token<'_>]) -> Option<ObjectKey> {
+    let on = toks.iter().position(|t| t.is_keyword("ON"))?;
+    let (name_toks, after_on) = toks.split_at(on);
+    let name = name_toks
+        .iter()
+        .map(|t| match t {
+            Token::Punct(c @ ('.' | '[' | ']' | '*')) => Some(c.to_string()),
+            other => other.name(),
+        })
+        .collect::<Option<String>>()
+        .filter(|name| !name.is_empty())?;
+    let after_on = after_on.get(1..)?;
+    let table_tok = match after_on {
+        [t, table, ..] if t.is_keyword("TABLE") && table.name().is_some() => table,
+        [table, ..] => table,
+        [] => return None,
+    };
+    Some(ObjectKey {
+        kind,
+        table: table_tok.name()?,
+        name,
+    })
 }
 
 /// Remove redundant SurrealQL statements from a list.
 ///
-/// Applies three passes:
+/// Understands `DEFINE` / `REMOVE` of tables, fields, indexes and events
+/// (with or without `IF NOT EXISTS`, `IF EXISTS`, `OVERWRITE`, and with
+/// `ON t` or `ON TABLE t`) and applies two rewrites:
 ///
-/// 1. Drop `DEFINE` + matching `REMOVE` pairs for the same object.
-/// 2. When the same object is defined more than once, drop all earlier
-///    definitions and keep the last (mirrors Python behaviour).
-/// 3. Drop `UPDATE` statements that reference a field whose `DEFINE` and
-///    `REMOVE` have both been dropped in pass 1 (orphaned data migrations).
+/// 1. A plain `DEFINE` (which fails when the object already exists) that
+///    is later removed again with nothing in between that could observe
+///    the object is dropped together with its `REMOVE`. A `DEFINE … IF NOT
+///    EXISTS` or `OVERWRITE` is kept: the object may have existed before,
+///    and then the `REMOVE` still has work to do.
+/// 2. Of two definitions of the same object with nothing observing it in
+///    between, the earlier is dropped when the later one `OVERWRITE`s it,
+///    and a later `IF NOT EXISTS` (a no-op at that point) is dropped.
+///
+/// "Could observe" is judged conservatively: any statement the optimiser
+/// does not understand (data statements included), any statement on the
+/// same table (other than a definition of an unrelated field of it), and
+/// any change to the table itself blocks a rewrite. Data statements are
+/// never removed.
 ///
 /// Returns the optimised list and the count of individual statements
 /// that were elided.
@@ -337,120 +326,92 @@ pub fn optimize_statements(statements: &[String]) -> (Vec<String>, usize) {
         .map(|s| parse_statement(s.as_str()))
         .collect();
 
-    let mut to_remove: HashSet<usize> = HashSet::new();
-    let mut optimisations: usize = 0;
-
-    pass_drop_define_remove_pairs(&parsed, &mut to_remove, &mut optimisations);
-    pass_drop_duplicate_defines(&parsed, &mut to_remove, &mut optimisations);
-    pass_drop_orphaned_updates(&parsed, &mut to_remove, &mut optimisations);
+    let mut removed = vec![false; parsed.len()];
+    drop_define_remove_pairs(&parsed, &mut removed);
+    drop_superseded_defines(&parsed, &mut removed);
 
     let optimised: Vec<String> = statements
         .iter()
-        .enumerate()
-        .filter_map(|(i, s)| {
-            if to_remove.contains(&i) {
-                None
-            } else {
-                Some(s.clone())
-            }
-        })
+        .zip(&removed)
+        .filter(|(_, gone)| !**gone)
+        .map(|(s, _)| s.clone())
         .collect();
-    (optimised, optimisations)
+    let count = removed.iter().filter(|gone| **gone).count();
+    (optimised, count)
 }
 
-fn object_pair_matches(a: &ParsedStatement, b: &ParsedStatement) -> bool {
-    if a.object_type != b.object_type || a.table_name != b.table_name {
+/// The next live statement after `i` that names the same object, provided
+/// nothing between the two could observe or depend on that object.
+fn next_same_object(parsed: &[ParsedStatement], removed: &[bool], i: usize) -> Option<usize> {
+    let key = parsed.get(i)?.object.as_ref()?;
+    for (j, stmt) in parsed.iter().enumerate().skip(i + 1) {
+        if removed.get(j).copied().unwrap_or(false) {
+            continue;
+        }
+        if stmt.object.as_ref() == Some(key) {
+            return Some(j);
+        }
+        if interferes(key, stmt) {
+            return None;
+        }
+    }
+    None
+}
+
+/// `true` when `stmt` may observe or depend on the object `key` names, so
+/// a rewrite may not move `key`'s definition across it.
+fn interferes(key: &ObjectKey, stmt: &ParsedStatement) -> bool {
+    let Some(other) = &stmt.object else {
+        return true;
+    };
+    if other.table != key.table {
         return false;
     }
-    match &a.object_type {
-        Some(ObjectType::Table) => true,
-        Some(ObjectType::Field) => a.field_name == b.field_name,
-        Some(ObjectType::Index | ObjectType::Event) => a.index_name == b.index_name,
-        None => false,
+    match (key.kind, other.kind) {
+        (ObjectType::Field, ObjectType::Field) => field_root(&key.name) == field_root(&other.name),
+        _ => true,
     }
 }
 
-fn pass_drop_define_remove_pairs(
-    parsed: &[ParsedStatement],
-    to_remove: &mut HashSet<usize>,
-    optimisations: &mut usize,
-) {
-    for i in 0..parsed.len() {
-        if to_remove.contains(&i) || parsed[i].operation != Operation::Define {
-            continue;
-        }
-        for j in (i + 1)..parsed.len() {
-            if to_remove.contains(&j) || parsed[j].operation != Operation::Remove {
-                continue;
-            }
-            if object_pair_matches(&parsed[i], &parsed[j]) {
-                to_remove.insert(i);
-                to_remove.insert(j);
-                *optimisations += 2;
-                break;
-            }
-        }
-    }
+/// The top-level field a field path belongs to (`address` for
+/// `address.city`, `tags` for `tags[*]`).
+fn field_root(path: &str) -> &str {
+    path.split(['.', '[']).next().unwrap_or(path)
 }
 
-fn pass_drop_duplicate_defines(
-    parsed: &[ParsedStatement],
-    to_remove: &mut HashSet<usize>,
-    optimisations: &mut usize,
-) {
-    let mut last_define_idx: std::collections::HashMap<DefineKey, usize> =
-        std::collections::HashMap::new();
-
+fn drop_define_remove_pairs(parsed: &[ParsedStatement], removed: &mut [bool]) {
     for (i, stmt) in parsed.iter().enumerate() {
-        if to_remove.contains(&i) || stmt.operation != Operation::Define {
+        if removed[i] || stmt.operation != Operation::Define || stmt.clause != Clause::Plain {
             continue;
         }
-        let key: DefineKey = (
-            stmt.object_type.clone(),
-            stmt.table_name.clone(),
-            stmt.field_name.clone(),
-            stmt.index_name.clone(),
-        );
-        if let Some(&earlier) = last_define_idx.get(&key) {
-            if !to_remove.contains(&earlier) {
-                to_remove.insert(earlier);
-                *optimisations += 1;
+        if let Some(j) = next_same_object(parsed, removed, i) {
+            if parsed[j].operation == Operation::Remove {
+                removed[i] = true;
+                removed[j] = true;
             }
         }
-        last_define_idx.insert(key, i);
     }
 }
 
-fn pass_drop_orphaned_updates(
-    parsed: &[ParsedStatement],
-    to_remove: &mut HashSet<usize>,
-    optimisations: &mut usize,
-) {
-    let mut removed_fields: HashSet<(Option<String>, Option<String>)> = HashSet::new();
-    for i in to_remove.iter() {
-        let s = &parsed[*i];
-        if matches!(s.object_type, Some(ObjectType::Field)) {
-            removed_fields.insert((s.table_name.clone(), s.field_name.clone()));
-        }
-    }
-
-    for (i, stmt) in parsed.iter().enumerate() {
-        if to_remove.contains(&i) || stmt.operation != Operation::Update {
-            continue;
-        }
-        let upper = stmt.statement.to_ascii_uppercase();
-        for (table, field) in &removed_fields {
-            let (Some(table), Some(field)) = (table.as_ref(), field.as_ref()) else {
-                continue;
-            };
-            let set_token = format!("SET {}", field.to_ascii_uppercase());
-            let tab_token = format!("UPDATE {}", table.to_ascii_uppercase());
-            if upper.contains(&set_token) && upper.contains(&tab_token) {
-                to_remove.insert(i);
-                *optimisations += 1;
-                break;
+fn drop_superseded_defines(parsed: &[ParsedStatement], removed: &mut [bool]) {
+    let mut i = 0;
+    while i < parsed.len() {
+        if !removed[i] && parsed[i].operation == Operation::Define {
+            if let Some(j) = next_same_object(parsed, removed, i) {
+                if parsed[j].operation == Operation::Define {
+                    match parsed[j].clause {
+                        Clause::Overwrite => removed[i] = true,
+                        Clause::IfNotExists => {
+                            // Look past the no-op for another definition.
+                            removed[j] = true;
+                            continue;
+                        }
+                        Clause::Plain | Clause::IfExists => {}
+                    }
+                }
             }
         }
+        i += 1;
     }
 }
 
@@ -461,6 +422,9 @@ fn pass_drop_orphaned_updates(
 /// Inspect `migrations` and return a list of warnings about
 /// data-manipulation statements, ordering issues, and other known
 /// squash hazards.
+///
+/// Statements are classified by their first keyword after any leading
+/// comments, so a `-- purge` line above a `DELETE` does not hide it.
 #[must_use]
 pub fn validate_squash_safety(migrations: &[Migration]) -> Vec<SquashWarning> {
     let mut warnings: Vec<SquashWarning> = Vec::new();
@@ -468,38 +432,38 @@ pub fn validate_squash_safety(migrations: &[Migration]) -> Vec<SquashWarning> {
     for migration in migrations {
         let version = &migration.version;
         for stmt in &migration.up {
-            let upper = stmt.to_ascii_uppercase();
-            let preview = preview_statement(stmt);
+            let code = lexer::strip_leading_comments(stmt);
+            let toks = lexer::tokens(code);
+            let has = |kw: &str| toks.iter().any(|t| t.is_keyword(kw));
+            let is_backfill = toks
+                .windows(2)
+                .any(|w| w[0].is_keyword("IS") && w[1].is_keyword("NONE"));
+            let preview = preview_statement(code);
+            let verb = toks.first();
 
-            if upper.trim_start().starts_with("INSERT") {
-                warnings.push(SquashWarning {
-                    migration: version.clone(),
-                    message: format!("Contains INSERT statement: {preview}..."),
-                    severity: SquashSeverity::Medium,
-                });
-            } else if upper.trim_start().starts_with("UPDATE") && upper.contains(" SET ") {
-                if !upper.contains(" IS NONE") {
-                    warnings.push(SquashWarning {
-                        migration: version.clone(),
-                        message: format!("Contains UPDATE statement: {preview}..."),
-                        severity: SquashSeverity::Medium,
-                    });
+            let warning = match verb {
+                Some(t) if t.is_keyword("INSERT") => Some(("INSERT", SquashSeverity::Medium)),
+                Some(t) if t.is_keyword("UPDATE") && has("SET") && !is_backfill => {
+                    Some(("UPDATE", SquashSeverity::Medium))
                 }
-            } else if upper.trim_start().starts_with("DELETE") {
+                Some(t) if t.is_keyword("DELETE") => Some(("DELETE", SquashSeverity::High)),
+                Some(t)
+                    if t.is_keyword("CREATE")
+                        && !toks.get(1).is_some_and(|t| t.is_keyword("TABLE")) =>
+                {
+                    Some(("CREATE", SquashSeverity::Low))
+                }
+                _ => None,
+            };
+            if let Some((kind, severity)) = warning {
                 warnings.push(SquashWarning {
                     migration: version.clone(),
-                    message: format!("Contains DELETE statement: {preview}..."),
-                    severity: SquashSeverity::High,
-                });
-            } else if upper.trim_start().starts_with("CREATE") && !upper.contains("CREATE TABLE") {
-                warnings.push(SquashWarning {
-                    migration: version.clone(),
-                    message: format!("Contains CREATE statement: {preview}..."),
-                    severity: SquashSeverity::Low,
+                    message: format!("Contains {kind} statement: {preview}..."),
+                    severity,
                 });
             }
 
-            if upper.contains("RECORD") && upper.contains("TYPE") {
+            if has("RECORD") && has("TYPE") {
                 warnings.push(SquashWarning {
                     migration: version.clone(),
                     message: "Contains record reference - verify table order".to_string(),
@@ -512,13 +476,9 @@ pub fn validate_squash_safety(migrations: &[Migration]) -> Vec<SquashWarning> {
     warnings
 }
 
+/// The first 50 characters of a statement (never cut inside a character).
 fn preview_statement(stmt: &str) -> String {
-    let trimmed = stmt.trim();
-    if trimmed.len() > 50 {
-        trimmed[..50].to_string()
-    } else {
-        trimmed.to_string()
-    }
+    stmt.trim().chars().take(50).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -545,11 +505,15 @@ pub fn generate_squashed_migration_content(
     let mut buf = String::new();
 
     buf.push_str("-- @metadata\n");
-    let _ = writeln!(buf, "-- version: {version}");
-    let _ = writeln!(buf, "-- description: {description}");
+    let _ = writeln!(buf, "-- version: {}", single_line(version));
+    let _ = writeln!(buf, "-- description: {}", single_line(description));
     buf.push_str("-- author: surql\n");
     if !original_migrations.is_empty() {
-        let _ = writeln!(buf, "-- squashed-from: {}", original_migrations.join(","));
+        let _ = writeln!(
+            buf,
+            "-- squashed-from: {}",
+            single_line(&original_migrations.join(","))
+        );
     }
     let _ = writeln!(buf, "-- generated_at: {}", now.to_rfc3339());
 
@@ -562,10 +526,7 @@ pub fn generate_squashed_migration_content(
             if stmt.is_empty() {
                 continue;
             }
-            buf.push_str(stmt);
-            if !stmt.ends_with(';') {
-                buf.push(';');
-            }
+            buf.push_str(&lexer::terminate_statement(stmt));
             buf.push('\n');
         }
     }
@@ -648,7 +609,7 @@ pub fn squash_migrations(directory: &Path, opts: &SquashOptions) -> Result<Squas
 
     let original_versions: Vec<String> = migrations.iter().map(|m| m.version.clone()).collect();
     let description = describe_range(&original_versions);
-    let version = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let version = next_free_version(directory)?;
 
     let content = generate_squashed_migration_content(
         &statements,
@@ -682,10 +643,15 @@ pub fn squash_migrations(directory: &Path, opts: &SquashOptions) -> Result<Squas
     })
 }
 
+/// `squashed_<first>_to_<last>`, reduced to filename-safe characters: it
+/// names the output file, and versions come from file metadata.
 fn describe_range(versions: &[String]) -> String {
     let first = versions.first().map_or("unknown", String::as_str);
     let last = versions.last().map_or("unknown", String::as_str);
     format!("squashed_{first}_to_{last}")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 fn persist_squashed_migration(output_path: &Path, content: &str, version: &str) -> Result<()> {
@@ -697,13 +663,20 @@ fn persist_squashed_migration(output_path: &Path, content: &str, version: &str) 
             ),
         })?;
     }
-    fs::write(output_path, content.as_bytes()).map_err(|e| SurqlError::Io {
-        reason: format!(
-            "failed to write squashed migration {}: {e}",
-            output_path.display()
-        ),
-    })?;
-    let checksum = sha2_lite::sha256_hex(content.as_bytes());
+    // Never replace an existing file: the default name carries a fresh
+    // version, so a clash means an explicit output path points at one.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_path)
+        .and_then(|mut file| file.write_all(content.as_bytes()))
+        .map_err(|e| SurqlError::Io {
+            reason: format!(
+                "failed to write squashed migration {}: {e}",
+                output_path.display()
+            ),
+        })?;
+    let checksum = sha256_hex(content.as_bytes());
     tracing::info!(
         target: "surql::migration::squash",
         version = %version,
@@ -718,9 +691,9 @@ fn persist_squashed_migration(output_path: &Path, content: &str, version: &str) 
 /// range.
 ///
 /// Either bound may be `None`. `from` bound is compared with `>=`; `to`
-/// bound is compared with `<=`. Versions are compared lexicographically,
-/// which matches Python and works correctly for the `YYYYMMDD_HHMMSS`
-/// format used throughout `surql`.
+/// bound is compared with `<=`. Versions are compared with runs of digits
+/// read as numbers (so `v9` < `v10`), which for the `YYYYMMDD_HHMMSS`
+/// format used throughout `surql` is plain string order.
 #[must_use]
 pub fn filter_migrations_by_version(
     migrations: &[Migration],
@@ -730,17 +703,8 @@ pub fn filter_migrations_by_version(
     migrations
         .iter()
         .filter(|m| {
-            if let Some(from) = from_version {
-                if m.version.as_str() < from {
-                    return false;
-                }
-            }
-            if let Some(to) = to_version {
-                if m.version.as_str() > to {
-                    return false;
-                }
-            }
-            true
+            from_version.is_none_or(|from| compare_versions(&m.version, from) != Ordering::Less)
+                && to_version.is_none_or(|to| compare_versions(&m.version, to) != Ordering::Greater)
         })
         .cloned()
         .collect()
@@ -751,601 +715,4 @@ pub fn filter_migrations_by_version(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        let nanos: u128 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("surql-squash-{tag}-{pid}-{nanos}-{n}"));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    fn write_migration(
-        dir: &Path,
-        version: &str,
-        description: &str,
-        up: &[&str],
-        down: &[&str],
-    ) -> PathBuf {
-        let path = dir.join(format!("{version}_{description}.surql"));
-        let mut content = String::new();
-        content.push_str("-- @metadata\n");
-        let _ = writeln!(content, "-- version: {version}");
-        let _ = writeln!(content, "-- description: {description}");
-        content.push_str("-- @up\n");
-        for stmt in up {
-            content.push_str(stmt);
-            content.push('\n');
-        }
-        content.push_str("-- @down\n");
-        for stmt in down {
-            content.push_str(stmt);
-            content.push('\n');
-        }
-        fs::write(&path, content).expect("write migration");
-        path
-    }
-
-    // --- parse_statement --------------------------------------------------
-
-    #[test]
-    fn parse_define_table() {
-        let p = parse_statement("DEFINE TABLE user SCHEMAFULL;");
-        assert_eq!(p.operation, Operation::Define);
-        assert_eq!(p.object_type, Some(ObjectType::Table));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
-    }
-
-    #[test]
-    fn parse_remove_table() {
-        let p = parse_statement("REMOVE TABLE user;");
-        assert_eq!(p.operation, Operation::Remove);
-        assert_eq!(p.object_type, Some(ObjectType::Table));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
-    }
-
-    #[test]
-    fn parse_define_field() {
-        let p = parse_statement("DEFINE FIELD email ON TABLE user TYPE string;");
-        assert_eq!(p.operation, Operation::Define);
-        assert_eq!(p.object_type, Some(ObjectType::Field));
-        assert_eq!(p.field_name.as_deref(), Some("email"));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
-    }
-
-    #[test]
-    fn parse_define_index() {
-        let p = parse_statement("DEFINE INDEX email_idx ON TABLE user COLUMNS email UNIQUE;");
-        assert_eq!(p.object_type, Some(ObjectType::Index));
-        assert_eq!(p.index_name.as_deref(), Some("email_idx"));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
-    }
-
-    #[test]
-    fn parse_define_event() {
-        let p = parse_statement(
-            "DEFINE EVENT user_created ON TABLE user WHEN $event = \"CREATE\" THEN {};",
-        );
-        assert_eq!(p.object_type, Some(ObjectType::Event));
-        assert_eq!(p.index_name.as_deref(), Some("user_created"));
-        assert_eq!(p.table_name.as_deref(), Some("user"));
-    }
-
-    #[test]
-    fn parse_unknown_statement() {
-        let p = parse_statement("SELECT * FROM user;");
-        assert_eq!(p.operation, Operation::Unknown);
-    }
-
-    // --- optimize_statements ---------------------------------------------
-
-    #[test]
-    fn optimise_empty_list() {
-        let (out, count) = optimize_statements(&[]);
-        assert!(out.is_empty());
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn optimise_removes_field_define_remove_pair() {
-        let stmts = vec![
-            "DEFINE TABLE user SCHEMAFULL;".to_string(),
-            "DEFINE FIELD temp ON TABLE user TYPE string;".to_string(),
-            "REMOVE FIELD temp ON TABLE user;".to_string(),
-        ];
-        let (out, count) = optimize_statements(&stmts);
-        assert_eq!(count, 2);
-        let joined = out.join(" ");
-        assert!(!joined.contains("DEFINE FIELD temp"));
-        assert!(!joined.contains("REMOVE FIELD temp"));
-    }
-
-    #[test]
-    fn optimise_removes_index_define_remove_pair() {
-        let stmts = vec![
-            "DEFINE TABLE user SCHEMAFULL;".to_string(),
-            "DEFINE INDEX email_idx ON TABLE user COLUMNS email UNIQUE;".to_string(),
-            "REMOVE INDEX email_idx ON TABLE user;".to_string(),
-        ];
-        let (out, count) = optimize_statements(&stmts);
-        assert_eq!(count, 2);
-        assert_eq!(out.len(), 1);
-    }
-
-    #[test]
-    fn optimise_removes_event_define_remove_pair() {
-        let stmts = vec![
-            "DEFINE EVENT user_created ON TABLE user WHEN $event = \"CREATE\" THEN {};".into(),
-            "REMOVE EVENT user_created ON TABLE user;".into(),
-        ];
-        let (out, count) = optimize_statements(&stmts);
-        assert_eq!(count, 2);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn optimise_removes_duplicate_defines_keeping_last() {
-        let stmts = vec![
-            "DEFINE FIELD email ON TABLE user TYPE string;".into(),
-            "DEFINE FIELD age ON TABLE user TYPE int;".into(),
-            "DEFINE FIELD email ON TABLE user TYPE string ASSERT string::is::email($value);".into(),
-        ];
-        let (out, count) = optimize_statements(&stmts);
-        assert_eq!(count, 1);
-        assert!(out.iter().any(|s| s.contains("ASSERT")));
-    }
-
-    #[test]
-    fn optimise_preserves_unrelated() {
-        let stmts = vec![
-            "DEFINE TABLE user SCHEMAFULL;".into(),
-            "DEFINE FIELD email ON TABLE user TYPE string;".into(),
-            "DEFINE TABLE post SCHEMAFULL;".into(),
-        ];
-        let (out, count) = optimize_statements(&stmts);
-        assert_eq!(count, 0);
-        assert_eq!(out.len(), 3);
-    }
-
-    #[test]
-    fn optimise_removes_orphaned_updates() {
-        let stmts = vec![
-            "DEFINE FIELD temp ON TABLE user TYPE string;".into(),
-            "UPDATE user SET temp = \"value\" WHERE temp IS NONE;".into(),
-            "REMOVE FIELD temp ON TABLE user;".into(),
-        ];
-        let (out, count) = optimize_statements(&stmts);
-        // DEFINE + REMOVE pair drops 2, orphaned UPDATE drops 1.
-        assert!(out.is_empty(), "got {out:?}");
-        assert!(count >= 3, "got count {count}");
-    }
-
-    // --- validate_squash_safety ------------------------------------------
-
-    fn mock_migration(version: &str, up: &[&str]) -> Migration {
-        Migration {
-            version: version.to_string(),
-            description: "test".to_string(),
-            path: PathBuf::from(format!("migrations/{version}_test.surql")),
-            up: up.iter().map(|s| (*s).to_string()).collect(),
-            down: Vec::new(),
-            checksum: Some("abc".to_string()),
-            depends_on: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn warn_on_insert_statement() {
-        let m = mock_migration("v1", &["INSERT INTO user (name) VALUES (\"t\");"]);
-        let w = validate_squash_safety(&[m]);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].severity, SquashSeverity::Medium);
-        assert!(w[0].message.contains("INSERT"));
-    }
-
-    #[test]
-    fn warn_on_update_statement() {
-        let m = mock_migration("v1", &["UPDATE user SET name = \"t\" WHERE id = 1;"]);
-        let w = validate_squash_safety(&[m]);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].severity, SquashSeverity::Medium);
-    }
-
-    #[test]
-    fn warn_on_delete_statement() {
-        let m = mock_migration("v1", &["DELETE FROM user WHERE id = 1;"]);
-        let w = validate_squash_safety(&[m]);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].severity, SquashSeverity::High);
-    }
-
-    #[test]
-    fn warn_on_record_reference() {
-        let m = mock_migration(
-            "v1",
-            &["DEFINE FIELD author ON TABLE post TYPE record<user>;"],
-        );
-        let warnings = validate_squash_safety(&[m]);
-        assert!(warnings
-            .iter()
-            .any(|w| w.severity == SquashSeverity::Low && w.message.contains("record reference")));
-    }
-
-    #[test]
-    fn no_warning_on_define_only() {
-        let m = mock_migration(
-            "v1",
-            &[
-                "DEFINE TABLE user SCHEMAFULL;",
-                "DEFINE FIELD email ON TABLE user TYPE string;",
-            ],
-        );
-        let w = validate_squash_safety(&[m]);
-        assert!(w.is_empty(), "got {w:?}");
-    }
-
-    #[test]
-    fn backfill_update_is_silent() {
-        let m = mock_migration(
-            "v1",
-            &["UPDATE user SET new_field = \"d\" WHERE new_field IS NONE;"],
-        );
-        let w = validate_squash_safety(&[m]);
-        assert!(w.is_empty(), "got {w:?}");
-    }
-
-    // --- generate_squashed_migration_content ------------------------------
-
-    #[test]
-    fn generated_content_has_all_sections() {
-        let content = generate_squashed_migration_content(
-            &["DEFINE TABLE user SCHEMAFULL;".to_string()],
-            "20260102_120000",
-            "squashed_v1_to_v2",
-            &["v1".to_string(), "v2".to_string()],
-        );
-        assert!(content.contains("-- @metadata"));
-        assert!(content.contains("-- @up"));
-        assert!(content.contains("-- @down"));
-        assert!(content.contains("DEFINE TABLE user SCHEMAFULL;"));
-        assert!(content.contains("-- squashed-from: v1,v2"));
-        assert!(content.contains("-- version: 20260102_120000"));
-    }
-
-    #[test]
-    fn generated_content_no_migrations_section_omits_squashed_from() {
-        let content = generate_squashed_migration_content(
-            &["DEFINE TABLE a SCHEMAFULL;".to_string()],
-            "20260101_000000",
-            "squashed_x",
-            &[],
-        );
-        assert!(!content.contains("-- squashed-from:"));
-    }
-
-    #[test]
-    fn generated_content_empty_statements_notes_marker() {
-        let content = generate_squashed_migration_content(
-            &[],
-            "20260101_000000",
-            "empty",
-            &["v1".to_string()],
-        );
-        assert!(content.contains("-- (no statements)"));
-    }
-
-    // --- filter_migrations_by_version -------------------------------------
-
-    #[test]
-    fn filter_no_constraints_is_identity() {
-        let mig = vec![
-            mock_migration("20260101_000000", &[]),
-            mock_migration("20260102_000000", &[]),
-        ];
-        let out = filter_migrations_by_version(&mig, None, None);
-        assert_eq!(out.len(), 2);
-    }
-
-    #[test]
-    fn filter_from_only() {
-        let mig = vec![
-            mock_migration("20260101_000000", &[]),
-            mock_migration("20260102_000000", &[]),
-            mock_migration("20260103_000000", &[]),
-        ];
-        let out = filter_migrations_by_version(&mig, Some("20260102_000000"), None);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].version, "20260102_000000");
-    }
-
-    #[test]
-    fn filter_to_only() {
-        let mig = vec![
-            mock_migration("20260101_000000", &[]),
-            mock_migration("20260102_000000", &[]),
-            mock_migration("20260103_000000", &[]),
-        ];
-        let out = filter_migrations_by_version(&mig, None, Some("20260102_000000"));
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1].version, "20260102_000000");
-    }
-
-    #[test]
-    fn filter_both_bounds_inclusive() {
-        let mig = vec![
-            mock_migration("20260101_000000", &[]),
-            mock_migration("20260102_000000", &[]),
-            mock_migration("20260103_000000", &[]),
-            mock_migration("20260104_000000", &[]),
-        ];
-        let out =
-            filter_migrations_by_version(&mig, Some("20260102_000000"), Some("20260103_000000"));
-        assert_eq!(out.len(), 2);
-    }
-
-    // --- squash_migrations -----------------------------------------------
-
-    #[test]
-    fn squash_missing_directory_errors() {
-        let missing = std::env::temp_dir().join("surql-squash-nope-xyz-123");
-        let err = squash_migrations(&missing, &SquashOptions::new()).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationSquash { .. }));
-    }
-
-    #[test]
-    fn squash_empty_directory_errors() {
-        let dir = unique_temp_dir("empty");
-        let err = squash_migrations(&dir, &SquashOptions::new()).unwrap_err();
-        assert!(matches!(err, SurqlError::MigrationSquash { .. }));
-        assert!(err.to_string().contains("No migrations found"));
-    }
-
-    #[test]
-    fn squash_single_migration_errors() {
-        let dir = unique_temp_dir("single");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "only",
-            &["DEFINE TABLE a SCHEMAFULL;"],
-            &["REMOVE TABLE a;"],
-        );
-        let err = squash_migrations(&dir, &SquashOptions::new()).unwrap_err();
-        assert!(err.to_string().contains("At least 2 migrations required"));
-    }
-
-    #[test]
-    fn squash_range_matches_nothing_errors() {
-        let dir = unique_temp_dir("no-match");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "a",
-            &["DEFINE TABLE a SCHEMAFULL;"],
-            &["REMOVE TABLE a;"],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "b",
-            &["DEFINE TABLE b SCHEMAFULL;"],
-            &["REMOVE TABLE b;"],
-        );
-        let err = squash_migrations(
-            &dir,
-            &SquashOptions::new()
-                .from_version("20270101_000000")
-                .to_version("20270102_000000"),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("No migrations match"));
-    }
-
-    #[test]
-    fn squash_dry_run_returns_result_without_writing() {
-        let dir = unique_temp_dir("dry");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "first",
-            &["DEFINE TABLE first SCHEMAFULL;"],
-            &["REMOVE TABLE first;"],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "second",
-            &["DEFINE TABLE second SCHEMAFULL;"],
-            &["REMOVE TABLE second;"],
-        );
-        let result = squash_migrations(&dir, &SquashOptions::new().dry_run(true)).unwrap();
-        assert_eq!(result.original_count, 2);
-        assert_eq!(result.statement_count, 2);
-        assert!(!result.squashed_path.exists());
-    }
-
-    #[test]
-    fn squash_writes_file_when_not_dry_run() {
-        let dir = unique_temp_dir("write");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "first",
-            &["DEFINE TABLE first SCHEMAFULL;"],
-            &["REMOVE TABLE first;"],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "second",
-            &["DEFINE TABLE second SCHEMAFULL;"],
-            &["REMOVE TABLE second;"],
-        );
-        let result = squash_migrations(&dir, &SquashOptions::new()).unwrap();
-        assert!(result.squashed_path.exists());
-        let content = fs::read_to_string(&result.squashed_path).unwrap();
-        assert!(content.contains("-- @up"));
-        assert!(content.contains("DEFINE TABLE first"));
-        assert!(content.contains("DEFINE TABLE second"));
-    }
-
-    #[test]
-    fn squash_optimise_on_reduces_statement_count() {
-        let dir = unique_temp_dir("opt-on");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "create_temp",
-            &["DEFINE FIELD temp ON TABLE user TYPE string;"],
-            &[],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "remove_temp",
-            &["REMOVE FIELD temp ON TABLE user;"],
-            &[],
-        );
-        let r =
-            squash_migrations(&dir, &SquashOptions::new().dry_run(true).optimize(true)).unwrap();
-        assert!(r.optimizations_applied >= 2);
-        assert_eq!(r.statement_count, 0);
-    }
-
-    #[test]
-    fn squash_optimise_off_preserves_statements() {
-        let dir = unique_temp_dir("opt-off");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "create_temp",
-            &["DEFINE FIELD temp ON TABLE user TYPE string;"],
-            &[],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "remove_temp",
-            &["REMOVE FIELD temp ON TABLE user;"],
-            &[],
-        );
-        let r =
-            squash_migrations(&dir, &SquashOptions::new().dry_run(true).optimize(false)).unwrap();
-        assert_eq!(r.optimizations_applied, 0);
-        assert_eq!(r.statement_count, 2);
-    }
-
-    #[test]
-    fn squash_high_severity_aborts_without_force() {
-        let dir = unique_temp_dir("high-sev");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "a",
-            &["DEFINE TABLE user SCHEMAFULL;"],
-            &[],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "b",
-            &["DELETE user WHERE inactive = true;"],
-            &[],
-        );
-        let err = squash_migrations(&dir, &SquashOptions::new().dry_run(true)).unwrap_err();
-        assert!(err.to_string().contains("High severity"));
-    }
-
-    #[test]
-    fn squash_force_bypasses_high_severity() {
-        let dir = unique_temp_dir("force");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "a",
-            &["DEFINE TABLE user SCHEMAFULL;"],
-            &[],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "b",
-            &["DELETE user WHERE inactive = true;"],
-            &[],
-        );
-        let r = squash_migrations(&dir, &SquashOptions::new().dry_run(true).force(true)).unwrap();
-        assert_eq!(r.original_count, 2);
-    }
-
-    #[test]
-    fn squash_range_filters_migrations() {
-        let dir = unique_temp_dir("range");
-        for (i, v) in [
-            "20260101_000000",
-            "20260102_000000",
-            "20260103_000000",
-            "20260104_000000",
-        ]
-        .iter()
-        .enumerate()
-        {
-            write_migration(
-                &dir,
-                v,
-                &format!("m{i}"),
-                &[&format!("DEFINE TABLE t{i} SCHEMAFULL;")],
-                &[],
-            );
-        }
-        let r = squash_migrations(
-            &dir,
-            &SquashOptions::new()
-                .from_version("20260102_000000")
-                .to_version("20260103_000000")
-                .dry_run(true),
-        )
-        .unwrap();
-        assert_eq!(r.original_count, 2);
-        assert!(r
-            .original_migrations
-            .contains(&"20260102_000000".to_string()));
-        assert!(r
-            .original_migrations
-            .contains(&"20260103_000000".to_string()));
-    }
-
-    #[test]
-    fn squash_custom_output_path_is_honoured() {
-        let dir = unique_temp_dir("custom-out");
-        write_migration(
-            &dir,
-            "20260101_000000",
-            "a",
-            &["DEFINE TABLE a SCHEMAFULL;"],
-            &[],
-        );
-        write_migration(
-            &dir,
-            "20260102_000000",
-            "b",
-            &["DEFINE TABLE b SCHEMAFULL;"],
-            &[],
-        );
-        let custom = dir.join("custom_squash.surql");
-        let r = squash_migrations(
-            &dir,
-            &SquashOptions::new().dry_run(true).output_path(&custom),
-        )
-        .unwrap();
-        assert_eq!(r.squashed_path, custom);
-    }
-}
+mod tests;

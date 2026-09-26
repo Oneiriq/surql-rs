@@ -6,13 +6,16 @@
 //! tests disable colours globally to keep snapshot-friendly output.
 
 use std::fmt::Display;
+use std::io::{IsTerminal, Write};
 
 use colored::Colorize;
 use comfy_table::{presets::UTF8_FULL, ContentArrangement, Table};
 
+use crate::error::{Result, SurqlError};
+
 /// Print an informational message to stdout.
 pub fn info(msg: impl Display) {
-    println!("{}", msg);
+    println!("{msg}");
 }
 
 /// Print a success message in green to stdout.
@@ -44,10 +47,48 @@ pub fn make_table() -> Table {
 /// # Errors
 ///
 /// Returns [`serde_json::Error`] if the value cannot be serialised.
-pub fn print_json<T: serde::Serialize>(value: &T) -> Result<(), serde_json::Error> {
+pub fn print_json<T: serde::Serialize>(value: &T) -> std::result::Result<(), serde_json::Error> {
     let s = serde_json::to_string_pretty(value)?;
     println!("{s}");
     Ok(())
+}
+
+/// Ask the operator to confirm `action` before a destructive command runs.
+///
+/// Returns immediately when `yes` is set (the command's `--yes` flag).
+/// Otherwise prints `<action>? [y/N]` to stderr and reads one line from
+/// stdin; only `y` or `yes` proceeds. When stdin is not a terminal there
+/// is nobody to ask, so the command is refused and `--yes` is required.
+///
+/// # Errors
+///
+/// Returns [`SurqlError::Validation`] when the action is refused or not
+/// confirmed, and [`SurqlError::Io`] when stdin cannot be read.
+pub fn confirm(action: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Err(SurqlError::Validation {
+            reason: format!("refusing to {action} without confirmation: pass --yes"),
+        });
+    }
+    eprint!("{action}? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    stdin.read_line(&mut answer)?;
+    if is_yes(&answer) {
+        Ok(())
+    } else {
+        Err(SurqlError::Validation {
+            reason: format!("aborted: did not {action}"),
+        })
+    }
+}
+
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Render a boolean status label (coloured `OK` / `FAIL`).
@@ -56,5 +97,25 @@ pub fn status_label(ok: bool) -> String {
         "OK".green().to_string()
     } else {
         "FAIL".red().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_with_yes_skips_the_prompt() {
+        assert!(confirm("remove everything", true).is_ok());
+    }
+
+    #[test]
+    fn only_y_or_yes_confirms() {
+        for answer in ["y\n", "YES\r\n", " yes "] {
+            assert!(is_yes(answer), "{answer:?}");
+        }
+        for answer in ["", "\n", "n", "no", "yess", "sure"] {
+            assert!(!is_yes(answer), "{answer:?}");
+        }
     }
 }

@@ -26,7 +26,7 @@ fn build_registry() -> Result<SchemaRegistry> {
         .build()?;
 
     let registry = SchemaRegistry::new();
-    registry.register_table(user)?;
+    registry.try_register_table(user)?;
     Ok(registry)
 }
 ```

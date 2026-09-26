@@ -157,7 +157,8 @@ impl Settings {
     ///
     /// 1. [`Settings::default`]
     /// 2. `Cargo.toml [package.metadata.surql]` (nearest `Cargo.toml`
-    ///    walking upward from the current directory).
+    ///    walking upward from the current directory), or the same table
+    ///    from the file given to [`SettingsBuilder::config_file`].
     /// 3. `.env` file (via `dotenvy`, if present).
     /// 4. `SURQL_*` environment variables.
     ///
@@ -173,6 +174,7 @@ impl Settings {
 pub struct SettingsBuilder {
     overrides: Overrides,
     cwd: Option<PathBuf>,
+    config_file: Option<PathBuf>,
     skip_dotenv: bool,
 }
 
@@ -243,7 +245,26 @@ impl SettingsBuilder {
         self
     }
 
+    /// Read the `[package.metadata.surql]` table from this TOML file
+    /// (any name, e.g. `prod.toml`) instead of discovering `Cargo.toml`
+    /// from the working directory.
+    ///
+    /// Unlike discovery, which quietly falls back to defaults, an explicit
+    /// file must be usable: [`SettingsBuilder::load`] fails when it is
+    /// missing, does not parse as TOML, or has no
+    /// `[package.metadata.surql]` table. `.env` discovery still uses the
+    /// working directory.
+    pub fn config_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config_file = Some(path.into());
+        self
+    }
+
     /// Run the layered load and apply overrides.
+    ///
+    /// # Errors
+    ///
+    /// Fails on an invalid value from any source, and on an unusable
+    /// [`SettingsBuilder::config_file`].
     pub fn load(self) -> Result<Settings> {
         let cwd = self
             .cwd
@@ -251,7 +272,10 @@ impl SettingsBuilder {
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let toml_values = load_cargo_metadata(&cwd)?;
+        let toml_values = match &self.config_file {
+            Some(path) => load_config_file(path)?,
+            None => load_cargo_metadata(&cwd)?,
+        };
         let dotenv_values = if self.skip_dotenv {
             HashMap::new()
         } else {
@@ -430,21 +454,45 @@ fn load_cargo_metadata(start: &Path) -> Result<CargoMetadataSection> {
         Ok(v) => v,
         Err(_) => return Ok(CargoMetadataSection::default()),
     };
-    let metadata = parsed
+    match surql_table(&parsed) {
+        Some(value) => parse_surql_table(value),
+        None => Ok(CargoMetadataSection::default()),
+    }
+}
+
+/// Read `[package.metadata.surql]` from an explicitly named file. Unlike
+/// [`load_cargo_metadata`], every way the file can be unusable is an error.
+fn load_config_file(path: &Path) -> Result<CargoMetadataSection> {
+    let raw = std::fs::read_to_string(path).map_err(|e| SurqlError::Io {
+        reason: format!("cannot read config file {}: {e}", path.display()),
+    })?;
+    let parsed: toml::Value = toml::from_str(&raw).map_err(|e| SurqlError::Validation {
+        reason: format!("config file {} is not valid TOML: {e}", path.display()),
+    })?;
+    let value = surql_table(&parsed).ok_or_else(|| SurqlError::Validation {
+        reason: format!(
+            "config file {} has no [package.metadata.surql] table",
+            path.display()
+        ),
+    })?;
+    parse_surql_table(value)
+}
+
+/// The `[package.metadata.surql]` table of a parsed TOML document.
+fn surql_table(document: &toml::Value) -> Option<&toml::Value> {
+    document
         .get("package")
         .and_then(|p| p.get("metadata"))
-        .and_then(|m| m.get("surql"));
-    let Some(value) = metadata else {
-        return Ok(CargoMetadataSection::default());
-    };
-    let section: CargoMetadataSection =
-        value
-            .clone()
-            .try_into()
-            .map_err(|e| SurqlError::Validation {
-                reason: format!("invalid [package.metadata.surql]: {e}"),
-            })?;
-    Ok(section)
+        .and_then(|m| m.get("surql"))
+}
+
+fn parse_surql_table(value: &toml::Value) -> Result<CargoMetadataSection> {
+    value
+        .clone()
+        .try_into()
+        .map_err(|e| SurqlError::Validation {
+            reason: format!("invalid [package.metadata.surql]: {e}"),
+        })
 }
 
 fn find_cargo_toml(start: &Path) -> Option<PathBuf> {
@@ -774,6 +822,116 @@ version = "0.0.0"
         assert_eq!("warn".parse::<LogLevel>().unwrap(), LogLevel::Warning);
         assert_eq!("INFO".parse::<LogLevel>().unwrap(), LogLevel::Info);
         assert!("loud".parse::<LogLevel>().is_err());
+    }
+
+    #[test]
+    fn config_file_reads_an_arbitrarily_named_file() {
+        let dir = TempDir::new().unwrap();
+        // The working directory's Cargo.toml is NOT consulted.
+        write_cargo(
+            dir.path(),
+            r#"
+[package]
+name = "demo"
+version = "0.0.0"
+
+[package.metadata.surql]
+app_name = "from-cargo"
+"#,
+        );
+        let prod = dir.path().join("prod.toml");
+        fs::write(
+            &prod,
+            r#"
+[package.metadata.surql]
+environment = "production"
+app_name = "from-prod"
+
+[package.metadata.surql.database]
+url = "wss://db.example/rpc"
+namespace = "prod"
+database = "core"
+enable_live_queries = true
+"#,
+        )
+        .unwrap();
+        let settings = SettingsBuilder::default()
+            .cwd(dir.path())
+            .config_file(&prod)
+            .skip_dotenv(true)
+            .load()
+            .unwrap();
+        assert_eq!(settings.environment, Environment::Production);
+        assert_eq!(settings.app_name, "from-prod");
+        assert_eq!(settings.database.url(), "wss://db.example/rpc");
+        assert_eq!(settings.database.namespace(), "prod");
+    }
+
+    #[test]
+    fn config_file_errors_instead_of_defaulting() {
+        let dir = TempDir::new().unwrap();
+        let load = |path: PathBuf| {
+            SettingsBuilder::default()
+                .cwd(dir.path())
+                .config_file(path)
+                .skip_dotenv(true)
+                .load()
+        };
+
+        let missing = load(dir.path().join("absent.toml")).unwrap_err();
+        assert!(matches!(missing, SurqlError::Io { .. }), "{missing}");
+
+        let broken = dir.path().join("broken.toml");
+        fs::write(&broken, "[package.metadata.surql\napp_name = ").unwrap();
+        let err = load(broken).unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+
+        let tableless = dir.path().join("tableless.toml");
+        fs::write(&tableless, "[package]\nname = \"demo\"\n").unwrap();
+        let err = load(tableless).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no [package.metadata.surql] table"),
+            "{err}"
+        );
+    }
+
+    /// Regression: `SURQL_TIMEOUT=inf` or a TOML `timeout = inf` loaded
+    /// fine and then panicked in `Duration::from_secs_f64` on connect.
+    #[test]
+    fn unbounded_timeouts_fail_to_load() {
+        for raw in ["inf", "1e20", "NaN"] {
+            let lookup = |key: &str| (key == "SURQL_TIMEOUT").then(|| raw.to_owned());
+            assert!(
+                build_connection_config(None, &lookup, None).is_err(),
+                "SURQL_TIMEOUT={raw}"
+            );
+        }
+        let toml_db = DatabaseTable {
+            timeout: Some(f64::INFINITY),
+            ..DatabaseTable::default()
+        };
+        assert!(build_connection_config(None, &|_: &str| None, Some(&toml_db)).is_err());
+    }
+
+    /// Regression: `Settings` (and its builder) derived `Debug` over the
+    /// nested connection config, printing the database password.
+    #[test]
+    fn debug_redacts_the_database_password() {
+        let database = ConnectionConfig {
+            db_url: "ws://svc:urlsecret@db.example/rpc".into(),
+            db_pass: Some("hunter2".into()),
+            ..ConnectionConfig::default()
+        };
+        let settings = Settings {
+            database: database.clone(),
+            ..Settings::default()
+        };
+        let builder = Settings::builder().database(database);
+        for shown in [format!("{settings:?}"), format!("{builder:?}")] {
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(!shown.contains("urlsecret"), "{shown}");
+        }
     }
 
     #[test]

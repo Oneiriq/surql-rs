@@ -10,14 +10,14 @@ any binary-only dependencies.
 
 | Feature         | Default | Implies                | Pulls in                                                   | What you get                                                                 |
 |-----------------|---------|------------------------|------------------------------------------------------------|------------------------------------------------------------------------------|
-| `client-rustls` | yes     | -                      | `tokio`, `surrealdb` 3.x (`rustls`), `reqwest` (`rustls-tls-webpki-roots`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). The default backend since 0.2.3. See [Picking a TLS backend](#picking-a-tls-backend). |
-| `client`        | no      | -                      | `tokio`, `surrealdb` 3.x (`native-tls`), `reqwest` (`default-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
-| `client-wasm`   | no      | -                      | `tokio` (wasm subset), `surrealdb` 3.x (`protocol-ws`, `kv-mem`), `futures` | Wasm-friendly variant. Same `DatabaseClient` API, no TLS / `reqwest` / `rt-multi-thread`. See [WebAssembly support](#webassembly-support). |
-| `cli`           | no      | `client`, `orchestration`, `settings` | `clap`, `tracing-subscriber`, `comfy-table`, `colored` | The `surql` binary (`migrate`, `schema`, `db`, `orchestrate`).              |
+| `client-rustls` | yes     | -                      | `tokio`, `surrealdb` 3.x (`rustls`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). The default backend since 0.2.3. See [Picking a TLS backend](#picking-a-tls-backend). |
+| `client`        | no      | -                      | `tokio`, `surrealdb` 3.x (`native-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
+| `client-wasm`   | no      | -                      | `tokio` (wasm subset), `surrealdb` 3.x (`protocol-ws`, `kv-mem`), `futures` | Wasm-friendly variant. Same `DatabaseClient` API, no TLS / `rt-multi-thread`. See [WebAssembly support](#webassembly-support). |
+| `cli`           | no      | `client-rustls`, `orchestration`, `settings` | `clap`, `tracing-subscriber`, `comfy-table`, `colored` | The `surql` binary (`migrate`, `schema`, `db`, `orchestrate`).              |
 | `cache`         | no      | -                      | `tokio`, `async-trait`                                     | `MemoryCache` backend, `CacheManager`, global cache registry.                |
 | `cache-redis`   | no      | `cache`                | `redis`                                                    | `RedisCache` backend for the cache manager.                                  |
 | `settings`      | no      | -                      | `dotenvy`, `toml`                                          | Layered `Settings` / `SettingsBuilder` (env, `.env`, `Cargo.toml` metadata). |
-| `orchestration` | no      | `client`               | `async-trait`                                              | Multi-database deployment strategies, environment registry, health checks.   |
+| `orchestration` | no      | `client-rustls`        | `async-trait`                                              | Multi-database deployment strategies, environment registry, health checks.   |
 | `watcher`       | no      | -                      | `notify`, `tokio`, `tokio-util`                            | Filesystem watcher for schema / migration hot-reload.                        |
 
 ## Picking a profile
@@ -152,8 +152,6 @@ Tracks Oneiriq/surql-rs#115. Enables the same
   pulls `ring`'s C glue) nor `native-tls` is enabled. `kv-mem` lets
   wasm callers run an embedded engine for local state and tests with
   no server roundtrip.
-- `reqwest` is **not** pulled. It is unused in `surql`'s source path
-  and `reqwest`'s default TLS stacks do not link on wasm.
 - `tokio` is reduced to `["sync", "macros", "rt", "time"]`.
   `tokio::spawn` is not available; if you need to fan out, use
   `wasm-bindgen-futures::spawn_local` from the caller crate.

@@ -1,0 +1,61 @@
+[package]
+name = "oneiriq-surql-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+serde_json = "1.0"
+oneiriq-surql = { path = "..", default-features = false }
+# The engine's own SurrealQL parser is the oracle: whatever this crate
+# renders has to parse back, as the statement count and the value it was
+# rendered from. Pinned to the version the root lockfile resolves.
+surrealdb-core = { version = "=3.3.0", default-features = false }
+surrealdb-types = "=3.3.0"
+
+# Its own workspace, so the root package stays a single crate and
+# `cargo fuzz` builds with its nightly sanitizer flags in isolation.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "record_id"
+path = "fuzz_targets/record_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "value"
+path = "fuzz_targets/value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ident"
+path = "fuzz_targets/ident.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema_info"
+path = "fuzz_targets/schema_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "migration"
+path = "fuzz_targets/migration.rs"
+test = false
+doc = false
+bench = false

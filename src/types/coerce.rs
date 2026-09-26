@@ -93,23 +93,16 @@ pub fn coerce_record_datetimes(
 /// Truncate fractional seconds beyond 9 digits so chrono's RFC3339
 /// parser accepts SurrealDB-style nanosecond precision.
 fn truncate_fraction(value: &str) -> String {
-    let Some(dot_idx) = value.find('.') else {
+    let Some((head, rest)) = value.split_once('.') else {
         return value.to_owned();
     };
-    let bytes = value.as_bytes();
-    let mut frac_end = dot_idx + 1;
-    while frac_end < bytes.len() && bytes[frac_end].is_ascii_digit() {
-        frac_end += 1;
+    let frac_len = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    match (rest.get(..9), rest.get(frac_len..)) {
+        (Some(kept), Some(tail)) if frac_len > 9 => format!("{head}.{kept}{tail}"),
+        _ => value.to_owned(),
     }
-    let frac = &value[dot_idx + 1..frac_end];
-    if frac.len() <= 9 {
-        return value.to_owned();
-    }
-    let mut out = String::with_capacity(value.len());
-    out.push_str(&value[..=dot_idx]);
-    out.push_str(&frac[..9]);
-    out.push_str(&value[frac_end..]);
-    out
 }
 
 #[cfg(test)]
@@ -137,6 +130,21 @@ mod tests {
     }
 
     use chrono::Datelike;
+
+    #[test]
+    fn truncates_long_fractions_only() {
+        assert_eq!(
+            truncate_fraction("2024-01-15T10:30:00.1234567891234Z"),
+            "2024-01-15T10:30:00.123456789Z"
+        );
+        assert_eq!(
+            truncate_fraction("2024-01-15T10:30:00.123Z"),
+            "2024-01-15T10:30:00.123Z"
+        );
+        assert_eq!(truncate_fraction("no-dot"), "no-dot");
+        assert_eq!(truncate_fraction("é.é"), "é.é");
+        assert_eq!(truncate_fraction(".1234567890é"), ".123456789é");
+    }
 
     #[test]
     fn parses_naive_date() {

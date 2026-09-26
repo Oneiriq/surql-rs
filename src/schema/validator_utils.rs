@@ -148,30 +148,48 @@ pub fn format_validation_report(results: &[ValidationResult], include_info: bool
     let warning_count = filter_warnings(&filtered).len();
 
     lines.push(format!(
-        "Schema Validation Report: {} errors, {} warnings",
-        error_count, warning_count,
+        "Schema Validation Report: {error_count} errors, {warning_count} warnings",
     ));
     lines.push("=".repeat(60));
 
     for (table_name, table_results) in &grouped {
         lines.push(String::new());
-        lines.push(format!("[{}]", table_name));
+        lines.push(format!("[{}]", printable(table_name)));
         for result in table_results {
             let icon = severity_icon(result.severity);
             let field_str = result
                 .field
                 .as_deref()
-                .map_or(String::new(), |f| format!(".{}", f));
+                .map_or(String::new(), |f| format!(".{}", printable(f)));
             lines.push(format!("  {} {}{}", icon, result.message, field_str));
             if result.code_value.is_some() || result.db_value.is_some() {
                 let code = result.code_value.as_deref().unwrap_or("None");
                 let db = result.db_value.as_deref().unwrap_or("None");
-                lines.push(format!("      code: {}, db: {}", code, db));
+                lines.push(format!(
+                    "      code: {}, db: {}",
+                    printable(code),
+                    printable(db)
+                ));
             }
         }
     }
 
     lines.join("\n")
+}
+
+/// Names and values in the report come from the database as well as the
+/// code, and the report goes to a terminal: control characters (ESC
+/// included) are written as `\u{..}` escapes so they cannot drive it.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 fn severity_icon(severity: ValidationSeverity) -> &'static str {
@@ -392,6 +410,22 @@ mod tests {
         let report = format_validation_report(&results, false);
         assert!(report.contains("code: string"));
         assert!(report.contains("db: int"));
+    }
+
+    #[test]
+    fn format_report_escapes_control_characters() {
+        let results = vec![ValidationResult::new(
+            ValidationSeverity::Warning,
+            "evil\u{1b}]0;pwned\u{7}",
+            Some("f\u{1b}[2J".into()),
+            "Field exists in database but not defined in code",
+            Some("missing".into()),
+            Some("line\nbreak".into()),
+        )];
+        let report = format_validation_report(&results, false);
+        assert!(!report.contains('\u{1b}'), "{report:?}");
+        assert!(report.contains("[evil\\u{1b}]0;pwned\\u{7}]"), "{report}");
+        assert!(report.contains("db: line\\u{a}break"), "{report}");
     }
 
     // -- get_validation_summary ------------------------------------------------

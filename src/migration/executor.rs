@@ -3,7 +3,8 @@
 //! Port of `surql/migration/executor.py`. Runs individual [`Migration`]
 //! definitions against a live [`DatabaseClient`] inside a
 //! [`Transaction`] (client-side buffered BEGIN/COMMIT) and records the
-//! outcome in the [`MigrationHistory`] table.
+//! outcome in the [`MigrationHistory`] table within that same
+//! transaction.
 //!
 //! All items here require the `client` cargo feature.
 //!
@@ -22,17 +23,17 @@
 //!   re-discovers migrations from disk at each call, matching the
 //!   "migrations on disk" convention of the port.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::connection::{DatabaseClient, Transaction};
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::discover_migrations;
+use crate::migration::discovery::{discover_migrations, order_migrations};
 use crate::migration::history::{
     ensure_migration_table, get_applied_migrations as history_get_applied, is_migration_applied,
-    record_migration, remove_migration_record,
+    record_statement, removal_statement,
 };
 use crate::migration::models::{
     Migration, MigrationDirection, MigrationHistory, MigrationPlan, MigrationState, MigrationStatus,
@@ -68,88 +69,99 @@ pub struct MigrateUpOptions {
     pub steps: Option<usize>,
 }
 
+/// Variable holding the transaction's start time, for the history row's
+/// `execution_time_ms`.
+const STARTED_VAR: &str = "$__surql_migration_started";
+
 /// Execute a single migration in the requested direction.
 ///
-/// Runs the migration's SurrealQL statements inside a
-/// [`Transaction`]; on success records (or removes, when rolling back)
-/// the migration from the history table.
+/// Runs the migration's SurrealQL statements and the matching history
+/// change (recording the version when applying, deleting its row when
+/// rolling back) in one [`Transaction`], so the schema change and the
+/// history row commit or fail together. The history row's id is derived
+/// from the version: when two runners apply the same migration at once,
+/// the second one's transaction is rejected as a whole, data statements
+/// included. Rolling back a migration that is not recorded as applied
+/// fails the same way.
+///
+/// A migration with no `down` statements (a squashed or a blank one) is
+/// refused in the `Down` direction instead of silently deleting its
+/// history row while the schema stays.
 ///
 /// Returns the resulting [`MigrationStatus`], including timing and, on
 /// failure, the error message captured during execution.
 ///
 /// # Errors
 ///
-/// Returns [`SurqlError::MigrationExecution`] when the transaction
-/// itself cannot be begun or the history update fails. Per-statement
-/// failures are reported via a [`MigrationStatus`] with
-/// [`MigrationState::Failed`] and a populated `error`.
+/// Returns [`SurqlError::MigrationExecution`] when the history table
+/// cannot be ensured or the transaction cannot be begun. Failures of the
+/// transaction itself (a bad statement, an already-recorded version) are
+/// reported via a [`MigrationStatus`] with [`MigrationState::Failed`] and
+/// a populated `error`; nothing was applied in that case.
 pub async fn execute_migration(
     client: &DatabaseClient,
     migration: &Migration,
     direction: MigrationDirection,
 ) -> Result<MigrationStatus> {
+    let failed = |error: String| MigrationStatus {
+        migration: migration.clone(),
+        state: MigrationState::Failed,
+        applied_at: None,
+        error: Some(error),
+    };
     let statements: &[String] = match direction {
         MigrationDirection::Up => &migration.up,
         MigrationDirection::Down => &migration.down,
     };
+    if direction == MigrationDirection::Down && statements.is_empty() {
+        return Ok(failed(format!(
+            "migration {} has no down statements; refusing to roll it back \
+             (restore from a snapshot or backup instead)",
+            migration.version
+        )));
+    }
 
-    let start = Instant::now();
-
-    let mut tx = Transaction::begin(client)
+    ensure_migration_table(client)
         .await
         .map_err(|e| SurqlError::MigrationExecution {
-            reason: format!("failed to begin transaction for {}: {e}", migration.version),
+            reason: format!("failed to ensure the migration history table: {e}"),
         })?;
 
-    for (idx, statement) in statements.iter().enumerate() {
-        if let Err(err) = tx.execute(statement).await {
-            let _ = tx.rollback().await;
-            return Ok(MigrationStatus {
-                migration: migration.clone(),
-                state: MigrationState::Failed,
-                applied_at: None,
-                error: Some(format!("statement {idx} failed: {err}")),
-            });
-        }
-    }
-
-    if let Err(err) = tx.commit().await {
-        return Ok(MigrationStatus {
-            migration: migration.clone(),
-            state: MigrationState::Failed,
-            applied_at: None,
-            error: Some(format!("commit failed: {err}")),
-        });
-    }
-
     let applied_at = Utc::now();
-    let execution_time_ms = u64::try_from(start.elapsed().as_millis()).ok();
-
-    match direction {
+    let history = match direction {
         MigrationDirection::Up => {
             let entry = MigrationHistory {
                 version: migration.version.clone(),
                 description: migration.description.clone(),
                 applied_at,
                 checksum: migration.checksum.clone().unwrap_or_default(),
-                execution_time_ms,
+                execution_time_ms: None,
             };
-            record_migration(client, &entry)
-                .await
-                .map_err(|e| SurqlError::MigrationExecution {
-                    reason: format!("failed to record migration {}: {e}", migration.version),
-                })?;
+            let elapsed = format!("duration::millis(time::now() - {STARTED_VAR})");
+            record_statement(&entry, Some(&elapsed))
         }
-        MigrationDirection::Down => {
-            remove_migration_record(client, &migration.version)
-                .await
-                .map_err(|e| SurqlError::MigrationExecution {
-                    reason: format!(
-                        "failed to remove migration record {}: {e}",
-                        migration.version
-                    ),
-                })?;
+        MigrationDirection::Down => removal_statement(&migration.version),
+    };
+
+    let mut tx = Transaction::begin(client)
+        .await
+        .map_err(|e| SurqlError::MigrationExecution {
+            reason: format!("failed to begin transaction for {}: {e}", migration.version),
+        })?;
+    let started = format!("LET {STARTED_VAR} = time::now();");
+    let queued = std::iter::once(started.as_str())
+        .chain(statements.iter().map(String::as_str))
+        .chain(std::iter::once(history.as_str()));
+    for statement in queued {
+        // Only fails when the transaction is no longer active, which a
+        // freshly begun one always is.
+        if let Err(err) = tx.execute(statement).await {
+            return Ok(failed(format!("failed to queue statement: {err}")));
         }
+    }
+
+    if let Err(err) = tx.commit().await {
+        return Ok(failed(format!("commit failed: {err}")));
     }
 
     let state = match direction {
@@ -226,10 +238,8 @@ pub async fn migrate_down(
     let mut applied = get_applied_migrations_ordered(client, migrations_dir).await?;
     applied.reverse();
 
-    let take = usize::try_from(steps)
-        .unwrap_or(usize::MAX)
-        .min(applied.len());
-    let to_roll = &applied[..take];
+    let take = usize::try_from(steps).unwrap_or(usize::MAX);
+    let to_roll: Vec<&MigrationHistory> = applied.iter().take(take).collect();
 
     // Join applied history metadata with on-disk migrations by version.
     let all_on_disk = discover_migrations(migrations_dir)?;
@@ -250,6 +260,7 @@ pub async fn migrate_down(
                     down: Vec::new(),
                     checksum: Some(history.checksum.clone()),
                     depends_on: Vec::new(),
+                    squashed_from: Vec::new(),
                 },
                 state: MigrationState::Failed,
                 applied_at: None,
@@ -270,7 +281,13 @@ pub async fn migrate_down(
     Ok(out)
 }
 
-/// List migrations that have not yet been applied, sorted by version.
+/// List migrations that have not yet been applied, in the order they
+/// would be applied (see [`discover_migrations`]).
+///
+/// A squashed migration is not pending where all of the migrations it
+/// was squashed from are applied, or are pending ahead of it (applying
+/// them covers it); and a migration a recorded squashed migration was
+/// squashed from is not pending either.
 ///
 /// # Errors
 ///
@@ -282,16 +299,66 @@ pub async fn get_pending_migrations(
 ) -> Result<Vec<Migration>> {
     ensure_migration_table(client).await?;
     let on_disk = discover_migrations(migrations_dir)?;
-    let applied = history_get_applied(client).await?;
-    let applied_set: std::collections::BTreeSet<String> =
-        applied.iter().map(|m| m.version.clone()).collect();
+    let history = history_get_applied(client).await?;
+    Ok(pending_among(on_disk, &history))
+}
 
-    let mut pending: Vec<Migration> = on_disk
+/// The migrations of `on_disk` (in apply order) that `history` leaves
+/// pending; see [`get_pending_migrations`].
+fn pending_among(on_disk: Vec<Migration>, history: &[MigrationHistory]) -> Vec<Migration> {
+    let mut applied: BTreeSet<String> = effective_applied(&on_disk, history).into_keys().collect();
+    on_disk
         .into_iter()
-        .filter(|m| !applied_set.contains(&m.version))
+        .filter(|m| {
+            if applied.contains(&m.version) || covered(m, |v| applied.contains(v)) {
+                return false;
+            }
+            // Once this is applied, a later squash of it is covered.
+            applied.insert(m.version.clone());
+            true
+        })
+        .collect()
+}
+
+/// When each on-disk migration counts as applied: the recorded versions,
+/// the sources of every recorded squashed migration, and every squashed
+/// migration whose sources are all applied (at the latest source's time).
+fn effective_applied(
+    on_disk: &[Migration],
+    history: &[MigrationHistory],
+) -> BTreeMap<String, DateTime<Utc>> {
+    let mut applied: BTreeMap<String, DateTime<Utc>> = history
+        .iter()
+        .map(|h| (h.version.clone(), h.applied_at))
         .collect();
-    pending.sort_by(|a, b| a.version.cmp(&b.version));
-    Ok(pending)
+    // Repeat until nothing changes, for squashes of squashes.
+    loop {
+        let before = applied.len();
+        for m in on_disk {
+            if let Some(at) = applied.get(&m.version).copied() {
+                for source in &m.squashed_from {
+                    applied.entry(source.clone()).or_insert(at);
+                }
+            } else if covered(m, |v| applied.contains_key(v)) {
+                let latest = m
+                    .squashed_from
+                    .iter()
+                    .filter_map(|v| applied.get(v).copied())
+                    .max();
+                if let Some(at) = latest {
+                    applied.insert(m.version.clone(), at);
+                }
+            }
+        }
+        if applied.len() == before {
+            return applied;
+        }
+    }
+}
+
+/// `true` for a squashed migration whose sources are all applied.
+fn covered(migration: &Migration, is_applied: impl Fn(&str) -> bool) -> bool {
+    !migration.squashed_from.is_empty() && migration.squashed_from.iter().all(|v| is_applied(v))
 }
 
 /// Return every applied migration history row in `applied_at` order.
@@ -313,6 +380,10 @@ pub async fn get_applied_migrations_ordered(
 
 /// Compute an applied / pending status report for a migrations directory.
 ///
+/// Both lists follow the order [`discover_migrations`] returns. A squashed
+/// migration whose sources are all applied, and a migration a recorded
+/// squashed migration replaced, are reported as applied.
+///
 /// # Errors
 ///
 /// Returns [`SurqlError::MigrationExecution`] if discovery or the
@@ -323,20 +394,17 @@ pub async fn get_migration_status(
 ) -> Result<MigrationStatusReport> {
     ensure_migration_table(client).await?;
     let on_disk = discover_migrations(migrations_dir)?;
-    let applied_history = history_get_applied(client).await?;
-    let applied_map: std::collections::BTreeMap<String, &MigrationHistory> = applied_history
-        .iter()
-        .map(|h| (h.version.clone(), h))
-        .collect();
+    let history = history_get_applied(client).await?;
+    let applied_map = effective_applied(&on_disk, &history);
 
     let mut applied = Vec::new();
     let mut pending = Vec::new();
     for migration in on_disk.iter().cloned() {
-        if let Some(history) = applied_map.get(&migration.version) {
+        if let Some(at) = applied_map.get(&migration.version) {
             applied.push(MigrationStatus {
                 migration,
                 state: MigrationState::Applied,
-                applied_at: Some(history.applied_at),
+                applied_at: Some(*at),
                 error: None,
             });
         } else {
@@ -348,8 +416,6 @@ pub async fn get_migration_status(
             });
         }
     }
-    applied.sort_by(|a, b| a.migration.version.cmp(&b.migration.version));
-    pending.sort_by(|a, b| a.migration.version.cmp(&b.migration.version));
 
     Ok(MigrationStatusReport {
         total: on_disk.len(),
@@ -376,22 +442,23 @@ pub async fn create_migration_plan(
 
 /// Execute a [`MigrationPlan`] end-to-end.
 ///
-/// For an `Up` plan, migrations are applied in ascending version order.
-/// For a `Down` plan, they are applied in reverse order. Execution
-/// stops at the first failure; the failed status is included in the
-/// return value.
+/// For an `Up` plan, migrations are applied in the order
+/// [`discover_migrations`] uses (versions compared numerically, each after
+/// its dependencies). For a `Down` plan, they are applied in reverse
+/// order. Execution stops at the first failure; the failed status is
+/// included in the return value.
 ///
 /// # Errors
 ///
 /// Returns [`SurqlError::MigrationExecution`] if the history table
-/// cannot be ensured.
+/// cannot be ensured, or [`SurqlError::MigrationDiscovery`] if the plan's
+/// dependencies form a cycle.
 pub async fn execute_migration_plan(
     client: &DatabaseClient,
     plan: MigrationPlan,
 ) -> Result<Vec<MigrationStatus>> {
     ensure_migration_table(client).await?;
-    let mut migrations = plan.migrations;
-    migrations.sort_by(|a, b| a.version.cmp(&b.version));
+    let mut migrations = order_migrations(plan.migrations)?;
     if plan.direction == MigrationDirection::Down {
         migrations.reverse();
     }
@@ -505,6 +572,77 @@ mod tests {
         assert!(errors.is_empty());
     }
 
+    fn mig(version: &str, squashed_from: &[&str]) -> Migration {
+        Migration {
+            version: version.into(),
+            description: String::new(),
+            path: PathBuf::new(),
+            up: vec![],
+            down: vec![],
+            checksum: None,
+            depends_on: vec![],
+            squashed_from: squashed_from.iter().map(|v| (*v).to_string()).collect(),
+        }
+    }
+
+    fn row(version: &str) -> MigrationHistory {
+        MigrationHistory {
+            version: version.into(),
+            description: String::new(),
+            applied_at: Utc::now(),
+            checksum: String::new(),
+            execution_time_ms: None,
+        }
+    }
+
+    fn pending_versions(on_disk: Vec<Migration>, history: &[MigrationHistory]) -> Vec<String> {
+        pending_among(on_disk, history)
+            .into_iter()
+            .map(|m| m.version)
+            .collect()
+    }
+
+    /// A squashed migration has a version of its own; on a database that
+    /// applied its sources it used to be pending forever, and `migrate_up`
+    /// re-applied every statement in it.
+    #[test]
+    fn a_squash_of_applied_migrations_is_not_pending() {
+        let disk = || vec![mig("v1", &[]), mig("v2", &[]), mig("v3", &["v1", "v2"])];
+        assert!(pending_versions(disk(), &[row("v1"), row("v2")]).is_empty());
+        // Sources that will be applied first cover it as well.
+        assert_eq!(pending_versions(disk(), &[]), vec!["v1", "v2"]);
+        assert_eq!(pending_versions(disk(), &[row("v1")]), vec!["v2"]);
+    }
+
+    #[test]
+    fn the_sources_of_an_applied_squash_are_not_pending() {
+        let disk = vec![mig("v1", &[]), mig("v2", &[]), mig("v3", &["v1", "v2"])];
+        assert!(pending_versions(disk, &[row("v3")]).is_empty());
+    }
+
+    #[test]
+    fn a_squash_whose_sources_are_gone_is_applied_on_a_fresh_database() {
+        let disk = vec![mig("v3", &["v1", "v2"]), mig("v4", &[])];
+        assert_eq!(pending_versions(disk, &[]), vec!["v3", "v4"]);
+    }
+
+    #[test]
+    fn squashes_of_squashes_resolve_transitively() {
+        let disk = || {
+            vec![
+                mig("v1", &[]),
+                mig("v2", &[]),
+                mig("v3", &["v1", "v2"]),
+                mig("v4", &[]),
+                mig("v5", &["v3", "v4"]),
+            ]
+        };
+        assert!(pending_versions(disk(), &[row("v1"), row("v2"), row("v4")]).is_empty());
+        assert!(pending_versions(disk(), &[row("v5")]).is_empty());
+        let applied = effective_applied(&disk(), &[row("v5")]);
+        assert!(applied.contains_key("v1"), "{applied:?}");
+    }
+
     #[test]
     fn migration_status_report_counts() {
         let report = MigrationStatusReport {
@@ -518,6 +656,7 @@ mod tests {
                     down: vec![],
                     checksum: None,
                     depends_on: vec![],
+                    squashed_from: vec![],
                 },
                 state: MigrationState::Applied,
                 applied_at: None,

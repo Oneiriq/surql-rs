@@ -103,8 +103,7 @@ pub fn get_or_init_manager() -> CacheManager {
     if let Some(m) = get_cache_manager() {
         return m;
     }
-    // Safe: default config cannot fail.
-    let m = CacheManager::new(CacheConfig::default()).expect("default cache manager");
+    let m = CacheManager::in_memory(CacheConfig::default());
     set_cache_manager(m.clone());
     m
 }

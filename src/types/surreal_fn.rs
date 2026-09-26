@@ -6,9 +6,16 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::query::expressions::Expression;
+
 /// Value wrapper for a raw SurrealDB function call.
 ///
-/// Renders as raw SurrealQL when embedded in query bodies.
+/// Converted into an [`Expression`] (`.into()`, or through
+/// [`lt_expr`](super::operators::lt_expr) and friends and `Query::set_expr`)
+/// it renders as raw SurrealQL. Serialised into a `serde_json::Value` it is
+/// plain data (`{"expression": "..."}`): the query renderers never treat a
+/// JSON object as SurrealQL, whatever its shape, because untrusted input can
+/// produce any shape.
 ///
 /// ## Examples
 ///
@@ -44,6 +51,12 @@ impl SurrealFn {
 impl std::fmt::Display for SurrealFn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.expression)
+    }
+}
+
+impl From<SurrealFn> for Expression {
+    fn from(f: SurrealFn) -> Self {
+        Expression::function(f.expression)
     }
 }
 

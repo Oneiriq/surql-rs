@@ -284,14 +284,23 @@ async fn concurrent_index_builds_and_leaves_no_residual_diff() {
         "the engine does not store the build directive"
     );
 
-    // Progress is readable, and by the time the statement returns on an
-    // in-memory engine with no rows the build is already done.
-    let info = client
-        .query(&info_for_index_surql("email_idx", "user"))
-        .await
-        .expect("INFO FOR INDEX");
-    let status = IndexBuildStatus::from_info(&info).expect("build status");
-    assert!(status.is_ready(), "index build reported ready: {status:?}");
+    // Progress is readable and the build finishes. A CONCURRENTLY build is
+    // asynchronous: 3.2 reported an empty table ready before the statement
+    // returned, 3.3 reports `started` first, so poll as callers must.
+    let mut status = None;
+    for _ in 0..100 {
+        let info = client
+            .query(&info_for_index_surql("email_idx", "user"))
+            .await
+            .expect("INFO FOR INDEX");
+        let current = IndexBuildStatus::from_info(&info).expect("build status");
+        if current.is_ready() {
+            status = Some(current);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(status.is_some(), "index build never reported ready");
 
     // The index is real: the uniqueness constraint bites.
     client

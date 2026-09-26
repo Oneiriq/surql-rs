@@ -18,15 +18,18 @@
 //! [`RollbackSafety::Warning`] (data-loss) and
 //! [`RollbackSafety::Danger`] (unsafe) as the task brief requires.
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::discover_migrations;
+use crate::migration::discovery::{compare_versions, discover_migrations};
 use crate::migration::executor::execute_migration;
 use crate::migration::history::get_applied_migrations;
+use crate::migration::lexer::{self, existence_clause, Token};
 use crate::migration::models::{Migration, MigrationDirection, MigrationStatus};
 
 /// Safety tier of a rollback operation.
@@ -100,9 +103,22 @@ pub struct RollbackPlan {
     /// `true` when the plan should require explicit user approval.
     #[serde(default)]
     pub requires_approval: bool,
+    /// `true` once the plan has been reviewed and approved (see
+    /// [`RollbackPlan::approve`]). [`execute_rollback`] refuses a plan
+    /// that `requires_approval` and is not approved.
+    #[serde(default)]
+    pub approved: bool,
 }
 
 impl RollbackPlan {
+    /// Mark the plan as reviewed, allowing [`execute_rollback`] to run it
+    /// even though it `requires_approval`.
+    #[must_use]
+    pub fn approve(mut self) -> Self {
+        self.approved = true;
+        self
+    }
+
     /// Number of migrations in the plan.
     pub fn migration_count(&self) -> usize {
         self.migrations.len()
@@ -170,7 +186,7 @@ pub async fn analyze_rollback_safety(
     let mut issues = Vec::new();
     for migration in on_disk
         .iter()
-        .filter(|m| m.version.as_str() > target_version)
+        .filter(|m| compare_versions(&m.version, target_version) == Ordering::Greater)
     {
         issues.extend(analyse_migration(migration));
     }
@@ -179,11 +195,16 @@ pub async fn analyze_rollback_safety(
 
 /// Build a rollback plan that moves the database to `target_version`.
 ///
+/// The current version is the highest applied version. Every applied
+/// migration newer than the target is rolled back, most recently applied
+/// first (the reverse of the order they were applied in).
+///
 /// # Errors
 ///
 /// Returns [`SurqlError::Validation`] if the current database has no
-/// applied migrations, if the target version is missing, or if the
-/// target is not older than the current version.
+/// applied migrations, if the target version is missing, if the target is
+/// not older than the current version, or if a migration that would have
+/// to be rolled back has no file on disk.
 pub async fn create_rollback_plan(
     client: &DatabaseClient,
     migrations_dir: &Path,
@@ -196,15 +217,20 @@ pub async fn create_rollback_plan(
         });
     }
 
+    // Ordered by `applied_at`, oldest first.
     let applied = get_applied_migrations(client).await?;
-    let Some(latest) = applied.last() else {
+    let Some(current_version) = applied
+        .iter()
+        .map(|h| h.version.as_str())
+        .max_by(|a, b| compare_versions(a, b))
+        .map(str::to_owned)
+    else {
         return Err(SurqlError::Validation {
             reason: "no migrations have been applied".to_string(),
         });
     };
-    let current_version = latest.version.clone();
 
-    if target_version >= current_version.as_str() {
+    if compare_versions(target_version, &current_version) != Ordering::Less {
         return Err(SurqlError::Validation {
             reason: format!(
                 "target version {target_version} must be older than current version {current_version}"
@@ -212,18 +238,24 @@ pub async fn create_rollback_plan(
         });
     }
 
-    // Applied versions on the database (ordered ascending already).
-    let applied_versions: std::collections::BTreeSet<String> =
-        applied.iter().map(|m| m.version.clone()).collect();
-
-    // The migrations we need to roll back are those applied on the server
-    // whose version is strictly greater than the target. Newest first.
-    let mut to_rollback: Vec<Migration> = on_disk
-        .iter()
-        .filter(|m| m.version.as_str() > target_version && applied_versions.contains(&m.version))
-        .cloned()
-        .collect();
-    to_rollback.sort_by(|a, b| b.version.cmp(&a.version));
+    let by_version: BTreeMap<&str, &Migration> =
+        on_disk.iter().map(|m| (m.version.as_str(), m)).collect();
+    let mut to_rollback: Vec<Migration> = Vec::new();
+    for history in applied.iter().rev() {
+        if compare_versions(&history.version, target_version) != Ordering::Greater {
+            continue;
+        }
+        let Some(migration) = by_version.get(history.version.as_str()) else {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "applied migration {} has no file in {}; cannot roll it back",
+                    history.version,
+                    migrations_dir.display()
+                ),
+            });
+        };
+        to_rollback.push((*migration).clone());
+    }
 
     let mut issues = Vec::new();
     let mut overall = RollbackSafety::Safe;
@@ -242,6 +274,7 @@ pub async fn create_rollback_plan(
         migrations: to_rollback,
         overall_safety: overall,
         requires_approval: overall != RollbackSafety::Safe,
+        approved: false,
         issues,
     })
 }
@@ -253,12 +286,24 @@ pub async fn create_rollback_plan(
 ///
 /// # Errors
 ///
-/// Returns [`SurqlError::MigrationExecution`] if a transaction cannot
-/// be begun or the history update fails.
+/// Returns [`SurqlError::Validation`] without touching the database when
+/// the plan `requires_approval` and has not been [approved]; returns
+/// [`SurqlError::MigrationExecution`] if a transaction cannot be begun.
+///
+/// [approved]: RollbackPlan::approve
 pub async fn execute_rollback(
     client: &DatabaseClient,
     plan: RollbackPlan,
 ) -> Result<RollbackResult> {
+    if plan.requires_approval && !plan.approved {
+        return Err(SurqlError::Validation {
+            reason: format!(
+                "rollback from {} to {} is classified {} and requires approval; \
+                 review its issues and call RollbackPlan::approve",
+                plan.from_version, plan.to_version, plan.overall_safety
+            ),
+        });
+    }
     let start = std::time::Instant::now();
     let mut rolled_back_count = 0usize;
     let mut errors: Vec<String> = Vec::new();
@@ -309,83 +354,137 @@ pub async fn plan_rollback_to_version(
 // ---------------------------------------------------------------------------
 
 fn analyse_migration(migration: &Migration) -> Vec<RollbackIssue> {
-    let mut issues = Vec::new();
     if migration.down.is_empty() {
-        issues.push(RollbackIssue {
+        return vec![RollbackIssue {
             safety: RollbackSafety::Danger,
             migration: migration.version.clone(),
             description: "migration has no `down` statements; cannot roll back cleanly".into(),
             affected_data: None,
             recommendation: Some("add a `-- @down` block or restore from backup".into()),
-        });
-        return issues;
+        }];
     }
-    for statement in &migration.down {
-        let upper = statement.to_ascii_uppercase();
-        let trimmed = upper.trim();
-
-        // Classify by looking at the first two significant tokens of the
-        // statement ("REMOVE TABLE …", "REMOVE FIELD …", "REMOVE INDEX …",
-        // "ALTER FIELD … TYPE …", etc.).
-        let head = leading_tokens(trimmed, 2);
-        let verb = head.first().map_or("", String::as_str);
-        let object = head.get(1).map_or("", String::as_str);
-        let is_remove_or_drop = matches!(verb, "REMOVE" | "DROP");
-
-        if is_remove_or_drop && object == "TABLE" {
-            let table = extract_after(statement, "TABLE").unwrap_or_else(|| "unknown".into());
-            issues.push(RollbackIssue {
-                safety: RollbackSafety::Danger,
-                migration: migration.version.clone(),
-                description: format!("dropping table: {table}"),
-                affected_data: Some(format!("all records in table {table}")),
-                recommendation: Some("export table data before rollback".into()),
-            });
-        } else if is_remove_or_drop && object == "FIELD" {
-            let field = extract_after(statement, "FIELD").unwrap_or_else(|| "unknown".into());
-            issues.push(RollbackIssue {
-                safety: RollbackSafety::Warning,
-                migration: migration.version.clone(),
-                description: format!("dropping field: {field}"),
-                affected_data: Some(format!("field data in {field}")),
-                recommendation: Some("back up affected field data".into()),
-            });
-        } else if verb == "ALTER" && object == "FIELD" && trimmed.contains("TYPE") {
-            issues.push(RollbackIssue {
-                safety: RollbackSafety::Warning,
-                migration: migration.version.clone(),
-                description: "altering field type may cause data conversion issues".into(),
-                affected_data: None,
-                recommendation: Some("review data compatibility before rollback".into()),
-            });
-        }
-        // Index / event drops and other operations are treated as safe.
-    }
-    issues
+    analyze_statements(&migration.version, &migration.down)
 }
 
-fn leading_tokens(upper: &str, n: usize) -> Vec<String> {
-    upper
-        .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
-        .filter(|s| !s.is_empty())
-        .take(n)
-        .map(str::to_string)
+/// Classify SurrealQL statements by the data they can destroy.
+///
+/// The rollback analyser runs this over each migration's `down` body; it
+/// works on any statement list (a forward migration's `up`, say). Each
+/// statement is classified by its leading keywords, after any comments:
+///
+/// * [`RollbackSafety::Danger`]: `REMOVE TABLE`, `REMOVE NAMESPACE` /
+///   `NS`, `REMOVE DATABASE` / `DB`, `REMOVE BUCKET`, and `DELETE`.
+/// * [`RollbackSafety::Warning`]: `REMOVE FIELD`, and `ALTER FIELD … TYPE`.
+///
+/// (`DROP` is accepted as a synonym of `REMOVE`.) Everything else, index,
+/// event, function and other definition drops included, raises no issue.
+/// `version` is recorded as each issue's [`RollbackIssue::migration`].
+pub fn analyze_statements(version: &str, statements: &[String]) -> Vec<RollbackIssue> {
+    statements
+        .iter()
+        .filter_map(|statement| classify_statement(version, statement))
         .collect()
 }
 
-fn extract_after(statement: &str, anchor: &str) -> Option<String> {
-    let upper = statement.to_ascii_uppercase();
-    let anchor_upper = anchor.to_ascii_uppercase();
-    let idx = upper.find(&anchor_upper)?;
-    let after = &statement[idx + anchor.len()..];
-    let token = after
-        .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
-        .find(|s| !s.is_empty())?;
-    Some(
-        token
-            .trim_matches(|c: char| c == ';' || c == ',')
-            .to_string(),
-    )
+fn classify_statement(version: &str, statement: &str) -> Option<RollbackIssue> {
+    let toks = lexer::tokens(statement);
+    let (verb, object) = match toks.as_slice() {
+        [verb, object, ..] => (Some(verb), Some(object)),
+        [verb] => (Some(verb), None),
+        [] => (None, None),
+    };
+    let is = |tok: Option<&Token<'_>>, kws: &[&str]| {
+        tok.is_some_and(|t| kws.iter().any(|kw| t.is_keyword(kw)))
+    };
+    let issue = |safety, description: String, affected: Option<String>, advice: &str| {
+        Some(RollbackIssue {
+            safety,
+            migration: version.to_string(),
+            description,
+            affected_data: affected,
+            recommendation: Some(advice.to_string()),
+        })
+    };
+    let name = || object_name(toks.get(2..).unwrap_or_default());
+
+    if is(verb, &["REMOVE", "DROP"]) {
+        if is(object, &["TABLE"]) {
+            let table = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping table: {table}"),
+                Some(format!("all records in table {table}")),
+                "export table data before rollback",
+            )
+        } else if is(object, &["NAMESPACE", "NS"]) {
+            let ns = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping namespace: {ns}"),
+                Some(format!("every database in namespace {ns}")),
+                "back up the namespace before rollback",
+            )
+        } else if is(object, &["DATABASE", "DB"]) {
+            let db = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping database: {db}"),
+                Some(format!("every table in database {db}")),
+                "back up the database before rollback",
+            )
+        } else if is(object, &["BUCKET"]) {
+            let bucket = name();
+            issue(
+                RollbackSafety::Danger,
+                format!("dropping bucket: {bucket}"),
+                Some(format!("files stored in bucket {bucket}")),
+                "export the bucket's files before rollback",
+            )
+        } else if is(object, &["FIELD"]) {
+            let field = name();
+            issue(
+                RollbackSafety::Warning,
+                format!("dropping field: {field}"),
+                Some(format!("field data in {field}")),
+                "back up affected field data",
+            )
+        } else {
+            None
+        }
+    } else if is(verb, &["ALTER"])
+        && is(object, &["FIELD"])
+        && toks.iter().any(|t| t.is_keyword("TYPE"))
+    {
+        issue(
+            RollbackSafety::Warning,
+            "altering field type may cause data conversion issues".into(),
+            None,
+            "review data compatibility before rollback",
+        )
+    } else if is(verb, &["DELETE"]) {
+        let target = object_name(toks.get(1..).unwrap_or_default());
+        issue(
+            RollbackSafety::Danger,
+            format!("deleting records: {target}"),
+            Some(format!("records deleted from {target}")),
+            "export the records before rollback",
+        )
+    } else {
+        None
+    }
+}
+
+/// The name after a kind keyword, past any `IF EXISTS` (or `FROM`, for a
+/// `DELETE`); `unknown` when there is none.
+fn object_name(toks: &[Token<'_>]) -> String {
+    let (_, rest) = existence_clause(toks);
+    let rest = match rest {
+        [from, rest @ ..] if from.is_keyword("FROM") || from.is_keyword("ONLY") => rest,
+        _ => rest,
+    };
+    rest.first()
+        .and_then(Token::name)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]
@@ -403,6 +502,7 @@ mod tests {
             down: down.iter().map(|s| (*s).to_string()).collect(),
             checksum: None,
             depends_on: vec![],
+            squashed_from: vec![],
         }
     }
 
@@ -461,10 +561,35 @@ mod tests {
             overall_safety: RollbackSafety::Warning,
             issues: vec![],
             requires_approval: true,
+            approved: false,
         };
         assert_eq!(plan.migration_count(), 1);
         assert!(!plan.is_safe());
         assert!(plan.has_data_loss());
+    }
+
+    #[tokio::test]
+    async fn execute_rollback_refuses_an_unapproved_risky_plan() {
+        use crate::connection::ConnectionConfig;
+
+        let client = DatabaseClient::new(ConnectionConfig::default()).unwrap();
+        let plan = RollbackPlan {
+            from_version: "v3".into(),
+            to_version: "v1".into(),
+            migrations: vec![m("v3", &["REMOVE TABLE t"])],
+            overall_safety: RollbackSafety::Danger,
+            issues: vec![],
+            requires_approval: true,
+            approved: false,
+        };
+        let err = execute_rollback(&client, plan.clone()).await.unwrap_err();
+        assert!(matches!(err, SurqlError::Validation { .. }), "{err}");
+        assert!(err.to_string().contains("requires approval"));
+
+        // Approved, it gets past the gate and fails on the unconnected
+        // client instead.
+        let err = execute_rollback(&client, plan.approve()).await.unwrap_err();
+        assert!(!matches!(err, SurqlError::Validation { .. }), "{err}");
     }
 
     #[test]
@@ -481,15 +606,62 @@ mod tests {
     }
 
     #[test]
-    fn extract_after_returns_table_name() {
-        assert_eq!(
-            extract_after("REMOVE TABLE user;", "TABLE"),
-            Some("user".to_string())
-        );
-        assert_eq!(
-            extract_after("remove table user;", "TABLE"),
-            Some("user".to_string())
-        );
+    fn object_name_skips_if_exists() {
+        let name = |s: &str| object_name(&lexer::tokens(s));
+        assert_eq!(name("user;"), "user");
+        assert_eq!(name("IF EXISTS user;"), "user");
+        assert_eq!(name("if exists `my-table`"), "`my-table`");
+        assert_eq!(name(";"), "unknown");
+    }
+
+    /// A comment in front of a destructive statement used to make its
+    /// first "token" `--`, so the plan came out Safe and needed no approval.
+    #[test]
+    fn a_leading_comment_does_not_hide_a_table_drop() {
+        let mig = m("v6", &["-- drop\nREMOVE TABLE IF EXISTS user"]);
+        let issues = analyse_migration(&mig);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].safety, RollbackSafety::Danger);
+        assert_eq!(issues[0].description, "dropping table: user");
+    }
+
+    #[test]
+    fn analyze_statements_flags_every_destructive_kind() {
+        let stmts: Vec<String> = [
+            "REMOVE NAMESPACE app;",
+            "REMOVE NS app;",
+            "-- note\nREMOVE DATABASE IF EXISTS main;",
+            "REMOVE DB main;",
+            "REMOVE BUCKET avatars;",
+            "DELETE ONLY user:1;",
+            "REMOVE INDEX idx ON user;",
+            "REMOVE FUNCTION fn::a;",
+            "DEFINE TABLE t;",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let issues = analyze_statements("v1", &stmts);
+        let danger = |d: &str| {
+            issues
+                .iter()
+                .any(|i| i.safety == RollbackSafety::Danger && i.description == d)
+        };
+        assert!(danger("dropping namespace: app"), "{issues:#?}");
+        assert!(danger("dropping database: main"), "{issues:#?}");
+        assert!(danger("dropping bucket: avatars"), "{issues:#?}");
+        assert!(danger("deleting records: user"), "{issues:#?}");
+        assert_eq!(issues.len(), 6, "{issues:#?}");
+        assert!(issues.iter().all(|i| i.migration == "v1"));
+    }
+
+    #[test]
+    fn delete_in_down_is_danger() {
+        let mig = m("v7", &["/* reset */ DELETE FROM user WHERE seeded = true"]);
+        let issues = analyse_migration(&mig);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].safety, RollbackSafety::Danger);
+        assert!(issues[0].description.contains("user"));
     }
 
     #[tokio::test]

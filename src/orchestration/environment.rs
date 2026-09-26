@@ -8,6 +8,7 @@
 //! established in [`crate::connection::registry`].
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -46,7 +47,7 @@ use crate::error::{Result, SurqlError};
 /// assert!(env.require_approval);
 /// # }
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvironmentConfig {
     /// Environment name (e.g. `production`, `staging`).
     pub name: String,
@@ -64,6 +65,52 @@ pub struct EnvironmentConfig {
     /// Allow destructive migrations (e.g. `REMOVE TABLE`).
     #[serde(default = "default_allow_destructive")]
     pub allow_destructive: bool,
+}
+
+/// Leaves the password out: plans, registries, and coordinators all reach
+/// their environments' `Debug`, and `tracing::debug!(?plan)` must not log
+/// credentials.
+impl fmt::Debug for EnvironmentConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvironmentConfig")
+            .field("name", &self.name)
+            .field("connection", &RedactedConnection(&self.connection))
+            .field("priority", &self.priority)
+            .field("tags", &self.tags)
+            .field("require_approval", &self.require_approval)
+            .field("allow_destructive", &self.allow_destructive)
+            .finish()
+    }
+}
+
+/// `Debug` view of a [`ConnectionConfig`] that names where it points and
+/// who it logs in as, never the password.
+struct RedactedConnection<'a>(&'a ConnectionConfig);
+
+impl fmt::Debug for RedactedConnection<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = self.0;
+        f.debug_struct("ConnectionConfig")
+            .field("url", &redact_url(cfg.url()))
+            .field("namespace", &cfg.namespace())
+            .field("database", &cfg.database())
+            .field("username", &cfg.username())
+            .field("password", &cfg.password().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+/// `url` with any `user:password@` part replaced by `<redacted>@`.
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at_checked(authority_end).unwrap_or((rest, ""));
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://<redacted>@{host}{tail}"),
+        None => url.to_string(),
+    }
 }
 
 fn default_priority() -> u32 {
@@ -115,7 +162,7 @@ impl EnvironmentConfig {
 }
 
 /// Builder for [`EnvironmentConfig`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EnvironmentConfigBuilder {
     name: String,
     connection: ConnectionConfig,
@@ -123,6 +170,19 @@ pub struct EnvironmentConfigBuilder {
     tags: BTreeSet<String>,
     require_approval: bool,
     allow_destructive: bool,
+}
+
+impl fmt::Debug for EnvironmentConfigBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvironmentConfigBuilder")
+            .field("name", &self.name)
+            .field("connection", &RedactedConnection(&self.connection))
+            .field("priority", &self.priority)
+            .field("tags", &self.tags)
+            .field("require_approval", &self.require_approval)
+            .field("allow_destructive", &self.allow_destructive)
+            .finish()
+    }
 }
 
 impl EnvironmentConfigBuilder {
@@ -303,14 +363,23 @@ impl EnvironmentRegistry {
     /// }
     /// ```
     ///
+    /// A connection needs `db_url`, `db_ns`, and `db` (or `url`,
+    /// `namespace`, `database`); every other connection field (`db_user`,
+    /// `db_pass`, `db_timeout`, ... or their short names) falls back to the
+    /// [`ConnectionConfig`] default. Each connection is validated as
+    /// [`ConnectionConfig::builder`] validates it. Unknown keys in an
+    /// environment or a connection are rejected, so a misspelt
+    /// `require_approval` cannot silently leave an environment unguarded.
+    ///
     /// A missing file yields an empty registry (matching Python).
     ///
     /// # Errors
     ///
     /// Returns [`SurqlError::Io`] when the file exists but cannot be
     /// read, [`SurqlError::Serialization`] when the JSON body cannot be
-    /// parsed, or [`SurqlError::Validation`] when an environment entry
-    /// has an invalid name.
+    /// parsed (including unknown keys), or [`SurqlError::Validation`]
+    /// when an environment name is invalid or repeated or a connection
+    /// fails validation.
     pub async fn from_config_file(path: &Path) -> Result<Self> {
         let registry = Self::new();
         if !path.exists() {
@@ -318,8 +387,20 @@ impl EnvironmentRegistry {
         }
         let body = std::fs::read_to_string(path)?;
         let config: FileConfig = serde_json::from_str(&body)?;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for entry in config.environments {
-            let env = EnvironmentConfig::builder(entry.name, entry.connection)
+            if !seen.insert(entry.name.clone()) {
+                return Err(SurqlError::Validation {
+                    reason: format!("environment {:?} is defined more than once", entry.name),
+                });
+            }
+            let connection = entry
+                .connection
+                .build()
+                .map_err(|err| SurqlError::Validation {
+                    reason: format!("environment {:?}: {err}", entry.name),
+                })?;
+            let env = EnvironmentConfig::builder(entry.name, connection)
                 .priority(entry.priority.unwrap_or_else(default_priority))
                 .tags(entry.tags.unwrap_or_default())
                 .require_approval(entry.require_approval.unwrap_or(false))
@@ -336,15 +417,16 @@ impl EnvironmentRegistry {
 }
 
 /// JSON shape accepted by [`EnvironmentRegistry::from_config_file`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Deserialize)]
 struct FileConfig {
     environments: Vec<FileEnvironment>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileEnvironment {
     name: String,
-    connection: ConnectionConfig,
+    connection: FileConnection,
     #[serde(default)]
     priority: Option<u32>,
     #[serde(default)]
@@ -353,6 +435,77 @@ struct FileEnvironment {
     require_approval: Option<bool>,
     #[serde(default)]
     allow_destructive: Option<bool>,
+}
+
+/// A connection as written in an environments file: the location is
+/// required, everything else optional. No `Debug`, as it holds the
+/// password.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConnection {
+    #[serde(alias = "url")]
+    db_url: String,
+    #[serde(alias = "namespace")]
+    db_ns: String,
+    #[serde(alias = "database")]
+    db: String,
+    #[serde(default, alias = "username")]
+    db_user: Option<String>,
+    #[serde(default, alias = "password")]
+    db_pass: Option<String>,
+    #[serde(default, alias = "timeout")]
+    db_timeout: Option<f64>,
+    #[serde(default, alias = "max_connections")]
+    db_max_connections: Option<u32>,
+    #[serde(default, alias = "retry_max_attempts")]
+    db_retry_max_attempts: Option<u32>,
+    #[serde(default, alias = "retry_min_wait")]
+    db_retry_min_wait: Option<f64>,
+    #[serde(default, alias = "retry_max_wait")]
+    db_retry_max_wait: Option<f64>,
+    #[serde(default, alias = "retry_multiplier")]
+    db_retry_multiplier: Option<f64>,
+    #[serde(default)]
+    enable_live_queries: Option<bool>,
+}
+
+impl FileConnection {
+    /// Build and validate the [`ConnectionConfig`], defaulting what the
+    /// file left out.
+    fn build(self) -> Result<ConnectionConfig> {
+        let mut builder = ConnectionConfig::builder()
+            .url(self.db_url)
+            .namespace(self.db_ns)
+            .database(self.db);
+        if let Some(v) = self.db_user {
+            builder = builder.username(v);
+        }
+        if let Some(v) = self.db_pass {
+            builder = builder.password(v);
+        }
+        if let Some(v) = self.db_timeout {
+            builder = builder.timeout(v);
+        }
+        if let Some(v) = self.db_max_connections {
+            builder = builder.max_connections(v);
+        }
+        if let Some(v) = self.db_retry_max_attempts {
+            builder = builder.retry_max_attempts(v);
+        }
+        if let Some(v) = self.db_retry_min_wait {
+            builder = builder.retry_min_wait(v);
+        }
+        if let Some(v) = self.db_retry_max_wait {
+            builder = builder.retry_max_wait(v);
+        }
+        if let Some(v) = self.db_retry_multiplier {
+            builder = builder.retry_multiplier(v);
+        }
+        if let Some(v) = self.enable_live_queries {
+            builder = builder.enable_live_queries(v);
+        }
+        builder.build()
+    }
 }
 
 static GLOBAL: OnceLock<EnvironmentRegistry> = OnceLock::new();
@@ -598,5 +751,110 @@ mod tests {
         assert!(!env.allow_destructive);
         assert!(env.has_tag("prod"));
         assert!(env.has_tag("critical"));
+    }
+
+    async fn load(body: &str) -> Result<EnvironmentRegistry> {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("envs.json");
+        std::fs::write(&path, body).unwrap();
+        EnvironmentRegistry::from_config_file(&path).await
+    }
+
+    #[tokio::test]
+    async fn from_config_file_accepts_the_documented_minimal_entry() {
+        let registry = load(
+            r#"{"environments": [{"name": "production",
+                "connection": {"db_url": "ws://db:8000", "db_ns": "prod", "db": "main"},
+                "require_approval": true, "allow_destructive": false}]}"#,
+        )
+        .await
+        .unwrap();
+        let env = registry.get("production").await.unwrap();
+        assert_eq!(env.connection.url(), "ws://db:8000");
+        assert_eq!(env.connection.namespace(), "prod");
+        assert!((env.connection.timeout() - ConnectionConfig::default().timeout()).abs() < 1e-9);
+        assert!(env.require_approval);
+
+        let short = load(
+            r#"{"environments": [{"name": "stage",
+                "connection": {"url": "ws://db:8000", "namespace": "s", "database": "main",
+                               "username": "root", "password": "pw"}}]}"#,
+        )
+        .await
+        .unwrap();
+        let env = short.get("stage").await.unwrap();
+        assert_eq!(env.connection.password(), Some("pw"));
+    }
+
+    #[tokio::test]
+    async fn from_config_file_rejects_what_it_cannot_honour() {
+        // A misspelt guard must not silently leave an environment open.
+        let typo = load(
+            r#"{"environments": [{"name": "p", "require_aproval": true,
+                "connection": {"db_url": "ws://db:8000", "db_ns": "n", "db": "d"}}]}"#,
+        )
+        .await;
+        assert!(
+            matches!(typo, Err(SurqlError::Serialization { .. })),
+            "{typo:?}"
+        );
+
+        let invalid_url = load(
+            r#"{"environments": [{"name": "p",
+                "connection": {"db_url": "ftp://db", "db_ns": "n", "db": "d"}}]}"#,
+        )
+        .await;
+        assert!(
+            matches!(invalid_url, Err(SurqlError::Validation { .. })),
+            "{invalid_url:?}"
+        );
+
+        let twice = load(
+            r#"{"environments": [
+                {"name": "p", "connection": {"db_url": "ws://a:1", "db_ns": "n", "db": "d"}},
+                {"name": "p", "connection": {"db_url": "ws://b:1", "db_ns": "n", "db": "d"}}]}"#,
+        )
+        .await;
+        assert!(
+            matches!(twice, Err(SurqlError::Validation { .. })),
+            "{twice:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_output_never_contains_the_password() {
+        let cfg = ConnectionConfig::builder()
+            .url("ws://localhost:8000")
+            .namespace("prod")
+            .database("main")
+            .username("root")
+            .password("hunter2-secret")
+            .build()
+            .unwrap();
+        let env = EnvironmentConfig::builder("prod", cfg.clone())
+            .build()
+            .unwrap();
+        let registry = EnvironmentRegistry::new();
+        registry.register(env.clone()).await;
+        for rendered in [
+            format!("{env:?}"),
+            format!("{:?}", EnvironmentConfig::builder("prod", cfg)),
+            format!("{registry:?}"),
+        ] {
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+            assert!(rendered.contains("prod"), "{rendered}");
+        }
+        assert!(format!("{env:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn redact_url_hides_userinfo_only() {
+        assert_eq!(
+            redact_url("wss://root:pw@db.example.com:8000/rpc"),
+            "wss://<redacted>@db.example.com:8000/rpc"
+        );
+        assert_eq!(redact_url("ws://db:8000/rpc"), "ws://db:8000/rpc");
+        assert_eq!(redact_url("ws://db:8000/a@b"), "ws://db:8000/a@b");
+        assert_eq!(redact_url("mem://"), "mem://");
     }
 }

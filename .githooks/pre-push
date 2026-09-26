@@ -2,6 +2,13 @@
 # pre-push: run the same checks as .github/workflows/ci.yml before the push
 # reaches GitHub Actions. CI minutes cost money — fail locally first.
 #
+# Wire it up once per clone: `git config core.hooksPath .githooks`.
+#
+# Every CI job has a step here. The ones that need an extra toolchain
+# (cargo-audit, Rust 1.95, a wasm-capable clang, mkdocs) run when it is
+# installed and print a SKIPPED line naming what to install when it is not,
+# so a skipped gate is visible rather than silent.
+#
 # Opt in to the integration suite by exporting SURQL_PRE_PUSH_INTEGRATION=1
 # and booting the v3.0.5 container:
 #
@@ -12,14 +19,13 @@
 
 set -euo pipefail
 
+skipped=()
+
 echo "[pre-push] cargo fmt --all --check"
 cargo fmt --all --check
 
 echo "[pre-push] cargo clippy --all-targets --all-features -- -D warnings"
 cargo clippy --all-targets --all-features -- -D warnings
-
-echo "[pre-push] cargo check --all-targets --all-features"
-cargo check --all-targets --all-features
 
 echo "[pre-push] cargo test --lib --all-features"
 cargo test --lib --all-features
@@ -27,11 +33,66 @@ cargo test --lib --all-features
 echo "[pre-push] cargo test --doc --all-features"
 cargo test --doc --all-features
 
-if [[ "${SURQL_PRE_PUSH_INTEGRATION:-0}" == "1" ]]; then
-  echo "[pre-push] cargo test --test '*' --all-features (SURQL_PRE_PUSH_INTEGRATION=1)"
-  cargo test --test '*' --all-features -- --test-threads=1
-else
-  echo "[pre-push] skipping integration tests (set SURQL_PRE_PUSH_INTEGRATION=1 to run)"
+echo "[pre-push] cargo check --no-default-features --features client-rustls --all-targets"
+cargo check --no-default-features --features client-rustls --all-targets
+if cargo tree --no-default-features --features client-rustls --prefix none \
+    | grep -E '^(openssl|openssl-sys|native-tls) '; then
+  echo "[pre-push] client-rustls pulled an OpenSSL / native-tls crate" >&2
+  exit 1
 fi
 
-echo "[pre-push] all checks passed"
+echo "[pre-push] cargo check --lib --no-default-features"
+RUSTFLAGS="-D warnings" cargo check --lib --no-default-features
+
+if command -v cargo-audit >/dev/null 2>&1; then
+  echo "[pre-push] cargo audit"
+  cargo audit
+else
+  skipped+=("cargo audit (cargo install --locked cargo-audit)")
+fi
+
+if rustup run 1.95 rustc --version >/dev/null 2>&1; then
+  echo "[pre-push] cargo +1.95 check (MSRV)"
+  cargo +1.95 check --lib --bins --all-features
+  cargo +1.95 check --lib --no-default-features --features client-rustls
+else
+  skipped+=("MSRV check (rustup toolchain install 1.95 --profile minimal)")
+fi
+
+# Mirrors the compiler discovery in scripts/check-wasm.sh.
+have_wasm_clang() {
+  [[ -n "${CC_wasm32_unknown_unknown:-}" ]] && return 0
+  clang --print-targets 2>/dev/null | grep -q wasm32 && return 0
+  local candidate
+  for candidate in /opt/homebrew/opt/llvm/bin/clang /usr/local/opt/llvm/bin/clang; do
+    [[ -x "$candidate" ]] && return 0
+  done
+  return 1
+}
+
+if have_wasm_clang; then
+  echo "[pre-push] scripts/check-wasm.sh"
+  ./scripts/check-wasm.sh
+else
+  skipped+=("client-wasm build (a wasm-capable clang; see scripts/check-wasm.sh)")
+fi
+
+if command -v mkdocs >/dev/null 2>&1; then
+  echo "[pre-push] mkdocs build --strict"
+  mkdocs build --strict --site-dir "$(mktemp -d)"
+else
+  skipped+=("docs build (pip install mkdocs-material mkdocs-minify-plugin)")
+fi
+
+if [[ "${SURQL_PRE_PUSH_INTEGRATION:-0}" == "1" ]]; then
+  echo "[pre-push] cargo test --tests --all-features (SURQL_PRE_PUSH_INTEGRATION=1)"
+  cargo test --all-features --tests -- --test-threads=1
+else
+  skipped+=("integration tests (set SURQL_PRE_PUSH_INTEGRATION=1 with a v3.0.5 container)")
+fi
+
+# `${arr[@]+...}` keeps an empty array legal under `set -u` on bash 3.2.
+for gate in ${skipped[@]+"${skipped[@]}"}; do
+  echo "[pre-push] SKIPPED: $gate"
+done
+echo "[pre-push] all checks that ran passed"

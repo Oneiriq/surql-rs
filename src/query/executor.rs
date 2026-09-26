@@ -36,8 +36,7 @@ use serde_json::Value;
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
 use crate::query::builder::Query;
-use crate::query::results::{extract_result, records, ListResult};
-// `extract_result` is used by `flatten_rows` as a legacy fallback.
+use crate::query::results::{records, response_rows, ListResult};
 
 /// Execute a rendered [`Query`] against the database.
 ///
@@ -72,8 +71,7 @@ pub async fn fetch_one<T: DeserializeOwned>(
     query: &Query,
 ) -> Result<Option<T>> {
     let raw = execute_query(client, query).await?;
-    let mut rows = flatten_rows(&raw);
-    let Some(first) = rows.drain(..).next() else {
+    let Some(first) = flatten_rows(&raw).into_iter().next() else {
         return Ok(None);
     };
     match first {
@@ -145,47 +143,16 @@ fn deserialize_row<T: DeserializeOwned>(row: serde_json::Map<String, Value>) -> 
 /// [`DatabaseClient::query`] yields a `Value::Array` with one entry per
 /// SurrealQL statement. Each entry is itself either:
 ///
-/// - an array of records (most `SELECT` / `CREATE` / `UPDATE` responses), or
+/// - an array of records (most `SELECT` / `CREATE` / `UPDATE` responses),
+///   spread by exactly one level, or
 /// - a single object (e.g. `RETURN {...}` / aggregate statements), or
 /// - a `null` / scalar (e.g. `RETURN 42`).
 ///
 /// The legacy nested shape (`[{"result": [...]}, ...]`) returned by the
-/// Python SDK is also accepted so this helper doubles as a compat layer.
+/// Python SDK is also accepted at the statement level; see
+/// `results::response_rows` for the exact rules.
 pub(crate) fn flatten_rows(raw: &Value) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    match raw {
-        Value::Array(items) => {
-            for item in items {
-                append_flattened(&mut out, item);
-            }
-        }
-        other => append_flattened(&mut out, other),
-    }
-    if out.is_empty() {
-        // Fall back to the legacy extractor so callers seeing the older
-        // `[{"result": [...]}]` wrapping still get something.
-        return extract_result(raw).into_iter().map(Value::Object).collect();
-    }
-    out
-}
-
-fn append_flattened(out: &mut Vec<Value>, value: &Value) {
-    match value {
-        Value::Null => {}
-        Value::Array(inner) => {
-            for v in inner {
-                append_flattened(out, v);
-            }
-        }
-        Value::Object(obj) => {
-            if let Some(inner) = obj.get("result") {
-                append_flattened(out, inner);
-            } else {
-                out.push(Value::Object(obj.clone()));
-            }
-        }
-        other => out.push(other.clone()),
-    }
+    response_rows(raw)
 }
 
 #[cfg(test)]
@@ -242,6 +209,37 @@ mod tests {
         let raw = json!([]);
         let rows: Vec<Row> = extract_rows(&raw).unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn rows_with_a_result_field_are_kept_whole() {
+        let raw = json!([[
+            {"id": "job:1", "result": "ok"},
+            {"id": "job:2", "result": null}
+        ]]);
+        assert_eq!(
+            flatten_rows(&raw),
+            vec![
+                json!({"id": "job:1", "result": "ok"}),
+                json!({"id": "job:2", "result": null})
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_array_rows_are_not_flattened() {
+        // `SELECT VALUE tags FROM post` returns one array per row.
+        let raw = json!([[["a", "b"], ["c"]]]);
+        assert_eq!(flatten_rows(&raw), vec![json!(["a", "b"]), json!(["c"])]);
+    }
+
+    #[test]
+    fn statement_results_concatenate() {
+        let raw = json!([[{"n": 1}], null, [{"n": 2}], 7]);
+        assert_eq!(
+            flatten_rows(&raw),
+            vec![json!({"n": 1}), json!({"n": 2}), json!(7)]
+        );
     }
 
     #[test]

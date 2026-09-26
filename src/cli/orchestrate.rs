@@ -12,8 +12,8 @@ use crate::cli::GlobalOpts;
 use crate::error::{Result, SurqlError};
 use crate::migration::discover_migrations;
 use crate::orchestration::{
-    configure_environments, get_registry, DeploymentPlan, DeploymentStatus, HealthCheck,
-    MigrationCoordinator, StrategyKind,
+    configure_environments, deploy_to_environments, get_registry, DeploymentPlan, DeploymentResult,
+    DeploymentStatus, HealthCheck, StrategyKind,
 };
 
 /// Deployment strategy flag mirroring [`StrategyKind`].
@@ -40,24 +40,42 @@ impl From<StrategyArg> for StrategyKind {
     }
 }
 
+/// Flags of `surql orchestrate deploy`.
+// Each bool is an independent command-line switch.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeployArgs {
+    /// Path to the environments JSON file.
+    #[arg(long, value_name = "PATH", default_value = "environments.json")]
+    pub plan: PathBuf,
+    /// Deployment strategy.
+    #[arg(long, value_enum, default_value_t = StrategyArg::Sequential)]
+    pub strategy: StrategyArg,
+    /// Comma-separated environment names (defaults to every registered env).
+    #[arg(long, value_name = "LIST")]
+    pub environments: Option<String>,
+    /// Dry-run: plan but do not apply.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Approve changes to environments marked `require_approval`; without
+    /// it the deploy is refused before anything runs.
+    #[arg(long)]
+    pub approve: bool,
+    /// Skip the confirmation prompt (required when stdin is not a
+    /// terminal).
+    #[arg(long = "yes", short = 'y')]
+    pub yes: bool,
+    /// Leave successful environments deployed when another one fails
+    /// (by default what this run applied is rolled back everywhere).
+    #[arg(long)]
+    pub no_auto_rollback: bool,
+}
+
 /// `surql orchestrate <subcommand>` commands.
 #[derive(Debug, Subcommand)]
 pub enum OrchestrateCommand {
     /// Deploy migrations across the environments declared by `--plan`.
-    Deploy {
-        /// Path to the environments JSON file.
-        #[arg(long, value_name = "PATH", default_value = "environments.json")]
-        plan: PathBuf,
-        /// Deployment strategy.
-        #[arg(long, value_enum, default_value_t = StrategyArg::Sequential)]
-        strategy: StrategyArg,
-        /// Comma-separated environment names (defaults to every registered env).
-        #[arg(long, value_name = "LIST")]
-        environments: Option<String>,
-        /// Dry-run: plan but do not apply.
-        #[arg(long)]
-        dry_run: bool,
-    },
+    Deploy(DeployArgs),
     /// Show the health of each registered environment.
     Status {
         /// Path to the environments JSON file.
@@ -80,12 +98,7 @@ pub enum OrchestrateCommand {
 pub async fn run(cmd: OrchestrateCommand, global: &GlobalOpts) -> Result<()> {
     let settings = global.settings()?;
     match cmd {
-        OrchestrateCommand::Deploy {
-            plan,
-            strategy,
-            environments,
-            dry_run,
-        } => deploy(&settings, &plan, strategy, environments.as_deref(), dry_run).await,
+        OrchestrateCommand::Deploy(args) => deploy(&settings, &args).await,
         OrchestrateCommand::Status { plan } => status(&plan).await,
         OrchestrateCommand::Validate { plan } => validate(&plan).await,
     }
@@ -101,14 +114,17 @@ async fn load_plan(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn deploy(
-    settings: &crate::settings::Settings,
-    plan_path: &Path,
-    strategy: StrategyArg,
-    environments: Option<&str>,
-    dry_run: bool,
-) -> Result<()> {
-    load_plan(plan_path).await?;
+async fn deploy(settings: &crate::settings::Settings, args: &DeployArgs) -> Result<()> {
+    let DeployArgs {
+        plan: plan_path,
+        strategy,
+        environments,
+        dry_run,
+        approve,
+        yes,
+        no_auto_rollback,
+    } = args.clone();
+    load_plan(&plan_path).await?;
     let registry = get_registry();
 
     let migrations = discover_migrations(&settings.migration_path)?;
@@ -119,48 +135,63 @@ async fn deploy(
         ));
     }
 
-    let env_names: Vec<String> = match environments {
-        Some(raw) => raw.split(',').map(|s| s.trim().to_string()).collect(),
+    let env_names: Vec<String> = match environments.as_deref() {
+        Some(raw) => parse_environment_list(raw),
         None => registry.list().await,
     };
 
-    let plan = DeploymentPlan::builder(registry.clone())
+    if !dry_run {
+        fmt::confirm(
+            &format!(
+                "deploy up to {} migration(s) to {} (auto-rollback {})",
+                migrations.len(),
+                env_names.join(", "),
+                if no_auto_rollback { "off" } else { "on" }
+            ),
+            yes,
+        )?;
+    }
+
+    let plan = DeploymentPlan::builder(registry)
         .environments(env_names.clone())
         .migrations(migrations.clone())
         .strategy(strategy.into())
         .dry_run(dry_run)
+        .approved(approve)
+        .auto_rollback(!no_auto_rollback)
         .build();
 
-    let coordinator =
-        MigrationCoordinator::with_strategy_label(registry, strategy.into(), 1, 10.0, 5)?;
-
     fmt::info(format!(
-        "deploying {} migration(s) to {} environment(s) (strategy: {:?}, dry_run: {})",
+        "deploying {} migration(s) to {} environment(s); each receives the ones it has not applied (strategy: {:?}, dry_run: {})",
         migrations.len(),
         env_names.len(),
         strategy,
         dry_run
     ));
 
-    let results = coordinator.deploy(&plan).await?;
+    let results = deploy_to_environments(&plan).await?;
 
+    let mut rows: Vec<&DeploymentResult> = results.values().collect();
+    rows.sort_by(|a, b| a.environment.cmp(&b.environment));
     let mut table = fmt::make_table();
     table.set_header(vec![
         "environment",
         "status",
-        "migrations",
+        "applied",
+        "rolled_back",
         "duration_ms",
         "error",
     ]);
-    let mut failures = 0;
-    for (env, result) in &results {
-        if result.status == DeploymentStatus::Failed {
-            failures += 1;
-        }
+    for result in &rows {
         table.add_row(vec![
-            env.clone(),
-            format!("{:?}", result.status),
-            format!("{}", result.migrations_applied),
+            result.environment.clone(),
+            result.status.to_string(),
+            if dry_run {
+                format!("up to {}", result.migrations_applied)
+            } else {
+                result.applied_versions.join(", ")
+            },
+            result.rolled_back_versions.join(", "),
             result
                 .execution_time_ms
                 .map_or_else(|| "-".to_string(), |d| format!("{d}")),
@@ -169,13 +200,31 @@ async fn deploy(
     }
     println!("{table}");
 
-    if failures > 0 {
+    let unsuccessful = rows
+        .iter()
+        .filter(|r| r.status != DeploymentStatus::Success)
+        .count();
+    if unsuccessful > 0 {
         return Err(SurqlError::Orchestration {
-            reason: format!("{failures} environment(s) failed"),
+            reason: format!(
+                "{unsuccessful} of {} environment(s) did not end deployed",
+                rows.len()
+            ),
         });
     }
-    fmt::success(format!("deployed to {} environment(s)", results.len()));
+    fmt::success(format!("deployed to {} environment(s)", rows.len()));
     Ok(())
+}
+
+/// Split a `--environments a,b` list, dropping blanks and repeats so no
+/// environment is deployed twice.
+fn parse_environment_list(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && seen.insert(*name))
+        .map(str::to_string)
+        .collect()
 }
 
 async fn status(plan_path: &Path) -> Result<()> {
@@ -231,9 +280,15 @@ async fn validate(plan_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// Ensure a compile-time reference to `HashMap` is not required even when
-// no orchestration results are materialised through the CLI.
-#[allow(dead_code)]
-fn _touch() -> Vec<DeploymentStatus> {
-    vec![DeploymentStatus::Success, DeploymentStatus::Failed]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_list_drops_blanks_and_repeats() {
+        assert_eq!(
+            parse_environment_list("prod, prod,,stage ,prod"),
+            vec!["prod".to_string(), "stage".to_string()]
+        );
+    }
 }

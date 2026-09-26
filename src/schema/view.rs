@@ -137,7 +137,7 @@ impl ViewDefinition {
             self.tables.join(", "),
         );
         if let Some(condition) = &self.condition {
-            write!(sql, " WHERE {condition}").expect("writing to String cannot fail");
+            let _ = write!(sql, " WHERE {condition}");
         }
         if let Some(group) = &self.group {
             sql.push_str(&group.to_clause());

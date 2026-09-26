@@ -15,6 +15,9 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::quote_ident;
+
+use super::fields::render_field_path;
 
 pub use super::index_vector::{
     diskann_index, hnsw_index, mtree_index, DiskAnnDistanceType, HnswDistanceType,
@@ -120,6 +123,9 @@ pub struct IndexDefinition {
     /// Whether a `SEARCH` index emits the `BM25` relevance-scoring clause —
     /// required for [`Query::search_score`](crate::query::builder::Query::search_score)
     /// to return a value. Uses the engine's default `(k1, b)` parameters.
+    ///
+    /// SurrealDB 3.x scores every `FULLTEXT` index with BM25 and always
+    /// echoes `BM25(k1,b)`, so a parsed full-text index always has this set.
     #[serde(default)]
     pub bm25: bool,
     /// Whether a `SEARCH` index stores positional `HIGHLIGHTS` data (enables
@@ -253,6 +259,15 @@ impl IndexDefinition {
                 reason: format!("Index {:?} must have at least one column", self.name),
             });
         }
+        if self.index_type == IndexType::Search && self.columns.len() != 1 {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "FULLTEXT index {:?} takes exactly one column; the engine refuses {}",
+                    self.name,
+                    self.columns.len()
+                ),
+            });
+        }
         if matches!(
             self.index_type,
             IndexType::Mtree | IndexType::Hnsw | IndexType::Diskann
@@ -345,70 +360,60 @@ impl IndexDefinition {
         self.render_guard(table, " OVERWRITE")
     }
 
+    /// `DEFINE INDEX <name> ON TABLE <table> COLUMNS <columns>`, the part
+    /// every index kind shares, with the names quoted where needed.
+    fn render_head(&self, table: &str, ine: &str, columns: &[String]) -> String {
+        let columns: Vec<String> = columns.iter().map(|c| render_field_path(c)).collect();
+        format!(
+            "DEFINE INDEX{ine} {name} ON TABLE {table} COLUMNS {columns}",
+            name = quote_ident(&self.name),
+            table = quote_ident(table),
+            columns = columns.join(", "),
+        )
+    }
+
     fn render_guard(&self, table: &str, ine: &str) -> String {
+        let first_column = self.columns.first().cloned().unwrap_or_default();
+        let single = std::slice::from_ref(&first_column);
         match self.index_type {
             IndexType::Mtree => {
-                let field = self.columns.first().map_or("", String::as_str);
-                let dim = self.dimension.unwrap_or(0);
-                let mut sql = format!(
-                    "DEFINE INDEX{ine} {name} ON TABLE {table} COLUMNS {field} MTREE DIMENSION {dim}",
-                    ine = ine,
-                    name = self.name,
-                    table = table,
-                    field = field,
-                    dim = dim,
-                );
+                let mut sql = self.render_head(table, ine, single);
+                let _ = write!(sql, " MTREE DIMENSION {}", self.dimension.unwrap_or(0));
                 if let Some(d) = self.distance {
-                    write!(sql, " DIST {}", d.as_str()).expect("writing to String cannot fail");
+                    let _ = write!(sql, " DIST {}", d.as_str());
                 }
                 if let Some(vt) = self.vector_type {
-                    write!(sql, " TYPE {}", vt.as_str()).expect("writing to String cannot fail");
+                    let _ = write!(sql, " TYPE {}", vt.as_str());
                 }
                 self.push_tail(&mut sql);
                 sql
             }
             IndexType::Hnsw => {
-                let field = self.columns.first().map_or("", String::as_str);
-                let dim = self.dimension.unwrap_or(0);
-                let mut sql = format!(
-                    "DEFINE INDEX{ine} {name} ON TABLE {table} COLUMNS {field} HNSW DIMENSION {dim}",
-                    ine = ine,
-                    name = self.name,
-                    table = table,
-                    field = field,
-                    dim = dim,
-                );
+                let mut sql = self.render_head(table, ine, single);
+                let _ = write!(sql, " HNSW DIMENSION {}", self.dimension.unwrap_or(0));
                 if let Some(d) = self.hnsw_distance {
-                    write!(sql, " DIST {}", d.as_str()).expect("writing to String cannot fail");
+                    let _ = write!(sql, " DIST {}", d.as_str());
                 }
                 if let Some(vt) = self.vector_type {
-                    write!(sql, " TYPE {}", vt.as_str()).expect("writing to String cannot fail");
+                    let _ = write!(sql, " TYPE {}", vt.as_str());
                 }
                 if let Some(efc) = self.efc {
-                    write!(sql, " EFC {efc}").expect("writing to String cannot fail");
+                    let _ = write!(sql, " EFC {efc}");
                 }
                 if let Some(m) = self.m {
-                    write!(sql, " M {m}").expect("writing to String cannot fail");
+                    let _ = write!(sql, " M {m}");
                 }
                 self.push_tail(&mut sql);
                 sql
             }
-            IndexType::Diskann => self.render_diskann(table, ine),
+            IndexType::Diskann => self.render_diskann(table, ine, single),
             _ => {
-                let columns = self.columns.join(", ");
-                let mut sql = format!(
-                    "DEFINE INDEX{ine} {name} ON TABLE {table} COLUMNS {columns}",
-                    ine = ine,
-                    name = self.name,
-                    table = table,
-                    columns = columns,
-                );
+                let mut sql = self.render_head(table, ine, &self.columns);
                 match self.index_type {
                     IndexType::Unique => sql.push_str(" UNIQUE"),
                     IndexType::Search => {
                         let analyzer = self.analyzer.as_deref().unwrap_or("ascii");
-                        write!(sql, " FULLTEXT ANALYZER {analyzer}")
-                            .expect("writing to String cannot fail");
+                        let _ = write!(sql, " FULLTEXT ANALYZER {}", quote_ident(analyzer));
                         if self.bm25 {
                             sql.push_str(" BM25");
                         }
@@ -425,13 +430,12 @@ impl IndexDefinition {
     }
 
     /// Render the `DISKANN` form. The engine always echoes DIST / TYPE /
-    /// DEGREE / L_BUILD / ALPHA back with its defaults filled in, even when
+    /// DEGREE / `L_BUILD` / ALPHA back with its defaults filled in, even when
     /// the definition never stated them, so this spells them all — the same
     /// lesson as the sequence BATCH/START echo. A definition that omitted
     /// one would never compare equal to its own echo, and a reconcile would
     /// re-apply the index on every boot.
-    fn render_diskann(&self, table: &str, ine: &str) -> String {
-        let field = self.columns.first().map_or("", String::as_str);
+    fn render_diskann(&self, table: &str, ine: &str, column: &[String]) -> String {
         let dim = self.dimension.unwrap_or(0);
         let dist = self
             .diskann_distance
@@ -440,20 +444,13 @@ impl IndexDefinition {
         let degree = self.degree.unwrap_or(DISKANN_DEFAULT_DEGREE);
         let l_build = self.l_build.unwrap_or(DISKANN_DEFAULT_L_BUILD);
         let alpha = self.alpha.as_deref().unwrap_or(DISKANN_DEFAULT_ALPHA);
-        let mut sql = format!(
-            "DEFINE INDEX{ine} {name} ON TABLE {table} COLUMNS {field} DISKANN \
-             DIMENSION {dim} DIST {dist} TYPE {vt} DEGREE {degree} L_BUILD {l_build} \
-             ALPHA {alpha}",
-            ine = ine,
-            name = self.name,
-            table = table,
-            field = field,
-            dim = dim,
+        let mut sql = self.render_head(table, ine, column);
+        let _ = write!(
+            sql,
+            " DISKANN DIMENSION {dim} DIST {dist} TYPE {vt} DEGREE {degree} \
+             L_BUILD {l_build} ALPHA {alpha}",
             dist = dist.as_str(),
             vt = vt.as_str(),
-            degree = degree,
-            l_build = l_build,
-            alpha = alpha,
         );
         if self.hashed_vector {
             sql.push_str(" HASHED_VECTOR");
@@ -487,7 +484,11 @@ impl IndexDefinition {
 /// );
 /// ```
 pub fn info_for_index_surql(name: &str, table: &str) -> String {
-    format!("INFO FOR INDEX {name} ON {table};")
+    format!(
+        "INFO FOR INDEX {} ON {};",
+        quote_ident(name),
+        quote_ident(table)
+    )
 }
 
 /// Progress of a background index build, as reported by
@@ -585,10 +586,10 @@ where
 /// ```
 /// use surql::schema::bm25_index;
 ///
-/// let idx = bm25_index("content_bm25", ["content"], "text_en");
+/// let idx = bm25_index("body_bm25", ["body"], "text_en");
 /// assert_eq!(
 ///     idx.to_surql("memory"),
-///     "DEFINE INDEX content_bm25 ON TABLE memory COLUMNS content FULLTEXT ANALYZER text_en BM25;"
+///     "DEFINE INDEX body_bm25 ON TABLE memory COLUMNS body FULLTEXT ANALYZER text_en BM25;"
 /// );
 /// ```
 pub fn bm25_index<I, S>(

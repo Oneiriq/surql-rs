@@ -5,27 +5,8 @@
 //! echoes `BATCH` and `START`, so the parser and the renderer agree on the
 //! defaults rather than one of them omitting them.
 
-use std::sync::OnceLock;
-
-use regex::Regex;
-
-use super::regex_case_insensitive;
+use super::scan::{define_head, tokens};
 use crate::schema::sequence::{SequenceDefinition, DEFAULT_BATCH, DEFAULT_START};
-
-fn batch_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bBATCH\s+(\d+)"))
-}
-
-fn start_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bSTART\s+(-?\d+)"))
-}
-
-fn timeout_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| regex_case_insensitive(r"\bTIMEOUT\s+(\S+?)\s*(?:;|$)"))
-}
 
 /// Parse one `DEFINE SEQUENCE` statement.
 ///
@@ -35,25 +16,25 @@ pub fn parse_sequence(name: &str, definition: &str) -> Option<SequenceDefinition
     if definition.is_empty() {
         return None;
     }
-    let batch = batch_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
+    let rest = define_head(definition, "SEQUENCE", false).map_or(definition, |head| head.rest);
+    let toks = tokens(rest);
+    let value_of = |keyword: &str| {
+        toks.windows(2)
+            .find(|pair| pair.first().is_some_and(|t| t.is(keyword)))
+            .and_then(|pair| pair.get(1))
+            .map(|t| t.text.trim_end_matches(';'))
+    };
+    let batch = value_of("BATCH")
+        .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_BATCH);
-    let start = start_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
+    let start = value_of("START")
+        .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_START);
-    let timeout = timeout_regex()
-        .captures(definition)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string());
 
     let mut sequence = SequenceDefinition::new(name)
         .with_batch(batch)
         .with_start(start);
-    sequence.timeout = timeout;
+    sequence.timeout = value_of("TIMEOUT").map(str::to_string);
     Some(sequence)
 }
 

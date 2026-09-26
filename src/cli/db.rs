@@ -13,6 +13,7 @@ use crate::cli::GlobalOpts;
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
 use crate::migration::history::{ensure_migration_table, MIGRATION_TABLE_NAME};
+use crate::types::escape::quote_ident;
 
 /// `surql db <subcommand>` commands.
 #[derive(Debug, Subcommand)]
@@ -29,7 +30,8 @@ pub enum DbCommand {
     },
     /// Remove every table from the configured database.
     Reset {
-        /// Skip the interactive confirmation prompt.
+        /// Skip the confirmation prompt (required when stdin is not a
+        /// terminal).
         #[arg(long = "yes", short = 'y')]
         yes: bool,
     },
@@ -141,15 +143,14 @@ fn info(settings: &crate::settings::Settings, as_json: bool) -> Result<()> {
 }
 
 async fn reset(settings: &crate::settings::Settings, yes: bool) -> Result<()> {
-    fmt::warn(format!(
-        "this will DROP all tables in {}/{}",
-        settings.database().namespace(),
-        settings.database().database()
-    ));
-    if !yes {
-        fmt::warn("re-run with --yes to confirm");
-        return Ok(());
-    }
+    fmt::confirm(
+        &format!(
+            "remove every table in {}/{}",
+            settings.database().namespace(),
+            settings.database().database()
+        ),
+        yes,
+    )?;
     let client = connected_client(settings).await?;
     let info_value = client.query("INFO FOR DB;").await?;
     let mut tables: Vec<String> = Vec::new();
@@ -167,11 +168,21 @@ async fn reset(settings: &crate::settings::Settings, yes: bool) -> Result<()> {
         return Ok(());
     }
     fmt::info(format!("removing {} table(s)", tables.len()));
-    for t in &tables {
-        client.query(&format!("REMOVE TABLE {t};")).await?;
+    for statement in remove_table_statements(&tables) {
+        client.query(&statement).await?;
     }
     fmt::success(format!("removed {} table(s)", tables.len()));
     Ok(())
+}
+
+/// One `REMOVE TABLE` per name. The names come from `INFO FOR DB` and can
+/// be any text a table was defined with (`foo-bar`, or one carrying a `;`
+/// and a second statement), so each is quoted as an identifier.
+fn remove_table_statements(tables: &[String]) -> Vec<String> {
+    tables
+        .iter()
+        .map(|t| format!("REMOVE TABLE {};", quote_ident(t)))
+        .collect()
 }
 
 async fn query(
@@ -205,4 +216,26 @@ async fn version(settings: &crate::settings::Settings) -> Result<()> {
     fmt::info(format!("connected to {}", settings.database().url()));
     fmt::print_json(&info)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_table_statements_quote_every_name() {
+        let names = vec![
+            "user".to_string(),
+            "foo-bar".to_string(),
+            "x; REMOVE NAMESPACE other".to_string(),
+        ];
+        assert_eq!(
+            remove_table_statements(&names),
+            vec![
+                "REMOVE TABLE user;".to_string(),
+                "REMOVE TABLE `foo-bar`;".to_string(),
+                "REMOVE TABLE `x; REMOVE NAMESPACE other`;".to_string(),
+            ]
+        );
+    }
 }

@@ -12,23 +12,41 @@ cargo install oneiriq-surql --features cli
 
 Every subcommand accepts:
 
-| Flag                 | Purpose                                                                 |
-|----------------------|-------------------------------------------------------------------------|
-| `--config <PATH>`    | Override automatic `Settings` discovery with a specific TOML file.      |
-| `-v`, `--verbose`    | Emit extra diagnostic output for subcommands that support it.           |
-| `--help`             | Standard clap help.                                                     |
-| `--version`          | Print the crate version (propagated to every subcommand).               |
+| Flag                 | Purpose                                                                          |
+|----------------------|----------------------------------------------------------------------------------|
+| `--config <PATH>`    | Read settings from this TOML file (or the `Cargo.toml` in this directory).       |
+| `-v`, `--verbose`    | Emit extra diagnostic output for subcommands that support it.                    |
+| `--help`             | Standard clap help.                                                              |
+| `--version`          | Print the crate version (propagated to every subcommand).                        |
 
 Without `--config`, the standard layered lookup runs: environment
-variables, `.env`, then `Cargo.toml [package.metadata.surql]`.
+variables, `.env`, then the `[package.metadata.surql]` table of the
+nearest `Cargo.toml` above the current directory.
+
+With `--config <PATH>`, the `[package.metadata.surql]` table is read from
+the named file (any name, such as `prod.toml`, or a directory holding a
+`Cargo.toml`) together with the `.env` beside it; `SURQL_*` environment
+variables still take precedence over the file. The file must exist,
+parse, and contain the table. Anything else (a missing file, invalid
+TOML, a file without the table) is an error rather than a silent fall
+back to the defaults.
 
 ## Exit codes
 
-| Code | Meaning                                         |
-|------|-------------------------------------------------|
-| `0`  | Success.                                        |
-| `1`  | Operation failure (`SurqlError` bubbled up).    |
-| `2`  | Usage error (enforced by clap's argument parser). |
+| Code | Meaning                                                                                  |
+|------|------------------------------------------------------------------------------------------|
+| `0`  | Success.                                                                                 |
+| `1`  | Operation failure (`SurqlError` bubbled up), including a migration that failed to apply or roll back, and a declined or impossible confirmation. |
+| `2`  | Usage error (enforced by clap's argument parser), including arguments that are not valid UTF-8. |
+
+## Confirmation prompts
+
+Commands that destroy data ask before they run: `db reset`, `bucket rm`,
+`bucket delete`, and `orchestrate deploy` (unless `--dry-run`). Answer
+`y` or `yes` to go ahead; anything else aborts with exit code `1`.
+`--yes` (`-y`) skips the prompt. When stdin is not a terminal (CI,
+pipes) there is nobody to answer, so these commands refuse to run
+unless `--yes` is given.
 
 ## Subcommand tree
 
@@ -66,9 +84,19 @@ surql
 |   |- visualize  [--theme modern|dark|forest|minimal]
 |   |             [-f mermaid|graphviz|ascii]
 |   |             [-o PATH]
+|- bucket
+|   |- define    <NAME> [--backend B] [--readonly] [--comment C] [--if-not-exists]
+|   |- list
+|   |- rm        <NAME> [--yes]
+|   |- put       <BUCKET> <KEY> (--text T | --file PATH) [--if-not-exists]
+|   |- get       <BUCKET> <KEY> [-o PATH]
+|   |- delete    <BUCKET> <KEY> [--yes]
+|   |- exists    <BUCKET> <KEY>
+|   |- files     <BUCKET>
 |- orchestrate
     |- deploy    [--plan PATH] [--strategy sequential|parallel|rolling|canary]
-    |            [--environments LIST] [--dry-run]
+    |            [--environments LIST] [--dry-run] [--approve] [--yes]
+    |            [--no-auto-rollback]
     |- status    [--plan PATH]
     |- validate  [--plan PATH]
 ```
@@ -83,7 +111,9 @@ from the resolved `Settings`.
 - `surql db info [--json]` - print resolved namespace / database /
   URL. `--json` emits a machine-readable payload.
 - `surql db reset [--yes]` - drop every table in the current database
-  (prompts for confirmation unless `--yes` is passed).
+  (prompts for confirmation unless `--yes` is passed). Table names are
+  quoted, so a name such as `foo-bar` or one containing `;` is removed
+  as a name and never run as SurrealQL.
 - `surql db query [<SURQL>] [--file PATH]` - execute an inline or
   file-loaded SurrealQL statement and pretty-print the result.
 - `surql db version` - print the server's `INFO FOR DB` version line.
@@ -97,6 +127,9 @@ group.
   migrations up to and including `--target` (defaults to the latest).
 - `surql migrate down [--target VERSION] [--dry-run]` - roll back to
   and including `--target`.
+
+Both stop at the first migration that fails, print the status table, and
+exit with code `1` naming the failed version.
 - `surql migrate status` - show applied vs pending counts for the
   configured migrations directory.
 - `surql migrate history` - dump the `_migration_history` rows.
@@ -143,6 +176,14 @@ hook helpers.
   mermaid|graphviz|ascii] [-o PATH]` - render the registry as a
   diagram. Defaults to Mermaid with the `modern` theme.
 
+## `surql bucket`
+
+Object-storage buckets and their files (SurrealDB v3 files). `define`,
+`list`, and `rm` manage bucket definitions; `put`, `get`, `delete`,
+`exists`, and `files` work on the files inside a bucket. `rm` (which
+drops the bucket and every file in it) and `delete` ask for
+confirmation unless `--yes` is passed.
+
 ## `surql orchestrate`
 
 Wraps `crate::orchestration`. Requires the `orchestration` feature
@@ -150,10 +191,18 @@ Wraps `crate::orchestration`. Requires the `orchestration` feature
 
 - `surql orchestrate deploy [--plan PATH] [--strategy
   sequential|parallel|rolling|canary] [--environments LIST]
-  [--dry-run]` - apply migrations across environments declared in the
-  plan file (default `environments.json`).
-  `--environments` accepts a comma-separated subset; omitted, every
-  registered environment is included.
+  [--dry-run] [--approve] [--yes] [--no-auto-rollback]` - apply
+  migrations across environments declared in the plan file (default
+  `environments.json`, format in [Orchestration](orchestration.md)).
+  Each environment receives only the migrations its history does not
+  record yet. `--environments` accepts a comma-separated subset (blanks
+  and repeats are dropped); omitted, every registered environment is
+  included. `--approve` is required when a target environment has
+  `require_approval`. After a failure, what this run applied is rolled
+  back everywhere unless `--no-auto-rollback` is given. The command asks
+  for confirmation (see above) and exits `1` unless every environment
+  ends deployed; the table shows the versions applied and rolled back
+  per environment.
 - `surql orchestrate status [--plan PATH]` - show a health table for
   each environment in the plan.
 - `surql orchestrate validate [--plan PATH]` - parse the plan and run

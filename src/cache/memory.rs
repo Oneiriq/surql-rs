@@ -1,13 +1,14 @@
 //! In-process LRU+TTL cache backend.
 //!
 //! Port of `surql/cache/backends.py::MemoryCache`. Uses a
-//! `HashMap<String, CacheEntry>` protected by a `tokio::sync::RwLock`
-//! rather than an LRU crate. Eviction on capacity overflow drops the
-//! oldest-inserted entry; TTL is enforced lazily on access. This keeps
-//! the dependency footprint minimal and matches the Python port's
-//! observable semantics closely enough for parity tests.
+//! `HashMap<String, Entry>` protected by a `tokio::sync::RwLock`
+//! rather than an LRU crate. When the cache is full, an insert first
+//! drops every expired entry and, only if that frees nothing, evicts the
+//! least-recently-used live one; TTL is otherwise enforced lazily on
+//! access. This keeps the dependency footprint minimal.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,11 +21,13 @@ use super::backend::{compile_glob, CacheBackend};
 use super::stats::CacheStats;
 
 /// Internal record for a single cache entry.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Entry {
     value: Value,
     expires_at: Option<Instant>,
-    inserted_at: Instant,
+    /// Tick of the last read or write; the smallest is the LRU entry.
+    /// Atomic so a read can refresh it under the shared lock.
+    last_used: AtomicU64,
 }
 
 impl Entry {
@@ -33,7 +36,7 @@ impl Entry {
     }
 }
 
-/// In-memory cache backend with size-based eviction and TTL expiry.
+/// In-memory cache backend with LRU eviction and TTL expiry.
 ///
 /// Not cloneable by design; wrap in [`std::sync::Arc`] if you need
 /// multiple owners.
@@ -42,17 +45,26 @@ pub struct MemoryCache {
     max_size: usize,
     default_ttl: Duration,
     inner: RwLock<HashMap<String, Entry>>,
+    /// Monotonic use counter behind [`Entry::last_used`].
+    clock: AtomicU64,
     stats: CacheStats,
 }
 
 impl MemoryCache {
     /// Create a memory cache with `max_size` entries and a default TTL.
     pub fn new(max_size: usize, default_ttl: Duration) -> Self {
+        Self::with_stats(max_size, default_ttl, CacheStats::new())
+    }
+
+    /// Like [`MemoryCache::new`], reporting size and evictions into an
+    /// existing statistics handle (a manager's, typically).
+    pub fn with_stats(max_size: usize, default_ttl: Duration, stats: CacheStats) -> Self {
         Self {
             max_size: max_size.max(1),
             default_ttl,
             inner: RwLock::new(HashMap::new()),
-            stats: CacheStats::new(),
+            clock: AtomicU64::new(0),
+            stats,
         }
     }
 
@@ -64,6 +76,10 @@ impl MemoryCache {
     /// Shared statistics handle.
     pub fn stats(&self) -> CacheStats {
         self.stats.clone()
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
     fn resolve_ttl(&self, ttl: Option<u64>) -> Option<Instant> {
@@ -78,6 +94,27 @@ impl MemoryCache {
             Instant::now().checked_add(dur)
         }
     }
+
+    fn report_size(&self, entries: &HashMap<String, Entry>) {
+        self.stats
+            .set_size(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+    }
+}
+
+/// Make room for one more entry: drop every expired entry first, and only
+/// when none was expired evict the least-recently-used live entry.
+/// Returns whether a live entry was evicted.
+fn make_room(entries: &mut HashMap<String, Entry>, now: Instant) -> bool {
+    let before = entries.len();
+    entries.retain(|_, e| !e.is_expired(now));
+    if entries.len() < before {
+        return false;
+    }
+    let lru = entries
+        .iter()
+        .min_by_key(|(_, e)| e.last_used.load(Ordering::Relaxed))
+        .map(|(k, _)| k.clone());
+    lru.is_some_and(|k| entries.remove(&k).is_some())
 }
 
 #[async_trait]
@@ -87,79 +124,65 @@ impl CacheBackend for MemoryCache {
         // Fast path: upgrade to write only when expiry cleanup is required.
         {
             let guard = self.inner.read().await;
-            if let Some(entry) = guard.get(key) {
-                if !entry.is_expired(now) {
+            match guard.get(key) {
+                None => return Ok(None),
+                Some(entry) if !entry.is_expired(now) => {
+                    entry.last_used.store(self.tick(), Ordering::Relaxed);
                     return Ok(Some(entry.value.clone()));
                 }
-            } else {
-                return Ok(None);
+                Some(_) => {}
             }
         }
         let mut guard = self.inner.write().await;
-        if let Some(entry) = guard.get(key) {
-            if entry.is_expired(now) {
-                guard.remove(key);
-                self.stats.set_size(guard.len() as u64);
-                return Ok(None);
-            }
-            return Ok(Some(entry.value.clone()));
+        if guard.get(key).is_some_and(|entry| entry.is_expired(now)) {
+            guard.remove(key);
+            self.report_size(&guard);
+            return Ok(None);
         }
-        Ok(None)
+        Ok(guard.get(key).map(|entry| {
+            entry.last_used.store(self.tick(), Ordering::Relaxed);
+            entry.value.clone()
+        }))
     }
 
     async fn set(&self, key: &str, value: Value, ttl_secs: Option<u64>) -> Result<()> {
         let expires_at = self.resolve_ttl(ttl_secs);
         let mut guard = self.inner.write().await;
-        let was_present = guard.contains_key(key);
-        if !was_present && guard.len() >= self.max_size {
-            // Evict the oldest-inserted entry.
-            if let Some((oldest_key, _)) = guard
-                .iter()
-                .min_by_key(|(_, e)| e.inserted_at)
-                .map(|(k, e)| (k.clone(), e.clone()))
-            {
-                guard.remove(&oldest_key);
-                self.stats.record_eviction();
-            }
+        if !guard.contains_key(key)
+            && guard.len() >= self.max_size
+            && make_room(&mut guard, Instant::now())
+        {
+            self.stats.record_eviction();
         }
         guard.insert(
             key.to_string(),
             Entry {
                 value,
                 expires_at,
-                inserted_at: Instant::now(),
+                last_used: AtomicU64::new(self.tick()),
             },
         );
-        self.stats.set_size(guard.len() as u64);
+        self.report_size(&guard);
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let mut guard = self.inner.write().await;
         guard.remove(key);
-        self.stats.set_size(guard.len() as u64);
+        self.report_size(&guard);
         Ok(())
     }
 
     async fn clear(&self, pattern: Option<&str>) -> Result<usize> {
+        let matcher = pattern.map(compile_glob).transpose()?;
         let mut guard = self.inner.write().await;
-        let count = match pattern {
-            None => {
-                let n = guard.len();
-                guard.clear();
-                n
-            }
-            Some(pat) => {
-                let re = compile_glob(pat);
-                let to_remove: Vec<String> =
-                    guard.keys().filter(|k| re.is_match(k)).cloned().collect();
-                for k in &to_remove {
-                    guard.remove(k);
-                }
-                to_remove.len()
-            }
-        };
-        self.stats.set_size(guard.len() as u64);
+        let before = guard.len();
+        match matcher {
+            None => guard.clear(),
+            Some(re) => guard.retain(|k, _| !re.is_match(k)),
+        }
+        let count = before.saturating_sub(guard.len());
+        self.report_size(&guard);
         Ok(count)
     }
 
@@ -176,7 +199,7 @@ mod tests {
     use serde_json::json;
 
     fn cache() -> MemoryCache {
-        MemoryCache::new(16, Duration::from_secs(60))
+        MemoryCache::new(16, Duration::from_mins(1))
     }
 
     #[tokio::test]
@@ -222,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_expiry_removes_entries() {
-        let c = MemoryCache::new(4, Duration::from_secs(60));
+        let c = MemoryCache::new(4, Duration::from_mins(1));
         c.set("k", json!(1), Some(1)).await.unwrap();
         assert_eq!(c.get("k").await.unwrap(), Some(json!(1)));
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -232,18 +255,43 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_on_capacity_overflow() {
-        let c = MemoryCache::new(2, Duration::from_secs(60));
+        let c = MemoryCache::new(2, Duration::from_mins(1));
         c.set("a", json!(1), None).await.unwrap();
-        // Ensure distinct insertion timestamps.
-        tokio::time::sleep(Duration::from_millis(10)).await;
         c.set("b", json!(2), None).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
         c.set("c", json!(3), None).await.unwrap();
         assert_eq!(c.size().await, 2);
-        // `a` is oldest; it must be the evicted one.
+        // `a` is least recently used; it must be the evicted one.
         assert_eq!(c.get("a").await.unwrap(), None);
         assert!(c.exists("b").await.unwrap());
         assert!(c.exists("c").await.unwrap());
         assert_eq!(c.stats().evictions(), 1);
+    }
+
+    /// Regression: eviction took the oldest INSERT, so a hot entry read on
+    /// every request was evicted ahead of a cold one.
+    #[tokio::test]
+    async fn eviction_spares_recently_read_entries() {
+        let c = MemoryCache::new(2, Duration::from_mins(1));
+        c.set("hot", json!(1), None).await.unwrap();
+        c.set("cold", json!(2), None).await.unwrap();
+        assert!(c.get("hot").await.unwrap().is_some());
+        c.set("new", json!(3), None).await.unwrap();
+        assert!(c.exists("hot").await.unwrap());
+        assert!(!c.exists("cold").await.unwrap());
+    }
+
+    /// Regression: a full cache evicted a live entry even when an expired
+    /// one was sitting there to be dropped instead.
+    #[tokio::test]
+    async fn expired_entries_make_room_before_live_ones() {
+        let c = MemoryCache::new(2, Duration::from_mins(1));
+        c.set("live", json!(1), None).await.unwrap();
+        c.set("brief", json!(2), Some(1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        c.set("new", json!(3), None).await.unwrap();
+        assert!(c.exists("live").await.unwrap());
+        assert!(c.exists("new").await.unwrap());
+        assert_eq!(c.stats().evictions(), 0);
+        assert_eq!(c.stats().size(), 2);
     }
 }

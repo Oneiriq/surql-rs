@@ -3,9 +3,12 @@
 //! Wraps the schema registry, parser, validator, visualiser, and hook
 //! helpers. Mirrors `surql-py`'s `surql.cli.schema` typer group.
 
+use std::collections::{BTreeMap, HashMap};
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
 use clap::{Subcommand, ValueEnum};
+use serde_json::Value;
 
 use crate::cli::fmt;
 use crate::cli::GlobalOpts;
@@ -15,10 +18,13 @@ use crate::migration::{
     check_schema_drift_from_snapshots, discover_migrations, generate_precommit_config,
     list_snapshots, registry_to_snapshot,
 };
+use crate::schema::parser::parse_table_full;
 use crate::schema::{
     generate_schema_sql, get_registered_buckets, get_registered_edges, get_registered_tables,
-    parse_db_info, visualize_from_registry, OutputFormat as VizFormat, ThemeOption,
+    parse_db_info, parse_edge_info, EdgeDefinition, OutputFormat as VizFormat, TableDefinition,
+    ThemeOption,
 };
+use crate::types::escape::quote_ident;
 
 /// Visualisation theme variants exposed on the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -190,7 +196,7 @@ async fn show(settings: &crate::settings::Settings, table: Option<&str>) -> Resu
     let client = connected_client(settings).await?;
     let stmt = table.map_or_else(
         || "INFO FOR DB;".to_string(),
-        |t| format!("INFO FOR TABLE {t};"),
+        |t| format!("INFO FOR TABLE {};", quote_ident(t)),
     );
     let result = client.query(&stmt).await?;
     fmt::print_json(&result)?;
@@ -210,23 +216,25 @@ fn diff(
     let from_snap = if let Some(p) = from {
         load_snapshot(p)?
     } else {
-        if snapshots.len() < 2 {
+        let Some(v) = snapshots
+            .len()
+            .checked_sub(2)
+            .and_then(|i| snapshots.get(i))
+        else {
             return Err(SurqlError::Validation {
                 reason: "need at least two snapshots (or --from) to diff".into(),
             });
-        }
-        let v = &snapshots[snapshots.len() - 2];
+        };
         crate::migration::hooks::versioned_to_snapshot(v)
     };
     let to_snap = if let Some(p) = to {
         load_snapshot(p)?
     } else {
-        if snapshots.is_empty() {
+        let Some(v) = snapshots.last() else {
             return Err(SurqlError::Validation {
                 reason: "no snapshots available; pass --to".into(),
             });
-        }
-        let v = &snapshots[snapshots.len() - 1];
+        };
         crate::migration::hooks::versioned_to_snapshot(v)
     };
     let report = check_schema_drift_from_snapshots(&from_snap, &to_snap);
@@ -244,7 +252,6 @@ fn load_snapshot(path: &Path) -> Result<crate::migration::SchemaSnapshot> {
 }
 
 fn generate(output: Option<&Path>) -> Result<()> {
-    use std::collections::BTreeMap;
     let tables = get_registered_tables();
     let edges = get_registered_edges();
     let buckets = get_registered_buckets();
@@ -293,18 +300,19 @@ async fn export(
         }))?,
         ExportFormat::Yaml => {
             // Minimal human-readable YAML-ish text.
-            let mut out = String::new();
-            out.push_str("tables:\n");
-            for name in parsed.tables.keys() {
-                use std::fmt::Write as _;
-                writeln!(&mut out, "  - {name}").ok();
-            }
-            out.push_str("accesses:\n");
-            for name in parsed.accesses.keys() {
-                use std::fmt::Write as _;
-                writeln!(&mut out, "  - {name}").ok();
-            }
-            out
+            let list = |names: Vec<&String>| -> String {
+                names.iter().fold(String::new(), |mut out, name| {
+                    out.push_str("  - ");
+                    out.push_str(name);
+                    out.push('\n');
+                    out
+                })
+            };
+            format!(
+                "tables:\n{}accesses:\n{}",
+                list(parsed.tables.keys().collect()),
+                list(parsed.accesses.keys().collect()),
+            )
         }
     };
     match output {
@@ -338,23 +346,90 @@ async fn tables(settings: &crate::settings::Settings) -> Result<()> {
 
 async fn inspect(settings: &crate::settings::Settings, table: &str) -> Result<()> {
     let client = connected_client(settings).await?;
-    let info = client.query(&format!("INFO FOR TABLE {table};")).await?;
+    let info = client
+        .query(&format!("INFO FOR TABLE {};", quote_ident(table)))
+        .await?;
     fmt::print_json(&info)?;
     Ok(())
 }
 
+/// Tables and edges read back from a live database, complete with the
+/// fields, indexes, and events each one's `INFO FOR TABLE` reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveSchema {
+    /// Plain (non-edge) tables keyed by name.
+    pub tables: HashMap<String, TableDefinition>,
+    /// Edges keyed by name.
+    pub edges: HashMap<String, EdgeDefinition>,
+}
+
+/// The `DEFINE TABLE` statement of every table in an `INFO FOR DB` response,
+/// keyed by table name. Accepts the bare object or the one-statement array
+/// [`DatabaseClient::query`] returns.
+fn table_statements(info: &Value) -> BTreeMap<String, String> {
+    let info = info
+        .as_array()
+        .and_then(|items| items.first())
+        .unwrap_or(info);
+    ["tables", "tb"]
+        .iter()
+        .find_map(|key| info.get(*key).and_then(Value::as_object))
+        .map(|tables| {
+            tables
+                .iter()
+                .filter_map(|(name, def)| Some((name.clone(), def.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read the live schema [`validate_schema`](crate::schema::validate_schema)
+/// compares the registry against.
+///
+/// `INFO FOR DB` lists the tables but carries none of their fields, indexes,
+/// or events, so every table is completed with its own `INFO FOR TABLE`. A
+/// table the database declares `TYPE RELATION`, or that `code_edges`
+/// registers as an edge, is parsed as an [`EdgeDefinition`] (tables and
+/// edges share one namespace, and a non-`RELATION` edge is an ordinary table
+/// to the engine); every other table as a [`TableDefinition`].
+///
+/// # Errors
+///
+/// Propagates query failures and [`SurqlError::SchemaParse`] for an `INFO`
+/// response that is not an object.
+pub async fn fetch_live_schema<S: BuildHasher>(
+    client: &DatabaseClient,
+    code_edges: &HashMap<String, EdgeDefinition, S>,
+) -> Result<LiveSchema> {
+    let info = client.query("INFO FOR DB;").await?;
+    let relations = parse_db_info(&info)?.edges;
+    let mut live = LiveSchema::default();
+    for (name, define) in table_statements(&info) {
+        let table_info = client
+            .query(&format!("INFO FOR TABLE {};", quote_ident(&name)))
+            .await?;
+        if relations.contains_key(&name) || code_edges.contains_key(&name) {
+            let edge = parse_edge_info(&name, &table_info, Some(&define))?;
+            live.edges.insert(name, edge);
+        } else {
+            let table = parse_table_full(&name, &define, &table_info)?;
+            live.tables.insert(name, table);
+        }
+    }
+    Ok(live)
+}
+
 async fn validate(settings: &crate::settings::Settings) -> Result<()> {
     let client = connected_client(settings).await?;
-    let info = client.query("INFO FOR DB;").await?;
-    let db = parse_db_info(&info)?;
-
     let code_tables = get_registered_tables();
     let code_edges = get_registered_edges();
-    // validate_schema wants `HashMap<String, TableDefinition>` for both
-    // tables and db_edges (parser emits edges as tables in its own map).
-    let db_tables: std::collections::HashMap<String, crate::schema::TableDefinition> =
-        db.tables.clone().into_iter().collect();
-    let results = crate::schema::validate_schema(&code_tables, &db_tables, Some(&code_edges), None);
+    let live = fetch_live_schema(&client, &code_edges).await?;
+    let results = crate::schema::validate_schema(
+        &code_tables,
+        &live.tables,
+        Some(&code_edges),
+        Some(&live.edges),
+    );
     let report = crate::schema::format_validation_report(&results, false);
     println!("{report}");
 
@@ -371,11 +446,10 @@ fn check(settings: &crate::settings::Settings) {
     let snapshots = list_snapshots(&snapshot_dir).unwrap_or_default();
     let registry = crate::schema::get_registry();
     let code_snapshot = registry_to_snapshot(registry);
-    if snapshots.is_empty() {
+    let Some(latest) = snapshots.last() else {
         fmt::info("no snapshots on disk; skipping drift check");
         return;
-    }
-    let latest = &snapshots[snapshots.len() - 1];
+    };
     let db_snapshot = crate::migration::hooks::versioned_to_snapshot(latest);
     let report = check_schema_drift_from_snapshots(&db_snapshot, &code_snapshot);
     println!("{}", report.to_summary());
@@ -385,20 +459,15 @@ fn check(settings: &crate::settings::Settings) {
     fmt::info(format!("{} migration(s) present on disk", migrations.len()));
 }
 
-#[allow(clippy::unnecessary_wraps)]
 fn watch() -> Result<()> {
-    #[cfg(feature = "watcher")]
-    {
-        fmt::info("schema watch: start the watcher programmatically via `SchemaWatcher::start`");
-        fmt::info("(CLI interactivity is intentionally minimal; hook into the lib API)");
-        Ok(())
-    }
-    #[cfg(not(feature = "watcher"))]
-    {
-        Err(SurqlError::Validation {
+    if !cfg!(feature = "watcher") {
+        return Err(SurqlError::Validation {
             reason: "schema watch requires the `watcher` feature".into(),
-        })
+        });
     }
+    fmt::info("schema watch: start the watcher programmatically via `SchemaWatcher::start`");
+    fmt::info("(CLI interactivity is intentionally minimal; hook into the lib API)");
+    Ok(())
 }
 
 fn visualize(theme: ThemeArg, format: VizFormatArg, output: Option<&Path>) -> Result<()> {
@@ -421,11 +490,4 @@ fn visualize_from_registry_with_theme(fmt_: VizFormat, theme: &ThemeOption<'_>) 
     let tables = reg.tables();
     let edges = reg.edges();
     crate::schema::visualize::visualize_schema(&tables, Some(&edges), fmt_, true, true, Some(theme))
-}
-
-// The `visualize_from_registry` helper is kept here as a hint that callers
-// may prefer the non-themed helper for simpler setups.
-#[allow(dead_code)]
-fn _untouched_helper() -> Result<String> {
-    visualize_from_registry(VizFormat::Mermaid, true, true)
 }

@@ -13,6 +13,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::quote_str;
+
+use super::validate::validate_identifier;
 
 /// Where a `SHOW CHANGES` read starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,11 +29,24 @@ pub enum ChangeSince {
 }
 
 impl ChangeSince {
-    /// Render as the `SINCE` operand.
+    /// Render as the `SINCE` operand. A timestamp is escaped inside the
+    /// datetime literal; [`show_changes_surql`] also requires it to be
+    /// RFC 3339.
     pub fn to_surql(&self) -> String {
         match self {
             Self::Versionstamp(v) => v.to_string(),
-            Self::Timestamp(ts) => format!("d'{ts}'"),
+            Self::Timestamp(ts) => format!("d{}", quote_str(ts)),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Versionstamp(_) => Ok(()),
+            Self::Timestamp(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|_| ())
+                .map_err(|e| SurqlError::Validation {
+                    reason: format!("SHOW CHANGES timestamp {ts:?} is not RFC 3339: {e}"),
+                }),
         }
     }
 }
@@ -43,8 +59,9 @@ impl From<u64> for ChangeSince {
 
 /// Render `SHOW CHANGES FOR TABLE <table> SINCE <since> [LIMIT <limit>]`.
 ///
-/// Returns [`SurqlError::Validation`] for an empty table name or a `limit` of
-/// zero, which the engine rejects.
+/// Returns [`SurqlError::Validation`] for a table name that is not an
+/// identifier, a timestamp that is not RFC 3339, or a `limit` of zero, which
+/// the engine rejects.
 ///
 /// ## Examples
 ///
@@ -71,6 +88,8 @@ pub fn show_changes_surql(table: &str, since: &ChangeSince, limit: Option<u32>) 
             reason: "SHOW CHANGES requires a table name".into(),
         });
     }
+    validate_identifier(table, "table name")?;
+    since.validate()?;
     if limit == Some(0) {
         return Err(SurqlError::Validation {
             reason: "SHOW CHANGES limit must be at least 1".into(),
@@ -111,8 +130,8 @@ impl ChangeSet {
         };
         // `query` wraps each statement's result, so a lone nested array is the
         // wrapper rather than the entries.
-        if items.len() == 1 && items[0].is_array() {
-            return Self::from_response(&items[0]);
+        if let [only @ serde_json::Value::Array(_)] = items.as_slice() {
+            return Self::from_response(only);
         }
         items
             .iter()
@@ -146,6 +165,26 @@ mod tests {
             ChangeSince::Timestamp("2026-01-01T00:00:00Z".into()).to_surql(),
             "d'2026-01-01T00:00:00Z'"
         );
+    }
+
+    #[test]
+    fn timestamp_cannot_close_the_literal() {
+        let since = ChangeSince::Timestamp("2026-01-01T00:00:00Z'; REMOVE TABLE audit; --".into());
+        assert_eq!(
+            since.to_surql(),
+            r"d'2026-01-01T00:00:00Z\'; REMOVE TABLE audit; --'"
+        );
+        assert!(show_changes_surql("audit", &since, None).is_err());
+    }
+
+    #[test]
+    fn table_must_be_an_identifier() {
+        assert!(show_changes_surql(
+            "audit SINCE 1; REMOVE TABLE audit; --",
+            &ChangeSince::Versionstamp(1),
+            None
+        )
+        .is_err());
     }
 
     #[test]

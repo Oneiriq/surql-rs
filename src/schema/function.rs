@@ -17,8 +17,41 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::{is_identifier, quote_ident, quote_str};
 
 use super::sequence::guard_keyword;
+
+/// How deep [`FunctionDefinition::normalized`] unwraps nested `option<…>`.
+/// Parsed definitions come from the server, so the nesting is bounded
+/// rather than trusted.
+const MAX_OPTION_DEPTH: usize = 16;
+
+/// Render a `$name` parameter: bare when identifier-shaped (a keyword is fine
+/// after `$`), backtick-quoted otherwise.
+pub(crate) fn render_param_name(name: &str) -> String {
+    let bare = name.trim_start_matches('$');
+    if is_identifier(bare) {
+        format!("${bare}")
+    } else {
+        format!("${}", quote_ident(bare))
+    }
+}
+
+/// Render a `fn::a::b` path with each segment quoted where needed.
+fn render_function_path(name: &str) -> String {
+    name.strip_prefix("fn::")
+        .unwrap_or(name)
+        .split("::")
+        .map(|segment| {
+            if is_identifier(segment) {
+                segment.to_string()
+            } else {
+                quote_ident(segment)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("::")
+}
 
 /// The engine's default permission posture for a function.
 pub const DEFAULT_PERMISSIONS: &str = "FULL";
@@ -44,7 +77,7 @@ impl FunctionArg {
 
     /// Render as `$name: type`.
     pub fn to_surql(&self) -> String {
-        format!("${}: {}", self.name, self.arg_type)
+        format!("{}: {}", render_param_name(&self.name), self.arg_type)
     }
 }
 
@@ -193,18 +226,18 @@ impl FunctionDefinition {
         let mut sql = format!(
             "DEFINE FUNCTION {guard}fn::{name}({args})",
             guard = guard_keyword(if_not_exists, overwrite),
-            name = self.name,
+            name = render_function_path(&self.name),
             args = args.join(", "),
         );
         if let Some(returns) = &self.returns {
-            write!(sql, " -> {returns}").expect("writing to String cannot fail");
+            let _ = write!(sql, " -> {returns}");
         }
-        write!(sql, " {{ {} }}", self.body.trim()).expect("writing to String cannot fail");
+        let _ = write!(sql, " {{ {} }}", self.body.trim());
         if let Some(comment) = &self.comment {
-            write!(sql, " COMMENT '{comment}'").expect("writing to String cannot fail");
+            let _ = write!(sql, " COMMENT {}", quote_str(comment));
         }
         if let Some(permissions) = &self.permissions {
-            write!(sql, " PERMISSIONS {permissions}").expect("writing to String cannot fail");
+            let _ = write!(sql, " PERMISSIONS {permissions}");
         }
         sql.push(';');
         Ok(sql)
@@ -223,22 +256,35 @@ impl FunctionDefinition {
     /// Render a `REMOVE FUNCTION` statement for a function by name (with or
     /// without the `fn::` prefix).
     pub fn remove_surql(name: &str) -> String {
-        let bare = name.strip_prefix("fn::").unwrap_or(name);
-        format!("REMOVE FUNCTION IF EXISTS fn::{bare};")
+        format!(
+            "REMOVE FUNCTION IF EXISTS fn::{};",
+            render_function_path(name)
+        )
     }
 }
 
 /// Rewrite `option<T>` as the `none | T` union the engine stores.
+///
+/// Unwraps at most [`MAX_OPTION_DEPTH`] levels, iteratively: the type may come
+/// from a parsed server definition, and a recursive unwrap of a crafted
+/// `option<option<…>>` would overflow the stack.
 fn normalize_type(declared: &str) -> String {
-    let trimmed = declared.trim();
-    let inner = trimmed
-        .strip_prefix("option<")
-        .or_else(|| trimmed.strip_prefix("OPTION<"))
-        .and_then(|rest| rest.strip_suffix('>'));
-    match inner {
-        Some(inner) => format!("none | {}", normalize_type(inner)),
-        None => normalize_whitespace(trimmed),
+    let mut rest = declared.trim();
+    let mut prefix = String::new();
+    for _ in 0..MAX_OPTION_DEPTH {
+        let inner = rest
+            .strip_prefix("option<")
+            .or_else(|| rest.strip_prefix("OPTION<"))
+            .and_then(|r| r.strip_suffix('>'));
+        match inner {
+            Some(inner) => {
+                prefix.push_str("none | ");
+                rest = inner.trim();
+            }
+            None => break,
+        }
     }
+    format!("{prefix}{}", normalize_whitespace(rest))
 }
 
 /// Trim the body and drop the trailing `;` the engine strips.
@@ -370,6 +416,46 @@ mod tests {
         assert_eq!(normalize_type("option<int>"), "none | int");
         assert_eq!(normalize_type("option<option<int>>"), "none | none | int");
         assert_eq!(normalize_type("  int  "), "int");
+    }
+
+    #[test]
+    fn normalize_is_bounded_on_deeply_nested_options() {
+        let depth = 100_000;
+        let crafted = format!("{}int{}", "option<".repeat(depth), ">".repeat(depth));
+        let normalized = normalize_type(&crafted);
+        assert!(normalized.starts_with("none | none | "));
+        assert_eq!(normalized.matches("none |").count(), MAX_OPTION_DEPTH);
+    }
+
+    #[test]
+    fn comments_and_names_are_escaped() {
+        let f = function_schema("greet", "RETURN 1")
+            .comment("user's greeting")
+            .build()
+            .unwrap();
+        assert_eq!(
+            f.to_surql().unwrap(),
+            r"DEFINE FUNCTION fn::greet() { RETURN 1 } COMMENT 'user\'s greeting';"
+        );
+        let f = function_schema("pkg::my-fn", "RETURN $x")
+            .arg("my-arg", "int")
+            .comment("x'; REMOVE TABLE user; --")
+            .build()
+            .unwrap();
+        assert_eq!(
+            f.to_surql().unwrap(),
+            r"DEFINE FUNCTION fn::pkg::`my-fn`($`my-arg`: int) { RETURN $x } COMMENT 'x\'; REMOVE TABLE user; --';"
+        );
+    }
+
+    #[test]
+    fn a_comment_round_trips_through_the_parser() {
+        let code = function_schema("f", "RETURN 1")
+            .comment("line1\nit's \\ done")
+            .build()
+            .unwrap();
+        let parsed = crate::schema::parser::parse_function("f", &code.to_surql().unwrap()).unwrap();
+        assert_eq!(parsed.comment, code.comment);
     }
 
     #[test]

@@ -29,7 +29,6 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::fmt::Write;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -40,20 +39,23 @@ use crate::query::builder::Query;
 use crate::query::executor::flatten_rows;
 use crate::query::expressions::Expression;
 use crate::query::results::{record, RecordResult};
+use crate::query::validate::{render_target, validate_field_path};
 use crate::types::operators::{Operator, OperatorExpr};
 use crate::types::record_id::RecordID;
 
 /// Create a record in `table` with the given JSON payload.
 ///
-/// Uses a raw `CREATE <table> CONTENT $data` with a bound variable so the
-/// payload is passed through as JSON without the SurrealDB SDK attempting
-/// to coerce it into the CBOR-tagged format. Returns a [`RecordResult`]
-/// wrapping the created record.
+/// `table` is a table name or a record id (`"user:alice"`), rendered as in
+/// [`Query::from_table`]. Uses a raw `CREATE <table> CONTENT $data` with a
+/// bound variable so the payload is passed through as JSON without the
+/// SurrealDB SDK attempting to coerce it into the CBOR-tagged format.
+/// Returns a [`RecordResult`] wrapping the created record.
 pub async fn create_record(
     client: &DatabaseClient,
     table: &str,
     data: Value,
 ) -> Result<RecordResult<Value>> {
+    let table = render_target(table)?;
     let mut vars = BTreeMap::new();
     vars.insert("data".to_owned(), data);
     let surql = format!("CREATE {table} CONTENT $data");
@@ -70,6 +72,7 @@ pub async fn create_records(
     table: &str,
     data: Vec<Value>,
 ) -> Result<Vec<Value>> {
+    let table = render_target(table)?;
     let mut out = Vec::with_capacity(data.len());
     for item in data {
         let mut vars = BTreeMap::new();
@@ -109,6 +112,9 @@ pub async fn update_record<T>(
 /// Update (replace) an existing record identified by a raw SurrealQL target
 /// string (e.g. `"user:alice"` or the rendering of a
 /// [`type_record`](crate::types::operators::type_record) expression).
+///
+/// The target is inserted verbatim, as SurrealQL: never pass it text from
+/// an untrusted source. Use [`update_record`] with a [`RecordID`] for that.
 ///
 /// Additive companion to [`update_record`] introduced for the query-UX
 /// release: accepts any target that can be rendered to SurrealQL without
@@ -153,6 +159,9 @@ pub async fn upsert_record<T>(
 
 /// Upsert using a raw SurrealQL target string (additive companion to
 /// [`upsert_record`]).
+///
+/// The target is inserted verbatim, as SurrealQL: never pass it text from
+/// an untrusted source. Use [`upsert_record`] with a [`RecordID`] for that.
 pub async fn upsert_record_target(
     client: &DatabaseClient,
     target: &str,
@@ -181,13 +190,17 @@ pub async fn delete_records(
     table: &str,
     where_: Option<&Operator>,
 ) -> Result<u64> {
-    let surql = if let Some(op) = where_ {
-        format!("DELETE {table} WHERE ({}) RETURN BEFORE", op.to_surql())
-    } else {
-        format!("DELETE {table} RETURN BEFORE")
-    };
+    let surql = delete_records_surql(table, where_)?;
     let raw = client.query(&surql).await?;
-    Ok(flatten_rows(&raw).len() as u64)
+    Ok(u64::try_from(flatten_rows(&raw).len()).unwrap_or(u64::MAX))
+}
+
+fn delete_records_surql(table: &str, where_: Option<&Operator>) -> Result<String> {
+    let table = render_target(table)?;
+    Ok(match where_ {
+        Some(op) => format!("DELETE {table} WHERE ({}) RETURN BEFORE", op.to_surql()),
+        None => format!("DELETE {table} RETURN BEFORE"),
+    })
 }
 
 /// Execute a rendered [`Query`] and deserialize each row into `T`.
@@ -210,18 +223,24 @@ pub async fn count_records(
     table: &str,
     where_: Option<&Operator>,
 ) -> Result<i64> {
-    let mut surql = format!("SELECT count() FROM {table}");
-    if let Some(op) = where_ {
-        write!(surql, " WHERE ({})", op.to_surql()).expect("write to String cannot fail");
-    }
-    surql.push_str(" GROUP ALL");
-
+    let surql = count_records_surql(table, where_)?;
     let raw = client.query(&surql).await?;
     let row = flatten_rows(&raw).into_iter().next();
     Ok(row
         .as_ref()
         .and_then(|r| r.get("count").and_then(Value::as_i64))
         .unwrap_or(0))
+}
+
+fn count_records_surql(table: &str, where_: Option<&Operator>) -> Result<String> {
+    let table = render_target(table)?;
+    Ok(match where_ {
+        Some(op) => format!(
+            "SELECT count() FROM {table} WHERE ({}) GROUP ALL",
+            op.to_surql()
+        ),
+        None => format!("SELECT count() FROM {table} GROUP ALL"),
+    })
 }
 
 /// Report whether the record identified by `record_id` exists.
@@ -247,24 +266,40 @@ pub async fn first<T: DeserializeOwned>(
 
 /// Return the *last* row matching `query` (mirrors Python's `last`).
 ///
-/// Reverses any explicit `ORDER BY` direction on the query, caps the result
-/// at `LIMIT 1`, and returns the first (now last) row.
+/// When the query has an `ORDER BY` and no `LIMIT` / `START`, every
+/// direction is reversed and the result capped at `LIMIT 1`, so only the
+/// last row is fetched. Otherwise the query runs as written and its final
+/// row is returned: reversing the order of a paged query would select a
+/// different page, and without an `ORDER BY` there is no order to reverse.
 pub async fn last<T: DeserializeOwned>(
     client: &DatabaseClient,
     query: &Query,
 ) -> Result<Option<T>> {
-    let mut cloned = query.clone();
-    for entry in &mut cloned.order_fields {
+    match reversed_for_last(query)? {
+        Some(reversed) => super::executor::fetch_one(client, &reversed).await,
+        None => Ok(super::executor::fetch_all::<T>(client, query)
+            .await?
+            .into_iter()
+            .last()),
+    }
+}
+
+/// The single-row query that fetches `query`'s last row, when reversing
+/// its order is sound (see [`last`]).
+fn reversed_for_last(query: &Query) -> Result<Option<Query>> {
+    if query.order_fields.is_empty() || query.limit_value.is_some() || query.offset_value.is_some()
+    {
+        return Ok(None);
+    }
+    let mut reversed = query.clone();
+    for entry in &mut reversed.order_fields {
         entry.direction = if entry.direction.eq_ignore_ascii_case("ASC") {
             "DESC".to_owned()
         } else {
             "ASC".to_owned()
         };
     }
-    if cloned.limit_value.is_none() {
-        cloned = cloned.limit(1)?;
-    }
-    super::executor::fetch_one(client, &cloned).await
+    reversed.limit(1).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +349,8 @@ pub struct AggregateOpts {
 /// [`super::executor::fetch_all`].
 ///
 /// Errors when `opts.select` is empty or when any builder-step validation
-/// fails (invalid table name, invalid order direction, negative limit).
+/// fails (invalid table name, alias, or field, invalid order direction,
+/// negative limit).
 pub fn build_aggregate_query(table: &str, opts: &AggregateOpts) -> Result<Query> {
     if opts.select.is_empty() {
         return Err(crate::error::SurqlError::Query {
@@ -322,11 +358,14 @@ pub fn build_aggregate_query(table: &str, opts: &AggregateOpts) -> Result<Query>
         });
     }
 
-    let fields: Vec<String> = opts
+    let fields = opts
         .select
         .iter()
-        .map(|(alias, expr)| format!("{} AS {alias}", expr.to_surql()))
-        .collect();
+        .map(|(alias, expr)| {
+            validate_field_path(alias, "aggregate alias")?;
+            Ok(format!("{} AS {alias}", expr.to_surql()))
+        })
+        .collect::<Result<Vec<String>>>()?;
 
     let mut query = Query::new().select(Some(fields)).from_table(table)?;
 
@@ -336,6 +375,9 @@ pub fn build_aggregate_query(table: &str, opts: &AggregateOpts) -> Result<Query>
     if opts.group_all {
         query = query.group_all();
     } else if !opts.group_by.is_empty() {
+        for field in &opts.group_by {
+            validate_field_path(field, "group field")?;
+        }
         query = query.group_by(opts.group_by.iter().cloned());
     }
     for (field, direction) in &opts.order_by {
@@ -384,11 +426,60 @@ mod tests {
     fn delete_records_renders_where_clause() {
         // Smoke-test the SurrealQL we render for delete_records (no DB needed).
         let op = eq("status", "inactive");
-        let rendered = format!("DELETE user WHERE ({}) RETURN BEFORE", op.to_surql());
         assert_eq!(
-            rendered,
+            delete_records_surql("user", Some(&op)).unwrap(),
             "DELETE user WHERE (status = 'inactive') RETURN BEFORE"
         );
+    }
+
+    #[test]
+    fn table_arguments_cannot_inject() {
+        assert!(delete_records_surql("user; REMOVE TABLE user", None).is_err());
+        assert!(count_records_surql("user GROUP ALL; DELETE user; --", None).is_err());
+        assert_eq!(
+            count_records_surql("user:a; DELETE user", None).unwrap(),
+            "SELECT count() FROM user:⟨a; DELETE user⟩ GROUP ALL"
+        );
+        assert_eq!(
+            count_records_surql("user", Some(&eq("n", 1))).unwrap(),
+            "SELECT count() FROM user WHERE (n = 1) GROUP ALL"
+        );
+    }
+
+    #[test]
+    fn aggregate_names_are_validated() {
+        use crate::query::expressions::count_all;
+
+        let bad_alias = AggregateOpts {
+            select: vec![("n FROM user; DELETE user; --".to_string(), count_all())],
+            ..Default::default()
+        };
+        assert!(build_aggregate_query("user", &bad_alias).is_err());
+        let bad_group = AggregateOpts {
+            select: vec![("n".to_string(), count_all())],
+            group_by: vec!["status; DELETE user".into()],
+            ..Default::default()
+        };
+        assert!(build_aggregate_query("user", &bad_group).is_err());
+    }
+
+    #[test]
+    fn last_reverses_only_an_unpaged_ordered_query() {
+        let base = Query::new().select(None).from_table("user").unwrap();
+        // No ORDER BY: nothing to reverse, the query runs as written.
+        assert!(reversed_for_last(&base).unwrap().is_none());
+        let ordered = base.order_by("age", "ASC").unwrap();
+        let reversed = reversed_for_last(&ordered).unwrap().unwrap();
+        assert_eq!(
+            reversed.to_surql().unwrap(),
+            "SELECT * FROM user ORDER BY age DESC LIMIT 1"
+        );
+        // A page window would move if reversed.
+        let paged = ordered.clone().limit(10).unwrap().offset(20).unwrap();
+        assert!(reversed_for_last(&paged).unwrap().is_none());
+        assert!(reversed_for_last(&ordered.offset(5).unwrap())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -86,6 +86,7 @@ nav:
   - Reference:
       - CLI: cli.md
       - Upgrading 0.1 -> 0.2: migration.md
+      - Known Issues: known-issues.md
       - API (docs.rs): https://docs.rs/oneiriq-surql
   - Changelog: changelog.md
 

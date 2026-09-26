@@ -9,18 +9,29 @@
 //! testable without a query.
 
 use crate::error::Result;
+use crate::types::escape::quote_ident;
 
 use super::builder::Query;
+use super::validate::quote_field_path;
 
 /// Render a `<~<table>[.{ f, ... }] AS <alias>` projection item.
 ///
 /// An empty `fields` slice renders the whole-record form, same as `None`.
+/// The table, each field, and the alias are quoted as identifiers, so any
+/// text renders as a name.
 pub fn reverse_reference_projection(table: &str, fields: Option<&[&str]>, alias: &str) -> String {
     let projection = match fields {
-        Some(fields) if !fields.is_empty() => format!(".{{ {} }}", fields.join(", ")),
+        Some(fields) if !fields.is_empty() => {
+            let quoted: Vec<String> = fields.iter().map(|f| quote_field_path(f)).collect();
+            format!(".{{ {} }}", quoted.join(", "))
+        }
         _ => String::new(),
     };
-    format!("<~{table}{projection} AS {alias}")
+    format!(
+        "<~{}{projection} AS {}",
+        quote_ident(table),
+        quote_field_path(alias)
+    )
 }
 
 /// Build `SELECT *, <~<source> AS <alias> FROM <table>`.
@@ -77,6 +88,18 @@ mod tests {
         assert_eq!(
             reverse_reference_projection("person", Some(&[]), "owners"),
             "<~person AS owners"
+        );
+    }
+
+    #[test]
+    fn names_cannot_extend_the_projection() {
+        assert_eq!(
+            reverse_reference_projection(
+                "person FROM user; DELETE user; --",
+                Some(&["id }, (DELETE user)"]),
+                "o FROM x"
+            ),
+            "<~`person FROM user; DELETE user; --`.{ `id }, (DELETE user)` } AS `o FROM x`"
         );
     }
 

@@ -10,14 +10,16 @@ use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
-use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
-use crate::migration::{execute_migration, Migration, MigrationDirection};
-use crate::orchestration::environment::{EnvironmentConfig, EnvironmentRegistry};
+use crate::migration::Migration;
+use crate::orchestration::environment::EnvironmentRegistry;
 use crate::orchestration::health::HealthCheck;
 use crate::orchestration::result::{DeploymentResult, DeploymentStatus};
+use crate::orchestration::rollback::rollback_deployment;
+use crate::orchestration::safety::needs_approval;
 use crate::orchestration::strategies::{
-    CanaryStrategy, DeploymentStrategy, ParallelStrategy, RollingStrategy, SequentialStrategy,
+    resolve_plan_environments, CanaryStrategy, DeploymentStrategy, ParallelStrategy,
+    RollingStrategy, SequentialStrategy,
 };
 
 /// Raised when orchestration fails in a fatal way (wraps
@@ -101,6 +103,8 @@ impl StrategyKind {
 /// Port of `surql.orchestration.coordinator.DeploymentPlan`. Cloneable
 /// so strategies can pass copies into spawned tasks without borrowing
 /// the coordinator.
+// The four flags are independent switches; enums would only rename them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct DeploymentPlan {
     /// Registry used for environment lookup.
@@ -120,26 +124,34 @@ pub struct DeploymentPlan {
     pub max_concurrent: usize,
     /// Verify environment health before deploying.
     pub verify_health: bool,
-    /// Auto-rollback previously successful deployments on failure.
+    /// When any environment fails, revert the migrations this deployment
+    /// applied to every environment.
     pub auto_rollback: bool,
     /// Simulate deployment without executing migrations.
     pub dry_run: bool,
+    /// The operator's approval to change environments marked
+    /// [`require_approval`](crate::orchestration::EnvironmentConfig::require_approval).
+    /// Without it such an environment is neither deployed nor rolled back.
+    pub approved: bool,
 }
 
 impl DeploymentPlan {
     /// Start a builder for a deployment plan.
     pub fn builder(registry: EnvironmentRegistry) -> DeploymentPlanBuilder {
         DeploymentPlanBuilder {
-            registry,
-            environments: Vec::new(),
-            migrations: Vec::new(),
-            strategy: StrategyKind::Sequential,
-            batch_size: 1,
-            canary_percentage: 10.0,
-            max_concurrent: 5,
-            verify_health: true,
-            auto_rollback: true,
-            dry_run: false,
+            plan: DeploymentPlan {
+                registry,
+                environments: Vec::new(),
+                migrations: Vec::new(),
+                strategy: StrategyKind::Sequential,
+                batch_size: 1,
+                canary_percentage: 10.0,
+                max_concurrent: 5,
+                verify_health: true,
+                auto_rollback: true,
+                dry_run: false,
+                approved: false,
+            },
         }
     }
 }
@@ -147,16 +159,7 @@ impl DeploymentPlan {
 /// Builder for [`DeploymentPlan`].
 #[derive(Debug, Clone)]
 pub struct DeploymentPlanBuilder {
-    registry: EnvironmentRegistry,
-    environments: Vec<String>,
-    migrations: Vec<Migration>,
-    strategy: StrategyKind,
-    batch_size: usize,
-    canary_percentage: f64,
-    max_concurrent: usize,
-    verify_health: bool,
-    auto_rollback: bool,
-    dry_run: bool,
+    plan: DeploymentPlan,
 }
 
 impl DeploymentPlanBuilder {
@@ -166,78 +169,73 @@ impl DeploymentPlanBuilder {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.environments = envs.into_iter().map(Into::into).collect();
+        self.plan.environments = envs.into_iter().map(Into::into).collect();
         self
     }
 
     /// Append a target environment name.
     pub fn environment(mut self, name: impl Into<String>) -> Self {
-        self.environments.push(name.into());
+        self.plan.environments.push(name.into());
         self
     }
 
     /// Replace the migration set.
     pub fn migrations(mut self, migrations: Vec<Migration>) -> Self {
-        self.migrations = migrations;
+        self.plan.migrations = migrations;
         self
     }
 
     /// Override the strategy label (informational).
     pub fn strategy(mut self, kind: StrategyKind) -> Self {
-        self.strategy = kind;
+        self.plan.strategy = kind;
         self
     }
 
     /// Override the rolling batch size.
     pub fn batch_size(mut self, value: usize) -> Self {
-        self.batch_size = value.max(1);
+        self.plan.batch_size = value.max(1);
         self
     }
 
     /// Override the canary percentage.
     pub fn canary_percentage(mut self, value: f64) -> Self {
-        self.canary_percentage = value;
+        self.plan.canary_percentage = value;
         self
     }
 
     /// Override the parallel max concurrency.
     pub fn max_concurrent(mut self, value: usize) -> Self {
-        self.max_concurrent = value.max(1);
+        self.plan.max_concurrent = value.max(1);
         self
     }
 
     /// Toggle pre-flight health checks.
     pub fn verify_health(mut self, value: bool) -> Self {
-        self.verify_health = value;
+        self.plan.verify_health = value;
         self
     }
 
     /// Toggle auto-rollback on any failure.
     pub fn auto_rollback(mut self, value: bool) -> Self {
-        self.auto_rollback = value;
+        self.plan.auto_rollback = value;
         self
     }
 
     /// Toggle dry-run (no migrations executed).
     pub fn dry_run(mut self, value: bool) -> Self {
-        self.dry_run = value;
+        self.plan.dry_run = value;
+        self
+    }
+
+    /// Record the operator's approval for environments that require it.
+    pub fn approved(mut self, value: bool) -> Self {
+        self.plan.approved = value;
         self
     }
 
     /// Finalise into a [`DeploymentPlan`].
     pub fn build(self) -> DeploymentPlan {
-        DeploymentPlan {
-            registry: self.registry,
-            environments: self.environments,
-            migrations: self.migrations,
-            strategy: self.strategy,
-            batch_size: self.batch_size,
-            canary_percentage: self.canary_percentage,
-            max_concurrent: self.max_concurrent,
-            verify_health: self.verify_health,
-            auto_rollback: self.auto_rollback,
-            dry_run: self.dry_run,
-        }
+        self.plan
     }
 }
 
@@ -292,12 +290,27 @@ impl MigrationCoordinator {
 
     /// Deploy the supplied plan.
     ///
+    /// Each environment receives only the plan migrations its history
+    /// does not already record. An environment named more than once is
+    /// deployed once. When any environment fails and
+    /// [`DeploymentPlan::auto_rollback`] is set, the migrations this call
+    /// applied are reverted (newest first) and the reverted environments
+    /// are reported as [`DeploymentStatus::RolledBack`]; migrations that
+    /// were applied before this call are never touched.
+    ///
+    /// Environment guards: nothing runs unless every environment with
+    /// `require_approval` is covered by [`DeploymentPlan::approved`]. An
+    /// environment with `allow_destructive = false` refuses (as a failed
+    /// result) a deployment whose pending `up` statements are destructive,
+    /// and its auto-rollback refuses destructive `down` statements.
+    ///
     /// # Errors
     ///
     /// Returns [`SurqlError::Orchestration`] when environments cannot be
-    /// resolved, pre-flight health checks fail, or the strategy raises
-    /// a fatal error. Per-environment failures are reported through the
-    /// returned map (status = [`DeploymentStatus::Failed`]).
+    /// resolved, an environment requires an approval the plan lacks,
+    /// pre-flight health checks fail, or the strategy raises a fatal
+    /// error. Per-environment failures are reported through the returned
+    /// map (status = [`DeploymentStatus::Failed`]).
     pub async fn deploy(&self, plan: &DeploymentPlan) -> Result<HashMap<String, DeploymentResult>> {
         info!(
             environments = plan.environments.len(),
@@ -308,7 +321,23 @@ impl MigrationCoordinator {
         );
 
         // Resolve environments up front so missing names fail fast.
-        let envs = resolve_environments(&self.registry, &plan.environments).await?;
+        let envs = resolve_plan_environments(plan).await?;
+
+        if !plan.dry_run {
+            let unapproved: Vec<&str> = envs
+                .iter()
+                .filter(|env| needs_approval(env, plan))
+                .map(|env| env.name.as_str())
+                .collect();
+            if !unapproved.is_empty() {
+                return Err(SurqlError::Orchestration {
+                    reason: format!(
+                        "environment(s) {} require approval; approve the plan to deploy",
+                        unapproved.join(", ")
+                    ),
+                });
+            }
+        }
 
         if plan.verify_health && !plan.dry_run {
             info!("verifying_environment_health");
@@ -332,32 +361,32 @@ impl MigrationCoordinator {
             }
         })?;
 
-        let map: HashMap<String, DeploymentResult> = results
-            .iter()
-            .map(|r| (r.environment.clone(), r.clone()))
-            .collect();
-
         let failed = results
             .iter()
             .filter(|r| r.status == DeploymentStatus::Failed)
             .count();
 
-        if failed > 0 && plan.auto_rollback && !plan.dry_run {
+        let results = if failed > 0 && plan.auto_rollback && !plan.dry_run {
             warn!(failed, "initiating_auto_rollback");
-            rollback_successful(&envs, &plan.migrations, &results).await;
-        }
+            rollback_deployment(&envs, plan, results).await
+        } else {
+            results
+        };
 
+        let count =
+            |status: DeploymentStatus| results.iter().filter(|r| r.status == status).count();
         info!(
             total = results.len(),
-            successful = results
-                .iter()
-                .filter(|r| r.status == DeploymentStatus::Success)
-                .count(),
-            failed,
+            successful = count(DeploymentStatus::Success),
+            rolled_back = count(DeploymentStatus::RolledBack),
+            failed = count(DeploymentStatus::Failed),
             "orchestration_completed"
         );
 
-        Ok(map)
+        Ok(results
+            .into_iter()
+            .map(|r| (r.environment.clone(), r))
+            .collect())
     }
 
     /// Return a map `env_name -> is_healthy` for the supplied environments.
@@ -379,111 +408,36 @@ impl MigrationCoordinator {
     }
 }
 
-async fn resolve_environments(
-    registry: &EnvironmentRegistry,
-    names: &[String],
-) -> Result<Vec<EnvironmentConfig>> {
-    let mut out = Vec::with_capacity(names.len());
-    for name in names {
-        match registry.get(name).await {
-            Some(cfg) => out.push(cfg),
-            None => {
-                return Err(SurqlError::Orchestration {
-                    reason: format!("Environment not found: {name}"),
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-async fn rollback_successful(
-    environments: &[EnvironmentConfig],
-    migrations: &[Migration],
-    results: &[DeploymentResult],
-) {
-    for result in results
-        .iter()
-        .filter(|r| r.status == DeploymentStatus::Success)
-    {
-        let Some(env) = environments.iter().find(|e| e.name == result.environment) else {
-            continue;
-        };
-        info!(environment = %env.name, "rolling_back_environment");
-        let client = match DatabaseClient::new(env.connection.clone()) {
-            Ok(c) => c,
-            Err(err) => {
-                error!(environment = %env.name, error = %err, "rollback_client_failed");
-                continue;
-            }
-        };
-        if let Err(err) = client.connect().await {
-            error!(environment = %env.name, error = %err, "rollback_connect_failed");
-            continue;
-        }
-        for migration in migrations.iter().rev() {
-            if let Err(err) = execute_migration(&client, migration, MigrationDirection::Down).await
-            {
-                error!(
-                    environment = %env.name,
-                    migration = %migration.version,
-                    error = %err,
-                    "rollback_migration_failed"
-                );
-            }
-        }
-        let _ = client.disconnect().await;
-        info!(environment = %env.name, "environment_rolled_back");
-    }
-}
-
 /// Convenience wrapper for the common `deploy(...)` invocation.
 ///
-/// Matches the Python `deploy_to_environments` free function — builds a
-/// [`DeploymentPlan`] from the supplied arguments, instantiates a
-/// coordinator with the requested strategy, and executes the deploy.
+/// Counterpart of the Python `deploy_to_environments` free function: runs
+/// `plan` through a coordinator built for the plan's own
+/// [`strategy`](DeploymentPlan::strategy),
+/// [`batch_size`](DeploymentPlan::batch_size),
+/// [`canary_percentage`](DeploymentPlan::canary_percentage), and
+/// [`max_concurrent`](DeploymentPlan::max_concurrent).
 ///
 /// # Errors
 ///
 /// Propagates errors from [`MigrationCoordinator::with_strategy_label`]
 /// and [`MigrationCoordinator::deploy`].
-#[allow(clippy::too_many_arguments)]
 pub async fn deploy_to_environments(
-    registry: EnvironmentRegistry,
-    environments: Vec<String>,
-    migrations: Vec<Migration>,
-    strategy: StrategyKind,
-    batch_size: usize,
-    canary_percentage: f64,
-    max_concurrent: usize,
-    verify_health: bool,
-    auto_rollback: bool,
-    dry_run: bool,
+    plan: &DeploymentPlan,
 ) -> Result<HashMap<String, DeploymentResult>> {
     let coordinator = MigrationCoordinator::with_strategy_label(
-        registry.clone(),
-        strategy,
-        batch_size,
-        canary_percentage,
-        max_concurrent,
+        plan.registry.clone(),
+        plan.strategy,
+        plan.batch_size,
+        plan.canary_percentage,
+        plan.max_concurrent,
     )?;
-    let plan = DeploymentPlan::builder(registry)
-        .environments(environments)
-        .migrations(migrations)
-        .strategy(strategy)
-        .batch_size(batch_size)
-        .canary_percentage(canary_percentage)
-        .max_concurrent(max_concurrent)
-        .verify_health(verify_health)
-        .auto_rollback(auto_rollback)
-        .dry_run(dry_run)
-        .build();
-    coordinator.deploy(&plan).await
+    coordinator.deploy(plan).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::environment::EnvironmentConfig;
 
     #[test]
     fn strategy_kind_parse_accepts_each_variant() {
@@ -588,5 +542,41 @@ mod tests {
         assert_eq!(results.len(), 1);
         let r = results.get("dry_run_env").unwrap();
         assert_eq!(r.status, DeploymentStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn plan_and_coordinator_debug_leave_out_passwords() {
+        let registry = EnvironmentRegistry::new();
+        let connection = crate::connection::ConnectionConfig::builder()
+            .url("ws://127.0.0.1:65535")
+            .namespace("prod")
+            .database("main")
+            .username("root")
+            .password("hunter2-secret")
+            .build()
+            .unwrap();
+        let env = EnvironmentConfig::builder("prod", connection)
+            .build()
+            .unwrap();
+        registry.register(env).await;
+        let plan = DeploymentPlan::builder(registry.clone())
+            .environment("prod")
+            .build();
+        let coordinator = MigrationCoordinator::with_strategy_label(
+            registry.clone(),
+            StrategyKind::Parallel,
+            1,
+            10.0,
+            2,
+        )
+        .unwrap();
+        for rendered in [
+            format!("{plan:?}"),
+            format!("{:?}", DeploymentPlan::builder(registry)),
+            format!("{coordinator:?}"),
+        ] {
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+            assert!(rendered.contains("prod"), "{rendered}");
+        }
     }
 }

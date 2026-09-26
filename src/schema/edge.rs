@@ -15,8 +15,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SurqlError};
+use crate::types::escape::quote_ident;
 
-use super::fields::FieldDefinition;
+use super::fields::{render_table_list, FieldDefinition};
+use super::permissions::{render_permissions_clause, validate_permissions, TABLE_ACTIONS};
 use super::table::{EventDefinition, IndexDefinition};
 
 /// Edge table mode.
@@ -56,10 +58,12 @@ pub struct EdgeDefinition {
     /// Edge mode.
     #[serde(default = "EdgeDefinition::default_mode")]
     pub mode: EdgeMode,
-    /// Source table constraint for `RELATION` mode.
+    /// Source table constraint for `RELATION` mode. Several tables are
+    /// written `"user | admin"`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub from_table: Option<String>,
-    /// Target table constraint for `RELATION` mode.
+    /// Target table constraint for `RELATION` mode, in the same form as
+    /// [`Self::from_table`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub to_table: Option<String>,
     /// Field definitions.
@@ -71,7 +75,8 @@ pub struct EdgeDefinition {
     /// Event definitions.
     #[serde(default)]
     pub events: Vec<EventDefinition>,
-    /// Per-action permissions map.
+    /// Per-action permissions map, in the shape of
+    /// [`TableDefinition::permissions`](super::table::TableDefinition::permissions).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub permissions: Option<BTreeMap<String, String>>,
 }
@@ -175,6 +180,11 @@ impl EdgeDefinition {
                 ),
             });
         }
+        validate_permissions(
+            &format!("Edge {:?}", self.name),
+            self.permissions.as_ref(),
+            TABLE_ACTIONS,
+        )?;
         for field in &self.fields {
             field.validate()?;
         }
@@ -207,16 +217,8 @@ impl EdgeDefinition {
     fn render_guard(&self, ine: &str) -> Result<String> {
         // Table-level PERMISSIONS render inline on the DEFINE TABLE statement
         // (the only valid placement), matching `TableDefinition`.
-        let perms = match &self.permissions {
-            Some(p) if !p.is_empty() => {
-                let clauses: Vec<String> = p
-                    .iter()
-                    .map(|(action, rule)| format!("FOR {action} WHERE {rule}"))
-                    .collect();
-                format!(" PERMISSIONS {}", clauses.join(" "))
-            }
-            _ => String::new(),
-        };
+        let perms = render_permissions_clause(self.permissions.as_ref());
+        let name = quote_ident(&self.name);
         match self.mode {
             EdgeMode::Relation => {
                 let from = self
@@ -239,25 +241,12 @@ impl EdgeDefinition {
                     })?;
                 Ok(format!(
                     "DEFINE TABLE{ine} {name} TYPE RELATION FROM {from} TO {to}{perms};",
-                    ine = ine,
-                    name = self.name,
-                    from = from,
-                    to = to,
-                    perms = perms,
+                    from = render_table_list(from),
+                    to = render_table_list(to),
                 ))
             }
-            EdgeMode::Schemafull => Ok(format!(
-                "DEFINE TABLE{ine} {name} SCHEMAFULL{perms};",
-                ine = ine,
-                name = self.name,
-                perms = perms,
-            )),
-            EdgeMode::Schemaless => Ok(format!(
-                "DEFINE TABLE{ine} {name} SCHEMALESS{perms};",
-                ine = ine,
-                name = self.name,
-                perms = perms,
-            )),
+            EdgeMode::Schemafull => Ok(format!("DEFINE TABLE{ine} {name} SCHEMAFULL{perms};")),
+            EdgeMode::Schemaless => Ok(format!("DEFINE TABLE{ine} {name} SCHEMALESS{perms};")),
         }
     }
 

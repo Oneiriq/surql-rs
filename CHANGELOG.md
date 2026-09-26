@@ -7,6 +7,248 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+A hardening pass over the whole crate: an adversarial review of every
+module, each finding reproduced by a failing test before it was fixed
+(unit tests, and engine tests against SurrealDB 3.0.5; the escaping rules
+also against 3.2.4 and 3.3.0), a cargo-fuzz harness whose oracle is the
+engine's own parser, and CI gates for the MSRV, the wasm client and the
+no-features build. Many fixes change rendered SQL, signatures or
+behaviour; every change a caller can observe is marked **Breaking**.
+Problems the pass found but did not fix are listed on the
+[Known issues](https://oneiriq.github.io/surql-rs/known-issues/) page.
+
+### Security
+
+- **Values are always data.** `quote_value` recognised `SurrealFn` and
+  `RecordRef` by JSON shape, so any object with an `"expression"` key (or
+  `table` plus `record_id`) inside insert, update, operator or batch data
+  rendered as raw SurrealQL: `{"body": {"expression": "1}; DELETE user;
+  --"}}` ran a second statement. Shape detection is gone. Raw expressions
+  enter only through typed channels: `Expression` (now `From<SurrealFn>`,
+  `From<RecordRef>`, `From<RecordID>`), the new `eq_expr` / `ne_expr` /
+  `gt_expr` / `gte_expr` / `lt_expr` / `lte_expr`, and `set_expr`, which
+  now also fills CREATE / UPSERT / RELATE `CONTENT`. **Breaking**
+- **Record ids cannot be broken out of.** String keys rendered as `⟨key⟩`
+  unescaped, and `⟨ ⟩` has no escape for `⟩`. Keys now render through the
+  new `types::escape` rules (backticks for a key containing `⟩`, `\`
+  escaped), tables through `quote_ident`, and a digit-only string key stays
+  a string key: `RecordID::new("post", "123")` renders `post:⟨123⟩`, not
+  the integer key `post:123` (and `"007"` no longer names the integer 7).
+  `RecordID::parse` keeps any quoted key a string and reverses escapes.
+  **Breaking**
+- **Every identifier and literal sink is validated or escaped.** Record-id
+  targets were checked only up to the first `:` in the builder, batch,
+  crud, typed and graph helpers; ORDER BY, GROUP BY, search, vector, alias
+  and graph names, CONTENT keys, `SHOW CHANGES` timestamps and tables, hint
+  text (which could close its `/* */`), `db reset` table names, the typed
+  client's CRUD and `LIVE` targets, and DDL comments, keys, backends and
+  names all reached query text raw. Targets are now parsed and re-rendered;
+  unquoted array, object, range and generator keys are refused. **Breaking**
+- **An expired session is never replayed as the config's credentials.**
+  The client re-signed in with its config (typically root) credentials
+  whenever a request failed with session expiry, even after `signin` had
+  switched the session to a record user, and it matched expiry by
+  substring on any error, so a stored value reading "session has expired"
+  re-ran a whole multi-statement query. The replay now happens only for
+  the config's own session, only on the request-level expiry error, and
+  serialised with identity changes; `connect()` on a `caller_session`
+  client is refused. **Breaking**
+- **Field `PERMISSIONS` reach the database.** They were modelled but never
+  rendered, so every such field was created `FULL`. They render, parse
+  back, and drift is detected by the diff and the validator.
+- **Event actions stay inside their event.** A multi-statement `THEN` was
+  rendered without braces, so its later statements ran when the definition
+  was applied.
+- **Secrets are redacted from `Debug`** for connection configs,
+  credentials, tokens, clients, cache configs, Redis caches, settings and
+  every orchestration type that embeds them.
+- **`require_approval` and `allow_destructive` are enforced** on
+  orchestrated deploys and on auto-rollback.
+- The Redis cache can no longer delete keys outside its prefix: an empty
+  prefix meant `SCAN MATCH *`, and the prefix was not glob-escaped.
+  **Breaking**
+- GraphViz and Mermaid output, ASCII diagrams and validation reports
+  escape names and terminal control bytes.
+- A snapshot version can no longer write outside the snapshot directory,
+  a migration description can no longer inject a `-- @up` section, and
+  names in generated down statements are quoted.
+- A failed transaction reports the statement that failed, not the
+  engine's generic "not executed" message for the others.
+
+### Fixed
+
+- **Query layer.**
+  - Rows keep their shape: a row with a `result` field, and the arrays of
+    `SELECT VALUE`, are no longer unwrapped or flattened, in the builder,
+    the executor and the typed client alike. **Breaking**
+  - Graph depth renders as unrolled hops (`->e->?`), which the engine
+    understands (`->follows2` named a table `follows2`);
+    `GraphQuery::to` follows the last hop's direction; `LIMIT` renders
+    before `FETCH`; depths and `shortest_path` are capped at 32.
+    **Breaking**
+  - `upsert_many` and friends require an id or conflict fields (a
+    table-wide `UPSERT` added a new record per call), prefix bare ids with
+    the table, accept integer ids, and apply conflict fields on every
+    path. **Breaking**
+  - `type_thing` renders `type::record` (3.x rejects `type::thing`);
+    `crud::last` honours paging; `has_more` no longer loops on a zero
+    limit; non-finite vectors and thresholds are refused; integers above
+    `i64::MAX` render as exact decimals; an empty object key renders.
+  - Table names that are reserved words are quoted, following the
+    engine's own reserved set: checked for every one of the 352 words in
+    its lexer on SurrealDB 3.0.5, 3.2.4 and 3.3.0.
+- **Schema DDL and the `INFO` parser.**
+  - The parser reads the engine's echo with a quote- and bracket-aware
+    scanner: table permissions no longer keep the `, ` separator (a
+    perpetual reconcile), FULLTEXT columns and index kinds read correctly,
+    keyword-named fields and quoted clauses keep their clauses, function
+    bodies with braces in strings survive, edge `IN`/`OUT` endpoints are
+    recovered, record `SIGNIN` survives a following `WITH JWT`, and `DROP`
+    and changefeeds are not read out of comments. `parse_analyzer` no
+    longer panics on multi-byte names.
+  - JWT access and bucket permission DDL follow the engine grammar (both
+    were parse errors); the table `DROP` flag renders.
+  - **Breaking:** `BucketDefinition::permissions` is `Option<String>`
+    (`NONE | FULL | WHERE expr`); parsed permission maps use `"NONE"` /
+    `"FULL"` and drop default actions; `JwtConfig::validate` refuses an
+    unknown algorithm or anything but exactly one verifier.
+- **Migrations: the schema diff.**
+  - An added edge with permissions is one statement that applies; dropped
+    tables, edges and indexes roll back to their whole definition (a
+    `UNIQUE` index comes back unique); index, event and edge-shape changes
+    are detected and re-defined with `OVERWRITE`; field nullability,
+    record target and permission changes are detected; normalisation
+    leaves string literals alone and is idempotent (it peeled one layer of
+    parentheses per call).
+  - `diff_schemas` orders object adds (functions, params, sequences,
+    analyzers, buckets) first, then every drop, then table and edge
+    changes, then object drops. **Breaking** (output order; and
+    `diff_permissions` renders `ALTER TABLE … PERMISSIONS`)
+- **Migrations: files, squash, execution and history.**
+  - Statements are split by a real SurrealQL lexer and sent verbatim: a
+    `;` or an apostrophe inside a comment split migrations in the wrong
+    place, and a literal such as `'a;b'` could be stored as `'a;\nb'`.
+  - `surql migrate squash` no longer deletes schema statements: `IF NOT
+    EXISTS` definitions were all keyed as the object `if`, fields on
+    different tables collided, and a DEFINE on one table paired with a
+    REMOVE on another. Unreadable statements are never removed, and the
+    text-based orphaned-UPDATE pass is gone. The squash preview no longer
+    panics on non-ASCII text.
+  - The history row commits inside the migration's own transaction, so a
+    migration whose record fails rolls back, and two concurrent runners
+    apply a migration once; a rollback's history delete is in the same
+    transaction.
+  - The squash safety scan and rollback classification read past a
+    leading comment (`-- purge\nDELETE FROM user` hid the DELETE); a
+    `DELETE` in a down body rates as danger.
+  - Rolling back a migration with no `down` fails instead of deleting its
+    history row, and `execute_rollback` refuses a risky plan until
+    `RollbackPlan::approve()`. **Breaking**
+  - A squashed migration counts as applied when its sources are (it was
+    re-applied); versions order numerically (`v10` after `v9`) and
+    `depends_on` orders migrations, with a cycle refused.
+  - Two migrations generated in the same second no longer overwrite each
+    other, and squash refuses to overwrite its output; a byte-order mark
+    no longer hides the metadata block; checksums ignore line endings and
+    the BOM (**Breaking**: such files' checksums change).
+  - The schema watcher no longer spins after it is dropped or panics
+    outside a runtime, and reports over a bounded channel. **Breaking**
+  - Non-ASCII staged files are detected; a corrupt newest snapshot is an
+    error instead of being skipped; snapshot comparison reports buckets.
+- **Validator and diagrams.**
+  - `validate_schema` compares every attribute the crate renders
+    (nullability, record target, `REFERENCE`, `COMPUTED`, permissions,
+    view, changefeed, `DROP`, event bodies, edge mode and endpoints),
+    reports database-only edges and members, returns results in a stable
+    order, and no longer reads engine defaults (`.*` array children, HNSW
+    and DISKANN tuning, the `ascii` analyzer) as drift. `surql schema
+    validate` reads the complete live schema. **Breaking:** `db_edges:
+    None` now skips edges, and edge maps take `EdgeDefinition`.
+  - Theme settings take effect; the registry refuses a table and an edge
+    sharing one name.
+- **Connection, settings and cache.**
+  - Unbounded or non-finite timeouts no longer panic on connect.
+    **Breaking:** timeouts above 86400 s, retry waits above 3600 s and
+    multipliers above 100 fail validation.
+  - Glob invalidation no longer falls back to match-everything for a
+    non-ASCII pattern; Redis reconnects after a dropped connection;
+    `MemoryCache` is a real LRU that evicts expired entries first; the
+    stats report size and evictions; cache keys can no longer collide.
+    **Breaking:** keys are prefixed once and `cache_key_for` output
+    changed, so existing cache entries become misses.
+  - `StreamingManager` prunes ended subscriptions. **Breaking**
+- **Orchestration and the CLI.**
+  - A failed migration fails its environment and triggers auto-rollback
+    (it was counted as applied); deploys apply only each environment's
+    pending migrations and roll back only what they applied, reported as
+    `RolledBack`; repeated environment names deploy once.
+  - `surql migrate up` / `down` and `orchestrate deploy` exit non-zero on
+    failure; the documented minimal environments file loads; a non-UTF-8
+    argument is a usage error instead of a panic; concurrent strategies
+    wait for every deployment instead of detaching them.
+  - `surql --config <file>` reads the named file (any TOML carrying
+    `[package.metadata.surql]`); it used to be ignored.
+
+### Changed
+
+- **MSRV is Rust 1.95.** `rust-version` said 1.90, which never built the
+  locked graph; surrealdb 3.3 uses `std::hint::cold_path` (stable since
+  1.95) and declares no `rust-version`. CI now checks it.
+- The lockfile moves to surrealdb 3.3.0, which a fresh consumer already
+  resolves.
+- Destructive CLI commands (`db reset`, `bucket rm`, `bucket delete`,
+  `orchestrate deploy`) prompt, and require `--yes` when stdin is not a
+  terminal; `orchestrate deploy` gains `--approve`, `--yes` and
+  `--no-auto-rollback`. **Breaking**
+- **Breaking:** `deploy_to_environments(&DeploymentPlan)` replaces the
+  ten-argument form; `DeploymentResult` gains `applied_versions` and
+  `rolled_back_versions`, `DeploymentPlan` gains `approved`; the
+  environments file rejects unknown keys and duplicate names;
+  `OrchestrateCommand::Deploy` takes `DeployArgs`.
+- **Breaking:** `Query::similarity_score` returns `Result`; `Operator`
+  gains the `Expr` variant; `GraphVizTheme` gains `palette`; index column
+  order is significant in validation; `register_table` / `register_edge`
+  refuse a cross-kind name clash.
+- **Breaking:** `Migration` and `MigrationMetadata` gain `squashed_from`;
+  `RollbackPlan` gains `approved`; `SnapshotComparison` gains bucket
+  fields; `SchemaWatcher::start` returns a bounded receiver and needs a
+  runtime; `Transaction::begin`, `execute` and `rollback` return ready
+  futures (awaiting them still compiles).
+- Shipped code may not `unwrap`, `expect` or `panic!`, enforced by lint;
+  the only exception is `RecordResult::unwrap`, whose contract is to
+  panic. Every source file is under 1000 lines.
+- Generators and validators are generic over `BuildHasher`.
+- Hint documentation says what hints do: they are comments the engine
+  ignores.
+
+### Added
+
+- `types::escape`: `is_identifier`, `quote_ident`, `quote_str`,
+  `quote_record_key`, `unescape` and `unquote_str`, following the engine's
+  own printer.
+- `eq_expr`, `ne_expr`, `gt_expr`, `gte_expr`, `lt_expr`, `lte_expr`;
+  `SettingsBuilder::config_file`; `try_register_table` /
+  `try_register_edge`; `themes::color_scheme_by_name`;
+  `cli::schema::fetch_live_schema`; `MemoryCache::with_stats`;
+  `MAX_TIMEOUT_SECS`, `MAX_RETRY_WAIT_SECS`, `MAX_RETRY_MULTIPLIER`; public
+  diff comparators (`fields_equal`, `indexes_equal`, `events_equal`,
+  `table_permissions_equal`, `field_permissions_equal`, …).
+- `migration::analyze_statements`, the rollback analyser for any statement
+  list; `DiffOperation::ModifyIndex` and `ModifyEvent`.
+- `fuzz/`, a cargo-fuzz crate whose targets check record ids, identifiers,
+  string literals and values against the engine's parser, and that the
+  `INFO` parsers return on arbitrary text.
+- CI jobs for the MSRV, the `client-wasm` build and the no-features
+  build; the pre-push hook runs every CI gate.
+
+### Removed
+
+- `reqwest`, a dependency no source file ever used.
+- `Query::to_surql_or_panic_with_table` (it was `doc(hidden)`).
+  **Breaking**
+- The vendored SHA-256 implementation, in favour of the `sha2` crate the
+  crate already depended on.
+
 ## [0.33.1] - 2026-08-27
 
 ### Fixed

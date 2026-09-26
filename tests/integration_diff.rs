@@ -1,0 +1,607 @@
+//! Engine-backed coverage for the schema diff: every statement the diff
+//! renders must apply, a rollback must put back what the forward removed,
+//! and the definition read back afterwards must diff clean.
+//!
+//! Gated on the `SURREAL_URL` env var like `integration_migration`, so
+//! `cargo test` stays green when no SurrealDB server is reachable:
+//!
+//! ```text
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+//! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
+//!   cargo test --all-features --test integration_diff -- --test-threads=1
+//! ```
+
+#![cfg(any(feature = "client", feature = "client-rustls"))]
+
+use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde_json::Value;
+use surql::connection::{ConnectionConfig, DatabaseClient};
+use surql::migration::diff::{
+    diff_edges, diff_events, diff_fields, diff_indexes, diff_schemas, diff_tables, SchemaSnapshot,
+};
+use surql::migration::{DiffOperation, SchemaDiff};
+use surql::schema::edge::{typed_edge, EdgeDefinition};
+use surql::schema::parser::{parse_edge_info, parse_table_full};
+use surql::schema::{
+    bm25_index, event, index, int_field, record_field, search_index, standard_analyzer,
+    string_field, table_schema, unique_index, ChangeFeed, FieldDefinition, IndexDefinition,
+    IndexType, ReferenceAction, TableDefinition,
+};
+
+static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+async fn connected_client() -> Option<DatabaseClient> {
+    let url = env::var("SURREAL_URL").ok()?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let seq = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let database = format!("it_diff_{nanos}_{seq}");
+    let cfg = ConnectionConfig::builder()
+        .url(url)
+        .namespace(format!("ns_{database}"))
+        .database(database)
+        .username(env::var("SURREAL_USER").unwrap_or_else(|_| "root".into()))
+        .password(env::var("SURREAL_PASS").unwrap_or_else(|_| "root".into()))
+        .timeout(10.0)
+        .build()
+        .expect("valid integration config");
+    let client = DatabaseClient::new(cfg).expect("client constructs");
+    client.connect().await.expect("connect to local surrealdb");
+    Some(client)
+}
+
+/// Run `statements` as one script, panicking with the script on failure.
+async fn apply(client: &DatabaseClient, statements: &[String]) {
+    let script = statements.join("\n");
+    client
+        .query(&script)
+        .await
+        .unwrap_or_else(|e| panic!("apply failed: {e}\n{script}"));
+}
+
+/// The `up` half of a migration built from `diffs`, in order.
+fn forward(diffs: &[SchemaDiff]) -> Vec<String> {
+    diffs
+        .iter()
+        .map(|d| d.forward_sql.clone())
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
+/// The `down` half of a migration built from `diffs`: reverse order.
+fn backward(diffs: &[SchemaDiff]) -> Vec<String> {
+    diffs
+        .iter()
+        .rev()
+        .map(|d| d.backward_sql.clone())
+        .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
+/// `DatabaseClient::query` wraps every statement result in an array.
+fn first(value: &Value) -> Value {
+    value
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The engine's own `DEFINE TABLE` echo for `table`, if it exists.
+async fn table_echo(client: &DatabaseClient, table: &str) -> Option<String> {
+    let info = first(&client.query("INFO FOR DB;").await.expect("INFO FOR DB"));
+    info.get("tables")
+        .and_then(|t| t.get(table))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+async fn table_info(client: &DatabaseClient, table: &str) -> Value {
+    first(
+        &client
+            .query(&format!("INFO FOR TABLE {table};"))
+            .await
+            .expect("INFO FOR TABLE"),
+    )
+}
+
+/// Read one table back through both `INFO` levels.
+async fn read_table(client: &DatabaseClient, table: &str) -> TableDefinition {
+    let define = table_echo(client, table).await.expect("table exists");
+    parse_table_full(table, &define, &table_info(client, table).await).expect("parse table")
+}
+
+/// Read one edge back through both `INFO` levels.
+async fn read_edge(client: &DatabaseClient, edge: &str) -> EdgeDefinition {
+    let define = table_echo(client, edge).await.expect("edge exists");
+    parse_edge_info(edge, &table_info(client, edge).await, Some(&define)).expect("parse edge")
+}
+
+/// Adding an edge that carries permissions is one statement the engine
+/// accepts; it used to be a bare `DEFINE TABLE e PERMISSIONS ...` after the
+/// `DEFINE TABLE e TYPE RELATION ...`, which the engine refuses because the
+/// table already exists.
+#[tokio::test]
+async fn an_added_edge_with_permissions_applies_and_rolls_back() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE person SCHEMAFULL;".into(),
+            "DEFINE TABLE post SCHEMAFULL;".into(),
+        ],
+    )
+    .await;
+
+    let likes = typed_edge("likes", "person", "post")
+        .with_permissions([("select", "$auth.id = in"), ("create", "true")]);
+    let diffs = diff_edges(std::slice::from_ref(&likes), &[]);
+    apply(&client, &forward(&diffs)).await;
+
+    let echo = table_echo(&client, "likes").await.expect("edge defined");
+    assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
+    assert!(echo.contains("FOR select WHERE $auth.id = in"), "{echo}");
+    assert!(echo.contains("FOR create WHERE true"), "{echo}");
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&likes), &[stored]);
+    assert!(residual.is_empty(), "{residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    assert!(table_echo(&client, "likes").await.is_none());
+}
+
+/// Walk one field change through the engine: define `old`, apply the diff's
+/// forward, check the stored field now diffs clean against `new`, apply the
+/// backward, and check it diffs clean against `old` again.
+async fn field_change_round_trips(old: FieldDefinition, new: FieldDefinition) {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE user SCHEMAFULL;".into(),
+            "DEFINE TABLE post SCHEMAFULL;".into(),
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            old.to_surql("doc"),
+        ],
+    )
+    .await;
+
+    let diffs = diff_fields(
+        "doc",
+        std::slice::from_ref(&new),
+        std::slice::from_ref(&old),
+    );
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    assert_eq!(diffs[0].operation, DiffOperation::ModifyField);
+
+    apply(&client, &forward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&new), &stored.fields);
+    assert!(residual.is_empty(), "forward left drift: {residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&old), &stored.fields);
+    assert!(residual.is_empty(), "rollback left drift: {residual:#?}");
+}
+
+#[tokio::test]
+async fn a_field_losing_option_is_migrated_both_ways() {
+    let old = string_field("title")
+        .nullable(true)
+        .build_unchecked()
+        .unwrap();
+    let new = string_field("title").build_unchecked().unwrap();
+    field_change_round_trips(old, new).await;
+}
+
+#[tokio::test]
+async fn a_record_link_changing_target_is_migrated_both_ways() {
+    let old = record_field("owner", Some("user"))
+        .build_unchecked()
+        .unwrap();
+    let new = record_field("owner", Some("post"))
+        .build_unchecked()
+        .unwrap();
+    field_change_round_trips(old, new).await;
+}
+
+#[tokio::test]
+async fn a_reference_action_change_is_migrated_both_ways() {
+    let old = record_field("owner", Some("user"))
+        .reference(ReferenceAction::Cascade)
+        .build_unchecked()
+        .unwrap();
+    let new = record_field("owner", Some("user"))
+        .reference(ReferenceAction::Reject)
+        .build_unchecked()
+        .unwrap();
+    field_change_round_trips(old, new).await;
+}
+
+#[tokio::test]
+async fn a_field_permission_change_is_migrated_both_ways() {
+    let old = string_field("title").build_unchecked().unwrap();
+    let new = string_field("title")
+        .permissions([("update", "$auth.admin = true")])
+        .build_unchecked()
+        .unwrap();
+    field_change_round_trips(old, new).await;
+}
+
+/// A string literal compares by content: the engine re-quoting a
+/// double-quoted default is no change, and a change to the spaces inside
+/// one is.
+#[tokio::test]
+async fn literal_defaults_compare_by_content() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let quoted = string_field("motto")
+        .default("\"hello  there\"")
+        .build_unchecked()
+        .unwrap();
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            quoted.to_surql("doc"),
+        ],
+    )
+    .await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&quoted), &stored.fields);
+    assert!(
+        residual.is_empty(),
+        "the echo is not a change: {residual:#?}"
+    );
+
+    let respaced = string_field("motto")
+        .default("'hello there'")
+        .build_unchecked()
+        .unwrap();
+    let diffs = diff_fields("doc", std::slice::from_ref(&respaced), &stored.fields);
+    assert_eq!(diffs.len(), 1, "the spaces are content: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_fields("doc", std::slice::from_ref(&respaced), &stored.fields);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// Whether a second row with the same `email` is refused.
+async fn email_is_unique(client: &DatabaseClient, table: &str) -> bool {
+    client
+        .query(&format!(
+            "DELETE {table}; CREATE {table}:a SET email = 'x@example.com';"
+        ))
+        .await
+        .expect("first row");
+    client
+        .query(&format!("CREATE {table}:b SET email = 'x@example.com';"))
+        .await
+        .is_err()
+}
+
+/// Dropping a table and rolling back restores all of it: its fields, a
+/// UNIQUE index that still bites, its events, its permissions, and its
+/// change feed. The rollback used to be a bare `DEFINE TABLE doc SCHEMAFULL`.
+#[tokio::test]
+async fn a_dropped_table_rolls_back_whole() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let doc = table_schema("doc")
+        .with_fields([
+            string_field("email").build_unchecked().unwrap(),
+            int_field("n").default("0").build_unchecked().unwrap(),
+        ])
+        .with_indexes([unique_index("email_idx", ["email"])])
+        .with_events([event("audit", "$event = 'CREATE'", "CREATE log SET n = 1")])
+        .with_permissions([("select", "true")])
+        .with_changefeed(ChangeFeed::new("1d"));
+    apply(
+        &client,
+        &forward(&diff_tables(std::slice::from_ref(&doc), &[])),
+    )
+    .await;
+
+    let diffs = diff_tables(&[], std::slice::from_ref(&doc));
+    apply(&client, &forward(&diffs)).await;
+    assert!(table_echo(&client, "doc").await.is_none());
+
+    apply(&client, &backward(&diffs)).await;
+    let echo = table_echo(&client, "doc").await.expect("table restored");
+    assert!(echo.contains("SCHEMAFULL"), "{echo}");
+    assert!(echo.contains("CHANGEFEED 1d"), "{echo}");
+    assert!(echo.contains("FOR select WHERE true"), "{echo}");
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_tables(std::slice::from_ref(&doc), &[stored]);
+    assert!(
+        residual.is_empty(),
+        "the rollback lost something: {residual:#?}"
+    );
+    assert!(email_is_unique(&client, "doc").await);
+}
+
+/// Dropping an edge and rolling back restores the edge, which used to have
+/// no rollback at all.
+#[tokio::test]
+async fn a_dropped_edge_rolls_back_whole() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE person SCHEMAFULL;".into(),
+            "DEFINE TABLE post SCHEMAFULL;".into(),
+        ],
+    )
+    .await;
+    let likes = typed_edge("likes", "person", "post")
+        .with_fields([int_field("weight").build_unchecked().unwrap()])
+        .with_indexes([unique_index("pair", ["in", "out"])])
+        .with_permissions([("select", "true")]);
+    apply(
+        &client,
+        &forward(&diff_edges(std::slice::from_ref(&likes), &[])),
+    )
+    .await;
+
+    let diffs = diff_edges(&[], std::slice::from_ref(&likes));
+    apply(&client, &forward(&diffs)).await;
+    assert!(table_echo(&client, "likes").await.is_none());
+
+    apply(&client, &backward(&diffs)).await;
+    let echo = table_echo(&client, "likes").await.expect("edge restored");
+    assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
+    assert!(echo.contains("FOR select WHERE true"), "{echo}");
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&likes), &[stored]);
+    assert!(
+        residual.is_empty(),
+        "the rollback lost something: {residual:#?}"
+    );
+}
+
+/// Dropping a UNIQUE index and rolling back brings back a UNIQUE index, not
+/// a plain one.
+#[tokio::test]
+async fn a_dropped_unique_index_rolls_back_unique() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let idx = unique_index("email_idx", ["email"]);
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            "DEFINE FIELD email ON doc TYPE string;".into(),
+            idx.to_surql("doc"),
+        ],
+    )
+    .await;
+
+    let diffs = diff_indexes("doc", &[], std::slice::from_ref(&idx));
+    apply(&client, &forward(&diffs)).await;
+    assert!(!email_is_unique(&client, "doc").await);
+
+    client.query("DELETE doc;").await.expect("clear rows");
+    apply(&client, &backward(&diffs)).await;
+    assert!(email_is_unique(&client, "doc").await);
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", std::slice::from_ref(&idx), &stored.indexes);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// An index turning UNIQUE is migrated both ways; the name-only comparison
+/// used to report nothing, so the constraint never reached the database.
+#[tokio::test]
+async fn an_index_turning_unique_is_migrated_both_ways() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let plain = index("email_idx", ["email"]);
+    let unique = unique_index("email_idx", ["email"]);
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            "DEFINE FIELD email ON doc TYPE string;".into(),
+            plain.to_surql("doc"),
+        ],
+    )
+    .await;
+
+    let diffs = diff_indexes(
+        "doc",
+        std::slice::from_ref(&unique),
+        std::slice::from_ref(&plain),
+    );
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    assert!(email_is_unique(&client, "doc").await);
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", std::slice::from_ref(&unique), &stored.indexes);
+    assert!(residual.is_empty(), "{residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    assert!(!email_is_unique(&client, "doc").await);
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", std::slice::from_ref(&plain), &stored.indexes);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// Indexes the engine stores with its defaults filled in read back equal to
+/// the code that left them out: an HNSW index without tuning, which the
+/// engine echoes as `DIST EUCLIDEAN TYPE F32 EFC 150 M 12`, and a full-text
+/// index without BM25, which the engine scores with BM25 anyway.
+#[tokio::test]
+async fn index_defaults_read_back_without_drift() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let bare_hnsw = IndexDefinition {
+        dimension: Some(4),
+        ..IndexDefinition::new("h", ["v"]).with_type(IndexType::Hnsw)
+    };
+    let code = [bare_hnsw, search_index("s", ["body"])];
+    let mut ddl = vec![
+        "DEFINE TABLE doc SCHEMAFULL;".to_owned(),
+        "DEFINE FIELD v ON doc TYPE array<float>;".to_owned(),
+        "DEFINE FIELD body ON doc TYPE string;".to_owned(),
+    ];
+    ddl.extend(code.iter().map(|idx| idx.to_surql("doc")));
+    apply(&client, &ddl).await;
+
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", &code, &stored.indexes);
+    assert!(
+        residual.is_empty(),
+        "re-applies on every boot: {residual:#?}"
+    );
+}
+
+/// An event changing its WHEN and THEN is migrated both ways.
+#[tokio::test]
+async fn an_event_change_is_migrated_both_ways() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let old = event("audit", "true", "CREATE log SET n = 1");
+    let new = event(
+        "audit",
+        "$event = 'CREATE'",
+        "LET $n = 2; CREATE log SET n = $n",
+    );
+    apply(&client, &["DEFINE TABLE doc SCHEMALESS;".into()]).await;
+    apply(
+        &client,
+        &forward(&diff_events("doc", std::slice::from_ref(&old), &[])),
+    )
+    .await;
+
+    let diffs = diff_events(
+        "doc",
+        std::slice::from_ref(&new),
+        std::slice::from_ref(&old),
+    );
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_events("doc", std::slice::from_ref(&new), &stored.events);
+    assert!(residual.is_empty(), "{residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_events("doc", std::slice::from_ref(&old), &stored.events);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// A relation changing its target table is migrated both ways, and the
+/// fields on it survive the re-definition.
+#[tokio::test]
+async fn an_edge_changing_endpoint_is_migrated_both_ways() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE person SCHEMAFULL;".into(),
+            "DEFINE TABLE post SCHEMAFULL;".into(),
+            "DEFINE TABLE comment SCHEMAFULL;".into(),
+        ],
+    )
+    .await;
+    let weight = int_field("weight").build_unchecked().unwrap();
+    let old = typed_edge("likes", "person", "post").with_fields([weight.clone()]);
+    let new = typed_edge("likes", "person", "comment").with_fields([weight]);
+    apply(
+        &client,
+        &forward(&diff_edges(std::slice::from_ref(&old), &[])),
+    )
+    .await;
+
+    let diffs = diff_edges(std::slice::from_ref(&new), std::slice::from_ref(&old));
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    let echo = table_echo(&client, "likes").await.expect("edge");
+    assert!(
+        echo.contains("TYPE RELATION IN person OUT comment"),
+        "{echo}"
+    );
+    // The fields survive the OVERWRITE, and the stored edge reads back as
+    // exactly the new definition.
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&new), &[stored]);
+    assert!(residual.is_empty(), "{residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    let stored = read_edge(&client, "likes").await;
+    let residual = diff_edges(std::slice::from_ref(&old), &[stored]);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// A whole-schema migration applies in one script and rolls back in one:
+/// over a table that already holds rows, a full-text index builds only once
+/// its analyzer exists, and an edge that becomes a table of the same name
+/// must be removed before the table is defined.
+#[tokio::test]
+async fn a_schema_migration_orders_dependencies() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let body = string_field("body").build_unchecked().unwrap();
+    let doc_v1 = table_schema("doc").with_fields([body.clone()]);
+    let doc_v2 = table_schema("doc")
+        .with_fields([body])
+        .with_indexes([bm25_index("body_ft", ["body"], "words")]);
+    let person = table_schema("person");
+    let tagged_edge = typed_edge("tagged", "person", "doc");
+    let tagged_table =
+        table_schema("tagged").with_fields([int_field("n").build_unchecked().unwrap()]);
+
+    let db = SchemaSnapshot {
+        tables: vec![doc_v1, person.clone()],
+        edges: vec![tagged_edge],
+        ..SchemaSnapshot::default()
+    };
+    let code = SchemaSnapshot {
+        tables: vec![doc_v2, person, tagged_table],
+        analyzers: vec![standard_analyzer("words")],
+        ..SchemaSnapshot::default()
+    };
+    apply(
+        &client,
+        &forward(&diff_schemas(&db, &SchemaSnapshot::default())),
+    )
+    .await;
+    client
+        .query("CREATE doc:1 SET body = 'hello world';")
+        .await
+        .expect("a row for the index to build over");
+
+    let diffs = diff_schemas(&code, &db);
+    apply(&client, &forward(&diffs)).await;
+    let echo = table_echo(&client, "tagged").await.expect("table");
+    assert!(!echo.contains("RELATION"), "{echo}");
+    let stored = read_table(&client, "doc").await;
+    assert!(
+        stored.indexes.iter().any(|i| i.name == "body_ft"),
+        "{stored:?}"
+    );
+
+    apply(&client, &backward(&diffs)).await;
+    let echo = table_echo(&client, "tagged").await.expect("edge");
+    assert!(echo.contains("TYPE RELATION IN person OUT doc"), "{echo}");
+    let stored = read_table(&client, "doc").await;
+    assert!(stored.indexes.is_empty(), "{stored:?}");
+}

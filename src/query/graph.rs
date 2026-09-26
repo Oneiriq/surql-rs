@@ -14,11 +14,14 @@
 //! [`query_with_vars`](crate::DatabaseClient::query_with_vars).
 //!
 //! [`create_relation`] and [`remove_relation`] are the exceptions: they
-//! stay hand-composed because [`Query::relate`] inlines its payload via
-//! `render_data_object`, whereas `create_relation` binds `CONTENT $data`
-//! as a variable — matching the discipline in
-//! [`create_record`](crate::query::crud::create_record). Routing them
-//! through the builder would inline caller payloads into the statement.
+//! stay hand-composed because [`Query::relate`] inlines its payload as a
+//! literal, whereas `create_relation` binds `CONTENT $data` as a variable —
+//! matching the discipline in
+//! [`create_record`](crate::query::crud::create_record).
+//!
+//! Every record argument is parsed and re-rendered as a record id (its key
+//! escaped), and every edge and target table must be an identifier. The
+//! `path` of [`traverse`] / [`traverse_raw`] is raw SurrealQL by design.
 //!
 //! ## Row-level filtering
 //!
@@ -85,7 +88,6 @@
 #![cfg(any(feature = "client", feature = "client-rustls", feature = "client-wasm"))]
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -95,6 +97,9 @@ use crate::error::{Result, SurqlError};
 
 use super::builder::{Condition, Query};
 use super::executor::{extract_rows, flatten_rows};
+use super::validate::{
+    parse_record, render_target, validate_depth, validate_identifier, MAX_GRAPH_DEPTH,
+};
 
 /// Append each entry of `conditions` to `query` as a `WHERE` clause.
 ///
@@ -105,19 +110,26 @@ fn apply_conditions(query: Query, conditions: Option<&[Condition]>) -> Query {
     conditions.unwrap_or(&[]).iter().fold(query, Query::where_)
 }
 
-/// Render `<arrow><edge>[<depth>]<arrow><target>` for a depth-bounded hop.
+/// Render the path of [`traverse_with_depth`]: `depth` hops through
+/// `edge_table` ending on `target_table`.
 ///
-/// When `depth` is `None` no numeric suffix is emitted, which SurrealDB
-/// interprets as a single hop.
+/// One hop (`None` or `Some(1)`) is `<arrow><edge><arrow><target>`. Deeper
+/// paths spell out each hop, with the `?` wildcard for the records in
+/// between: `Some(2)` renders `->follows->?->follows->user`.
 fn depth_path(
     edge_table: &str,
     target_table: &str,
     direction: Direction,
     depth: Option<u32>,
-) -> String {
+) -> Result<String> {
+    validate_identifier(edge_table, "edge table name")?;
+    validate_identifier(target_table, "target table name")?;
+    let depth = depth.unwrap_or(1);
+    validate_depth(depth)?;
     let arrow = direction.arrow();
-    let depth_str = depth.map_or(String::new(), |d| d.to_string());
-    format!("{arrow}{edge_table}{depth_str}{arrow}{target_table}")
+    let hop = format!("{arrow}{edge_table}{arrow}?");
+    let hops: String = (1..depth).map(|_| hop.as_str()).collect();
+    Ok(format!("{hops}{arrow}{edge_table}{arrow}{target_table}"))
 }
 
 /// Render `SELECT * FROM <start><path> [WHERE ...]`.
@@ -138,6 +150,7 @@ fn select_traversal_surql(
 /// [`Direction::Both`] is rejected: the aggregate needs a single arrow at
 /// the tail of the `FROM` expression.
 fn count_related_surql(record: &str, edge_table: &str, direction: Direction) -> Result<String> {
+    validate_identifier(edge_table, "edge table name")?;
     let path = match direction {
         Direction::Out => format!("->{edge_table}"),
         // See `get_incoming_edges` — SurrealDB v3 parses incoming edges
@@ -171,10 +184,11 @@ fn shortest_path_surql(
     depth: u32,
     conditions: Option<&[Condition]>,
 ) -> Result<String> {
-    let mut path = String::new();
-    for _ in 0..depth {
-        write!(path, "->{edge_table}->?").expect("write to String cannot fail");
-    }
+    validate_identifier(edge_table, "edge table name")?;
+    validate_depth(depth)?;
+    let to_record = parse_record(to_record)?;
+    let hop = format!("->{edge_table}->?");
+    let path: String = (0..depth).map(|_| hop.as_str()).collect();
 
     let query = Query::new()
         .select(None)
@@ -228,11 +242,13 @@ pub async fn traverse<T: DeserializeOwned>(
     extract_rows::<T>(&raw)
 }
 
-/// Traverse a graph with an optional depth limit.
+/// Traverse exactly `depth` hops through `edge_table`, ending on
+/// `target_table` records.
 ///
-/// Constructs `<arrow><edge>[<depth>]<arrow><target>` and delegates to
-/// [`traverse`]. When `depth` is `None`, no numeric suffix is emitted,
-/// which SurrealDB interprets as a single hop.
+/// `None` is a single hop (`->edge->target`). `Some(n)` spells out `n`
+/// hops, with the `?` wildcard for the records in between
+/// (`->follows->?->follows->user` for `Some(2)`); `n` must be in `1..=32`.
+/// Delegates to [`traverse`].
 pub async fn traverse_with_depth<T: DeserializeOwned>(
     client: &DatabaseClient,
     start: &str,
@@ -242,7 +258,7 @@ pub async fn traverse_with_depth<T: DeserializeOwned>(
     depth: Option<u32>,
     conditions: Option<&[Condition]>,
 ) -> Result<Vec<T>> {
-    let path = depth_path(edge_table, target_table, direction, depth);
+    let path = depth_path(edge_table, target_table, direction, depth)?;
     traverse(client, start, &path, conditions).await
 }
 
@@ -261,6 +277,14 @@ pub async fn traverse_raw(
     Ok(flatten_rows(&raw))
 }
 
+/// Render `<from>-><edge>-><to>` for the relation helpers.
+fn relation_path(edge_table: &str, from_record: &str, to_record: &str) -> Result<String> {
+    validate_identifier(edge_table, "edge table name")?;
+    let from = render_target(from_record)?;
+    let to = render_target(to_record)?;
+    Ok(format!("{from}->{edge_table}->{to}"))
+}
+
 /// Create a graph relation via `RELATE <from>-><edge>-><to> [CONTENT $data]`.
 ///
 /// `data`, when present, is bound as a variable so payload shape is
@@ -272,10 +296,11 @@ pub async fn create_relation(
     to_record: &str,
     data: Option<Value>,
 ) -> Result<Value> {
+    let relation = relation_path(edge_table, from_record, to_record)?;
     let surql = if data.is_some() {
-        format!("RELATE {from_record}->{edge_table}->{to_record} CONTENT $data")
+        format!("RELATE {relation} CONTENT $data")
     } else {
-        format!("RELATE {from_record}->{edge_table}->{to_record}")
+        format!("RELATE {relation}")
     };
 
     let raw = if let Some(payload) = data {
@@ -295,7 +320,10 @@ pub async fn remove_relation(
     from_record: &str,
     to_record: &str,
 ) -> Result<()> {
-    let surql = format!("DELETE {from_record}->{edge_table}->{to_record}");
+    let surql = format!(
+        "DELETE {}",
+        relation_path(edge_table, from_record, to_record)?
+    );
     client.query(&surql).await?;
     Ok(())
 }
@@ -307,6 +335,7 @@ pub async fn get_outgoing_edges(
     edge_table: &str,
     conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
+    validate_identifier(edge_table, "edge table name")?;
     let surql = select_traversal_surql(record, &format!("->{edge_table}"), conditions)?;
     let raw = client.query(&surql).await?;
     Ok(flatten_rows(&raw))
@@ -324,6 +353,7 @@ pub async fn get_incoming_edges(
     edge_table: &str,
     conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
+    validate_identifier(edge_table, "edge table name")?;
     let surql = select_traversal_surql(record, &format!("<-{edge_table}"), conditions)?;
     let raw = client.query(&surql).await?;
     Ok(flatten_rows(&raw))
@@ -342,6 +372,8 @@ pub async fn get_related_records(
     direction: Direction,
     conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
+    validate_identifier(edge_table, "edge table name")?;
+    validate_identifier(target_table, "target table name")?;
     let path = match direction {
         Direction::Out => format!("->{edge_table}->{target_table}"),
         // SurrealDB v3 parses `<-edge<-target` relative to the record at
@@ -397,7 +429,8 @@ pub async fn count_related(
 /// with `AND`, so a tenant guard narrows every depth probe.
 ///
 /// The matching rows are returned as raw JSON. `max_depth = 0`
-/// short-circuits without issuing queries.
+/// short-circuits without issuing queries; a `max_depth` above 32 is a
+/// validation error (each depth is one query spelling out every hop).
 pub async fn shortest_path(
     client: &DatabaseClient,
     from_record: &str,
@@ -406,6 +439,11 @@ pub async fn shortest_path(
     max_depth: u32,
     conditions: Option<&[Condition]>,
 ) -> Result<Vec<Value>> {
+    if max_depth > MAX_GRAPH_DEPTH {
+        return Err(SurqlError::Validation {
+            reason: format!("shortest_path max_depth must be at most {MAX_GRAPH_DEPTH}"),
+        });
+    }
     for depth in 1..=max_depth {
         let surql = shortest_path_surql(from_record, to_record, edge_table, depth, conditions)?;
 
@@ -492,15 +530,15 @@ mod tests {
     #[test]
     fn direction_arrow_matches_py_semantics_via_depth_path() {
         assert_eq!(
-            depth_path("follows", "user", Direction::Out, None),
+            depth_path("follows", "user", Direction::Out, None).unwrap(),
             "->follows->user"
         );
         assert_eq!(
-            depth_path("follows", "user", Direction::In, None),
+            depth_path("follows", "user", Direction::In, None).unwrap(),
             "<-follows<-user"
         );
         assert_eq!(
-            depth_path("follows", "user", Direction::Both, None),
+            depth_path("follows", "user", Direction::Both, None).unwrap(),
             "<->follows<->user"
         );
     }
@@ -508,9 +546,32 @@ mod tests {
     #[test]
     fn depth_path_renders_depth_suffix() {
         assert_eq!(
-            depth_path("follows", "user", Direction::Out, Some(2)),
-            "->follows2->user"
+            depth_path("follows", "user", Direction::Out, Some(2)).unwrap(),
+            "->follows->?->follows->user"
         );
+        assert_eq!(
+            depth_path("follows", "user", Direction::In, Some(1)).unwrap(),
+            "<-follows<-user"
+        );
+    }
+
+    #[test]
+    fn depth_path_validates_names_and_depth() {
+        let out = Direction::Out;
+        assert!(depth_path("follows", "user", out, Some(0)).is_err());
+        assert!(depth_path("follows", "user", out, Some(MAX_GRAPH_DEPTH + 1)).is_err());
+        assert!(depth_path("follows->user; DELETE", "user", out, None).is_err());
+        assert!(depth_path("follows", "user WHERE true", out, None).is_err());
+    }
+
+    #[test]
+    fn relation_path_escapes_records() {
+        assert_eq!(
+            relation_path("likes", "user:a", "post:b; DELETE post").unwrap(),
+            "user:a->likes->post:⟨b; DELETE post⟩"
+        );
+        assert!(relation_path("likes; DELETE", "user:a", "post:b").is_err());
+        assert!(relation_path("likes", "user; DELETE user", "post:b").is_err());
     }
 
     #[test]
@@ -545,6 +606,27 @@ mod tests {
             shortest_path_surql("user:alice", "user:bob", "follows", 3, None).unwrap(),
             "SELECT * FROM user:alice->follows->?->follows->?->follows->? \
              WHERE (id = user:bob) LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn shortest_path_target_cannot_extend_the_where_clause() {
+        let sql =
+            shortest_path_surql("user:alice", "user:bob OR true", "follows", 1, None).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM user:alice->follows->? WHERE (id = user:⟨bob OR true⟩) LIMIT 1"
+        );
+        assert!(
+            shortest_path_surql("user:alice", "user:bob", "follows; DELETE user", 1, None).is_err()
+        );
+    }
+
+    #[test]
+    fn edge_names_are_validated() {
+        assert!(
+            count_related_surql("user:alice", "likes GROUP ALL; DELETE user", Direction::Out)
+                .is_err()
         );
     }
 

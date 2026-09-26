@@ -78,12 +78,22 @@ pub struct DeploymentResult {
     pub started_at: DateTime<Utc>,
     /// When the deployment finished (`None` when still in flight).
     pub completed_at: Option<DateTime<Utc>>,
-    /// Error message captured when `status == Failed`.
+    /// Error message captured when `status == Failed`, or a note on why
+    /// an auto-rollback did not run for this environment.
     pub error: Option<String>,
     /// Wall-clock execution time in milliseconds.
     pub execution_time_ms: Option<u64>,
-    /// Number of migrations actually applied.
+    /// Number of migrations this deployment applied to the environment.
     pub migrations_applied: usize,
+    /// Versions this deployment applied, in the order they ran. Migrations
+    /// that were already recorded in the environment's history are skipped
+    /// and never listed here.
+    #[serde(default)]
+    pub applied_versions: Vec<String>,
+    /// Versions of [`applied_versions`](Self::applied_versions) that an
+    /// auto-rollback reverted, newest first.
+    #[serde(default)]
+    pub rolled_back_versions: Vec<String>,
 }
 
 impl DeploymentResult {
@@ -101,6 +111,8 @@ impl DeploymentResult {
             error: None,
             execution_time_ms: None,
             migrations_applied: 0,
+            applied_versions: Vec::new(),
+            rolled_back_versions: Vec::new(),
         }
     }
 
@@ -140,6 +152,8 @@ pub struct DeploymentResultBuilder {
     error: Option<String>,
     execution_time_ms: Option<u64>,
     migrations_applied: usize,
+    applied_versions: Vec<String>,
+    rolled_back_versions: Vec<String>,
 }
 
 impl DeploymentResultBuilder {
@@ -173,6 +187,20 @@ impl DeploymentResultBuilder {
         self
     }
 
+    /// Set the versions this deployment applied. Also sets
+    /// [`migrations_applied`](Self::migrations_applied) to their count.
+    pub fn applied_versions(mut self, value: Vec<String>) -> Self {
+        self.migrations_applied = value.len();
+        self.applied_versions = value;
+        self
+    }
+
+    /// Set the versions an auto-rollback reverted.
+    pub fn rolled_back_versions(mut self, value: Vec<String>) -> Self {
+        self.rolled_back_versions = value;
+        self
+    }
+
     /// Finalise into a [`DeploymentResult`].
     pub fn build(self) -> DeploymentResult {
         DeploymentResult {
@@ -183,6 +211,8 @@ impl DeploymentResultBuilder {
             error: self.error,
             execution_time_ms: self.execution_time_ms,
             migrations_applied: self.migrations_applied,
+            applied_versions: self.applied_versions,
+            rolled_back_versions: self.rolled_back_versions,
         }
     }
 }

@@ -2,7 +2,7 @@
 name = "oneiriq-surql"
 version = "0.33.1"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.95"
 authors = ["Shon Thomas <shon@oneiriq.com>"]
 license = "Apache-2.0"
 description = "Code-first database toolkit for SurrealDB - schema definitions, migrations, query building, and typed CRUD (Rust port of oneiriq-surql). Published as the `oneiriq-surql` crate; imported as `use surql::...`."
@@ -40,19 +40,17 @@ default = ["client-rustls"]
 client = [
     "dep:tokio",
     "dep:surrealdb",
-    "dep:reqwest",
     "dep:futures",
     "surrealdb/native-tls",
-    "reqwest/default-tls",
 ]
 # Alias for `client` -- the historical `native-tls` (openssl) backend.
 # Kept as a named flag so downstream consumers can opt into the system
 # OpenSSL stack with a stable feature name.
 client-tls = ["client"]
 # Pure-Rust TLS variant. Enables the same `client` code paths but swaps the
-# TLS backend to `rustls` + webpki roots so nothing in the resolved
-# dependency graph depends on `openssl-sys`. Use this variant on CI
-# runners / images that do not install `libssl-dev`.
+# TLS backend to `rustls` so nothing in the resolved dependency graph
+# depends on `openssl-sys`. Use this variant on CI runners / images that do
+# not install `libssl-dev`.
 #
 # Note that enabling this alongside `client` is additive and compiles, but
 # the resulting binary will link both TLS stacks. Downstream workspaces
@@ -60,10 +58,8 @@ client-tls = ["client"]
 client-rustls = [
     "dep:tokio",
     "dep:surrealdb",
-    "dep:reqwest",
     "dep:futures",
     "surrealdb/rustls",
-    "reqwest/rustls-tls-webpki-roots",
 ]
 # Wasm-friendly client surface (Oneiriq/surql-rs#115). Enables the same
 # `DatabaseClient` / `executor` / `crud` / `graph` query API as
@@ -75,8 +71,6 @@ client-rustls = [
 #     which has no wasm32-unknown-unknown C build) nor `native-tls` is
 #     enabled. `kv-mem` lets wasm callers run an embedded engine for
 #     local state / tests with no server roundtrip.
-#   * `reqwest` is **not** pulled. It is unused in `surql`'s source today
-#     and `reqwest`'s default TLS stacks do not link on wasm.
 #   * `tokio` features are reduced to the wasm-buildable subset
 #     (`sync`, `macros`, `rt`) via the
 #     `[target.'cfg(target_arch = "wasm32")'.dependencies]` block below;
@@ -120,12 +114,11 @@ ulid = { version = "3.0", features = ["serde"] }
 # so that wasm32 builds get a wasm-buildable feature subset (no
 # `rt-multi-thread` / `net` / `process` / etc.).
 #
-# `surrealdb` and `reqwest` opt out of default features so the TLS backend is
-# selected explicitly by the `client` / `client-rustls` feature flags. The
-# default-feature set of `surrealdb` includes `rustls`; we prefer to be
-# explicit so downstream consumers know which TLS stack they are pulling.
+# `surrealdb` opts out of default features so the TLS backend is selected
+# explicitly by the `client` / `client-rustls` feature flags. Its
+# default-feature set includes `rustls`; we prefer to be explicit so
+# downstream consumers know which TLS stack they are pulling.
 surrealdb = { version = "3.1.5", default-features = false, features = ["protocol-ws"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "http2", "system-proxy"], optional = true }
 futures = { version = "0.3", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
@@ -185,6 +178,4 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-doc_markdown = "allow"
-uninlined_format_args = "allow"
+return_self_not_must_use = "allow"

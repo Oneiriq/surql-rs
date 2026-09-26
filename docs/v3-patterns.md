@@ -210,6 +210,11 @@ Bare `BM25` uses the engine defaults (`k1 = 1.2`, `b = 0.75`); the analyzer
 defaults to `like` if the clause is omitted (so define + name one explicitly for
 lexical recall).
 
+A `FULLTEXT` index takes exactly one column (`Expected one column, found 2`);
+`IndexDefinition::validate` refuses more. The engine scores every full-text
+index with BM25 and echoes it back as `BM25(1.2,0.75)` whether or not the
+statement asked for it, so a parsed full-text index always reads `bm25: true`.
+
 ### `search::score` and scan ordering
 
 The full-text index decides WHICH rows match. It does not rank them.
@@ -354,6 +359,46 @@ The facts underneath, all engine-verified:
 - Engine refusals are silent. A write a table forbids returns empty
   rows with no error, so the application layer stays the face that
   explains refusals and the engine acts as a backstop.
+
+## 13. `INFO FOR` echoes a canonical form, not what you sent
+
+Schema reconciliation reads definitions back from `INFO FOR DB` /
+`INFO FOR TABLE` and compares them with the code. The engine rewrites what
+it stores, and `surql::schema::parser` reads the rewritten form back into the
+shape the builders produce (all probed against v3.0.5):
+
+| You send | The engine echoes |
+|---|---|
+| `DEFINE TABLE likes TYPE RELATION FROM user TO post` | `... TYPE RELATION IN user OUT post SCHEMALESS PERMISSIONS NONE` |
+| `PERMISSIONS FOR select WHERE a = 1` on a table | `PERMISSIONS FOR select WHERE a = 1, FOR create, update, delete NONE` |
+| `... FOR delete FULL` among other table rules | `delete` left out of the list (the printer is shared with fields) |
+| a field without `PERMISSIONS` | `PERMISSIONS FULL` |
+| `TYPE option<int>` | `TYPE none \| int` |
+| `DEFINE TABLE t DROP SCHEMALESS` | `DEFINE TABLE t TYPE ANY DROP SCHEMALESS ...` |
+| `THEN { a; b }` on an event | `THEN { a; b; }` |
+| `BM25` on a full-text index (or nothing) | `BM25(1.2,0.75)` |
+| `COMMENT 'it\'s'` | `COMMENT "it's"` (double quotes when the text has `'`) |
+| an HMAC `KEY 'secret'` | `KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]'` |
+| no `DURATION` on an access method | `DURATION FOR TOKEN 1h, FOR SESSION NONE` |
+
+Names that spell keywords come back bare in most places (`DEFINE FIELD
+default ON card`, `FIELDS type, comment`, `OUT select`), so the parser reads
+every statement after its `DEFINE <kind> <name> ON <table>` head and only
+treats a word as a clause outside quotes, brackets, and backticked names.
+
+Permission maps use `"NONE"` / `"FULL"` for the fixed postures and keep only
+actions that differ from the default (`NONE` for tables and edges, `FULL` for
+fields), so a definition without permissions compares equal to its echo.
+
+Three rendering rules follow from the engine's grammar:
+
+- A field's `PERMISSIONS` go on its own `DEFINE FIELD`; without them the
+  field is `FULL` whatever the table says.
+- A bucket takes one permission (`PERMISSIONS WHERE $auth.admin`), not the
+  per-action `FOR select ...` list a table takes.
+- A JWT access method is verified by `ALGORITHM <alg> KEY '<key>'` or by
+  `URL '<jwks>'`, never both, and `WITH ISSUER KEY` names the key the engine
+  signs its own tokens with, not an issuer claim.
 
 ## What's next
 
