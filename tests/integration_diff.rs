@@ -23,8 +23,8 @@ use surql::migration::{DiffOperation, SchemaDiff};
 use surql::schema::edge::typed_edge;
 use surql::schema::parser::parse_table_full;
 use surql::schema::{
-    event, int_field, record_field, string_field, table_schema, unique_index, ChangeFeed,
-    FieldDefinition, ReferenceAction, TableDefinition,
+    event, index, int_field, record_field, string_field, table_schema, unique_index, ChangeFeed,
+    FieldDefinition, IndexDefinition, IndexType, ReferenceAction, TableDefinition,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -389,4 +389,150 @@ async fn a_dropped_unique_index_rolls_back_unique() {
     let stored = read_table(&client, "doc").await;
     let residual = diff_indexes("doc", std::slice::from_ref(&idx), &stored.indexes);
     assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// An index turning UNIQUE is migrated both ways; the name-only comparison
+/// used to report nothing, so the constraint never reached the database.
+#[tokio::test]
+async fn an_index_turning_unique_is_migrated_both_ways() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let plain = index("email_idx", ["email"]);
+    let unique = unique_index("email_idx", ["email"]);
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE doc SCHEMAFULL;".into(),
+            "DEFINE FIELD email ON doc TYPE string;".into(),
+            plain.to_surql("doc"),
+        ],
+    )
+    .await;
+
+    let diffs = diff_indexes(
+        "doc",
+        std::slice::from_ref(&unique),
+        std::slice::from_ref(&plain),
+    );
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    assert!(email_is_unique(&client, "doc").await);
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", std::slice::from_ref(&unique), &stored.indexes);
+    assert!(residual.is_empty(), "{residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    assert!(!email_is_unique(&client, "doc").await);
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", std::slice::from_ref(&plain), &stored.indexes);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// An index the engine stores with its defaults filled in reads back equal
+/// to the code that left them out: here an HNSW index without tuning, which
+/// the engine echoes as `DIST EUCLIDEAN TYPE F32 EFC 150 M 12`.
+#[tokio::test]
+async fn index_defaults_read_back_without_drift() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let bare_hnsw = IndexDefinition {
+        dimension: Some(4),
+        ..IndexDefinition::new("h", ["v"]).with_type(IndexType::Hnsw)
+    };
+    let code = [bare_hnsw];
+    let mut ddl = vec![
+        "DEFINE TABLE doc SCHEMAFULL;".to_owned(),
+        "DEFINE FIELD v ON doc TYPE array<float>;".to_owned(),
+    ];
+    ddl.extend(code.iter().map(|idx| idx.to_surql("doc")));
+    apply(&client, &ddl).await;
+
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_indexes("doc", &code, &stored.indexes);
+    assert!(
+        residual.is_empty(),
+        "re-applies on every boot: {residual:#?}"
+    );
+}
+
+/// An event changing its WHEN and THEN is migrated both ways.
+#[tokio::test]
+async fn an_event_change_is_migrated_both_ways() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    let old = event("audit", "true", "CREATE log SET n = 1");
+    let new = event(
+        "audit",
+        "$event = 'CREATE'",
+        "LET $n = 2; CREATE log SET n = $n",
+    );
+    apply(&client, &["DEFINE TABLE doc SCHEMALESS;".into()]).await;
+    apply(
+        &client,
+        &forward(&diff_events("doc", std::slice::from_ref(&old), &[])),
+    )
+    .await;
+
+    let diffs = diff_events(
+        "doc",
+        std::slice::from_ref(&new),
+        std::slice::from_ref(&old),
+    );
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_events("doc", std::slice::from_ref(&new), &stored.events);
+    assert!(residual.is_empty(), "{residual:#?}");
+
+    apply(&client, &backward(&diffs)).await;
+    let stored = read_table(&client, "doc").await;
+    let residual = diff_events("doc", std::slice::from_ref(&old), &stored.events);
+    assert!(residual.is_empty(), "{residual:#?}");
+}
+
+/// A relation changing its target table is migrated both ways, and the
+/// fields on it survive the re-definition.
+#[tokio::test]
+async fn an_edge_changing_endpoint_is_migrated_both_ways() {
+    let Some(client) = connected_client().await else {
+        return;
+    };
+    apply(
+        &client,
+        &[
+            "DEFINE TABLE person SCHEMAFULL;".into(),
+            "DEFINE TABLE post SCHEMAFULL;".into(),
+            "DEFINE TABLE comment SCHEMAFULL;".into(),
+        ],
+    )
+    .await;
+    let weight = int_field("weight").build_unchecked().unwrap();
+    let old = typed_edge("likes", "person", "post").with_fields([weight.clone()]);
+    let new = typed_edge("likes", "person", "comment").with_fields([weight]);
+    apply(
+        &client,
+        &forward(&diff_edges(std::slice::from_ref(&old), &[])),
+    )
+    .await;
+
+    let diffs = diff_edges(std::slice::from_ref(&new), std::slice::from_ref(&old));
+    assert_eq!(diffs.len(), 1, "the change went unnoticed: {diffs:#?}");
+    apply(&client, &forward(&diffs)).await;
+    let echo = table_echo(&client, "likes").await.expect("edge");
+    assert!(
+        echo.contains("TYPE RELATION IN person OUT comment"),
+        "{echo}"
+    );
+    let stored = read_table(&client, "likes").await;
+    assert!(
+        stored.fields.iter().any(|f| f.name == "weight"),
+        "{stored:?}"
+    );
+
+    apply(&client, &backward(&diffs)).await;
+    let echo = table_echo(&client, "likes").await.expect("edge");
+    assert!(echo.contains("TYPE RELATION IN person OUT post"), "{echo}");
 }

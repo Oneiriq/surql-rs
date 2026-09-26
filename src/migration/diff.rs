@@ -47,14 +47,17 @@ pub use crate::migration::diff_objects::{diff_analyzers, diff_buckets};
 use crate::migration::diff_objects::{diff_functions, diff_params, diff_sequences};
 use crate::migration::models::{DiffOperation, SchemaDiff};
 use crate::schema::bucket::BucketDefinition;
-use crate::schema::edge::EdgeDefinition;
+use crate::schema::edge::{EdgeDefinition, EdgeMode};
 use crate::schema::fields::{FieldDefinition, FieldType};
 use crate::schema::function::FunctionDefinition;
+use crate::schema::index_vector::{
+    DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE, DISKANN_DEFAULT_L_BUILD,
+};
 use crate::schema::param::ParamDefinition;
 use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::{
-    EventDefinition, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
-    MTreeVectorType, TableDefinition,
+    DiskAnnDistanceType, EventDefinition, HnswDistanceType, IndexDefinition, IndexType,
+    MTreeDistanceType, MTreeVectorType, TableDefinition,
 };
 use crate::schema::view::ViewDefinition;
 use crate::types::escape::{quote_str, unquote_str};
@@ -568,6 +571,11 @@ pub fn diff_fields(
 }
 
 /// Compare two index slices for the named table.
+///
+/// Indexes only in `code` are added and indexes only in `db` dropped. An
+/// index in both whose definition differs (see [`indexes_equal`]) is
+/// re-defined with `DEFINE INDEX OVERWRITE` in both directions, reported as
+/// [`DiffOperation::ModifyTable`] with [`SchemaDiff::index`] naming it.
 #[must_use]
 pub fn diff_indexes(
     table: &str,
@@ -588,10 +596,22 @@ pub fn diff_indexes(
             out.push(generate_drop_index_diff(table, idx));
         }
     }
+    for idx in code {
+        if let Some(db_idx) = db_map.get(idx.name.as_str()) {
+            if !indexes_equal(idx, db_idx) {
+                out.push(generate_modify_index_diff(table, db_idx, idx));
+            }
+        }
+    }
     out
 }
 
 /// Compare two event slices for the named table.
+///
+/// Events only in `code` are added and events only in `db` dropped. An event
+/// in both whose `WHEN` or `THEN` differs (see [`events_equal`]) is
+/// re-defined with `DEFINE EVENT OVERWRITE` in both directions, reported as
+/// [`DiffOperation::ModifyTable`] with [`SchemaDiff::event`] naming it.
 #[must_use]
 pub fn diff_events(
     table: &str,
@@ -610,6 +630,13 @@ pub fn diff_events(
     for ev in db {
         if !code_map.contains_key(ev.name.as_str()) {
             out.push(generate_drop_event_diff(table, ev));
+        }
+    }
+    for ev in code {
+        if let Some(db_ev) = db_map.get(ev.name.as_str()) {
+            if !events_equal(ev, db_ev) {
+                out.push(generate_modify_event_diff(table, db_ev, ev));
+            }
         }
     }
     out
@@ -643,7 +670,9 @@ pub fn diff_permissions(
 /// Same high-level behaviour as [`diff_tables`]: added edges produce add
 /// diffs for the edge and all of its contained objects; dropped edges
 /// produce drop diffs; edges present in both are recursively compared on
-/// fields/indexes/events/permissions.
+/// fields/indexes/events/permissions. A change to an edge's own shape (its
+/// mode, or a relation's `FROM` / `TO` table) re-defines it with
+/// `DEFINE TABLE OVERWRITE`, reported as [`DiffOperation::ModifyTable`].
 #[must_use]
 pub fn diff_edges(code: &[EdgeDefinition], db: &[EdgeDefinition]) -> Vec<SchemaDiff> {
     let code_map = index_by_name(code, |e| e.name.as_str());
@@ -739,7 +768,24 @@ fn diff_table_pair_inner(code: &TableDefinition, db: &TableDefinition) -> Vec<Sc
 }
 
 fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<SchemaDiff> {
-    let mut out = diff_fields(&code.name, &code.fields, &db.fields);
+    let mut out = Vec::new();
+    if edge_shape(code) != edge_shape(db) {
+        out.push(SchemaDiff {
+            operation: DiffOperation::ModifyTable,
+            table: code.name.clone(),
+            field: None,
+            index: None,
+            event: None,
+            bucket: None,
+            analyzer: None,
+            object: None,
+            description: format!("Modify edge {}", code.name),
+            forward_sql: edge_define_sql(code, true),
+            backward_sql: edge_define_sql(db, true),
+            details: BTreeMap::new(),
+        });
+    }
+    out.extend(diff_fields(&code.name, &code.fields, &db.fields));
     out.extend(diff_indexes(&code.name, &code.indexes, &db.indexes));
     out.extend(diff_events(&code.name, &code.events, &db.events));
     if !permissions_equal(code.permissions.as_ref(), db.permissions.as_ref()) {
@@ -750,6 +796,20 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
         ));
     }
     out
+}
+
+/// What an edge's own `DEFINE TABLE` says about its shape: the mode and, for
+/// a relation, the two endpoint tables. A non-relation edge renders no
+/// endpoints, so any it carries are not part of its shape.
+fn edge_shape(edge: &EdgeDefinition) -> (EdgeMode, Option<String>, Option<String>) {
+    match edge.mode {
+        EdgeMode::Relation => (
+            edge.mode,
+            edge.from_table.as_deref().map(normalize_expression),
+            edge.to_table.as_deref().map(normalize_expression),
+        ),
+        mode => (mode, None, None),
+    }
 }
 
 /// Compare the parts of a `DEFINE TABLE` statement that belong to the table
@@ -1040,6 +1100,31 @@ fn generate_drop_index_diff(table: &str, idx: &IndexDefinition) -> SchemaDiff {
     }
 }
 
+/// An index whose definition changed, re-defined whole in both directions.
+///
+/// There is no index-specific modify operation, so the change reports as
+/// [`DiffOperation::ModifyTable`] with [`SchemaDiff::index`] naming the index.
+fn generate_modify_index_diff(
+    table: &str,
+    old_idx: &IndexDefinition,
+    new_idx: &IndexDefinition,
+) -> SchemaDiff {
+    SchemaDiff {
+        operation: DiffOperation::ModifyTable,
+        table: table.to_string(),
+        field: None,
+        index: Some(new_idx.name.clone()),
+        event: None,
+        bucket: None,
+        analyzer: None,
+        object: None,
+        description: format!("Modify index {} on {}", new_idx.name, table),
+        forward_sql: index_to_sql(table, new_idx, true),
+        backward_sql: index_to_sql(table, old_idx, true),
+        details: BTreeMap::new(),
+    }
+}
+
 fn generate_add_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
     let forward_sql = event_to_sql(table, ev, false);
     let backward_sql = format!("REMOVE EVENT {} ON TABLE {};", ev.name, table);
@@ -1074,6 +1159,30 @@ fn generate_drop_event_diff(table: &str, ev: &EventDefinition) -> SchemaDiff {
         description: format!("Drop event {} from {}", ev.name, table),
         forward_sql,
         backward_sql,
+        details: BTreeMap::new(),
+    }
+}
+
+/// An event whose `WHEN` or `THEN` changed, re-defined whole in both
+/// directions; reported as [`DiffOperation::ModifyTable`] with
+/// [`SchemaDiff::event`] naming the event, as for an index.
+fn generate_modify_event_diff(
+    table: &str,
+    old_ev: &EventDefinition,
+    new_ev: &EventDefinition,
+) -> SchemaDiff {
+    SchemaDiff {
+        operation: DiffOperation::ModifyTable,
+        table: table.to_string(),
+        field: None,
+        index: None,
+        event: Some(new_ev.name.clone()),
+        bucket: None,
+        analyzer: None,
+        object: None,
+        description: format!("Modify event {} on {}", new_ev.name, table),
+        forward_sql: event_to_sql(table, new_ev, true),
+        backward_sql: event_to_sql(table, old_ev, true),
         details: BTreeMap::new(),
     }
 }
@@ -1387,6 +1496,126 @@ pub fn permissions_equal(
     }
 }
 
+/// HNSW construction defaults the engine fills in when a statement leaves
+/// them out, and always echoes (`EFC 150 M 12`); from its `DEFINE INDEX`
+/// parser.
+const HNSW_DEFAULT_EFC: u32 = 150;
+/// See [`HNSW_DEFAULT_EFC`].
+const HNSW_DEFAULT_M: u32 = 12;
+
+/// Whether two index definitions describe the same stored index.
+///
+/// The name, kind, and columns always count, and so does every member the
+/// kind renders. A member the engine fills with a default when the statement
+/// leaves it out compares as that default (an HNSW index's
+/// `DIST EUCLIDEAN TYPE F32 EFC 150 M 12`, the DISKANN tail, a full-text
+/// index's `ascii` analyzer), and a member the kind does not render is
+/// ignored. So are `CONCURRENTLY`, a build directive the engine does not
+/// store, and a full-text index's `BM25` flag: the engine scores every
+/// full-text index with BM25 whether or not the statement asked for it.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff::indexes_equal;
+/// use surql::schema::{index, unique_index};
+///
+/// assert!(indexes_equal(&index("i", ["a"]), &index("i", ["a"]).with_concurrently(true)));
+/// assert!(!indexes_equal(&index("i", ["a"]), &unique_index("i", ["a"])));
+/// assert!(!indexes_equal(&index("i", ["a"]), &index("i", ["a", "b"])));
+/// ```
+#[must_use]
+pub fn indexes_equal(a: &IndexDefinition, b: &IndexDefinition) -> bool {
+    comparable_index(a) == comparable_index(b)
+}
+
+/// `idx` reduced to what the engine stores for its kind, with the engine's
+/// defaults filled in.
+fn comparable_index(idx: &IndexDefinition) -> IndexDefinition {
+    let columns = idx
+        .columns
+        .iter()
+        .map(|column| normalize_expression(column));
+    let base = IndexDefinition::new(idx.name.clone(), columns).with_type(idx.index_type);
+    match idx.index_type {
+        IndexType::Unique | IndexType::Standard => base,
+        IndexType::Search => IndexDefinition {
+            analyzer: idx
+                .analyzer
+                .clone()
+                .filter(|analyzer| !analyzer.eq_ignore_ascii_case("ascii")),
+            highlights: idx.highlights,
+            ..base
+        },
+        IndexType::Mtree => IndexDefinition {
+            dimension: idx.dimension,
+            distance: Some(idx.distance.unwrap_or(MTreeDistanceType::Euclidean)),
+            vector_type: Some(idx.vector_type.unwrap_or(MTreeVectorType::F64)),
+            ..base
+        },
+        IndexType::Hnsw => IndexDefinition {
+            dimension: idx.dimension,
+            hnsw_distance: Some(idx.hnsw_distance.unwrap_or(HnswDistanceType::Euclidean)),
+            vector_type: Some(idx.vector_type.unwrap_or(MTreeVectorType::F32)),
+            efc: Some(idx.efc.unwrap_or(HNSW_DEFAULT_EFC)),
+            m: Some(idx.m.unwrap_or(HNSW_DEFAULT_M)),
+            ..base
+        },
+        IndexType::Diskann => IndexDefinition {
+            dimension: idx.dimension,
+            diskann_distance: Some(
+                idx.diskann_distance
+                    .unwrap_or(DiskAnnDistanceType::Euclidean),
+            ),
+            vector_type: Some(idx.vector_type.unwrap_or(MTreeVectorType::F32)),
+            degree: Some(idx.degree.unwrap_or(DISKANN_DEFAULT_DEGREE)),
+            l_build: Some(idx.l_build.unwrap_or(DISKANN_DEFAULT_L_BUILD)),
+            alpha: Some(
+                idx.alpha
+                    .clone()
+                    .unwrap_or_else(|| DISKANN_DEFAULT_ALPHA.to_owned()),
+            ),
+            hashed_vector: idx.hashed_vector,
+            ..base
+        },
+    }
+}
+
+/// Whether two event definitions fire on the same condition and run the
+/// same action.
+///
+/// Both halves compare through [`normalize_expression`]. The action also
+/// drops the block braces and trailing `;` the engine may add or remove: it
+/// stores a block action as `{ ... }` and a bare one wrapped in parentheses.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff::events_equal;
+/// use surql::schema::event;
+///
+/// let code = event("audit", "$event = 'CREATE'", "CREATE log SET n = 1");
+/// let echo = event("audit", "$event = \"CREATE\"", "(CREATE log SET n = 1)");
+/// assert!(events_equal(&code, &echo));
+/// assert!(!events_equal(&code, &event("audit", "true", "CREATE log SET n = 1")));
+/// ```
+#[must_use]
+pub fn events_equal(a: &EventDefinition, b: &EventDefinition) -> bool {
+    a.name == b.name
+        && normalize_expression(&a.condition) == normalize_expression(&b.condition)
+        && event_body(&a.action) == event_body(&b.action)
+}
+
+/// An event action without its block braces or trailing `;`, normalised.
+fn event_body(action: &str) -> String {
+    let trimmed = action.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    normalize_expression(inner.trim().trim_end_matches(';'))
+}
+
 fn mtree_index_to_sql(table: &str, idx: &IndexDefinition, guard: &str) -> String {
     let field = idx.columns.first().map_or("", String::as_str);
     let dim = idx.dimension.unwrap_or(0);
@@ -1405,7 +1634,9 @@ fn hnsw_index_to_sql(table: &str, idx: &IndexDefinition, guard: &str) -> String 
     let field = idx.columns.first().map_or("", String::as_str);
     let dim = idx.dimension.unwrap_or(0);
     let distance = idx.hnsw_distance.unwrap_or(HnswDistanceType::Euclidean);
-    let vtype = idx.vector_type.unwrap_or(MTreeVectorType::F64);
+    // The engine's own default when TYPE is left out, and what the canonical
+    // renderer (which leaves it out) therefore produces.
+    let vtype = idx.vector_type.unwrap_or(MTreeVectorType::F32);
     let mut sql = format!(
         "DEFINE INDEX{guard} {name} ON TABLE {table} COLUMNS {field} HNSW DIMENSION {dim} \
          DIST {distance} TYPE {vtype}",
@@ -2072,7 +2303,122 @@ mod tests {
         assert!(diffs[0].forward_sql.contains("FULLTEXT"));
     }
 
+    /// An index that keeps its name but changes kind or columns is
+    /// re-defined whole, both ways.
+    #[test]
+    fn a_changed_index_is_redefined_both_ways() {
+        let diffs = diff_indexes(
+            "user",
+            &[unique_index("email_idx", ["email"])],
+            &[index("email_idx", ["email"])],
+        );
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert_eq!(diffs[0].index.as_deref(), Some("email_idx"));
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE INDEX OVERWRITE email_idx ON TABLE user COLUMNS email UNIQUE;"
+        );
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE INDEX OVERWRITE email_idx ON TABLE user COLUMNS email;"
+        );
+
+        let diffs = diff_indexes("t", &[index("i", ["a", "b"])], &[index("i", ["a"])]);
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert!(diffs[0].forward_sql.contains("COLUMNS a, b"));
+    }
+
+    /// What the engine fills in or never stores is not a change.
+    #[test]
+    fn index_defaults_and_directives_are_not_changes() {
+        let bare_hnsw = IndexDefinition {
+            dimension: Some(4),
+            ..IndexDefinition::new("h", ["v"]).with_type(IndexType::Hnsw)
+        };
+        let echoed_hnsw = hnsw_index(
+            "h",
+            "v",
+            4,
+            HnswDistanceType::Euclidean,
+            MTreeVectorType::F32,
+            Some(150),
+            Some(12),
+        );
+        assert!(indexes_equal(&bare_hnsw, &echoed_hnsw));
+
+        let fulltext = IndexDefinition::new("s", ["body"]).with_type(IndexType::Search);
+        let echoed_fulltext = fulltext.clone().with_analyzer("ascii").with_bm25();
+        assert!(indexes_equal(&fulltext, &echoed_fulltext));
+        assert!(!indexes_equal(
+            &fulltext,
+            &fulltext.clone().with_analyzer("english")
+        ));
+
+        let concurrent = unique_index("u", ["a"]).with_concurrently(true);
+        assert!(diff_indexes("t", &[concurrent], &[unique_index("u", ["a"])]).is_empty());
+    }
+
+    #[test]
+    fn a_changed_hnsw_tuning_is_a_change() {
+        let tuned = |efc| {
+            hnsw_index(
+                "h",
+                "v",
+                4,
+                HnswDistanceType::Cosine,
+                MTreeVectorType::F32,
+                Some(efc),
+                None,
+            )
+        };
+        let diffs = diff_indexes("t", &[tuned(200)], &[tuned(150)]);
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert!(diffs[0].forward_sql.starts_with("DEFINE INDEX OVERWRITE h"));
+        assert!(diffs[0].forward_sql.contains("EFC 200"));
+        assert!(diffs[0].backward_sql.contains("EFC 150"));
+    }
+
     // ----- diff_events -----
+
+    #[test]
+    fn a_changed_event_is_redefined_both_ways() {
+        let old = event("audit", "true", "CREATE log SET n = 1");
+        let new = event("audit", "$event = 'CREATE'", "CREATE log SET n = 2");
+        let diffs = diff_events("t", std::slice::from_ref(&new), std::slice::from_ref(&old));
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert_eq!(diffs[0].event.as_deref(), Some("audit"));
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE EVENT OVERWRITE audit ON TABLE t WHEN $event = 'CREATE' \
+             THEN { CREATE log SET n = 2 };"
+        );
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE EVENT OVERWRITE audit ON TABLE t WHEN true THEN { CREATE log SET n = 1 };"
+        );
+    }
+
+    /// The engine wraps a bare action in parentheses, keeps a block's
+    /// trailing `;`, and drops parentheses around the condition.
+    #[test]
+    fn the_engine_echo_of_an_event_is_not_a_change() {
+        let code = event(
+            "audit",
+            "($before.a != $after.a)",
+            "LET $x = 1; CREATE log SET x = $x",
+        );
+        let echo = event(
+            "audit",
+            "$before.a != $after.a",
+            "{ LET $x = 1; CREATE log SET x = $x; }",
+        );
+        assert!(diff_events("t", &[code], &[echo]).is_empty());
+        let bare = event("e", "true", "CREATE log SET n = 1");
+        let bare_echo = event("e", "true", "(CREATE log SET n = 1)");
+        assert!(diff_events("t", &[bare], &[bare_echo]).is_empty());
+    }
 
     #[test]
     fn diff_events_detects_added() {
@@ -2278,6 +2624,42 @@ mod tests {
         assert!(ops.contains(&DiffOperation::AddIndex));
         assert!(ops.contains(&DiffOperation::AddEvent));
         assert!(ops.contains(&DiffOperation::ModifyPermissions));
+    }
+
+    /// A relation that changes endpoint or an edge that changes mode is
+    /// re-defined whole, both ways.
+    #[test]
+    fn a_changed_edge_shape_is_redefined_both_ways() {
+        let old = relation_edge("likes");
+        let new = relation_edge("likes").with_to_table("comment");
+        let diffs = diff_edges(std::slice::from_ref(&new), std::slice::from_ref(&old));
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert_eq!(diffs[0].operation, DiffOperation::ModifyTable);
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE TABLE OVERWRITE likes TYPE RELATION FROM user TO comment;"
+        );
+        assert_eq!(
+            diffs[0].backward_sql,
+            "DEFINE TABLE OVERWRITE likes TYPE RELATION FROM user TO post;"
+        );
+
+        let schemafull = relation_edge("likes").with_mode(EdgeMode::Schemafull);
+        let diffs = diff_edges(&[schemafull], std::slice::from_ref(&old));
+        assert_eq!(diffs.len(), 1, "{diffs:#?}");
+        assert_eq!(
+            diffs[0].forward_sql,
+            "DEFINE TABLE OVERWRITE likes SCHEMAFULL;"
+        );
+    }
+
+    /// Endpoints only render on a relation, so on any other edge they are
+    /// not part of its shape.
+    #[test]
+    fn endpoints_off_a_relation_are_not_a_change() {
+        let plain = EdgeDefinition::new("rel").with_mode(EdgeMode::Schemafull);
+        let stray = plain.clone().with_from_table("user");
+        assert!(diff_edges(&[stray], &[plain]).is_empty());
     }
 
     #[test]
