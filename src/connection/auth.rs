@@ -6,9 +6,12 @@
 //! client; that wrapper lands with the runtime client in a later PR.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::connection::config::REDACTED;
 
 /// SurrealDB authentication level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,7 +50,7 @@ pub trait Credentials {
 }
 
 /// Root-level credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootCredentials {
     /// Root username.
     pub username: String,
@@ -63,6 +66,15 @@ impl RootCredentials {
             username: username.into(),
             password: Some(password.into()),
         }
+    }
+}
+
+impl fmt::Debug for RootCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RootCredentials")
+            .field("username", &self.username)
+            .field("password", &redacted(self.password.as_ref()))
+            .finish()
     }
 }
 
@@ -82,7 +94,7 @@ impl Credentials for RootCredentials {
 }
 
 /// Namespace-level credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceCredentials {
     /// Target namespace.
     pub namespace: String,
@@ -108,6 +120,16 @@ impl NamespaceCredentials {
     }
 }
 
+impl fmt::Debug for NamespaceCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NamespaceCredentials")
+            .field("namespace", &self.namespace)
+            .field("username", &self.username)
+            .field("password", &redacted(self.password.as_ref()))
+            .finish()
+    }
+}
+
 impl Credentials for NamespaceCredentials {
     fn auth_type(&self) -> AuthType {
         AuthType::Namespace
@@ -125,7 +147,7 @@ impl Credentials for NamespaceCredentials {
 }
 
 /// Database-level credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseCredentials {
     /// Target namespace.
     pub namespace: String,
@@ -155,6 +177,17 @@ impl DatabaseCredentials {
     }
 }
 
+impl fmt::Debug for DatabaseCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseCredentials")
+            .field("namespace", &self.namespace)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &redacted(self.password.as_ref()))
+            .finish()
+    }
+}
+
 impl Credentials for DatabaseCredentials {
     fn auth_type(&self) -> AuthType {
         AuthType::Database
@@ -177,7 +210,7 @@ impl Credentials for DatabaseCredentials {
 /// `variables` holds the scope-defined fields (commonly `email`,
 /// `password`, etc.). They are flattened into the top-level payload at
 /// signin time to match the SDK contract.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScopeCredentials {
     /// Target namespace.
     pub namespace: String,
@@ -212,6 +245,18 @@ impl ScopeCredentials {
     }
 }
 
+impl fmt::Debug for ScopeCredentials {
+    /// Shows the variable names only: the values are the credentials.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScopeCredentials")
+            .field("namespace", &self.namespace)
+            .field("database", &self.database)
+            .field("access", &self.access)
+            .field("variables", &self.variables.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl Credentials for ScopeCredentials {
     fn auth_type(&self) -> AuthType {
         AuthType::Scope
@@ -230,7 +275,7 @@ impl Credentials for ScopeCredentials {
 }
 
 /// Pre-existing JWT token authentication.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenAuth {
     /// JWT authentication token.
     pub token: String,
@@ -243,6 +288,19 @@ impl TokenAuth {
             token: token.into(),
         }
     }
+}
+
+impl fmt::Debug for TokenAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenAuth")
+            .field("token", &REDACTED)
+            .finish()
+    }
+}
+
+/// A secret as `Debug` shows it: whether it is set, never its value.
+fn redacted(secret: Option<&String>) -> Option<&'static str> {
+    secret.map(|_| REDACTED)
 }
 
 #[cfg(test)]
@@ -302,12 +360,27 @@ mod tests {
         assert_eq!(creds.auth_type(), AuthType::Scope);
     }
 
+    /// Regression: every credential type and `TokenAuth` derived `Debug`,
+    /// so logging one (or anything holding one) printed the secret.
     #[test]
-    fn token_auth_debug_does_not_panic() {
-        let t = TokenAuth::new("eyJhbGciOiJIUzI1NiJ9.abc");
-        // Ensure Debug is implemented; this will print the token since
-        // we keep Serialize for wire use. Users should avoid logging.
-        let _ = format!("{t:?}");
+    fn debug_redacts_every_secret() {
+        let shown = [
+            format!("{:?}", TokenAuth::new("eyJhbGciOiJIUzI1NiJ9.secret")),
+            format!("{:?}", RootCredentials::new("root", "secret")),
+            format!("{:?}", NamespaceCredentials::new("ns", "u", "secret")),
+            format!("{:?}", DatabaseCredentials::new("ns", "db", "u", "secret")),
+            format!(
+                "{:?}",
+                ScopeCredentials::new("ns", "db", "user")
+                    .with("email", "a@example.com")
+                    .with("password", "secret")
+            ),
+        ];
+        for s in &shown {
+            assert!(!s.contains("secret"), "{s}");
+            assert!(!s.contains("a@example.com"), "{s}");
+        }
+        assert!(shown[4].contains("password"), "variable names stay visible");
     }
 
     #[test]

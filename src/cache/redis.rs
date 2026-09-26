@@ -19,12 +19,21 @@ use super::backend::CacheBackend;
 ///
 /// The underlying connection is lazily established on first use and
 /// reused across subsequent operations.
-#[derive(Debug)]
 pub struct RedisCache {
     client: Client,
     prefix: String,
     default_ttl_secs: u64,
     connection: Mutex<Option<redis::aio::MultiplexedConnection>>,
+}
+
+impl std::fmt::Debug for RedisCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The client holds the connection info, credentials included.
+        f.debug_struct("RedisCache")
+            .field("prefix", &self.prefix)
+            .field("default_ttl_secs", &self.default_ttl_secs)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RedisCache {
@@ -183,5 +192,13 @@ mod tests {
     fn invalid_url_surfaces_database_error() {
         let err = RedisCache::new("not-a-url", "p:", 30).unwrap_err();
         assert!(matches!(err, SurqlError::Database { .. }));
+    }
+
+    #[test]
+    fn debug_redacts_the_url_credentials() {
+        let cache = RedisCache::new("redis://svc:hunter2@127.0.0.1:6379", "p:", 30).unwrap();
+        let shown = format!("{cache:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("svc"), "{shown}");
     }
 }

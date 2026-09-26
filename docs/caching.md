@@ -110,6 +110,8 @@ let manager = configure_cache(config)?;
 `RedisCache` lazily opens its connection on the first `get` / `set`.
 Values are JSON-encoded on the wire so the backend can be shared with
 non-Rust consumers that adhere to the same prefix and value contract.
+The `Debug` output of `CacheConfig`, `CacheManager` and `RedisCache`
+redacts the credentials a `redis://user:password@host` URL carries.
 
 ## Statistics and invalidation
 

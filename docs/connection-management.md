@@ -101,6 +101,13 @@ if !auth.is_authenticated().await {
 (useful after a reconnect because the v3 SDK has no dedicated refresh
 endpoint).
 
+`Debug` output never carries a secret: `ConnectionConfig` (and
+everything that holds one, such as `DatabaseClient`,
+`ConnectionRegistry` and `Settings`) shows the password and any
+`user:password@` in the URL as `<redacted>`, the credential types and
+`TokenAuth` redact their password or token (`ScopeCredentials` shows its
+variable names only), and so `AuthManager` never prints the cached JWT.
+
 ## Expired sessions
 
 A long-lived connection's authenticated session can expire server-side

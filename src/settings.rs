@@ -794,6 +794,26 @@ version = "0.0.0"
         assert!(build_connection_config(None, &|_: &str| None, Some(&toml_db)).is_err());
     }
 
+    /// Regression: `Settings` (and its builder) derived `Debug` over the
+    /// nested connection config, printing the database password.
+    #[test]
+    fn debug_redacts_the_database_password() {
+        let database = ConnectionConfig {
+            db_url: "ws://svc:urlsecret@db.example/rpc".into(),
+            db_pass: Some("hunter2".into()),
+            ..ConnectionConfig::default()
+        };
+        let settings = Settings {
+            database: database.clone(),
+            ..Settings::default()
+        };
+        let builder = Settings::builder().database(database);
+        for shown in [format!("{settings:?}"), format!("{builder:?}")] {
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(!shown.contains("urlsecret"), "{shown}");
+        }
+    }
+
     #[test]
     fn parse_bool_covers_common_forms() {
         assert!(parse_bool("yes").unwrap());

@@ -369,6 +369,22 @@ mod tests {
         assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
     }
 
+    /// Regression: the registry's `Debug` printed every registered
+    /// config, passwords included.
+    #[tokio::test]
+    async fn debug_redacts_registered_secrets() {
+        let r = ConnectionRegistry::new();
+        let cfg = ConnectionConfig {
+            db_pass: Some("hunter2".into()),
+            db_user: Some("svc".into()),
+            ..make_config("a")
+        };
+        r.register("a", cfg, false, false).await.unwrap();
+        let shown = format!("{r:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("svc"), "{shown}");
+    }
+
     #[tokio::test]
     async fn set_default_promotes_named_connection() {
         let r = ConnectionRegistry::new();

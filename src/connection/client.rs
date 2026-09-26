@@ -16,6 +16,7 @@
 //! types (not `SurrealValue`).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +54,10 @@ use crate::types::RecordID;
 /// needs an independent session says so through
 /// [`DatabaseClient::caller_session`] or an explicit
 /// `client.inner().clone()`.
-#[derive(Debug, Clone)]
+///
+/// `Debug` output shows the config with its secrets redacted and leaves
+/// the SDK handle out.
+#[derive(Clone)]
 pub struct DatabaseClient {
     config: ConnectionConfig,
     inner: Arc<Surreal<Any>>,
@@ -81,6 +85,16 @@ pub struct DatabaseClient {
     /// Such a client never replays and refuses `connect`, which would sign
     /// it in with the config credentials.
     caller_bound: bool,
+}
+
+impl fmt::Debug for DatabaseClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseClient")
+            .field("config", &self.config)
+            .field("connected", &self.is_connected())
+            .field("caller_session", &self.caller_bound)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DatabaseClient {
@@ -899,6 +913,22 @@ mod tests {
         let cfg = ConnectionConfig::default();
         let client = DatabaseClient::new(cfg).expect("valid default config");
         assert!(!client.is_connected());
+    }
+
+    /// Regression: the derived `Debug` printed the config's password (and
+    /// the SDK handle); a client is routinely logged.
+    #[test]
+    fn debug_redacts_the_config_secrets() {
+        let client = DatabaseClient::new(ConnectionConfig {
+            db_url: "ws://svc:urlsecret@db.example/rpc".into(),
+            db_user: Some("svc".into()),
+            db_pass: Some("hunter2".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let shown = format!("{client:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("urlsecret"), "{shown}");
     }
 
     #[test]

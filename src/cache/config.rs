@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::connection::config::redact_url;
 use crate::error::{Result, SurqlError};
 
 /// Supported cache backend types.
@@ -41,7 +42,9 @@ pub enum CacheBackendKind {
 /// assert_eq!(cfg.default_ttl_secs, 600);
 /// # }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` output redacts any credentials in `redis_url`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheConfig {
     /// Whether caching is enabled globally.
     pub enabled: bool,
@@ -55,6 +58,19 @@ pub struct CacheConfig {
     pub redis_url: String,
     /// Prefix applied to all cache keys.
     pub key_prefix: String,
+}
+
+impl std::fmt::Debug for CacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheConfig")
+            .field("enabled", &self.enabled)
+            .field("backend", &self.backend)
+            .field("default_ttl_secs", &self.default_ttl_secs)
+            .field("max_size", &self.max_size)
+            .field("redis_url", &redact_url(&self.redis_url))
+            .field("key_prefix", &self.key_prefix)
+            .finish()
+    }
 }
 
 impl Default for CacheConfig {
@@ -221,6 +237,25 @@ mod tests {
             .with_tables(["user", "role"]);
         assert_eq!(opts.key.as_deref(), Some("k"));
         assert_eq!(opts.invalidate_on, vec!["user", "role"]);
+    }
+
+    /// Regression: the derived `Debug` printed `redis_url`, which carries
+    /// the Redis password as `redis://:pw@host`.
+    #[test]
+    fn debug_redacts_the_redis_password() {
+        let cfg = CacheConfig::builder()
+            .redis_url("redis://:hunter2@cache.example:6379/0")
+            .build();
+        for shown in [
+            format!("{cfg:?}"),
+            format!(
+                "{:?}",
+                CacheConfig::builder().redis_url(cfg.redis_url.clone())
+            ),
+        ] {
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(shown.contains("cache.example:6379/0"), "{shown}");
+        }
     }
 
     #[test]

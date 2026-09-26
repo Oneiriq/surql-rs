@@ -398,6 +398,18 @@ mod tests {
         assert_eq!(v, 99);
     }
 
+    /// Regression: the manager's `Debug` printed its config, whose
+    /// `redis_url` carries the Redis password.
+    #[test]
+    fn debug_redacts_the_redis_password() {
+        let cfg = CacheConfig::builder()
+            .redis_url("redis://:hunter2@cache.example:6379/0")
+            .build();
+        let shown = format!("{:?}", CacheManager::new(cfg).unwrap());
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("cache.example"), "{shown}");
+    }
+
     #[tokio::test]
     async fn redis_without_feature_fails() {
         #[cfg(not(feature = "cache-redis"))]
