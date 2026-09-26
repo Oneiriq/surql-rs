@@ -113,8 +113,15 @@ jobs:
       - name: cargo test --lib
         run: cargo test --lib --all-features
 
+      # Every doctest is its own binary linking the whole engine (dozens
+      # of crates since surrealdb 3.3), and rustdoc builds them in
+      # parallel; at full width that exhausts the runner pod's memory and
+      # the job dies without a log. No debuginfo and four at a time keeps
+      # it inside the pod.
       - name: cargo test --doc
-        run: cargo test --doc --all-features
+        run: cargo test --doc --all-features -- --test-threads=4
+        env:
+          RUSTDOCFLAGS: "-C debuginfo=0"
 
   build-rustls:
     name: Build client-rustls (no openssl-sys)
