@@ -556,12 +556,50 @@ pub fn quote_value_public(value: &Value) -> String {
 /// - arrays and objects render as literals, at any depth, with object keys
 ///   quoted by [`quote_object_key`].
 ///
+/// A value nested more than [`MAX_INLINE_DEPTH`] arrays and objects deep is
+/// the exception: the engine's parser refuses a literal nested 20 levels
+/// deep ("Exceeded query recursion depth limit"), so such a value renders
+/// as its JSON text in a string literal, decoded by the engine
+/// (`encoding::json::decode('…')`, SurrealDB 3.1+). The parser then sees
+/// one flat string whatever the depth, and the value arrives the same:
+/// JSON strings stay strings, and an integer above `i64::MAX` is a decimal
+/// either way.
+///
 /// A `Value` is always data: no shape of JSON renders as raw SurrealQL.
 /// Function calls and record references reach a query only through typed
 /// channels ([`SurrealFn`](super::SurrealFn) and
 /// [`RecordRef`](super::RecordRef) converted into an [`Expression`], the
 /// `*_expr` comparisons, `Query::set_expr`).
 pub(crate) fn quote_value(value: &Value) -> String {
+    if nesting_exceeds(value, MAX_INLINE_DEPTH) {
+        // Serialising a `serde_json::Value` cannot fail.
+        let json = serde_json::to_string(value).unwrap_or_default();
+        return format!("encoding::json::decode({})", quote_str(&json));
+    }
+    quote_inline(value)
+}
+
+/// The deepest array / object nesting [`quote_value`] renders as a literal.
+/// Below the parser's limit of 20 levels by enough to leave room for the
+/// statement around the value (a `CONTENT` object, an `INSERT` list, the
+/// parentheses of a `WHERE`).
+pub const MAX_INLINE_DEPTH: usize = 16;
+
+/// `true` when `value` nests arrays and objects more than `limit` deep.
+fn nesting_exceeds(value: &Value, limit: usize) -> bool {
+    let children: Box<dyn Iterator<Item = &Value>> = match value {
+        Value::Array(items) => Box::new(items.iter()),
+        Value::Object(fields) => Box::new(fields.values()),
+        _ => return false,
+    };
+    limit == 0
+        || children
+            .into_iter()
+            .any(|child| nesting_exceeds(child, limit - 1))
+}
+
+/// Render `value` as a literal, however deep.
+fn quote_inline(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
@@ -569,13 +607,13 @@ pub(crate) fn quote_value(value: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::String(s) => quote_str(s),
         Value::Array(arr) => {
-            let inner = arr.iter().map(quote_value).collect::<Vec<_>>().join(", ");
+            let inner = arr.iter().map(quote_inline).collect::<Vec<_>>().join(", ");
             format!("[{inner}]")
         }
         Value::Object(obj) => {
             let inner = obj
                 .iter()
-                .map(|(k, v)| format!("{}: {}", quote_object_key(k), quote_value(v)))
+                .map(|(k, v)| format!("{}: {}", quote_object_key(k), quote_inline(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{{ {inner} }}")
@@ -778,6 +816,45 @@ mod tests {
     #[test]
     fn string_escapes_backslash() {
         assert_eq!(eq("path", "a\\b").to_surql(), "path = 'a\\\\b'");
+    }
+
+    fn nested(depth: usize) -> Value {
+        (0..depth).fold(json!("it's \\ x"), |inner, _| json!({ "a": [inner] }))
+    }
+
+    /// The parser refuses a literal nested 20 levels deep, so a value past
+    /// the inline limit travels as JSON text the engine decodes.
+    #[test]
+    fn deeply_nested_values_are_decoded_by_the_engine() {
+        // Each `nested` level is an object and an array.
+        let at_limit = nested(MAX_INLINE_DEPTH / 2);
+        let inline = quote_value(&at_limit);
+        assert!(inline.starts_with("{ a: [{ a: ["), "{inline}");
+        assert!(!inline.contains("encoding::json::decode"));
+
+        let deeper = nested(MAX_INLINE_DEPTH / 2 + 1);
+        let decoded = quote_value(&deeper);
+        let json = serde_json::to_string(&deeper).unwrap();
+        assert_eq!(
+            decoded,
+            format!("encoding::json::decode({})", quote_str(&json))
+        );
+        // One string literal: the only nesting the parser sees.
+        assert_eq!(
+            crate::types::escape::unquote_str(
+                decoded
+                    .strip_prefix("encoding::json::decode(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .unwrap()
+            )
+            .as_deref(),
+            Some(json.as_str())
+        );
+
+        // A shallow neighbour of a deep value is rendered with it.
+        let pair = json!({ "shallow": 1, "deep": deeper });
+        assert!(quote_value(&pair).starts_with("encoding::json::decode("));
+        assert_eq!(quote_value(&json!({ "shallow": 1 })), "{ shallow: 1 }");
     }
 
     #[test]

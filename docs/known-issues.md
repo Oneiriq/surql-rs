@@ -3,15 +3,6 @@
 Open problems that are understood but not yet fixed, each with the fix it
 would take. Fixed issues move to the [changelog](changelog.md).
 
-## Queries
-
-- **Deeply nested values cannot be inlined.** Values are rendered into
-  the statement as literals, and the engine's parser refuses nesting
-  deeper than its recursion limit (about 20 levels of objects and
-  arrays), so such a value fails with "Exceeded query recursion depth
-  limit". Binding values as query parameters instead of inlining them
-  would lift the limit.
-
 ## Cache
 
 - **Redis reconnects by dropping the connection.** A connection that

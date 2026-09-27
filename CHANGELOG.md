@@ -181,6 +181,14 @@ Problems the pass found but did not fix are listed on the
     diff.
   - A COUNT index used to read back as a standard index with no columns,
     and a union field type as `any`; both now read back as themselves.
+- **Deeply nested values reach the engine.** Values render into the
+  statement as literals, and the engine's parser refuses a literal nested
+  20 levels deep ("Exceeded query recursion depth limit"), so the builder,
+  `insert_many`, `relate_many`, `upsert_many_in_tx` and operator values
+  failed on such data. A value nested more than `MAX_INLINE_DEPTH` (16)
+  levels now renders as its JSON text decoded by the engine
+  (`encoding::json::decode('…')`, SurrealDB 3.1+), which the parser reads
+  as one flat string; the value arrives the same.
   - Theme settings take effect; the registry refuses a table and an edge
     sharing one name.
 - **Connection, settings and cache.**
