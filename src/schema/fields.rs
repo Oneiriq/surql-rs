@@ -149,6 +149,14 @@ pub struct FieldDefinition {
     /// lookup lives.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub computed: Option<String>,
+    /// A SurrealQL type the [`FieldType`] keywords cannot spell, rendered
+    /// verbatim as the `TYPE` clause (inside `option<...>` when
+    /// [`Self::nullable`]): a union (`array<string> | int`), a literal
+    /// (`'draft' | 'published'`), or a typed container (`array<string, 5>`,
+    /// `set<int>`, `geometry<point>`). `field_type` is [`FieldType::Any`]
+    /// when it is set. Set it with [`Self::with_custom_type`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub custom_type: Option<String>,
 }
 
 impl FieldDefinition {
@@ -170,7 +178,47 @@ impl FieldDefinition {
             nullable: false,
             reference: None,
             computed: None,
+            custom_type: None,
         }
+    }
+
+    /// Type the field with a SurrealQL type the [`FieldType`] keywords
+    /// cannot spell (see [`Self::custom_type`]), such as a union. Sets
+    /// `field_type` to [`FieldType::Any`] and clears `target_table`; use
+    /// [`Self::with_nullable`] rather than writing `option<...>` or
+    /// `none | ...` here.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::schema::{FieldDefinition, FieldType};
+    ///
+    /// let status = FieldDefinition::new("status", FieldType::Any)
+    ///     .with_custom_type("'draft' | 'published'");
+    /// assert_eq!(
+    ///     status.to_surql("post"),
+    ///     "DEFINE FIELD status ON TABLE post TYPE 'draft' | 'published';"
+    /// );
+    /// ```
+    pub fn with_custom_type(mut self, ty: impl Into<String>) -> Self {
+        self.custom_type = Some(ty.into());
+        self.field_type = FieldType::Any;
+        self.target_table = None;
+        self
+    }
+
+    /// The `TYPE` clause this field renders, `option<...>` included, or
+    /// `None` for a `COMPUTED` field that declares no type.
+    pub fn type_clause(&self) -> Option<String> {
+        if self.omits_type_clause() {
+            return None;
+        }
+        let (ty, _) = self.resolve_type_clause();
+        Some(if self.nullable {
+            format!("option<{ty}>")
+        } else {
+            ty
+        })
     }
 
     /// Set the assertion expression.
@@ -302,19 +350,14 @@ impl FieldDefinition {
     }
 
     fn render_guard(&self, table: &str, ine: &str) -> String {
-        let (type_clause, drop_value) = self.resolve_type_clause();
-        let type_clause = if self.nullable {
-            format!("option<{type_clause}>")
-        } else {
-            type_clause
-        };
+        let (_, drop_value) = self.resolve_type_clause();
         let mut sql = format!(
             "DEFINE FIELD{ine} {name} ON TABLE {table}",
             ine = ine,
             name = render_field_path(&self.name),
             table = quote_ident(table),
         );
-        if !self.omits_type_clause() {
+        if let Some(type_clause) = self.type_clause() {
             let _ = write!(sql, " TYPE {type_clause}");
         }
         // SurrealDB v3 requires FLEXIBLE immediately after the TYPE
@@ -359,13 +402,18 @@ impl FieldDefinition {
             && self.field_type == FieldType::Any
             && !self.nullable
             && self.target_table.is_none()
+            && self.custom_type.is_none()
     }
 
-    /// Resolve the `TYPE` clause, honoring a `target_table` by emitting
-    /// `record<target>` for a RECORD field and `array<record<target>>` for an
-    /// ARRAY field. The returned boolean indicates whether a redundant
-    /// `type::record("target", $value)` VALUE coercion should be dropped.
+    /// Resolve the `TYPE` clause, honoring a `custom_type` verbatim and a
+    /// `target_table` by emitting `record<target>` for a RECORD field and
+    /// `array<record<target>>` for an ARRAY field. The returned boolean
+    /// indicates whether a redundant `type::record("target", $value)` VALUE
+    /// coercion should be dropped.
     fn resolve_type_clause(&self) -> (String, bool) {
+        if let Some(custom) = &self.custom_type {
+            return (custom.clone(), false);
+        }
         let Some(target) = self.target_table.as_deref() else {
             return (self.field_type.as_str().to_string(), false);
         };

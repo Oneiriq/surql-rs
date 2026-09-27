@@ -2,18 +2,19 @@
 //!
 //! Extracts [`IndexDefinition`] values from SurrealDB `INFO FOR TABLE`
 //! responses, including the vector-index variants (`UNIQUE`, `SEARCH`,
-//! `MTREE`, `HNSW`, `DISKANN`). Split out of the monolithic `parser.rs` so
-//! each submodule stays under the 1000-LOC budget; see parent [`super`] for
-//! the public entry points.
+//! `COUNT`, `HNSW`, `DISKANN`, and the pre-3.0 `MTREE`). Split out of the
+//! monolithic `parser.rs` so each submodule stays under the 1000-LOC
+//! budget; see parent [`super`] for the public entry points.
 //!
 //! The engine echoes `DEFINE INDEX <name> ON <table> FIELDS <a>, <b> [<kind>
-//! <params>] [COMMENT …] [CONCURRENTLY]`. The statement is read word by word
-//! after its head: the column list is the comma-separated run after
-//! `FIELDS` / `COLUMNS`, and the index kind is the word that follows it, so
-//! neither a table named `custom_fields` nor a column named `year` or
-//! `research` can be mistaken for a clause.
+//! <params>] [COMMENT …] [CONCURRENTLY]`, and a count index as `DEFINE
+//! INDEX <name> ON <table> COUNT [WHERE <condition>] [COMMENT …]`. The
+//! statement is read word by word after its head: the column list is the
+//! comma-separated run after `FIELDS` / `COLUMNS`, and the index kind is the
+//! word that follows it, so neither a table named `custom_fields` nor a
+//! column named `year` or `research` can be mistaken for a clause.
 
-use super::scan::{define_head, split_top_level, tokens, unquote_ident, Token};
+use super::scan::{define_head, find_keyword_from, split_top_level, tokens, unquote_ident, Token};
 use crate::schema::table::{
     DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
     MTreeVectorType,
@@ -58,7 +59,9 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
             index.index_type = IndexType::Hnsw;
             i = read_vector(&toks, i, &mut index);
         } else if token.is("MTREE") {
-            index.index_type = IndexType::Mtree;
+            #[allow(deprecated)]
+            let mtree = IndexType::Mtree;
+            index.index_type = mtree;
             i = read_vector(&toks, i, &mut index);
         } else if token.is("DISKANN") {
             index.index_type = IndexType::Diskann;
@@ -66,9 +69,12 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
         } else if token.is("COMMENT") {
             i += 1;
         } else if token.is("COUNT") {
-            // A count index keeps an optional `WHERE` condition this crate
-            // does not model; nothing after it is an index clause.
-            break;
+            index.index_type = IndexType::Count;
+            if toks.get(i).is_some_and(|t| t.is("WHERE")) {
+                let (condition, next) = read_condition(body, &toks, i + 1);
+                index.condition = condition;
+                i = next;
+            }
         }
     }
     // `CONCURRENTLY` is a build directive the engine drops from the
@@ -80,6 +86,31 @@ pub fn parse_index(name: &str, definition: &str) -> Option<IndexDefinition> {
 }
 
 // --- Index extractors --------------------------------------------------------
+
+/// Read a count index's `WHERE` condition, starting at token `at`: the text
+/// up to the next top-level `COMMENT` or `CONCURRENTLY`, or the end. Returns
+/// the condition and the index of the first token after it.
+fn read_condition(body: &str, toks: &[Token<'_>], at: usize) -> (Option<String>, usize) {
+    let Some(start) = toks.get(at).map(|t| t.start) else {
+        return (None, at);
+    };
+    let end = ["COMMENT", "CONCURRENTLY"]
+        .iter()
+        .filter_map(|keyword| find_keyword_from(body, keyword, start))
+        .min()
+        .unwrap_or(body.len());
+    let condition = body
+        .get(start..end)
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(';')
+        .trim_end();
+    let next = toks
+        .iter()
+        .position(|t| t.start >= end)
+        .unwrap_or(toks.len());
+    ((!condition.is_empty()).then(|| condition.to_string()), next)
+}
 
 /// Read the comma-separated column list starting at token `at`. Returns the
 /// unquoted columns and the index of the first token after the list.

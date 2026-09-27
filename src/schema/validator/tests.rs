@@ -4,7 +4,7 @@
 use super::*;
 use crate::schema::fields::{FieldDefinition, FieldType};
 use crate::schema::table::{
-    event, mtree_index, table_schema, EventDefinition, IndexDefinition, IndexType,
+    count_index, event, mtree_index, table_schema, EventDefinition, IndexDefinition, IndexType,
     MTreeDistanceType, MTreeVectorType, TableDefinition, TableMode,
 };
 
@@ -385,6 +385,37 @@ fn extra_index_in_database() {
         .collect();
     assert_eq!(extra.len(), 1);
     assert_eq!(extra[0].severity, ValidationSeverity::Warning);
+}
+
+#[test]
+fn count_index_condition_is_compared() {
+    let validate = |code: IndexDefinition, db: IndexDefinition| {
+        let mut code_tables = HashMap::new();
+        code_tables.insert("user".into(), table_schema("user").with_indexes([code]));
+        let mut db_tables = HashMap::new();
+        db_tables.insert("user".into(), table_schema("user").with_indexes([db]));
+        validate_schema(&code_tables, &db_tables, None, None)
+    };
+    let echo = crate::schema::parse_index(
+        "active",
+        "DEFINE INDEX active ON user COUNT WHERE active = true",
+    )
+    .unwrap();
+
+    let same = validate(
+        count_index("active").with_condition("(active  = true)"),
+        echo.clone(),
+    );
+    assert!(same.is_empty(), "{same:?}");
+
+    let changed = validate(count_index("active").with_condition("active = false"), echo);
+    assert!(
+        changed
+            .iter()
+            .any(|r| r.message == "COUNT index condition mismatch"
+                && r.severity == ValidationSeverity::Error),
+        "{changed:?}"
+    );
 }
 
 #[test]

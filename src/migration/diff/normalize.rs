@@ -11,7 +11,11 @@ use crate::types::escape::{quote_str, unquote_str};
 /// any depth), `IS NONE` / `IS NOT NONE` read as `= NONE` /
 /// `!= NONE`, a cast loses the space after it (`<string> id`), and a string
 /// literal takes one quote style (the engine prints `"it's"` for what code
-/// wrote as `'it\'s'`).
+/// wrote as `'it\'s'`). Operators take the spelling the engine prints
+/// (`&&` / `||` as `AND` / `OR`, `IN` as `INSIDE`, `NOT IN` as `NOTINSIDE`,
+/// operator keywords in upper case), and the spacing around brackets,
+/// braces, commas, colons and semicolons goes, since the engine prints
+/// `[1,2]` as `[1, 2]` and `{a:1}` as `{ a: 1 }`.
 ///
 /// None of that reaches inside a quoted token. String literals, backtick
 /// identifiers, and `⟨…⟩` record keys keep every byte, so `'a  b'` and
@@ -24,6 +28,10 @@ use crate::types::escape::{quote_str, unquote_str};
 ///
 /// assert_eq!(normalize_expression("($value  IS NONE)"), "$value = NONE");
 /// assert_eq!(normalize_expression("\"a  b\""), "'a  b'");
+/// assert_eq!(
+///     normalize_expression("$event in ['CREATE','UPDATE'] && $after.n NOT IN [1,2]"),
+///     normalize_expression("$event INSIDE ['CREATE', 'UPDATE'] AND $after.n NOTINSIDE [1, 2]"),
+/// );
 /// ```
 #[must_use]
 pub fn normalize_expression(expr: &str) -> String {
@@ -43,10 +51,96 @@ pub fn normalize_expression(expr: &str) -> String {
     pieces
         .into_iter()
         .map(|piece| match piece {
-            Piece::Code(code) => fold_cast_spacing(&fold_none_checks(&code)),
+            Piece::Code(code) => fold_punctuation_spacing(&fold_cast_spacing(&fold_none_checks(
+                &fold_operators(&code),
+            ))),
             Piece::Quoted(quoted) => quoted.text,
         })
         .collect()
+}
+
+/// Operator keywords, which the engine prints in upper case. `NONE` and
+/// `NULL` ride along so `is not none` folds like `IS NOT NONE`.
+const OPERATOR_WORDS: &[&str] = &[
+    "AND",
+    "OR",
+    "NOT",
+    "IS",
+    "IN",
+    "INSIDE",
+    "NOTINSIDE",
+    "OUTSIDE",
+    "INTERSECTS",
+    "CONTAINS",
+    "CONTAINSNOT",
+    "CONTAINSALL",
+    "CONTAINSANY",
+    "CONTAINSNONE",
+    "ALLINSIDE",
+    "ANYINSIDE",
+    "NONEINSIDE",
+    "NONE",
+    "NULL",
+];
+
+/// The operator spellings the engine prints: `&&` / `||` as `AND` / `OR`,
+/// `IN` as `INSIDE`, `NOT IN` and `NOT INSIDE` as `NOTINSIDE`, and the
+/// operator keywords upper-cased. A word that is a parameter (`$in`), a
+/// path segment (`a.in`), part of a name (`fn::in`, `in:1`) or a call
+/// (`in(...)`) is left alone.
+fn fold_operators(code: &str) -> String {
+    let code = code.replace("&&", " AND ").replace("||", " OR ");
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code.as_str();
+    while let Some(ch) = rest.chars().next() {
+        if !(ch.is_ascii_alphabetic() || ch == '_') {
+            out.push(ch);
+            rest = rest.get(ch.len_utf8()..).unwrap_or("");
+            continue;
+        }
+        let len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(len);
+        rest = tail;
+        let upper = word.to_ascii_uppercase();
+        let named = out.ends_with(['$', '.', ':', '@']) || tail.starts_with([':', '(']);
+        if named || !OPERATOR_WORDS.contains(&upper.as_str()) {
+            out.push_str(word);
+        } else if upper == "IN" || upper == "INSIDE" {
+            if let Some(kept) = out.strip_suffix("NOT ") {
+                out.truncate(kept.len());
+                out.push_str("NOTINSIDE");
+            } else {
+                out.push_str("INSIDE");
+            }
+        } else {
+            out.push_str(&upper);
+        }
+    }
+    collapse_whitespace(&out)
+}
+
+/// Drop the whitespace just inside a bracket or brace and around a comma,
+/// colon or semicolon: the engine prints lists as `[1, 2]`, objects as
+/// `{ a: 1 }` and blocks as `{ a; b }` whatever the definition's spacing.
+/// Spacing outside a bracket (`(a) + (b)`) is kept.
+fn fold_punctuation_spacing(code: &str) -> String {
+    let opens_or_separates = |c: char| matches!(c, '[' | '(' | '{' | ',' | ':' | ';');
+    let closes_or_separates = |c: char| matches!(c, ']' | ')' | '}' | ',' | ':' | ';');
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = String::with_capacity(code.len());
+    for (at, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() {
+            let before = out.chars().last().is_some_and(opens_or_separates);
+            let after = chars.get(at + 1).copied().is_some_and(closes_or_separates);
+            if before || after {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// One run of expression text.
@@ -233,6 +327,81 @@ fn fold_cast_spacing(code: &str) -> String {
         }
     }
     out
+}
+
+/// Normalise a SurrealQL type for comparison.
+///
+/// On top of [`normalize_expression`] (string literals in one quote style),
+/// every space outside quotes goes, since the engine prints `none | int`
+/// and `array<string, 5>` however the definition spaced them, and a float
+/// literal loses the `f` suffix the engine echoes it with (`2.5f`).
+///
+/// ## Examples
+///
+/// ```
+/// use surql::migration::diff::normalize_type;
+///
+/// assert_eq!(normalize_type("\"a\" | 2.5 | array<string,5>"), "'a'|2.5|array<string,5>");
+/// assert_eq!(normalize_type("'a' |  2.5f | array<string, 5>"), "'a'|2.5|array<string,5>");
+/// ```
+#[must_use]
+pub fn normalize_type(ty: &str) -> String {
+    let expr = normalize_expression(ty);
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if let Some(close) = quote {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == close {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                out.push(ch);
+            }
+            '⟨' => {
+                quote = Some('⟩');
+                out.push(ch);
+            }
+            c if c.is_whitespace() => {}
+            'f' if in_number(&out)
+                && !chars
+                    .peek()
+                    .is_some_and(|next| next.is_alphanumeric() || *next == '_') => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `true` when the word `text` ends in is a number (`2`, `2.5`), not an
+/// identifier that happens to end in a digit (`t1`).
+fn in_number(text: &str) -> bool {
+    let word = text
+        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .next()
+        .unwrap_or("");
+    word.starts_with(|c: char| c.is_ascii_digit()) && word.ends_with(|c: char| c.is_ascii_digit())
+}
+
+/// Whether two optional types are the same once normalised with
+/// [`normalize_type`]. Two absent types are equal.
+#[must_use]
+pub fn type_eq(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => normalize_type(x) == normalize_type(y),
+        _ => false,
+    }
 }
 
 /// Whether two optional expressions are the same once normalised with

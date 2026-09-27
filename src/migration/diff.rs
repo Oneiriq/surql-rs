@@ -69,12 +69,14 @@ use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::{EventDefinition, IndexDefinition, TableDefinition};
 use crate::schema::view::ViewDefinition;
 
+mod access_equality;
 mod equality;
 mod generate;
 mod normalize;
 mod render;
 mod validate;
 
+pub use access_equality::{accesses_equal, duration_nanos};
 pub use equality::{
     events_equal, field_permissions_equal, fields_equal, indexes_equal, permissions_equal,
     table_permissions_equal,
@@ -86,7 +88,7 @@ use generate::{
     generate_drop_table_diffs, generate_modify_event_diff, generate_modify_field_diff,
     generate_modify_index_diff, generate_modify_permissions_diff,
 };
-pub use normalize::{expr_eq, normalize_expression};
+pub use normalize::{expr_eq, normalize_expression, normalize_type, type_eq};
 use render::edge_define_sql;
 pub use validate::{validate_default_value, validate_event_expression};
 
@@ -629,4 +631,5 @@ where
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // MTREE stays covered: old snapshots and echoes still load
 mod tests;

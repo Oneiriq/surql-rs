@@ -32,7 +32,9 @@ const ACCESS_CLAUSES: &[(&str, Shape)] = &[
     ("ALGORITHM", Shape::Expr),
     ("KEY", Shape::Expr),
     ("URL", Shape::Expr),
+    ("AUDIENCE", Shape::Expr),
     ("AUTHENTICATE", Shape::Expr),
+    ("CONTEXT", Shape::Expr),
     ("DURATION", Shape::Expr),
     ("COMMENT", Shape::Str),
 ];
@@ -73,6 +75,8 @@ pub fn parse_access(name: &str, definition: &str) -> Option<AccessDefinition> {
     let mut signup = None;
     let mut signin = None;
     let mut durations = (None, None);
+    let mut authenticate = None;
+    let mut context = None;
     let mut issuer_scope = false;
     for c in &found {
         match c.keyword {
@@ -90,6 +94,14 @@ pub fn parse_access(name: &str, definition: &str) -> Option<AccessDefinition> {
                 match other {
                     "SIGNUP" => signup = Some(unwrap_parens(c.body)),
                     "SIGNIN" => signin = Some(unwrap_parens(c.body)),
+                    "AUDIENCE" => {
+                        jwt.audience = split_top_level(c.body, ',')
+                            .into_iter()
+                            .map(|a| literal(a.trim()))
+                            .collect();
+                    }
+                    "AUTHENTICATE" => authenticate = Some(c.body.to_string()),
+                    "CONTEXT" => context = Some(c.body.to_string()),
                     "DURATION" => durations = parse_durations(c.body),
                     _ => {}
                 }
@@ -104,6 +116,8 @@ pub fn parse_access(name: &str, definition: &str) -> Option<AccessDefinition> {
         record: None,
         duration_session: durations.0,
         duration_token: durations.1,
+        authenticate,
+        context,
     };
     match access_type {
         AccessType::Jwt => acc.jwt = Some(jwt.into_config()),
@@ -129,6 +143,7 @@ struct JwtParts {
     url: Option<String>,
     issuer_algorithm: Option<String>,
     issuer: Option<String>,
+    audience: Vec<String>,
 }
 
 impl JwtParts {
@@ -143,6 +158,7 @@ impl JwtParts {
             algorithm,
             key: self.key,
             url: self.url,
+            audience: self.audience,
         }
     }
 }
@@ -183,6 +199,7 @@ fn parse_durations(body: &str) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::diff::accesses_equal;
 
     #[test]
     fn record_signin_survives_a_following_jwt_clause() {
@@ -249,5 +266,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(acc.jwt.unwrap().key.as_deref(), Some(r"it's \ key"));
+    }
+
+    // The SurrealDB 3.3 echoes of what this crate renders, and how they
+    // compare with the definitions that produced them.
+
+    #[test]
+    fn audience_does_not_run_into_the_key() {
+        let echo = parse_access(
+            "j2",
+            "DEFINE ACCESS j2 ON DATABASE TYPE JWT ALGORITHM RS256 KEY 'pub' AUDIENCE 'api', \
+             'web' DURATION FOR SESSION 1w",
+        )
+        .unwrap();
+        let jwt = echo.jwt.clone().unwrap();
+        assert_eq!(jwt.key.as_deref(), Some("pub"));
+        assert_eq!(jwt.audience, vec!["api".to_string(), "web".to_string()]);
+        assert_eq!(echo.duration_session.as_deref(), Some("1w"));
+
+        let code = crate::schema::jwt_access(
+            "j2",
+            JwtConfig::new("RS256")
+                .with_key("pub")
+                .with_audience(["api", "web"]),
+        )
+        .with_session("168h");
+        assert!(accesses_equal(&code, &echo));
+        let other = crate::schema::jwt_access(
+            "j2",
+            JwtConfig::new("RS256")
+                .with_key("pub")
+                .with_audience(["api"]),
+        )
+        .with_session("168h");
+        assert!(!accesses_equal(&other, &echo));
+    }
+
+    #[test]
+    fn authenticate_and_context_read_back() {
+        let echo = parse_access(
+            "r2",
+            "DEFINE ACCESS r2 ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user) WITH JWT \
+             ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE \
+             $auth.enabled = true CONTEXT { tenant: 'x' } DURATION FOR TOKEN 1h, FOR SESSION 4w2d",
+        )
+        .unwrap();
+        assert_eq!(echo.authenticate.as_deref(), Some("$auth.enabled = true"));
+        assert_eq!(echo.context.as_deref(), Some("{ tenant: 'x' }"));
+        assert_eq!(echo.duration_session.as_deref(), Some("4w2d"));
+
+        // Declared without a verifier: the engine's implied HS512 one and
+        // the respelled durations are no difference.
+        let code = crate::schema::record_access(
+            "r2",
+            RecordAccessConfig::new().with_signin("SELECT * FROM user"),
+        )
+        .with_authenticate("$auth.enabled = true")
+        .with_context("{tenant:'x'}")
+        .with_session("30d");
+        assert_eq!(
+            code.to_surql().unwrap(),
+            "DEFINE ACCESS r2 ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user) \
+             AUTHENTICATE $auth.enabled = true CONTEXT {tenant:'x'} DURATION FOR SESSION 30d;"
+        );
+        assert!(accesses_equal(&code, &echo));
+        assert!(!accesses_equal(
+            &code.clone().with_context("{ tenant: 'y' }"),
+            &echo
+        ));
+        let declared = crate::schema::record_access(
+            "r2",
+            RecordAccessConfig::new()
+                .with_signin("SELECT * FROM user")
+                .with_jwt(JwtConfig::new("RS256").with_key("pub")),
+        )
+        .with_authenticate("$auth.enabled = true")
+        .with_context("{tenant:'x'}")
+        .with_session("30d");
+        assert!(!accesses_equal(&declared, &echo));
+    }
+
+    #[test]
+    fn durations_compare_by_length() {
+        let echo = parse_access(
+            "j1",
+            "DEFINE ACCESS j1 ON DATABASE TYPE JWT ALGORITHM HS256 KEY '[REDACTED]' WITH ISSUER \
+             KEY '[REDACTED]' DURATION FOR TOKEN 1h30m, FOR SESSION NONE",
+        )
+        .unwrap();
+        let code = crate::schema::jwt_access("j1", JwtConfig::hs256("secret")).with_token("90m");
+        assert!(accesses_equal(&code, &echo));
+        assert!(accesses_equal(&code.clone().with_session("NONE"), &echo));
+        assert!(!accesses_equal(&code.clone().with_token("1h"), &echo));
+        assert!(!accesses_equal(&code.with_session("1d"), &echo));
     }
 }

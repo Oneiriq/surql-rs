@@ -172,6 +172,15 @@ Problems the pass found but did not fix are listed on the
     and DISKANN tuning, the `ascii` analyzer) as drift. `surql schema
     validate` reads the complete live schema. **Breaking:** `db_edges:
     None` now skips edges, and edge maps take `EdgeDefinition`.
+  - The engine's operator and spacing rewrites are not drift:
+    `normalize_expression` (and so the diff and the validator) reads `&&` /
+    `||` as `AND` / `OR`, `IN` as `INSIDE`, `NOT IN` as `NOTINSIDE`,
+    operator keywords in any case, and `[1,2]` / `{a:1}` as the engine's
+    `[1, 2]` / `{ a: 1 }`. Event conditions, assertions and permissions
+    using them used to warn on every validation and re-apply on every
+    diff.
+  - A COUNT index used to read back as a standard index with no columns,
+    and a union field type as `any`; both now read back as themselves.
   - Theme settings take effect; the registry refuses a table and an edge
     sharing one name.
 - **Connection, settings and cache.**
@@ -248,11 +257,46 @@ Problems the pass found but did not fix are listed on the
   `INFO` parsers return on arbitrary text.
 - CI jobs for the MSRV, the `client-wasm` build and the no-features
   build; the pre-push hook runs every CI gate.
+- Union, literal and typed-container field types:
+  `FieldDefinition::custom_type` / `with_custom_type` render a type the
+  `FieldType` keywords cannot spell (`array<string> | int`, `'draft' |
+  'published'`, `array<string, 5>`, `set<int>`, `geometry<point>`), and the
+  parser keeps any type it cannot render back from the keywords there
+  instead of reading it as `any`. The diff and the validator compare it
+  through the new `normalize_type` / `type_eq`; `FieldDefinition::type_clause`
+  returns the rendered type. `FieldDefinition` gains `custom_type`
+  (**Breaking** for struct literals).
+- Access comparison: `accesses_equal` and `validate_accesses` compare
+  access definitions with the engine's echo, folding away redacted keys,
+  normalised durations (`duration_nanos`: `24h` is `1d`), the default token
+  duration and the verifier the engine gives a record access declared
+  without one. Accesses stay out of the migration diff (their keys never
+  come back, so no rollback could restore them).
+- SurrealDB 3.3 access clauses: `JwtConfig::with_audience` (`AUDIENCE`) and
+  `AccessDefinition::with_context` (`CONTEXT`), plus
+  `AccessDefinition::with_authenticate` (`AUTHENTICATE`). The parser reads
+  all three; `AUDIENCE` used to run into the preceding key. `JwtConfig`
+  gains `audience` and `AccessDefinition` gains `authenticate` and
+  `context` (**Breaking** for struct literals).
+- COUNT indexes: `IndexType::Count`, `count_index(name)` and
+  `IndexDefinition::with_condition` render `DEFINE INDEX … COUNT [WHERE
+  …]`; the parser reads the engine's echo (it used to read a standard
+  index with no columns), and the diff and validator compare the
+  condition. `IndexDefinition` gains `condition` (**Breaking** for struct
+  literals and exhaustive matches on `IndexType`).
 - `modified_migrations`, `get_modified_migrations`, `rehash_migrations`,
   `update_migration_checksum` and `ModifiedMigration`;
   `MigrationStatusReport` gains `modified` (**Breaking** for struct
   literals); `surql migrate rehash [<VERSION>...]` accepts an edit to an
   applied migration by recording its current checksum.
+
+### Deprecated
+
+- `mtree_index` and `IndexType::Mtree`. SurrealDB 3 has no MTREE index
+  (every 3.x engine refuses the statement), so `IndexDefinition::validate`
+  now refuses one; use `hnsw_index` or `diskann_index`. The variant stays
+  so existing code and snapshots still load. `IndexType::is_removed`
+  reports it.
 
 ### Removed
 

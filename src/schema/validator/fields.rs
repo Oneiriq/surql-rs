@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use super::normalize::expr_eq;
 use super::permissions::{compare_permissions, FIELD_PERMISSIONS};
 use super::{presence, ValidationResult, ValidationSeverity};
+use crate::migration::diff::type_eq;
 use crate::schema::fields::{FieldDefinition, FieldType};
 
 /// `true` for the `<parent>.*` (or `<parent>[*]`) child the engine defines on
@@ -74,6 +75,7 @@ fn effective_target(field: &FieldDefinition) -> Option<&str> {
 /// The `TYPE` clause a field renders, for reporting.
 fn type_label(field: &FieldDefinition) -> String {
     let base = match (field.field_type, effective_target(field)) {
+        _ if field.custom_type.is_some() => field.custom_type.clone().unwrap_or_default(),
         (FieldType::Record, Some(target)) => format!("record<{target}>"),
         (FieldType::Array, Some(target)) => format!("array<record<{target}>>"),
         (ty, _) => ty.as_str().to_string(),
@@ -144,9 +146,18 @@ fn field_checks(code: &FieldDefinition, db: &FieldDefinition) -> Vec<Check> {
         Check {
             severity: ValidationSeverity::Error,
             message: "Field type mismatch",
-            differs: code.field_type != db.field_type,
-            code: Some(code.field_type.as_str().to_string()),
-            db: Some(db.field_type.as_str().to_string()),
+            differs: code.field_type != db.field_type
+                || !type_eq(code.custom_type.as_deref(), db.custom_type.as_deref()),
+            code: Some(
+                code.custom_type
+                    .clone()
+                    .unwrap_or_else(|| code.field_type.as_str().to_string()),
+            ),
+            db: Some(
+                db.custom_type
+                    .clone()
+                    .unwrap_or_else(|| db.field_type.as_str().to_string()),
+            ),
         },
         Check {
             severity: ValidationSeverity::Error,

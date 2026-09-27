@@ -23,11 +23,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use surql::connection::{ConnectionConfig, DatabaseClient};
+use surql::migration::diff::{accesses_equal, fields_equal, indexes_equal};
+#[allow(deprecated)]
+use surql::schema::mtree_index;
 use surql::schema::parser::{parse_db_info, parse_table_full};
 use surql::schema::{
-    analyzer, bm25_index, event, function_schema, index, jwt_access, param_schema, record_access,
-    string_field, table_schema, typed_edge, AccessType, FieldDefinition, FieldType, JwtConfig,
-    RecordAccessConfig, TableDefinition, TokenFilter, Tokenizer,
+    analyzer, bm25_index, count_index, event, function_schema, index, jwt_access, param_schema,
+    record_access, string_field, table_schema, typed_edge, validate_accesses, validate_schema,
+    AccessType, FieldDefinition, FieldType, IndexType, JwtConfig, MTreeDistanceType,
+    MTreeVectorType, RecordAccessConfig, TableDefinition, TableMode, TokenFilter, Tokenizer,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -364,4 +368,151 @@ async fn functions_params_and_comments_round_trip_and_cannot_inject() {
     assert_eq!(db.functions["strip"].normalized(), strip.normalized());
     assert_eq!(db.functions["open"].normalized(), open.normalized());
     assert_eq!(db.params["obj"].normalized(), obj.normalized());
+}
+
+#[tokio::test]
+async fn count_indexes_apply_count_and_read_back() {
+    let client = client().await;
+    let table = table_schema("visit")
+        .with_fields([FieldDefinition::new("bot", FieldType::Bool)])
+        .with_indexes([
+            count_index("visits"),
+            count_index("human_visits").with_condition("(bot = false)"),
+        ]);
+    apply(&client, &table.to_surql_all()).await;
+    apply(
+        &client,
+        &["CREATE visit SET bot = false; CREATE visit SET bot = true;".to_string()],
+    )
+    .await;
+    let count = first(
+        &client
+            .query("SELECT count() FROM visit GROUP ALL;")
+            .await
+            .expect("count"),
+    );
+    assert_eq!(count[0]["count"], 2, "{count}");
+
+    let parsed = read_table(&client, "visit").await;
+    for code in &table.indexes {
+        let echo = parsed
+            .indexes
+            .iter()
+            .find(|i| i.name == code.name)
+            .unwrap_or_else(|| panic!("no index {} in {parsed:?}", code.name));
+        assert_eq!(echo.index_type, IndexType::Count);
+        assert!(echo.columns.is_empty(), "{echo:?}");
+        assert!(indexes_equal(code, echo), "{code:?} vs {echo:?}");
+    }
+    let echo = parsed
+        .indexes
+        .iter()
+        .find(|i| i.name == "human_visits")
+        .unwrap();
+    assert_eq!(echo.condition.as_deref(), Some("bot = false"));
+}
+
+#[tokio::test]
+async fn an_mtree_index_is_refused_before_it_reaches_the_engine() {
+    #[allow(deprecated)]
+    let idx = mtree_index("m", "v", 3, MTreeDistanceType::Cosine, MTreeVectorType::F32);
+    assert!(idx.validate().is_err());
+    let client = client().await;
+    let err = client
+        .query(&idx.to_surql("t"))
+        .await
+        .expect_err("the engine has no MTREE either");
+    assert!(err.to_string().contains("MTREE"), "{err}");
+}
+
+#[tokio::test]
+async fn custom_types_and_rewritten_operators_validate_clean() {
+    let client = client().await;
+    let table = table_schema("post")
+        .with_mode(TableMode::Schemafull)
+        .with_fields([
+            FieldDefinition::new("status", FieldType::Any)
+                .with_custom_type("\"draft\"|'published'")
+                .with_assertion("$value IN ['draft','published'] && $value != NONE"),
+            FieldDefinition::new("tags", FieldType::Any)
+                .with_custom_type("array<string, 5> | string")
+                .with_nullable(true),
+            FieldDefinition::new("score", FieldType::Any).with_custom_type("1 | 2.5"),
+            FieldDefinition::new("owner", FieldType::Record).with_target_table("user"),
+        ])
+        .with_events([event(
+            "published",
+            "$event IN ['CREATE','UPDATE'] && $after.status NOT IN ['draft'] || false",
+            "CREATE log SET post = $after.id, meta = {at:time::now(),tags:[1,2]}",
+        )]);
+    apply(&client, &table.to_surql_all()).await;
+
+    let parsed = read_table(&client, "post").await;
+    for code in &table.fields {
+        let echo = field(&parsed, &code.name);
+        assert!(fields_equal(code, echo), "{code:?}\nvs\n{echo:?}");
+    }
+    assert_eq!(
+        field(&parsed, "status").custom_type.as_deref(),
+        Some("'draft' | 'published'")
+    );
+
+    let mut code_tables = std::collections::HashMap::new();
+    code_tables.insert("post".to_string(), table);
+    let mut db_tables = std::collections::HashMap::new();
+    db_tables.insert("post".to_string(), parsed);
+    let results = validate_schema(&code_tables, &db_tables, None, None);
+    assert!(results.is_empty(), "{results:#?}");
+}
+
+#[tokio::test]
+async fn access_definitions_compare_equal_to_their_echo() {
+    let client = client().await;
+    // `AUDIENCE` and `CONTEXT` are SurrealDB 3.3 syntax.
+    let since_3_3 = client
+        .query("DEFINE ACCESS probe ON DATABASE TYPE JWT URL 'https://x' AUDIENCE 'x';")
+        .await
+        .is_ok();
+    let mut sso = JwtConfig::new("RS256").with_key("-----BEGIN PUBLIC KEY----- x");
+    let mut user = record_access(
+        "user",
+        RecordAccessConfig::new()
+            .with_signup("CREATE user SET email = $email")
+            .with_signin("SELECT * FROM user WHERE email = $email"),
+    )
+    .with_authenticate("$auth.enabled = true")
+    .with_session("24h");
+    if since_3_3 {
+        sso = sso.with_audience(["api", "web"]);
+        user = user.with_context("{tenant:$token.tenant}");
+    }
+    let accesses = [
+        jwt_access("api", JwtConfig::hs256("secret")).with_token("90m"),
+        jwt_access("sso", sso).with_session("168h"),
+        user,
+    ];
+    let statements: Vec<String> = accesses.iter().map(|a| a.to_surql().unwrap()).collect();
+    apply(&client, &statements).await;
+
+    let db = parse_db_info(&info_for_db(&client).await).unwrap();
+    for code in &accesses {
+        let echo = &db.accesses[&code.name];
+        assert!(accesses_equal(code, echo), "{code:?}\nvs\n{echo:?}");
+    }
+    let echoes: Vec<_> = db
+        .accesses
+        .values()
+        .filter(|a| a.name != "probe")
+        .cloned()
+        .collect();
+    assert!(validate_accesses(&accesses, &echoes).is_empty());
+
+    let changed = [accesses[2].clone().with_session("12h")];
+    let results = validate_accesses(&changed, &echoes);
+    assert!(
+        results
+            .iter()
+            .any(|r| r.message == "Access definition mismatch"),
+        "{results:#?}"
+    );
 }

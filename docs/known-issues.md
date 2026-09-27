@@ -12,22 +12,6 @@ would take. Fixed issues move to the [changelog](changelog.md).
   limit". Binding values as query parameters instead of inlining them
   would lift the limit.
 
-## Schema
-
-- **`mtree_index` renders DDL the 3.x grammar rejects.** SurrealDB 3 has
-  no `MTREE` index; use `hnsw_index` or `diskann_index`.
-- **COUNT indexes are not modelled.** One read from the database parses
-  as a standard index with no columns. The fix is an `IndexType::Count`.
-- **Union field types read back as `any`.** A type such as
-  `array<string> | int` parses as `FieldType::Any`.
-- **Access definitions are not compared.** The engine echoes them with
-  keys redacted, durations normalised (`24h` becomes `1d`) and implied
-  algorithms, so comparing them would need that normalisation. Accesses
-  are not diffed, so reconciling is unaffected.
-- **Some event bodies still warn in validation.** The engine rewrites
-  `IN` to `INSIDE` and respaces lists in event conditions, which
-  `validate_schema` reports as a warning (never an error).
-
 ## Cache
 
 - **Redis reconnects by dropping the connection.** A connection that

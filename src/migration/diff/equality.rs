@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use super::normalize::{expr_eq, normalize_expression};
+use super::normalize::{expr_eq, normalize_expression, type_eq};
 use crate::schema::fields::{FieldDefinition, FieldType};
 use crate::schema::index_vector::{
     DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE, DISKANN_DEFAULT_L_BUILD,
@@ -40,6 +40,7 @@ use crate::schema::table::{
 pub fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
     a.name == b.name
         && a.field_type == b.field_type
+        && type_eq(a.custom_type.as_deref(), b.custom_type.as_deref())
         && a.nullable == b.nullable
         && rendered_target(a) == rendered_target(b)
         && a.readonly == b.readonly
@@ -247,8 +248,17 @@ fn comparable_index(idx: &IndexDefinition) -> IndexDefinition {
         .iter()
         .map(|column| normalize_expression(column));
     let base = IndexDefinition::new(idx.name.clone(), columns).with_type(idx.index_type);
+    #[allow(deprecated)]
     match idx.index_type {
         IndexType::Unique | IndexType::Standard => base,
+        IndexType::Count => IndexDefinition {
+            condition: idx
+                .condition
+                .as_deref()
+                .map(normalize_expression)
+                .filter(|condition| !condition.is_empty()),
+            ..base
+        },
         IndexType::Search => IndexDefinition {
             analyzer: idx
                 .analyzer

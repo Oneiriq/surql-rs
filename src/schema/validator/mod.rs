@@ -56,12 +56,14 @@ use super::edge::{EdgeDefinition, EdgeMode};
 use super::table::{TableDefinition, TableMode};
 use super::view::ViewDefinition;
 
+mod accesses;
 mod events;
 mod fields;
 mod indexes;
 mod normalize;
 mod permissions;
 
+pub use accesses::validate_accesses;
 pub use fields::validate_field;
 pub use indexes::validate_index;
 pub use normalize::normalize_expression;
@@ -565,6 +567,7 @@ pub fn validate_edge(
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // MTREE stays covered: old snapshots and echoes still load
 mod tests;
 #[cfg(test)]
 mod tests_drift;

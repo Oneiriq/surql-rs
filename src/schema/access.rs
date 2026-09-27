@@ -103,6 +103,10 @@ pub struct JwtConfig {
     /// JWT access method only verifies externally issued tokens.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub issuer: Option<String>,
+    /// Audiences a verified token's `aud` claim must name (`AUDIENCE 'a',
+    /// 'b'`, SurrealDB 3.3+). Empty accepts any audience.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub audience: Vec<String>,
 }
 
 impl JwtConfig {
@@ -115,8 +119,7 @@ impl JwtConfig {
         Self {
             algorithm: "HS256".into(),
             key: Some(key.into()),
-            url: None,
-            issuer: None,
+            ..Self::default()
         }
     }
 
@@ -124,10 +127,31 @@ impl JwtConfig {
     pub fn new(algorithm: impl Into<String>) -> Self {
         Self {
             algorithm: algorithm.into(),
-            key: None,
-            url: None,
-            issuer: None,
+            ..Self::default()
         }
+    }
+
+    /// Accept only tokens whose `aud` claim names one of `audience`
+    /// (`AUDIENCE`, SurrealDB 3.3+).
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::schema::{jwt_access, JwtConfig};
+    ///
+    /// let api = jwt_access("api", JwtConfig::new("RS256").with_key("pub").with_audience(["api"]));
+    /// assert_eq!(
+    ///     api.to_surql().unwrap(),
+    ///     "DEFINE ACCESS api ON DATABASE TYPE JWT ALGORITHM RS256 KEY 'pub' AUDIENCE 'api';"
+    /// );
+    /// ```
+    pub fn with_audience<I, S>(mut self, audience: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.audience = audience.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Set the verification key.
@@ -177,9 +201,10 @@ impl JwtConfig {
         }
     }
 
-    /// Render `ALGORITHM <alg> KEY '<key>'` or `URL '<url>'`, then the
-    /// optional `WITH ISSUER` clause. The engine names the issuer algorithm
-    /// only when the verifier (a JWKS url) does not already fix it.
+    /// Render `ALGORITHM <alg> KEY '<key>'` or `URL '<url>'`, the optional
+    /// `AUDIENCE`, then the optional `WITH ISSUER` clause. The engine names
+    /// the issuer algorithm only when the verifier (a JWKS url) does not
+    /// already fix it.
     fn to_clause(&self) -> String {
         let algorithm = self.algorithm.to_ascii_uppercase();
         let mut sql = match (&self.key, &self.url) {
@@ -187,6 +212,10 @@ impl JwtConfig {
             (None, Some(url)) => format!("URL {}", quote_str(url)),
             (None, None) => format!("ALGORITHM {algorithm}"),
         };
+        if !self.audience.is_empty() {
+            let audience: Vec<String> = self.audience.iter().map(|a| quote_str(a)).collect();
+            let _ = write!(sql, " AUDIENCE {}", audience.join(", "));
+        }
         if let Some(issuer) = &self.issuer {
             if self.key.is_some() {
                 let _ = write!(sql, " WITH ISSUER KEY {}", quote_str(issuer));
@@ -214,6 +243,7 @@ impl Default for JwtConfig {
             key: None,
             url: None,
             issuer: None,
+            audience: Vec::new(),
         }
     }
 }
@@ -280,6 +310,15 @@ pub struct AccessDefinition {
     /// Token duration (e.g. `15m`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub duration_token: Option<String>,
+    /// Expression run after every sign-in and token authentication
+    /// (`AUTHENTICATE`); throwing from it refuses the session.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub authenticate: Option<String>,
+    /// Read-only expression evaluated once a session settles on its
+    /// identity, its value kept as the session's data (`CONTEXT`,
+    /// SurrealDB 3.3+).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub context: Option<String>,
 }
 
 impl AccessDefinition {
@@ -292,6 +331,8 @@ impl AccessDefinition {
             record: None,
             duration_session: None,
             duration_token: None,
+            authenticate: None,
+            context: None,
         }
     }
 
@@ -304,7 +345,37 @@ impl AccessDefinition {
             record: Some(config),
             duration_session: None,
             duration_token: None,
+            authenticate: None,
+            context: None,
         }
+    }
+
+    /// Run `expression` after every sign-in and token authentication
+    /// (`AUTHENTICATE`).
+    pub fn with_authenticate(mut self, expression: impl Into<String>) -> Self {
+        self.authenticate = Some(expression.into());
+        self
+    }
+
+    /// Keep the value of the read-only `expression` as each session's data
+    /// (`CONTEXT`, SurrealDB 3.3+).
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::schema::{record_access, RecordAccessConfig};
+    ///
+    /// let user = record_access("user", RecordAccessConfig::new().with_signin("SELECT * FROM user"))
+    ///     .with_context("{ tenant: $token.tenant }");
+    /// assert_eq!(
+    ///     user.to_surql().unwrap(),
+    ///     "DEFINE ACCESS user ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user) \
+    ///      CONTEXT { tenant: $token.tenant };"
+    /// );
+    /// ```
+    pub fn with_context(mut self, expression: impl Into<String>) -> Self {
+        self.context = Some(expression.into());
+        self
     }
 
     /// Set the session duration.
@@ -411,6 +482,13 @@ impl AccessDefinition {
             }
         }
 
+        if let Some(authenticate) = &self.authenticate {
+            let _ = write!(sql, " AUTHENTICATE {authenticate}");
+        }
+        if let Some(context) = &self.context {
+            let _ = write!(sql, " CONTEXT {context}");
+        }
+
         if self.duration_session.is_some() || self.duration_token.is_some() {
             let mut parts: Vec<String> = Vec::new();
             if let Some(session) = &self.duration_session {
@@ -482,6 +560,8 @@ pub fn access_schema(name: impl Into<String>, access_type: AccessType) -> Access
             record: None,
             duration_session: None,
             duration_token: None,
+            authenticate: None,
+            context: None,
         },
     }
 }

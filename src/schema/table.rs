@@ -19,10 +19,11 @@ use super::fields::FieldDefinition;
 use super::permissions::{render_permissions_clause, validate_permissions, TABLE_ACTIONS};
 use super::view::ViewDefinition;
 
+#[allow(deprecated)] // re-exports `mtree_index`, kept for existing code
 pub use super::index::{
-    bm25_index, diskann_index, hnsw_index, index, mtree_index, search_index, unique_index,
-    DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
-    MTreeVectorType,
+    bm25_index, count_index, diskann_index, hnsw_index, index, mtree_index, search_index,
+    unique_index, DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType,
+    MTreeDistanceType, MTreeVectorType,
 };
 
 /// Table schema mode.

@@ -4,11 +4,13 @@
 //! 1000-LOC budget. Everything here is re-exported from `schema::table`, so
 //! existing paths keep resolving.
 //!
-//! Covers the plain / `UNIQUE` / `FULLTEXT` forms plus the `MTREE`, `HNSW`,
+//! Covers the plain / `UNIQUE` / `FULLTEXT` / `COUNT` forms plus the `HNSW`
 //! and `DISKANN` vector indexes, and the `CONCURRENTLY` build directive that
 //! lets a large index populate in the background. The vector vocabulary
 //! (distance metrics, element types, vector builders) lives in
-//! [`super::index_vector`] and is re-exported here.
+//! [`super::index_vector`] and is re-exported here. `MTREE` is kept only so
+//! existing code and snapshots still load: SurrealDB 3 has no MTREE index,
+//! and validation refuses one.
 
 use std::fmt::Write as _;
 
@@ -19,6 +21,7 @@ use crate::types::escape::quote_ident;
 
 use super::fields::render_field_path;
 
+#[allow(deprecated)] // re-exports `mtree_index`, kept for existing code
 pub use super::index_vector::{
     diskann_index, hnsw_index, mtree_index, DiskAnnDistanceType, HnswDistanceType,
     MTreeDistanceType, MTreeVectorType, DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE,
@@ -37,7 +40,13 @@ pub enum IndexType {
     Search,
     /// Plain b-tree style index.
     Standard,
-    /// MTREE vector similarity index.
+    /// MTREE vector similarity index. SurrealDB 3 removed it: the engine
+    /// refuses the statement, and [`IndexDefinition::validate`] refuses the
+    /// definition. Kept so existing code and snapshots still load.
+    #[deprecated(
+        since = "0.34.0",
+        note = "SurrealDB 3 has no MTREE index; use IndexType::Hnsw or IndexType::Diskann"
+    )]
     Mtree,
     /// HNSW vector similarity index.
     Hnsw,
@@ -45,11 +54,17 @@ pub enum IndexType {
     /// built for corpora too large for HNSW's memory residency. Reached by
     /// the same `<|k,ef|>` KNN operator.
     Diskann,
+    /// COUNT index: keeps the number of the table's records, or of those
+    /// matching its [`condition`](IndexDefinition::condition), so
+    /// `SELECT count() FROM t GROUP ALL` reads it instead of scanning.
+    /// Takes no columns. Build one with [`count_index`].
+    Count,
 }
 
 impl IndexType {
     /// Render as SurrealQL keyword (matching the Python enum values).
     pub fn as_str(self) -> &'static str {
+        #[allow(deprecated)]
         match self {
             Self::Unique => "UNIQUE",
             Self::Search => "FULLTEXT",
@@ -57,7 +72,14 @@ impl IndexType {
             Self::Mtree => "MTREE",
             Self::Hnsw => "HNSW",
             Self::Diskann => "DISKANN",
+            Self::Count => "COUNT",
         }
+    }
+
+    /// `true` for the kinds SurrealDB 3 no longer has (`MTREE`).
+    #[allow(deprecated)]
+    pub fn is_removed(self) -> bool {
+        self == Self::Mtree
     }
 }
 
@@ -143,6 +165,10 @@ pub struct IndexDefinition {
     /// [`info_for_index_surql`] / [`IndexBuildStatus`].
     #[serde(default)]
     pub concurrently: bool,
+    /// The `WHERE` condition of a `COUNT` index: only records matching it
+    /// are counted. `None` counts every record.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub condition: Option<String>,
 }
 
 impl IndexDefinition {
@@ -175,7 +201,15 @@ impl IndexDefinition {
             bm25: false,
             highlights: false,
             concurrently: false,
+            condition: None,
         }
+    }
+
+    /// Count only the records matching `condition` (a `COUNT` index's
+    /// `WHERE` clause).
+    pub fn with_condition(mut self, condition: impl Into<String>) -> Self {
+        self.condition = Some(condition.into());
+        self
     }
 
     /// Set the index kind.
@@ -244,14 +278,46 @@ impl IndexDefinition {
 
     /// Validate the index definition.
     ///
-    /// Returns [`SurqlError::Validation`] when the name or column list is
-    /// empty, when vector-index fields are missing required members, or when
-    /// a vector index carries a member combination the engine is known to
-    /// refuse (see [`Self::validate_vector_members`]).
+    /// Returns [`SurqlError::Validation`] when the name is empty, when an
+    /// index other than `COUNT` has no columns (a `COUNT` index takes
+    /// none), when a condition is set on anything but a `COUNT` index, for
+    /// an `MTREE` index (SurrealDB 3 has none), when vector-index fields are
+    /// missing required members, or when a vector index carries a member
+    /// combination the engine is known to refuse (see
+    /// [`Self::validate_vector_members`]).
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(SurqlError::Validation {
                 reason: "Index name cannot be empty".into(),
+            });
+        }
+        if self.index_type.is_removed() {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Index {:?} is an MTREE index, which SurrealDB 3 does not have; \
+                     use hnsw_index or diskann_index",
+                    self.name
+                ),
+            });
+        }
+        if self.index_type == IndexType::Count {
+            if !self.columns.is_empty() {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "COUNT index {:?} takes no columns; the engine refuses a count \
+                         index with fields",
+                        self.name
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if self.condition.is_some() {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Index {:?} has a condition, which only a COUNT index takes",
+                    self.name
+                ),
             });
         }
         if self.columns.is_empty() {
@@ -268,10 +334,8 @@ impl IndexDefinition {
                 ),
             });
         }
-        if matches!(
-            self.index_type,
-            IndexType::Mtree | IndexType::Hnsw | IndexType::Diskann
-        ) && self.dimension.is_none()
+        if matches!(self.index_type, IndexType::Hnsw | IndexType::Diskann)
+            && self.dimension.is_none()
         {
             return Err(SurqlError::Validation {
                 reason: format!("Vector index {:?} requires a dimension", self.name),
@@ -283,8 +347,6 @@ impl IndexDefinition {
     /// Engine-shaped refusals for the vector kinds, caught before a
     /// statement is sent (all probed against SurrealDB 3.2.4).
     ///
-    /// - MTREE parses only `F64` / `F32` / `I64` / `I32` / `I16` element
-    ///   types; `F16` / `I8` / `U8` are a parse error.
     /// - DISKANN accepts only `F32` / `F16` / `I8` / `U8` element types.
     /// - DISKANN accepts only the metrics [`DiskAnnDistanceType`] can spell
     ///   (`EUCLIDEAN`, `COSINE`, `INNER_PRODUCT`, `COSINE_NORMALIZED`); a
@@ -293,23 +355,6 @@ impl IndexDefinition {
     ///
     /// HNSW accepts every [`MTreeVectorType`] variant, so it needs no check.
     fn validate_vector_members(&self) -> Result<()> {
-        if self.index_type == IndexType::Mtree {
-            if let Some(vt) = self.vector_type {
-                if matches!(
-                    vt,
-                    MTreeVectorType::F16 | MTreeVectorType::I8 | MTreeVectorType::U8
-                ) {
-                    return Err(SurqlError::Validation {
-                        reason: format!(
-                            "MTREE index {:?} cannot use TYPE {}: the engine only accepts \
-                             F64, F32, I64, I32, or I16 for MTREE",
-                            self.name,
-                            vt.as_str()
-                        ),
-                    });
-                }
-            }
-        }
         if self.index_type == IndexType::Diskann {
             if let Some(vt) = self.vector_type {
                 if !matches!(
@@ -375,7 +420,20 @@ impl IndexDefinition {
     fn render_guard(&self, table: &str, ine: &str) -> String {
         let first_column = self.columns.first().cloned().unwrap_or_default();
         let single = std::slice::from_ref(&first_column);
+        #[allow(deprecated)]
         match self.index_type {
+            IndexType::Count => {
+                let mut sql = format!(
+                    "DEFINE INDEX{ine} {name} ON TABLE {table} COUNT",
+                    name = quote_ident(&self.name),
+                    table = quote_ident(table),
+                );
+                if let Some(condition) = &self.condition {
+                    let _ = write!(sql, " WHERE {condition}");
+                }
+                self.push_tail(&mut sql);
+                sql
+            }
             IndexType::Mtree => {
                 let mut sql = self.render_head(table, ine, single);
                 let _ = write!(sql, " MTREE DIMENSION {}", self.dimension.unwrap_or(0));
@@ -575,6 +633,24 @@ where
     IndexDefinition::new(name, columns).with_type(IndexType::Search)
 }
 
+/// Build a `COUNT` index, which keeps the table's record count so
+/// `SELECT count() FROM t GROUP ALL` does not scan. Chain
+/// [`IndexDefinition::with_condition`] to count only matching records.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::schema::count_index;
+///
+/// assert_eq!(
+///     count_index("active_users").with_condition("active = true").to_surql("user"),
+///     "DEFINE INDEX active_users ON TABLE user COUNT WHERE active = true;"
+/// );
+/// ```
+pub fn count_index(name: impl Into<String>) -> IndexDefinition {
+    IndexDefinition::new(name, Vec::<String>::new()).with_type(IndexType::Count)
+}
+
 /// Build a BM25-scored full-text `SEARCH` index over `columns`, analyzed by
 /// `analyzer`. This is the index to pair with
 /// [`Query::fulltext_search`](crate::query::builder::Query::fulltext_search) and
@@ -608,6 +684,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // MTREE stays covered: old snapshots and echoes still load
 mod tests {
     use super::*;
 
@@ -797,12 +874,53 @@ mod tests {
         assert!(idx.validate().is_err());
     }
 
+    /// SurrealDB 3 has no MTREE index; the statement is a parse error on
+    /// every 3.x engine, so no MTREE definition validates.
     #[test]
-    fn index_validate_mtree_requires_dimension() {
-        let mut idx = IndexDefinition::new("x", ["v"]).with_type(IndexType::Mtree);
-        assert!(idx.validate().is_err());
-        idx.dimension = Some(64);
-        assert!(idx.validate().is_ok());
+    fn index_validate_refuses_mtree() {
+        for vt in [MTreeVectorType::F32, MTreeVectorType::F64] {
+            let idx = mtree_index("x", "v", 8, MTreeDistanceType::Cosine, vt);
+            let err = idx.validate().expect_err("SurrealDB 3 has no MTREE");
+            assert!(
+                err.to_string().contains("hnsw_index or diskann_index"),
+                "{err}"
+            );
+        }
+        assert!(IndexType::Mtree.is_removed());
+        assert!(!IndexType::Hnsw.is_removed());
+    }
+
+    #[test]
+    fn count_index_renders_without_columns() {
+        assert_eq!(
+            count_index("n").to_surql("user"),
+            "DEFINE INDEX n ON TABLE user COUNT;"
+        );
+        assert_eq!(
+            count_index("n")
+                .with_condition("active = true AND age > 18")
+                .to_surql_overwrite("user"),
+            "DEFINE INDEX OVERWRITE n ON TABLE user COUNT WHERE active = true AND age > 18;"
+        );
+        assert_eq!(
+            count_index("n").with_concurrently(true).to_surql("user"),
+            "DEFINE INDEX n ON TABLE user COUNT CONCURRENTLY;"
+        );
+        assert_eq!(IndexType::Count.as_str(), "COUNT");
+    }
+
+    #[test]
+    fn count_index_validation() {
+        assert!(count_index("n").validate().is_ok());
+        assert!(count_index("n").with_condition("a > 1").validate().is_ok());
+        let with_columns = IndexDefinition::new("n", ["a"]).with_type(IndexType::Count);
+        let err = with_columns.validate().expect_err("COUNT takes no columns");
+        assert!(err.to_string().contains("takes no columns"), "{err}");
+        let err = index("i", ["a"])
+            .with_condition("a > 1")
+            .validate()
+            .expect_err("only COUNT takes a condition");
+        assert!(err.to_string().contains("only a COUNT index"), "{err}");
     }
 
     #[test]
@@ -817,18 +935,6 @@ mod tests {
         assert!(idx.validate().is_err());
         idx.dimension = Some(64);
         assert!(idx.validate().is_ok());
-    }
-
-    #[test]
-    fn index_validate_refuses_f16_on_mtree() {
-        let idx = mtree_index("x", "v", 8, MTreeDistanceType::Cosine, MTreeVectorType::F16);
-        let err = idx.validate().expect_err("MTREE refuses F16");
-        assert!(
-            err.to_string().contains("F64, F32, I64, I32, or I16"),
-            "{err}"
-        );
-        let idx = mtree_index("x", "v", 8, MTreeDistanceType::Cosine, MTreeVectorType::U8);
-        assert!(idx.validate().is_err());
     }
 
     #[test]

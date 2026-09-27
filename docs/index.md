@@ -19,7 +19,7 @@ Define schemas, generate migrations, build queries, and perform typed CRUD
 - **Query UX Helpers** -- `type_record` / `type_thing`, `extract_many` /
   `has_result`, `aggregate_records` + `AggregateOpts` hoisted to the
   crate root for ergonomic imports.
-- **Vector Search** -- HNSW and MTREE index support with 8 distance metrics
+- **Vector Search** -- HNSW and DISKANN index support with 8 distance metrics
   and EFC/M tuning.
 - **Graph Traversal** -- Native SurrealDB graph features with edge
   relationships and [v3-compatible arrow chains](v3-patterns.md).
