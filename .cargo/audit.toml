@@ -36,14 +36,15 @@ ignore = [
     # RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (quick-xml < 0.41:
     # quadratic duplicate-attribute check, unbounded namespace allocation
     # in NsReader) reach the lockfile through object_store 0.13.2's `aws`
-    # backend, which surrealdb-core 3.3 enables. No object_store 0.13
-    # release takes quick-xml 0.41 yet. Only the embedded engine pulls it
-    # in (`client-wasm`'s `kv-mem`, and the test-only `kv-mem`
-    # dev-dependency): `cargo tree -i quick-xml -e normal` with the default,
-    # `client-rustls`, `cli`, cache and watcher features prints nothing. It
-    # parses XML responses from an S3 endpoint, which an in-memory engine
-    # never talks to. Re-evaluate when object_store moves to quick-xml
-    # 0.41 or surrealdb-core stops enabling `aws`.
+    # backend, which surrealdb-core 3.3.0 enables unconditionally on native
+    # targets. No object_store 0.13 release takes quick-xml 0.41;
+    # object_store 0.14 does (it requires ^0.41), but surrealdb-core pins
+    # 0.13. Only the embedded engine pulls it in (`client-wasm`'s `kv-mem`,
+    # and the test-only `kv-mem` dev-dependency): `cargo tree -i quick-xml
+    # -e normal` with the default, `client-rustls`, `cli`, cache and watcher
+    # features prints nothing. It parses XML responses from an S3 endpoint,
+    # which an in-memory engine never talks to. Remove both entries when
+    # surrealdb-core moves to object_store 0.14 or stops enabling `aws`.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]

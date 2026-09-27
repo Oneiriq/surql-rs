@@ -181,6 +181,12 @@ Problems the pass found but did not fix are listed on the
     diff.
   - A COUNT index used to read back as a standard index with no columns,
     and a union field type as `any`; both now read back as themselves.
+- **The Redis cache reconnects in the background.** A dropped connection
+  was discarded on the error that revealed it and reopened by the next
+  call. `RedisCache` now holds a redis `ConnectionManager` (the
+  `connection-manager` feature of `redis`), which replaces a dropped
+  connection itself; an unreachable server still fails after two
+  connection attempts rather than the manager's default backoff.
 - **Deeply nested values reach the engine.** Values render into the
   statement as literals, and the engine's parser refuses a literal nested
   20 levels deep ("Exceeded query recursion depth limit"), so the builder,
