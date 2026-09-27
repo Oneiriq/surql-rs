@@ -191,6 +191,30 @@ let loose = edge_schema("entity_relation").with_mode(EdgeMode::Schemafull);
 The engine echoes the endpoints as `TYPE RELATION IN user OUT post`; the
 parser reads both spellings, `a | b` lists, and backticked names.
 
+A relation can require its endpoints to exist (`with_enforced(true)`,
+`ENFORCED`), and on SurrealDB 3.3 store its edges as adjacency entries on
+the endpoints alone, with no edge records (`with_lightweight(true)`,
+`ENFORCED LIGHTWEIGHT`); a lightweight relation takes no fields, indexes
+or events. Also 3.3: a table or an edge can keep a cache of its records'
+edges and incoming references beside each record
+(`with_inline_edges(n)`, `with_inline_references(n)`), and a top-level
+field of a relation can be copied into the adjacency entries so a
+traversal filters on it without reading the edge
+(`FieldDefinition::with_inline(true)`, `INLINE`).
+
+```rust
+use surql::schema::{typed_edge, FieldDefinition, FieldType};
+
+let follows = typed_edge("follows", "user", "user").with_lightweight(true);
+// DEFINE TABLE follows TYPE RELATION FROM user TO user ENFORCED LIGHTWEIGHT;
+let rated = typed_edge("rated", "user", "film")
+    .with_inline_edges(64)
+    .with_fields([FieldDefinition::new("stars", FieldType::Int).with_inline(true)]);
+```
+
+All of these read back from the echo and are compared by the diff and
+the validator.
+
 ## Access (record + JWT)
 
 ```rust

@@ -51,16 +51,36 @@ pub enum Tokenizer {
     Class,
     /// Split on punctuation (`punct`).
     Punct,
+    /// Split Chinese, Japanese or Korean text into words with a dictionary
+    /// segmenter (`segment(chinese)`, SurrealDB 3.3+ built with CJK
+    /// support), for scripts that do not separate words with spaces.
+    Segment(SegmentLanguage),
+}
+
+/// The language a [`Tokenizer::Segment`] tokenizer segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SegmentLanguage {
+    /// Chinese (`segment(chinese)`).
+    Chinese,
+    /// Japanese (`segment(japanese)`).
+    Japanese,
+    /// Korean (`segment(korean)`).
+    Korean,
 }
 
 impl Tokenizer {
-    /// Render as the SurrealQL keyword (`blank` / `camel` / `class` / `punct`).
+    /// Render as the SurrealQL keyword (`blank` / `camel` / `class` /
+    /// `punct` / `segment(<language>)`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Blank => "blank",
             Self::Camel => "camel",
             Self::Class => "class",
             Self::Punct => "punct",
+            Self::Segment(SegmentLanguage::Chinese) => "segment(chinese)",
+            Self::Segment(SegmentLanguage::Japanese) => "segment(japanese)",
+            Self::Segment(SegmentLanguage::Korean) => "segment(korean)",
         }
     }
 }

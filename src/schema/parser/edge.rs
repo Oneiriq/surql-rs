@@ -196,6 +196,7 @@ pub fn parse_edge_info(
         .map(|v| parse_events(&value_to_string_map(v)))
         .unwrap_or_default();
 
+    let statement = super::table::read_table(tb_definition);
     Ok(EdgeDefinition {
         name: edge_name.to_string(),
         mode,
@@ -205,6 +206,10 @@ pub fn parse_edge_info(
         indexes,
         events,
         permissions,
+        enforced: statement.enforced,
+        lightweight: statement.lightweight,
+        inline_edges: statement.inline_edges,
+        inline_references: statement.inline_references,
     })
 }
 

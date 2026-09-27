@@ -292,6 +292,20 @@ Problems the pass found but did not fix are listed on the
   all three; `AUDIENCE` used to run into the preceding key. `JwtConfig`
   gains `audience` and `AccessDefinition` gains `authenticate` and
   `context` (**Breaking** for struct literals).
+- Relation flags and SurrealDB 3.3 graph caches: `EdgeDefinition` gains
+  `enforced` (`ENFORCED`, which the parser used to skip), `lightweight`
+  (`LIGHTWEIGHT`, edges with no records), and, like `TableDefinition`,
+  `inline_edges` / `inline_references` (`INLINE EDGES n` / `INLINE
+  REFERENCES n`); `FieldDefinition` gains `inline` (`INLINE`). Each has a
+  `with_*` builder, renders in the engine's order, reads back from the
+  echo, and is compared by the diff and the validator; validation refuses
+  what the engine refuses (a lightweight relation with fields, an `INLINE`
+  field that is nested, `COMPUTED` or on a non-relation table). The new
+  members are **Breaking** for struct literals.
+- `Tokenizer::Segment(SegmentLanguage)`: the SurrealDB 3.3 CJK tokenizer
+  (`segment(chinese)` / `japanese` / `korean`). An analyzer using it used
+  to fail to parse and drop out of `parse_db_info`. **Breaking** for
+  exhaustive matches on `Tokenizer`.
 - COUNT indexes: `IndexType::Count`, `count_index(name)` and
   `IndexDefinition::with_condition` render `DEFINE INDEX … COUNT [WHERE
   …]`; the parser reads the engine's echo (it used to read a standard

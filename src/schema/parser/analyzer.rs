@@ -7,7 +7,7 @@
 
 use super::scan::{clause, clauses, define_head, split_top_level, Shape};
 use crate::error::{Result, SurqlError};
-use crate::schema::analyzer::{AnalyzerDefinition, TokenFilter, Tokenizer};
+use crate::schema::analyzer::{AnalyzerDefinition, SegmentLanguage, TokenFilter, Tokenizer};
 
 const ANALYZER_CLAUSES: &[(&str, Shape)] = &[
     ("FUNCTION", Shape::Expr),
@@ -23,11 +23,19 @@ fn invalid(name: &str, detail: &str) -> SurqlError {
 }
 
 fn parse_tokenizer(name: &str, raw: &str) -> Result<Tokenizer> {
-    match raw.to_ascii_lowercase().as_str() {
+    let raw: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match raw.as_str() {
         "blank" => Ok(Tokenizer::Blank),
         "camel" => Ok(Tokenizer::Camel),
         "class" => Ok(Tokenizer::Class),
         "punct" => Ok(Tokenizer::Punct),
+        "segment(chinese)" => Ok(Tokenizer::Segment(SegmentLanguage::Chinese)),
+        "segment(japanese)" => Ok(Tokenizer::Segment(SegmentLanguage::Japanese)),
+        "segment(korean)" => Ok(Tokenizer::Segment(SegmentLanguage::Korean)),
         other => Err(invalid(name, &format!("unknown tokenizer {other:?}"))),
     }
 }
@@ -163,5 +171,32 @@ mod tests {
     fn unknown_pieces_refuse() {
         assert!(parse_analyzer("t", "DEFINE ANALYZER t TOKENIZERS mystery;").is_err());
         assert!(parse_analyzer("t", "DEFINE ANALYZER t FILTERS mystery;").is_err());
+        assert!(parse_analyzer("t", "DEFINE ANALYZER t TOKENIZERS SEGMENT(KLINGON);").is_err());
+    }
+
+    /// The SurrealDB 3.3 echo of the CJK segmenting tokenizer.
+    #[test]
+    fn segment_tokenizers_round_trip() {
+        let parsed = parse_analyzer(
+            "mix",
+            "DEFINE ANALYZER mix TOKENIZERS BLANK,SEGMENT(JAPANESE),CLASS",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.tokenizers,
+            vec![
+                Tokenizer::Blank,
+                Tokenizer::Segment(SegmentLanguage::Japanese),
+                Tokenizer::Class
+            ]
+        );
+        let code = crate::schema::analyzer("zh")
+            .with_tokenizers([Tokenizer::Segment(SegmentLanguage::Chinese)]);
+        let rendered = code.to_surql();
+        assert!(
+            rendered.contains("TOKENIZERS segment(chinese)"),
+            "{rendered}"
+        );
+        assert_eq!(parse_analyzer("zh", &rendered).unwrap(), code);
     }
 }

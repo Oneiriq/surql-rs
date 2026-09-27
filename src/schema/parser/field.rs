@@ -12,7 +12,7 @@ use crate::schema::fields::{FieldDefinition, FieldType};
 use crate::schema::reference::ReferenceAction;
 
 /// The clauses of a `DEFINE FIELD` statement. The engine echoes them as
-/// `TYPE … [FLEXIBLE] [DEFAULT …] [READONLY] [VALUE …] [ASSERT …]
+/// `TYPE … [FLEXIBLE] [DEFAULT …] [READONLY] [INLINE] [VALUE …] [ASSERT …]
 /// [COMPUTED …] [REFERENCE …] [COMMENT …] PERMISSIONS …`; this crate renders
 /// a different order, and both are read the same way.
 const FIELD_CLAUSES: &[(&str, Shape)] = &[
@@ -20,6 +20,7 @@ const FIELD_CLAUSES: &[(&str, Shape)] = &[
     ("FLEXIBLE", Shape::Flag),
     ("DEFAULT", Shape::Expr),
     ("READONLY", Shape::Flag),
+    ("INLINE", Shape::Flag),
     ("VALUE", Shape::Expr),
     ("ASSERT", Shape::Expr),
     ("COMPUTED", Shape::Expr),
@@ -92,6 +93,7 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
         reference: extract_reference(&found),
         computed: expression(&found, "COMPUTED"),
         custom_type: kind.custom_type,
+        inline: has("INLINE"),
     })
 }
 

@@ -95,6 +95,9 @@ pub(crate) fn render_table_list(tables: &str) -> String {
 /// let email = FieldDefinition::new("email", FieldType::String);
 /// assert_eq!(email.to_surql("user"), "DEFINE FIELD email ON TABLE user TYPE string;");
 /// ```
+// The bools mirror independent DDL flags (READONLY, FLEXIBLE, INLINE, the
+// `option<...>` wrapper); folding them into enums would only rename them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldDefinition {
     /// Field name (supports dot notation for nested fields).
@@ -157,6 +160,12 @@ pub struct FieldDefinition {
     /// when it is set. Set it with [`Self::with_custom_type`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub custom_type: Option<String>,
+    /// Whether the field's value is kept in the edge's adjacency entries
+    /// (`INLINE`, SurrealDB 3.3+), so a traversal can filter on it without
+    /// fetching the edge record. Only a top-level, non-`COMPUTED` field of a
+    /// relation table that is not lightweight may set it.
+    #[serde(default)]
+    pub inline: bool,
 }
 
 impl FieldDefinition {
@@ -179,7 +188,15 @@ impl FieldDefinition {
             reference: None,
             computed: None,
             custom_type: None,
+            inline: false,
         }
+    }
+
+    /// Keep the field's value in the edge's adjacency entries (`INLINE`,
+    /// SurrealDB 3.3+), for a top-level field of a relation table.
+    pub fn with_inline(mut self, inline: bool) -> Self {
+        self.inline = inline;
+        self
     }
 
     /// Type the field with a SurrealQL type the [`FieldType`] keywords
@@ -316,6 +333,14 @@ impl FieldDefinition {
                 self.default.as_deref(),
             )?;
         }
+        if self.inline && (self.computed.is_some() || self.name.contains(['.', '['])) {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Field {:?}: INLINE takes a top-level field that is not COMPUTED",
+                    self.name
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -386,6 +411,9 @@ impl FieldDefinition {
         }
         if self.readonly {
             sql.push_str(" READONLY");
+        }
+        if self.inline {
+            sql.push_str(" INLINE");
         }
         // Field permissions: without this clause the field would get the
         // engine default, FULL, whatever the definition declares.

@@ -101,7 +101,9 @@ pub use access::{
     access_schema, jwt_access, record_access, AccessDefinition, AccessSchemaBuilder, AccessType,
     JwtConfig, RecordAccessConfig,
 };
-pub use analyzer::{analyzer, standard_analyzer, AnalyzerDefinition, TokenFilter, Tokenizer};
+pub use analyzer::{
+    analyzer, standard_analyzer, AnalyzerDefinition, SegmentLanguage, TokenFilter, Tokenizer,
+};
 pub use bucket::{
     bucket_schema, file_bucket, memory_bucket, BucketDefinition, BucketSchemaBuilder,
 };

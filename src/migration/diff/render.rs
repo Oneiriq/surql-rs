@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use crate::schema::edge::EdgeDefinition;
 use crate::schema::fields::{render_field_path, render_table_list, FieldDefinition};
 use crate::schema::permissions::render_permissions_clause;
-use crate::schema::table::{EventDefinition, IndexDefinition};
+use crate::schema::table::{render_inline_caps, EventDefinition, IndexDefinition};
 use crate::types::escape::quote_ident;
 
 /// Render an edge's `DEFINE TABLE` statement, in its `OVERWRITE` form when
@@ -37,6 +37,11 @@ pub(super) fn edge_define_sql(edge: &EdgeDefinition, overwrite: bool) -> String 
             sql.push_str(" TO ");
             sql.push_str(&render_table_list(to));
         }
+        sql.push_str(edge.relation_flags());
+        sql.push_str(&render_inline_caps(
+            edge.inline_edges,
+            edge.inline_references,
+        ));
         sql.push_str(&render_permissions_clause(edge.permissions.as_ref()));
         sql.push(';');
         sql

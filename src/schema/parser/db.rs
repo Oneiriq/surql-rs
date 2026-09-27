@@ -96,6 +96,7 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
             let Some(def) = def_value.as_str() else {
                 continue;
             };
+            let statement = super::table::read_table(def);
             if is_edge_definition(def) {
                 let (from_table, to_table) = parse_edge_endpoints(def);
                 out.edges.insert(
@@ -109,6 +110,10 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
                         indexes: Vec::new(),
                         events: Vec::new(),
                         permissions: parse_table_permissions(def),
+                        enforced: statement.enforced,
+                        lightweight: statement.lightweight,
+                        inline_edges: statement.inline_edges,
+                        inline_references: statement.inline_references,
                     },
                 );
             } else {
@@ -125,6 +130,8 @@ pub fn parse_db_info(info: &Value) -> Result<DatabaseInfo> {
                         drop: false,
                         changefeed: parse_changefeed(def),
                         view: parse_view(def),
+                        inline_edges: statement.inline_edges,
+                        inline_references: statement.inline_references,
                     },
                 );
             }

@@ -45,6 +45,7 @@ pub fn fields_equal(a: &FieldDefinition, b: &FieldDefinition) -> bool {
         && rendered_target(a) == rendered_target(b)
         && a.readonly == b.readonly
         && a.flexible == b.flexible
+        && a.inline == b.inline
         && a.reference == b.reference
         && expr_eq(a.assertion.as_deref(), b.assertion.as_deref())
         && expr_eq(a.default.as_deref(), b.default.as_deref())

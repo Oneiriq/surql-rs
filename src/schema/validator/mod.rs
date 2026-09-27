@@ -389,6 +389,11 @@ pub fn validate_table(
         ));
     }
 
+    results.extend(compare_inline_caps(
+        table,
+        (code_table.inline_edges, code_table.inline_references),
+        (db_table.inline_edges, db_table.inline_references),
+    ));
     results.extend(compare_permissions(
         table,
         None,
@@ -444,7 +449,39 @@ fn edge_from_table(table: &TableDefinition) -> EdgeDefinition {
         indexes: table.indexes.clone(),
         events: table.events.clone(),
         permissions: table.permissions.clone(),
+        enforced: false,
+        lightweight: false,
+        inline_edges: table.inline_edges,
+        inline_references: table.inline_references,
     }
+}
+
+/// Report differing `INLINE EDGES` / `INLINE REFERENCES` caps of a table or
+/// an edge. A cache only changes how fast traversals read, so a difference
+/// is a warning.
+fn compare_inline_caps(
+    table: &str,
+    code: (Option<u32>, Option<u32>),
+    db: (Option<u32>, Option<u32>),
+) -> Vec<ValidationResult> {
+    let render = |cap: Option<u32>| Some(cap.map_or_else(|| "none".to_string(), |n| n.to_string()));
+    [
+        ("Table INLINE EDGES mismatch", code.0, db.0),
+        ("Table INLINE REFERENCES mismatch", code.1, db.1),
+    ]
+    .into_iter()
+    .filter(|(_, c, d)| c != d)
+    .map(|(message, c, d)| {
+        ValidationResult::new(
+            ValidationSeverity::Warning,
+            table,
+            None,
+            message,
+            render(c),
+            render(d),
+        )
+    })
+    .collect()
 }
 
 fn compare_edges(
@@ -550,7 +587,36 @@ pub fn validate_edge(
             code_edge.to_table.as_deref(),
             db_edge.to_table.as_deref(),
         ));
+        let flags = [
+            (
+                "Edge ENFORCED mismatch",
+                code_edge.is_enforced(),
+                db_edge.is_enforced(),
+            ),
+            (
+                "Edge LIGHTWEIGHT mismatch",
+                code_edge.lightweight,
+                db_edge.lightweight,
+            ),
+        ];
+        for (message, code_flag, db_flag) in flags {
+            if code_flag != db_flag {
+                results.push(ValidationResult::new(
+                    ValidationSeverity::Error,
+                    edge,
+                    None,
+                    message,
+                    Some(code_flag.to_string()),
+                    Some(db_flag.to_string()),
+                ));
+            }
+        }
     }
+    results.extend(compare_inline_caps(
+        edge,
+        (code_edge.inline_edges, code_edge.inline_references),
+        (db_edge.inline_edges, db_edge.inline_references),
+    ));
 
     results.extend(compare_permissions(
         edge,

@@ -213,6 +213,13 @@ fn field_checks(code: &FieldDefinition, db: &FieldDefinition) -> Vec<Check> {
             code: flag(code.flexible),
             db: flag(db.flexible),
         },
+        Check {
+            severity: ValidationSeverity::Info,
+            message: "Field INLINE flag mismatch",
+            differs: code.inline != db.inline,
+            code: flag(code.inline),
+            db: flag(db.inline),
+        },
     ]);
     checks
 }

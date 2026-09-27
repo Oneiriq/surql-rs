@@ -23,16 +23,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use surql::connection::{ConnectionConfig, DatabaseClient};
-use surql::migration::diff::{accesses_equal, fields_equal, indexes_equal};
+use surql::migration::diff::{
+    accesses_equal, diff_edge_pair, diff_table_pair, fields_equal, indexes_equal,
+};
 #[allow(deprecated)]
 use surql::schema::mtree_index;
-use surql::schema::parser::{parse_db_info, parse_table_full};
+use surql::schema::parser::{parse_db_info, parse_edge_info, parse_table_full};
 use surql::schema::{
     analyzer, bm25_index, count_index, event, function_schema, index, jwt_access, param_schema,
     record_access, string_field, table_schema, typed_edge, validate_accesses, validate_schema,
     AccessType, FieldDefinition, FieldType, IndexType, JwtConfig, MTreeDistanceType,
     MTreeVectorType, RecordAccessConfig, TableDefinition, TableMode, TokenFilter, Tokenizer,
 };
+use surql::schema::{validate_edge, EdgeDefinition};
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -515,4 +518,78 @@ async fn access_definitions_compare_equal_to_their_echo() {
             .any(|r| r.message == "Access definition mismatch"),
         "{results:#?}"
     );
+}
+
+/// Read one edge back through both `INFO` levels.
+async fn read_edge(client: &DatabaseClient, name: &str) -> EdgeDefinition {
+    let db = info_for_db(client).await;
+    let define = echo(&db, "tables", name).to_string();
+    let info = first(
+        &client
+            .query(&format!("INFO FOR TABLE {name};"))
+            .await
+            .expect("INFO FOR TABLE"),
+    );
+    parse_edge_info(name, &info, Some(&define)).expect("parse INFO FOR TABLE")
+}
+
+#[tokio::test]
+async fn relation_flags_and_inline_caches_read_back() {
+    let client = client().await;
+    apply(&client, &[table_schema("person").to_surql()]).await;
+    let enforced = typed_edge("knows", "person", "person").with_enforced(true);
+    apply(&client, &enforced.to_surql_all().unwrap()).await;
+    assert_eq!(read_edge(&client, "knows").await, enforced);
+
+    // LIGHTWEIGHT and INLINE are SurrealDB 3.3 syntax.
+    let since_3_3 = client
+        .query("DEFINE TABLE probe SCHEMAFULL INLINE EDGES 1;")
+        .await
+        .is_ok();
+    if !since_3_3 {
+        return;
+    }
+    let follows = typed_edge("follows", "person", "person").with_lightweight(true);
+    let likes = typed_edge("likes", "person", "person")
+        .with_enforced(true)
+        .with_inline_edges(8)
+        .with_inline_references(4)
+        .with_fields([
+            FieldDefinition::new("weight", FieldType::Number)
+                .with_nullable(true)
+                .with_inline(true),
+            FieldDefinition::new("at", FieldType::Datetime).with_inline(true),
+        ]);
+    let doc = table_schema("doc")
+        .with_mode(TableMode::Schemafull)
+        .with_inline_edges(16);
+    let mut statements = follows.to_surql_all().unwrap();
+    statements.extend(likes.to_surql_all().unwrap());
+    statements.extend(doc.to_surql_all());
+    apply(&client, &statements).await;
+
+    for code in [&follows, &likes] {
+        let echo = read_edge(&client, &code.name).await;
+        assert!(
+            diff_edge_pair(Some(code), Some(&echo)).is_empty(),
+            "{code:?}\nvs\n{echo:?}"
+        );
+        assert!(
+            validate_edge(code, &echo).is_empty(),
+            "{:#?}",
+            validate_edge(code, &echo)
+        );
+    }
+    let echo = read_table(&client, "doc").await;
+    assert_eq!(echo.inline_edges, Some(16));
+    assert!(diff_table_pair(Some(&doc), Some(&echo)).is_empty());
+
+    // A changed cache or flag is drift.
+    let echo = read_edge(&client, "likes").await;
+    let wider = likes.clone().with_inline_edges(32);
+    assert_eq!(diff_edge_pair(Some(&wider), Some(&echo)).len(), 1);
+    let unenforced = likes.clone().with_enforced(false);
+    assert!(validate_edge(&unenforced, &echo)
+        .iter()
+        .any(|r| r.message == "Edge ENFORCED mismatch"));
 }
