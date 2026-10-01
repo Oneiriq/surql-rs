@@ -181,6 +181,14 @@ Problems the pass found but did not fix are listed on the
     diff.
   - A COUNT index used to read back as a standard index with no columns,
     and a union field type as `any`; both now read back as themselves.
+- **A failed transaction reports the error that says why.** The client
+  reported the first "not executed" statement of a failed transaction,
+  and the engine marks the statements before the failure that way too,
+  with a fixed sentence. A failure that is itself "not executed" with a
+  cause (SurrealDB 3.3 refuses a `DEFINE INDEX` while the table's
+  document ids are reclaimed this way) was reported as "The query was not
+  executed due to a failed transaction". The error carrying a cause now
+  wins over the fixed sentences.
 - **The Redis cache reconnects in the background.** A dropped connection
   was discarded on the error that revealed it and reopened by the next
   call. `RedisCache` now holds a redis `ConnectionManager` (the

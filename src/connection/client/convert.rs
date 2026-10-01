@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use surrealdb::IndexedResults;
 
-use super::errors::{query_err, statement_was_not_executed};
+use super::errors::{not_executed_says_why, query_err, statement_was_not_executed};
 use crate::error::{Result, SurqlError};
 use crate::query::results::response_rows;
 use crate::query::validate::render_target as query_target;
@@ -17,7 +17,8 @@ use crate::query::validate::render_target as query_target;
 /// A statement's error fails the whole call (and is never retried). When a
 /// transaction fails, the engine marks every other statement in it "not
 /// executed"; the error reported is the one that says why, and a
-/// not-executed error only when no statement says more.
+/// not-executed error only when no statement says more (see
+/// [`keep_not_executed`]).
 pub(super) fn statement_results(mut response: IndexedResults) -> Result<Value> {
     let count = response.num_statements();
     let mut out = Vec::with_capacity(count);
@@ -31,15 +32,29 @@ pub(super) fn statement_results(mut response: IndexedResults) -> Result<Value> {
         let taken: std::result::Result<surrealdb::types::Value, _> = response.take(i);
         match taken {
             Ok(raw) => out.push(raw.into_json_value()),
-            Err(e) if statement_was_not_executed(&e) => {
-                skipped.get_or_insert_with(|| query_err(&e));
-            }
+            Err(e) if statement_was_not_executed(&e) => skipped = keep_not_executed(skipped, &e),
             Err(e) => return Err(query_err(&e)),
         }
     }
     match skipped {
-        Some(err) => Err(err),
+        Some((_, err)) => Err(err),
         None => Ok(Value::Array(out)),
+    }
+}
+
+/// The not-executed error to report once the response is read: the first
+/// one that says why (see [`not_executed_says_why`]), else the first.
+/// The engine also marks the statements *before* a failure as not
+/// executed, so the first of them is usually the fixed sentence.
+pub(super) fn keep_not_executed(
+    kept: Option<(bool, SurqlError)>,
+    err: &surrealdb::Error,
+) -> Option<(bool, SurqlError)> {
+    let says_why = not_executed_says_why(err);
+    match kept {
+        Some((false, _)) | None if says_why => Some((true, query_err(err))),
+        None => Some((false, query_err(err))),
+        kept => kept,
     }
 }
 

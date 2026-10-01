@@ -90,7 +90,29 @@ pub(super) fn statement_was_not_executed(err: &surrealdb::Error) -> bool {
         || err
             .message()
             .trim()
-            .eq_ignore_ascii_case("the query was not executed due to a failed transaction")
+            .to_ascii_lowercase()
+            .starts_with("the query was not executed due to a failed transaction")
+}
+
+/// The engine's fixed not-executed messages: each says only that another
+/// statement failed.
+const UNINFORMATIVE_NOT_EXECUTED: [&str; 3] = [
+    "the query was not executed due to a failed transaction",
+    "the query was not executed due to a cancelled transaction",
+    "cannot commit: the transaction was aborted due to a prior error",
+];
+
+/// `true` for a not-executed error that says why: one whose message is not
+/// a fixed "another statement failed" sentence. SurrealDB 3.3 refuses a
+/// `DEFINE INDEX` while the table's document ids are being reclaimed with
+/// such an error, and in a transaction it sits among the fixed ones.
+pub(super) fn not_executed_says_why(err: &surrealdb::Error) -> bool {
+    let message = err
+        .message()
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    !UNINFORMATIVE_NOT_EXECUTED.contains(&message.as_str())
 }
 
 pub(super) fn query_err(err: &surrealdb::Error) -> SurqlError {

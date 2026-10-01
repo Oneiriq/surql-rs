@@ -6,13 +6,17 @@ would take. Fixed issues move to the [changelog](changelog.md).
 ## Migrations
 
 - **An index can be refused while SurrealDB 3.3 reclaims its table's
-  document ids.** After a `REMOVE INDEX` or a `DEFINE INDEX OVERWRITE`,
-  3.3 cleans the table's shared document-id space up in the background,
-  and a non-COUNT `DEFINE INDEX` on that table fails with "still being
-  reclaimed" while the cleanup runs. The migration is left unapplied
-  (its transaction rolls back) and applies once the cleanup finishes.
+  document ids.** After an index is removed or overwritten, 3.3 can
+  reclaim the table's shared document-id space in the background, and a
+  `DEFINE INDEX` (other than `COUNT`) on that table that arrives once the
+  reclaim has started fails with "The shared document-ID space for table `t` is
+  still being reclaimed; retry DEFINE INDEX after cleanup completes". The
+  migration is left unapplied (its transaction rolls back), the error
+  names that cause, and running it again after the cleanup applies it.
   The fix would be for the executor to retry that one error after a
-  delay; it has not been seen outside a cleanup already in progress.
+  delay; it could not be provoked on demand (200,000 records and repeated
+  remove / define on a 3.3.0 server never hit it), so an untested retry
+  was not added.
 
 ## Dependencies
 

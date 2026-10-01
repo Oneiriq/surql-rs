@@ -152,11 +152,12 @@ let active = count_index("active_users").with_condition("active = true");
 // DEFINE INDEX active_users ON TABLE user COUNT WHERE active = true;
 ```
 
-On SurrealDB 3.3, removing or overwriting an index starts a background
-cleanup of the table's shared document-id space, and a non-COUNT
-`DEFINE INDEX` on that table can fail with "still being reclaimed" while
-it runs. The failure leaves the migration unapplied; run it again once
-the cleanup has finished.
+On SurrealDB 3.3, removing or overwriting an index can start a
+background reclaim of the table's shared document-id space, and a
+non-COUNT `DEFINE INDEX` on that table that arrives while it runs fails
+with "still being reclaimed". The failure leaves the migration unapplied
+and names that cause; run it again once the reclaim has finished (see
+[Known issues](known-issues.md)).
 
 ## Events
 
