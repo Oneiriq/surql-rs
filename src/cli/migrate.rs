@@ -11,11 +11,13 @@ use crate::cli::fmt;
 use crate::cli::GlobalOpts;
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
+use crate::migration::executor::refuse_modified;
 use crate::migration::{
     create_blank_migration, create_migration_plan, discover_migrations, execute_migration_plan,
-    get_migration_history, get_migration_status, migrate_down as lib_migrate_down,
-    squash_migrations, validate_migrations, MigrationDirection, MigrationPlan, MigrationState,
-    MigrationStatus, SquashOptions,
+    get_migration_history, get_migration_status, get_modified_migrations,
+    migrate_down as lib_migrate_down, rehash_migrations, squash_migrations, validate_migrations,
+    MigrationDirection, MigrationPlan, MigrationState, MigrationStatus, ModifiedMigration,
+    SquashOptions,
 };
 
 /// `surql migrate <subcommand>` commands.
@@ -41,6 +43,12 @@ pub enum MigrateCommand {
     },
     /// Show applied/pending counts for the current migrations directory.
     Status,
+    /// Record the current checksum of applied migrations whose file was
+    /// edited, accepting an edit that needs no applying.
+    Rehash {
+        /// Versions to re-hash. Defaults to every modified migration.
+        versions: Vec<String>,
+    },
     /// Show the `_migration_history` table rows.
     History,
     /// Create a blank migration template on disk.
@@ -99,6 +107,7 @@ pub async fn run(cmd: MigrateCommand, global: &GlobalOpts) -> Result<()> {
             down(&settings, &migrations_dir, target.as_deref(), dry_run).await
         }
         MigrateCommand::Status => status(&settings, &migrations_dir).await,
+        MigrateCommand::Rehash { versions } => rehash(&settings, &migrations_dir, &versions).await,
         MigrateCommand::History => history(&settings).await,
         MigrateCommand::Create {
             description,
@@ -133,6 +142,9 @@ async fn up(
     dry_run: bool,
 ) -> Result<()> {
     let client = connected_client(settings).await?;
+    let modified = get_modified_migrations(&client, migrations_dir).await?;
+    report_modified(&modified);
+    refuse_modified(&modified)?;
     let plan = create_migration_plan(&client, migrations_dir).await?;
     let selected = select_up_range(plan, target)?;
 
@@ -196,9 +208,13 @@ async fn status(settings: &crate::settings::Settings, migrations_dir: &Path) -> 
     let mut table = fmt::make_table();
     table.set_header(vec!["version", "state", "description"]);
     for s in &report.applied {
+        let edited = report
+            .modified
+            .iter()
+            .any(|m| m.version == s.migration.version);
         table.add_row(vec![
             s.migration.version.clone(),
-            "applied".to_string(),
+            if edited { "modified" } else { "applied" }.to_string(),
             s.migration.description.clone(),
         ]);
     }
@@ -210,7 +226,40 @@ async fn status(settings: &crate::settings::Settings, migrations_dir: &Path) -> 
         ]);
     }
     println!("{table}");
+    report_modified(&report.modified);
     Ok(())
+}
+
+async fn rehash(
+    settings: &crate::settings::Settings,
+    migrations_dir: &Path,
+    versions: &[String],
+) -> Result<()> {
+    let client = connected_client(settings).await?;
+    let rehashed = rehash_migrations(&client, migrations_dir, versions).await?;
+    if rehashed.is_empty() {
+        fmt::info("no applied migration was modified");
+    }
+    for m in &rehashed {
+        fmt::success(format!(
+            "{}: recorded checksum {} -> {}",
+            m.version, m.recorded_checksum, m.current_checksum
+        ));
+    }
+    Ok(())
+}
+
+/// Warn about each applied migration whose file changed since.
+fn report_modified(modified: &[ModifiedMigration]) {
+    for m in modified {
+        fmt::warn(format!(
+            "{} was modified after it was applied ({}): recorded checksum {}, file now {}",
+            m.version,
+            m.path.display(),
+            m.recorded_checksum,
+            m.current_checksum
+        ));
+    }
 }
 
 async fn history(settings: &crate::settings::Settings) -> Result<()> {

@@ -1,14 +1,14 @@
 //! Integration tests for the `orchestration` module.
 //!
 //! Runs a real sequential deployment against a live SurrealDB instance
-//! (defaults to the `v3.0.5` container the umbrella issue pins for CI).
+//! (CI runs the `v3.3.0` container).
 //! The test is gated on the `SURREAL_URL` environment variable so the
 //! rest of `cargo test` stays green on machines without a server.
 //!
 //! To exercise locally:
 //!
 //! ```text
-//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.3.0 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --all-features --test integration_orchestration -- --test-threads=1
 //! ```
@@ -555,4 +555,75 @@ async fn allow_destructive_false_refuses_destructive_migration() {
         "{result:?}"
     );
     assert!(table_names(&cfg).await.contains(&"precious".to_string()));
+}
+
+#[tokio::test]
+async fn an_edited_applied_migration_fails_the_deployment() {
+    let database = unique_db("it_orch_modified");
+    let Some(cfg) = integration_config(&database) else {
+        eprintln!("SURREAL_URL not set; skipping");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_migration(
+        tmp.path(),
+        "20260101_000001_first.surql",
+        &migration_file(
+            "20260101_000001",
+            "DEFINE TABLE first;",
+            "REMOVE TABLE first;",
+        ),
+    );
+
+    let registry = EnvironmentRegistry::new();
+    let env = EnvironmentConfig::builder("prod", cfg.clone())
+        .build()
+        .expect("env");
+    registry.register(env).await;
+    let plan = |dir: &std::path::Path| {
+        DeploymentPlan::builder(registry.clone())
+            .environment("prod")
+            .migrations(discover_migrations(dir).expect("discover"))
+            .verify_health(false)
+            .build()
+    };
+    let results = coordinator(&registry)
+        .deploy(&plan(tmp.path()))
+        .await
+        .expect("deploy");
+    assert_eq!(results["prod"].status, DeploymentStatus::Success);
+
+    write_migration(
+        tmp.path(),
+        "20260101_000001_first.surql",
+        &migration_file(
+            "20260101_000001",
+            "DEFINE TABLE first SCHEMAFULL;",
+            "REMOVE TABLE first;",
+        ),
+    );
+    write_migration(
+        tmp.path(),
+        "20260101_000002_second.surql",
+        &migration_file(
+            "20260101_000002",
+            "DEFINE TABLE second;",
+            "REMOVE TABLE second;",
+        ),
+    );
+    let results = coordinator(&registry)
+        .deploy(&plan(tmp.path()))
+        .await
+        .expect("deploy");
+    let result = &results["prod"];
+    assert_eq!(result.status, DeploymentStatus::Failed, "{result:?}");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("20260101_000001"),
+        "{result:?}"
+    );
+    assert!(!table_names(&cfg).await.contains(&"second".to_string()));
 }

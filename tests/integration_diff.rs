@@ -6,7 +6,7 @@
 //! `cargo test` stays green when no SurrealDB server is reachable:
 //!
 //! ```text
-//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.3.0 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --all-features --test integration_diff -- --test-threads=1
 //! ```

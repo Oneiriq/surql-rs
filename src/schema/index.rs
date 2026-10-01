@@ -4,11 +4,13 @@
 //! 1000-LOC budget. Everything here is re-exported from `schema::table`, so
 //! existing paths keep resolving.
 //!
-//! Covers the plain / `UNIQUE` / `FULLTEXT` forms plus the `MTREE`, `HNSW`,
+//! Covers the plain / `UNIQUE` / `FULLTEXT` / `COUNT` forms plus the `HNSW`
 //! and `DISKANN` vector indexes, and the `CONCURRENTLY` build directive that
 //! lets a large index populate in the background. The vector vocabulary
 //! (distance metrics, element types, vector builders) lives in
-//! [`super::index_vector`] and is re-exported here.
+//! [`super::index_vector`] and is re-exported here. `MTREE` is kept only so
+//! existing code and snapshots still load: SurrealDB 3 has no MTREE index,
+//! and validation refuses one.
 
 use std::fmt::Write as _;
 
@@ -19,6 +21,7 @@ use crate::types::escape::quote_ident;
 
 use super::fields::render_field_path;
 
+#[allow(deprecated)] // re-exports `mtree_index`, kept for existing code
 pub use super::index_vector::{
     diskann_index, hnsw_index, mtree_index, DiskAnnDistanceType, HnswDistanceType,
     MTreeDistanceType, MTreeVectorType, DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE,
@@ -37,7 +40,13 @@ pub enum IndexType {
     Search,
     /// Plain b-tree style index.
     Standard,
-    /// MTREE vector similarity index.
+    /// MTREE vector similarity index. SurrealDB 3 removed it: the engine
+    /// refuses the statement, and [`IndexDefinition::validate`] refuses the
+    /// definition. Kept so existing code and snapshots still load.
+    #[deprecated(
+        since = "0.34.0",
+        note = "SurrealDB 3 has no MTREE index; use IndexType::Hnsw or IndexType::Diskann"
+    )]
     Mtree,
     /// HNSW vector similarity index.
     Hnsw,
@@ -45,11 +54,17 @@ pub enum IndexType {
     /// built for corpora too large for HNSW's memory residency. Reached by
     /// the same `<|k,ef|>` KNN operator.
     Diskann,
+    /// COUNT index: keeps the number of the table's records, or of those
+    /// matching its [`condition`](IndexDefinition::condition), so
+    /// `SELECT count() FROM t GROUP ALL` reads it instead of scanning.
+    /// Takes no columns. Build one with [`count_index`].
+    Count,
 }
 
 impl IndexType {
     /// Render as SurrealQL keyword (matching the Python enum values).
     pub fn as_str(self) -> &'static str {
+        #[allow(deprecated)]
         match self {
             Self::Unique => "UNIQUE",
             Self::Search => "FULLTEXT",
@@ -57,7 +72,14 @@ impl IndexType {
             Self::Mtree => "MTREE",
             Self::Hnsw => "HNSW",
             Self::Diskann => "DISKANN",
+            Self::Count => "COUNT",
         }
+    }
+
+    /// `true` for the kinds SurrealDB 3 no longer has (`MTREE`).
+    #[allow(deprecated)]
+    pub fn is_removed(self) -> bool {
+        self == Self::Mtree
     }
 }
 
@@ -143,6 +165,10 @@ pub struct IndexDefinition {
     /// [`info_for_index_surql`] / [`IndexBuildStatus`].
     #[serde(default)]
     pub concurrently: bool,
+    /// The `WHERE` condition of a `COUNT` index: only records matching it
+    /// are counted. `None` counts every record.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub condition: Option<String>,
 }
 
 impl IndexDefinition {
@@ -175,7 +201,15 @@ impl IndexDefinition {
             bm25: false,
             highlights: false,
             concurrently: false,
+            condition: None,
         }
+    }
+
+    /// Count only the records matching `condition` (a `COUNT` index's
+    /// `WHERE` clause).
+    pub fn with_condition(mut self, condition: impl Into<String>) -> Self {
+        self.condition = Some(condition.into());
+        self
     }
 
     /// Set the index kind.
@@ -244,14 +278,46 @@ impl IndexDefinition {
 
     /// Validate the index definition.
     ///
-    /// Returns [`SurqlError::Validation`] when the name or column list is
-    /// empty, when vector-index fields are missing required members, or when
-    /// a vector index carries a member combination the engine is known to
-    /// refuse (see [`Self::validate_vector_members`]).
+    /// Returns [`SurqlError::Validation`] when the name is empty, when an
+    /// index other than `COUNT` has no columns (a `COUNT` index takes
+    /// none), when a condition is set on anything but a `COUNT` index, for
+    /// an `MTREE` index (SurrealDB 3 has none), when vector-index fields are
+    /// missing required members, or when a vector index carries a member
+    /// combination the engine is known to refuse (see
+    /// [`Self::validate_vector_members`]).
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(SurqlError::Validation {
                 reason: "Index name cannot be empty".into(),
+            });
+        }
+        if self.index_type.is_removed() {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Index {:?} is an MTREE index, which SurrealDB 3 does not have; \
+                     use hnsw_index or diskann_index",
+                    self.name
+                ),
+            });
+        }
+        if self.index_type == IndexType::Count {
+            if !self.columns.is_empty() {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "COUNT index {:?} takes no columns; the engine refuses a count \
+                         index with fields",
+                        self.name
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if self.condition.is_some() {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Index {:?} has a condition, which only a COUNT index takes",
+                    self.name
+                ),
             });
         }
         if self.columns.is_empty() {
@@ -268,10 +334,8 @@ impl IndexDefinition {
                 ),
             });
         }
-        if matches!(
-            self.index_type,
-            IndexType::Mtree | IndexType::Hnsw | IndexType::Diskann
-        ) && self.dimension.is_none()
+        if matches!(self.index_type, IndexType::Hnsw | IndexType::Diskann)
+            && self.dimension.is_none()
         {
             return Err(SurqlError::Validation {
                 reason: format!("Vector index {:?} requires a dimension", self.name),
@@ -283,8 +347,6 @@ impl IndexDefinition {
     /// Engine-shaped refusals for the vector kinds, caught before a
     /// statement is sent (all probed against SurrealDB 3.2.4).
     ///
-    /// - MTREE parses only `F64` / `F32` / `I64` / `I32` / `I16` element
-    ///   types; `F16` / `I8` / `U8` are a parse error.
     /// - DISKANN accepts only `F32` / `F16` / `I8` / `U8` element types.
     /// - DISKANN accepts only the metrics [`DiskAnnDistanceType`] can spell
     ///   (`EUCLIDEAN`, `COSINE`, `INNER_PRODUCT`, `COSINE_NORMALIZED`); a
@@ -293,23 +355,6 @@ impl IndexDefinition {
     ///
     /// HNSW accepts every [`MTreeVectorType`] variant, so it needs no check.
     fn validate_vector_members(&self) -> Result<()> {
-        if self.index_type == IndexType::Mtree {
-            if let Some(vt) = self.vector_type {
-                if matches!(
-                    vt,
-                    MTreeVectorType::F16 | MTreeVectorType::I8 | MTreeVectorType::U8
-                ) {
-                    return Err(SurqlError::Validation {
-                        reason: format!(
-                            "MTREE index {:?} cannot use TYPE {}: the engine only accepts \
-                             F64, F32, I64, I32, or I16 for MTREE",
-                            self.name,
-                            vt.as_str()
-                        ),
-                    });
-                }
-            }
-        }
         if self.index_type == IndexType::Diskann {
             if let Some(vt) = self.vector_type {
                 if !matches!(
@@ -375,7 +420,20 @@ impl IndexDefinition {
     fn render_guard(&self, table: &str, ine: &str) -> String {
         let first_column = self.columns.first().cloned().unwrap_or_default();
         let single = std::slice::from_ref(&first_column);
+        #[allow(deprecated)]
         match self.index_type {
+            IndexType::Count => {
+                let mut sql = format!(
+                    "DEFINE INDEX{ine} {name} ON TABLE {table} COUNT",
+                    name = quote_ident(&self.name),
+                    table = quote_ident(table),
+                );
+                if let Some(condition) = &self.condition {
+                    let _ = write!(sql, " WHERE {condition}");
+                }
+                self.push_tail(&mut sql);
+                sql
+            }
             IndexType::Mtree => {
                 let mut sql = self.render_head(table, ine, single);
                 let _ = write!(sql, " MTREE DIMENSION {}", self.dimension.unwrap_or(0));
@@ -575,6 +633,24 @@ where
     IndexDefinition::new(name, columns).with_type(IndexType::Search)
 }
 
+/// Build a `COUNT` index, which keeps the table's record count so
+/// `SELECT count() FROM t GROUP ALL` does not scan. Chain
+/// [`IndexDefinition::with_condition`] to count only matching records.
+///
+/// ## Examples
+///
+/// ```
+/// use surql::schema::count_index;
+///
+/// assert_eq!(
+///     count_index("active_users").with_condition("active = true").to_surql("user"),
+///     "DEFINE INDEX active_users ON TABLE user COUNT WHERE active = true;"
+/// );
+/// ```
+pub fn count_index(name: impl Into<String>) -> IndexDefinition {
+    IndexDefinition::new(name, Vec::<String>::new()).with_type(IndexType::Count)
+}
+
 /// Build a BM25-scored full-text `SEARCH` index over `columns`, analyzed by
 /// `analyzer`. This is the index to pair with
 /// [`Query::fulltext_search`](crate::query::builder::Query::fulltext_search) and
@@ -608,330 +684,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concurrently_renders_last() {
-        let idx = unique_index("email_idx", ["email"]).with_concurrently(true);
-        assert_eq!(
-            idx.to_surql("user"),
-            "DEFINE INDEX email_idx ON TABLE user COLUMNS email UNIQUE CONCURRENTLY;"
-        );
-    }
-
-    #[test]
-    fn concurrently_is_off_by_default() {
-        assert!(!index("i", ["a"]).concurrently);
-        assert!(!index("i", ["a"]).to_surql("t").contains("CONCURRENTLY"));
-    }
-
-    #[test]
-    fn concurrently_composes_with_the_guards() {
-        let idx = index("i", ["a"]).with_concurrently(true);
-        assert_eq!(
-            idx.to_surql_with_options("t", true),
-            "DEFINE INDEX IF NOT EXISTS i ON TABLE t COLUMNS a CONCURRENTLY;"
-        );
-        assert_eq!(
-            idx.to_surql_overwrite("t"),
-            "DEFINE INDEX OVERWRITE i ON TABLE t COLUMNS a CONCURRENTLY;"
-        );
-    }
-
-    #[test]
-    fn concurrently_renders_on_the_vector_forms() {
-        let mtree = mtree_index("m", "v", 8, MTreeDistanceType::Cosine, MTreeVectorType::F32)
-            .with_concurrently(true);
-        assert!(mtree.to_surql("t").ends_with("TYPE F32 CONCURRENTLY;"));
-        let hnsw = hnsw_index(
-            "h",
-            "v",
-            8,
-            HnswDistanceType::Cosine,
-            MTreeVectorType::F32,
-            Some(64),
-            Some(8),
-        )
-        .with_concurrently(true);
-        assert!(hnsw.to_surql("t").ends_with("M 8 CONCURRENTLY;"));
-    }
-
-    #[test]
-    fn concurrently_survives_serde_and_defaults_on_old_snapshots() {
-        let idx = index("i", ["a"]).with_concurrently(true);
-        let json = serde_json::to_string(&idx).unwrap();
-        let back: IndexDefinition = serde_json::from_str(&json).unwrap();
-        assert_eq!(idx, back);
-        let legacy: IndexDefinition =
-            serde_json::from_str(r#"{"name":"i","columns":["a"]}"#).unwrap();
-        assert!(!legacy.concurrently);
-    }
-
-    #[test]
-    fn info_for_index_statement() {
-        assert_eq!(
-            info_for_index_surql("email_idx", "user"),
-            "INFO FOR INDEX email_idx ON user;"
-        );
-    }
-
-    #[test]
-    fn build_status_reads_the_indexing_shape() {
-        let info = serde_json::json!({
-            "building": { "initial": 100, "pending": 20, "status": "indexing", "updated": 4 }
-        });
-        let status = IndexBuildStatus::from_info(&info).expect("status");
-        assert_eq!(status.status, "indexing");
-        assert_eq!(status.initial, 100);
-        assert_eq!(status.pending, 20);
-        assert_eq!(status.updated, 4);
-        assert!(!status.is_ready());
-    }
-
-    #[test]
-    fn build_status_reads_the_ready_shape_through_the_client_array() {
-        let info = serde_json::json!([{ "building": { "status": "ready" } }]);
-        let status = IndexBuildStatus::from_info(&info).expect("status");
-        assert!(status.is_ready());
-        assert_eq!(status.initial, 0);
-    }
-
-    #[test]
-    fn build_status_is_none_without_a_status() {
-        assert!(IndexBuildStatus::from_info(&serde_json::json!({})).is_none());
-    }
-
-    #[test]
-    fn index_type_strings() {
-        assert_eq!(IndexType::Unique.as_str(), "UNIQUE");
-        assert_eq!(IndexType::Standard.as_str(), "INDEX");
-        assert_eq!(IndexType::Mtree.as_str(), "MTREE");
-        assert_eq!(IndexType::Hnsw.as_str(), "HNSW");
-        assert_eq!(IndexType::Diskann.as_str(), "DISKANN");
-    }
-
-    #[test]
-    fn index_new_defaults_to_standard() {
-        let idx = index("title_idx", ["title"]);
-        assert_eq!(idx.index_type, IndexType::Standard);
-    }
-
-    #[test]
-    fn unique_index_to_surql() {
-        let idx = unique_index("email_idx", ["email"]);
-        assert_eq!(
-            idx.to_surql("user"),
-            "DEFINE INDEX email_idx ON TABLE user COLUMNS email UNIQUE;"
-        );
-    }
-
-    #[test]
-    fn standard_index_to_surql() {
-        let idx = index("title_idx", ["title"]);
-        assert_eq!(
-            idx.to_surql("post"),
-            "DEFINE INDEX title_idx ON TABLE post COLUMNS title;"
-        );
-    }
-
-    #[test]
-    fn search_index_to_surql() {
-        let idx = search_index("content_search", ["title", "content"]);
-        assert_eq!(
-            idx.to_surql("post"),
-            "DEFINE INDEX content_search ON TABLE post COLUMNS title, content FULLTEXT ANALYZER ascii;"
-        );
-    }
-
-    #[test]
-    fn bm25_index_renders_analyzer_and_bm25() {
-        let idx = bm25_index("content_bm25", ["content"], "text_en");
-        assert_eq!(
-            idx.to_surql("memory"),
-            "DEFINE INDEX content_bm25 ON TABLE memory COLUMNS content FULLTEXT ANALYZER text_en BM25;"
-        );
-    }
-
-    #[test]
-    fn search_index_with_analyzer_bm25_highlights() {
-        let idx = search_index("s", ["content"])
-            .with_analyzer("text_en")
-            .with_bm25()
-            .with_highlights();
-        assert_eq!(
-            idx.to_surql("doc"),
-            "DEFINE INDEX s ON TABLE doc COLUMNS content FULLTEXT ANALYZER text_en BM25 HIGHLIGHTS;"
-        );
-    }
-
-    #[test]
-    fn bm25_index_if_not_exists() {
-        let idx = bm25_index("content_bm25", ["content"], "text_en");
-        assert_eq!(
-            idx.to_surql_with_options("memory", true),
-            "DEFINE INDEX IF NOT EXISTS content_bm25 ON TABLE memory COLUMNS content \
-             FULLTEXT ANALYZER text_en BM25;"
-        );
-    }
-
-    #[test]
-    fn index_to_surql_if_not_exists() {
-        let idx = unique_index("email_idx", ["email"]);
-        assert_eq!(
-            idx.to_surql_with_options("user", true),
-            "DEFINE INDEX IF NOT EXISTS email_idx ON TABLE user COLUMNS email UNIQUE;"
-        );
-    }
-
-    #[test]
-    fn index_validate_rejects_empty_name() {
-        let mut idx = unique_index("x", ["a"]);
-        idx.name = String::new();
-        assert!(idx.validate().is_err());
-    }
-
-    #[test]
-    fn index_validate_rejects_empty_columns() {
-        let idx = IndexDefinition::new("x", Vec::<String>::new()).with_type(IndexType::Unique);
-        assert!(idx.validate().is_err());
-    }
-
-    #[test]
-    fn index_validate_mtree_requires_dimension() {
-        let mut idx = IndexDefinition::new("x", ["v"]).with_type(IndexType::Mtree);
-        assert!(idx.validate().is_err());
-        idx.dimension = Some(64);
-        assert!(idx.validate().is_ok());
-    }
-
-    #[test]
-    fn index_validate_hnsw_requires_dimension() {
-        let idx = IndexDefinition::new("x", ["v"]).with_type(IndexType::Hnsw);
-        assert!(idx.validate().is_err());
-    }
-
-    #[test]
-    fn index_validate_diskann_requires_dimension() {
-        let mut idx = IndexDefinition::new("x", ["v"]).with_type(IndexType::Diskann);
-        assert!(idx.validate().is_err());
-        idx.dimension = Some(64);
-        assert!(idx.validate().is_ok());
-    }
-
-    #[test]
-    fn index_validate_refuses_f16_on_mtree() {
-        let idx = mtree_index("x", "v", 8, MTreeDistanceType::Cosine, MTreeVectorType::F16);
-        let err = idx.validate().expect_err("MTREE refuses F16");
-        assert!(
-            err.to_string().contains("F64, F32, I64, I32, or I16"),
-            "{err}"
-        );
-        let idx = mtree_index("x", "v", 8, MTreeDistanceType::Cosine, MTreeVectorType::U8);
-        assert!(idx.validate().is_err());
-    }
-
-    #[test]
-    fn index_validate_refuses_wide_types_on_diskann() {
-        for vt in [
-            MTreeVectorType::F64,
-            MTreeVectorType::I64,
-            MTreeVectorType::I32,
-            MTreeVectorType::I16,
-        ] {
-            let idx = diskann_index("x", "v", 8, DiskAnnDistanceType::Cosine, vt);
-            let err = idx.validate().expect_err("DISKANN refuses the wide types");
-            assert!(err.to_string().contains("F32, F16, I8, or U8"), "{err}");
-        }
-        for vt in [
-            MTreeVectorType::F32,
-            MTreeVectorType::F16,
-            MTreeVectorType::I8,
-            MTreeVectorType::U8,
-        ] {
-            let idx = diskann_index("x", "v", 8, DiskAnnDistanceType::Cosine, vt);
-            assert!(idx.validate().is_ok());
-        }
-    }
-
-    #[test]
-    fn index_validate_refuses_a_foreign_metric_on_diskann() {
-        let mut idx = diskann_index(
-            "x",
-            "v",
-            8,
-            DiskAnnDistanceType::Cosine,
-            MTreeVectorType::F32,
-        );
-        idx.hnsw_distance = Some(HnswDistanceType::Manhattan);
-        let err = idx.validate().expect_err("DISKANN refuses HNSW metrics");
-        assert!(err.to_string().contains("diskann_distance"), "{err}");
-    }
-
-    #[test]
-    fn diskann_renders_the_defaults_even_when_unset() {
-        // A hand-assembled definition with an empty tail still spells the
-        // engine's defaults, per the echo discipline.
-        let mut idx = IndexDefinition::new("pc", ["v"]).with_type(IndexType::Diskann);
-        idx.dimension = Some(3);
-        assert_eq!(
-            idx.to_surql("t"),
-            "DEFINE INDEX pc ON TABLE t COLUMNS v DISKANN DIMENSION 3 \
-             DIST EUCLIDEAN TYPE F32 DEGREE 64 L_BUILD 100 ALPHA 1.2;"
-        );
-    }
-
-    #[test]
-    fn with_alpha_stores_the_canonical_decimal() {
-        let idx = diskann_index(
-            "pc",
-            "v",
-            3,
-            DiskAnnDistanceType::Cosine,
-            MTreeVectorType::F32,
-        )
-        .with_alpha(1.5);
-        assert_eq!(idx.alpha.as_deref(), Some("1.5"));
-        assert_eq!(
-            diskann_index(
-                "pc",
-                "v",
-                3,
-                DiskAnnDistanceType::Cosine,
-                MTreeVectorType::F32
-            )
-            .with_alpha(2.0)
-            .alpha
-            .as_deref(),
-            Some("2")
-        );
-    }
-
-    #[test]
-    fn diskann_survives_serde_and_defaults_on_old_snapshots() {
-        let idx = diskann_index(
-            "pc",
-            "v",
-            3,
-            DiskAnnDistanceType::CosineNormalized,
-            MTreeVectorType::I8,
-        )
-        .with_degree(48)
-        .with_hashed_vector(true);
-        let json = serde_json::to_string(&idx).unwrap();
-        let back: IndexDefinition = serde_json::from_str(&json).unwrap();
-        assert_eq!(idx, back);
-        // Stored snapshots and old contracts predate every DISKANN member;
-        // they must keep deserialising with the members defaulted off.
-        let legacy: IndexDefinition = serde_json::from_str(
-            r#"{"name":"i","columns":["a"],"type":"HNSW","dimension":8,"efc":150}"#,
-        )
-        .unwrap();
-        assert_eq!(legacy.index_type, IndexType::Hnsw);
-        assert_eq!(legacy.diskann_distance, None);
-        assert_eq!(legacy.degree, None);
-        assert_eq!(legacy.l_build, None);
-        assert_eq!(legacy.alpha, None);
-        assert!(!legacy.hashed_vector);
-    }
-}
+#[allow(deprecated)] // MTREE stays covered: old snapshots and echoes still load
+mod tests;

@@ -278,6 +278,9 @@ pub struct Query {
     /// Hints rendered as a `/* ... */` comment prefix (see
     /// [`hints`](super::hints): the server ignores them).
     pub hints: Vec<QueryHint>,
+    /// Lock the selected records until the transaction ends
+    /// (`SELECT ... FOR UPDATE`, SurrealDB 3.3+).
+    pub for_update: bool,
 }
 
 impl Query {
@@ -419,6 +422,34 @@ impl Query {
     pub fn group_all(self) -> Self {
         Self {
             group_all_flag: true,
+            ..self
+        }
+    }
+
+    /// Lock the selected records until the surrounding transaction ends
+    /// (`FOR UPDATE`, SurrealDB 3.3+), so a read-then-write in one
+    /// transaction cannot race another writer. Only a `SELECT` renders it,
+    /// and only on a record id target: the engine refuses a table, and so
+    /// does [`Query::to_surql`].
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::query::builder::Query;
+    ///
+    /// let q = Query::new()
+    ///     .select(None)
+    ///     .from_table("account:alice")
+    ///     .unwrap()
+    ///     .for_update();
+    /// assert_eq!(q.to_surql().unwrap(), "SELECT * FROM account:alice FOR UPDATE");
+    ///
+    /// let table = Query::new().select(None).from_table("account").unwrap().for_update();
+    /// assert!(table.to_surql().is_err());
+    /// ```
+    pub fn for_update(self) -> Self {
+        Self {
+            for_update: true,
             ..self
         }
     }

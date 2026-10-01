@@ -7,7 +7,7 @@
 //! This backend is gated behind the `cache-redis` feature.
 
 use async_trait::async_trait;
-use redis::aio::MultiplexedConnection;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{AsyncCommands, Client, RedisError};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -16,12 +16,19 @@ use crate::error::{Result, SurqlError};
 
 use super::backend::{escape_glob, CacheBackend};
 
+/// Connection attempts after the first before an operation reports the
+/// server unreachable. Each failed operation starts a new round, so a
+/// cache in front of a down server fails fast instead of stalling every
+/// caller through a long backoff.
+const CONNECT_RETRIES: usize = 1;
+
 /// Redis-backed cache.
 ///
-/// The underlying connection is lazily established on first use and
-/// reused across subsequent operations. A connection that breaks (the
-/// server restarts, the socket drops) is discarded on the error that
-/// reveals it, and the next operation connects afresh.
+/// The connection is established on first use and shared by every
+/// operation after it. It is a redis `ConnectionManager`: when the server
+/// drops it (a restart, a killed client, a network blip), the operation
+/// that finds out fails and a new connection is made in the background, so
+/// later operations succeed again without anything being rebuilt.
 ///
 /// Every key is stored under `prefix`, and [`CacheBackend::clear`] only
 /// ever touches keys under it. With an empty prefix the cache shares the
@@ -34,7 +41,7 @@ pub struct RedisCache {
     client: Client,
     prefix: String,
     default_ttl_secs: u64,
-    connection: Mutex<Option<MultiplexedConnection>>,
+    connection: Mutex<Option<ConnectionManager>>,
 }
 
 impl std::fmt::Debug for RedisCache {
@@ -88,14 +95,17 @@ impl RedisCache {
         out
     }
 
-    async fn connection(&self) -> Result<MultiplexedConnection> {
+    /// The shared connection, established on first use. A handle is cheap
+    /// to clone and every clone uses the same connection.
+    async fn connection(&self) -> Result<ConnectionManager> {
         let mut guard = self.connection.lock().await;
         if let Some(conn) = guard.as_ref() {
             return Ok(conn.clone());
         }
+        let config = ConnectionManagerConfig::new().set_number_of_retries(CONNECT_RETRIES);
         let conn = self
             .client
-            .get_multiplexed_async_connection()
+            .get_connection_manager_with_config(config)
             .await
             .map_err(|e| SurqlError::Connection {
                 reason: format!("redis connect failed: {e}"),
@@ -103,17 +113,13 @@ impl RedisCache {
         *guard = Some(conn.clone());
         Ok(conn)
     }
+}
 
-    /// Map a failed command, first discarding the cached connection when
-    /// the error means it is broken: a multiplexed connection never
-    /// reconnects by itself, so keeping it would fail every later call.
-    async fn command_failed(&self, command: &str, err: &RedisError) -> SurqlError {
-        if err.is_unrecoverable_error() || err.is_io_error() || err.is_connection_dropped() {
-            *self.connection.lock().await = None;
-        }
-        SurqlError::Database {
-            reason: format!("redis {command} failed: {err}"),
-        }
+/// Map a failed command. A broken connection needs nothing here: the
+/// connection manager has already started replacing it.
+fn command_failed(command: &str, err: &RedisError) -> SurqlError {
+    SurqlError::Database {
+        reason: format!("redis {command} failed: {err}"),
     }
 }
 
@@ -123,7 +129,7 @@ impl CacheBackend for RedisCache {
         let mut conn = self.connection().await?;
         let raw: Option<String> = match conn.get(self.prefixed(key)).await {
             Ok(raw) => raw,
-            Err(e) => return Err(self.command_failed("GET", &e).await),
+            Err(e) => return Err(command_failed("GET", &e)),
         };
         let Some(raw) = raw else { return Ok(None) };
         match serde_json::from_str::<Value>(&raw) {
@@ -144,7 +150,7 @@ impl CacheBackend for RedisCache {
         };
         match outcome {
             Ok(()) => Ok(()),
-            Err(e) => Err(self.command_failed("SET", &e).await),
+            Err(e) => Err(command_failed("SET", &e)),
         }
     }
 
@@ -152,7 +158,7 @@ impl CacheBackend for RedisCache {
         let mut conn = self.connection().await?;
         match conn.del::<_, ()>(self.prefixed(key)).await {
             Ok(()) => Ok(()),
-            Err(e) => Err(self.command_failed("DEL", &e).await),
+            Err(e) => Err(command_failed("DEL", &e)),
         }
     }
 
@@ -183,11 +189,11 @@ impl CacheBackend for RedisCache {
                 .await;
             let (new_cursor, keys) = match scanned {
                 Ok(page) => page,
-                Err(e) => return Err(self.command_failed("SCAN", &e).await),
+                Err(e) => return Err(command_failed("SCAN", &e)),
             };
             if !keys.is_empty() {
                 if let Err(e) = conn.del::<_, ()>(keys.as_slice()).await {
-                    return Err(self.command_failed("DEL", &e).await);
+                    return Err(command_failed("DEL", &e));
                 }
                 count += keys.len();
             }
@@ -203,7 +209,7 @@ impl CacheBackend for RedisCache {
         let mut conn = self.connection().await?;
         match conn.exists(self.prefixed(key)).await {
             Ok(present) => Ok(present),
-            Err(e) => Err(self.command_failed("EXISTS", &e).await),
+            Err(e) => Err(command_failed("EXISTS", &e)),
         }
     }
 
@@ -251,6 +257,19 @@ mod tests {
         let cache = RedisCache::new("redis://127.0.0.1:1", "", 30).unwrap();
         let err = cache.clear(None).await.unwrap_err();
         assert!(matches!(err, SurqlError::Validation { .. }), "{err}");
+    }
+
+    /// The connection manager retries with a backoff; the cache keeps that
+    /// short, so an unreachable server is an error, not a stall.
+    #[tokio::test]
+    async fn an_unreachable_server_fails_fast() {
+        let cache = RedisCache::new("redis://127.0.0.1:1", "p:", 30).unwrap();
+        let started = std::time::Instant::now();
+        let err = cache.get("k").await.unwrap_err();
+        assert!(matches!(err, SurqlError::Connection { .. }), "{err}");
+        // Two attempts. The manager's default, seven attempts with a
+        // doubling backoff, takes over six seconds before the first error.
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
     }
 
     #[test]

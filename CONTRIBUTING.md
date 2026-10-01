@@ -16,11 +16,11 @@ rustup target add wasm32-unknown-unknown   # plus a wasm-capable clang, see scri
 pip install mkdocs-material mkdocs-minify-plugin
 ```
 
-Integration tests (against a local `surrealdb/surrealdb:v3.0.5` container) are opt-in:
+Integration tests (against a local `surrealdb/surrealdb:v3.3.0` container) are opt-in:
 
 ```bash
 export SURQL_PRE_PUSH_INTEGRATION=1
-docker run -d -p 8000:8000 --name surrealdb surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+docker run -d -p 8000:8000 --name surrealdb surrealdb/surrealdb:v3.3.0 start --user root --pass root memory
 ```
 
 Bypass (rarely, only with authorisation):

@@ -189,6 +189,14 @@ impl std::fmt::Display for MTreeVectorType {
 }
 
 /// Build an MTREE vector index.
+///
+/// SurrealDB 3 has no MTREE index: the engine refuses the statement and
+/// [`IndexDefinition::validate`] refuses the definition. Use
+/// [`hnsw_index`] or [`diskann_index`].
+#[deprecated(
+    since = "0.34.0",
+    note = "SurrealDB 3 has no MTREE index; use hnsw_index or diskann_index"
+)]
 pub fn mtree_index(
     name: impl Into<String>,
     column: impl Into<String>,
@@ -196,8 +204,10 @@ pub fn mtree_index(
     distance: MTreeDistanceType,
     vector_type: MTreeVectorType,
 ) -> IndexDefinition {
+    #[allow(deprecated)]
+    let index_type = IndexType::Mtree;
     IndexDefinition {
-        index_type: IndexType::Mtree,
+        index_type,
         dimension: Some(dimension),
         distance: Some(distance),
         vector_type: Some(vector_type),
@@ -270,6 +280,7 @@ pub fn diskann_index(
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // MTREE stays covered: old snapshots and echoes still load
 mod tests {
     use super::*;
 

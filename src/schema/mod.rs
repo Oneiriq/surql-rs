@@ -101,7 +101,9 @@ pub use access::{
     access_schema, jwt_access, record_access, AccessDefinition, AccessSchemaBuilder, AccessType,
     JwtConfig, RecordAccessConfig,
 };
-pub use analyzer::{analyzer, standard_analyzer, AnalyzerDefinition, TokenFilter, Tokenizer};
+pub use analyzer::{
+    analyzer, standard_analyzer, AnalyzerDefinition, SegmentLanguage, TokenFilter, Tokenizer,
+};
 pub use bucket::{
     bucket_schema, file_bucket, memory_bucket, BucketDefinition, BucketSchemaBuilder,
 };
@@ -135,10 +137,11 @@ pub use sql::{
     generate_sequence_sql, generate_sequence_sql_with_options, generate_table_sql,
     generate_table_sql_overwrite,
 };
+#[allow(deprecated)] // re-exports `mtree_index`, kept for existing code
 pub use table::{
-    bm25_index, diskann_index, event, hnsw_index, index, mtree_index, search_index, table_schema,
-    unique_index, DiskAnnDistanceType, EventDefinition, HnswDistanceType, IndexDefinition,
-    IndexType, MTreeDistanceType, MTreeVectorType, TableDefinition, TableMode,
+    bm25_index, count_index, diskann_index, event, hnsw_index, index, mtree_index, search_index,
+    table_schema, unique_index, DiskAnnDistanceType, EventDefinition, HnswDistanceType,
+    IndexDefinition, IndexType, MTreeDistanceType, MTreeVectorType, TableDefinition, TableMode,
 };
 pub use themes::{
     color_scheme_by_name, dark_ascii, dark_color_scheme, dark_graphviz, dark_mermaid, dark_theme,
@@ -149,8 +152,9 @@ pub use themes::{
 };
 pub use utils::{char_display_width, display_width, strip_ansi};
 pub use validator::{
-    normalize_expression, validate_edge, validate_edges, validate_field, validate_index,
-    validate_schema, validate_table, validate_tables, ValidationResult, ValidationSeverity,
+    normalize_expression, validate_accesses, validate_edge, validate_edges, validate_field,
+    validate_index, validate_schema, validate_table, validate_tables, ValidationResult,
+    ValidationSeverity,
 };
 pub use validator_utils::{
     filter_by_severity, filter_errors, filter_warnings, format_validation_report,

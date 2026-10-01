@@ -24,6 +24,7 @@ Short overview; the full matrix and recipes live on the
 |-----------------|---------|-----------------------------------------------------------|
 | `client`        | yes     | Async SurrealDB client (`tokio`, `surrealdb` 3.x) with `native-tls`. |
 | `client-rustls` | no      | Same client surface but with pure-Rust TLS (no `openssl-sys`). |
+| `client-grpc`   | no      | The gRPC transport (`grpc://`, `grpcs://`, SurrealDB 3.3+), on top of `client-rustls`. |
 | `cli`           | no      | `surql` binary (implies `client`, `orchestration`, `settings`). |
 | `cache`         | no      | In-process `MemoryCache` backend + `CacheManager`.        |
 | `cache-redis`   | no      | Redis backend for the cache manager (implies `cache`).    |
@@ -58,6 +59,12 @@ Subcommand reference: [CLI](cli.md).
   TLS stack (`libssl-dev` on Linux, `Security.framework` on macOS).
 - For the `client-rustls` feature: SurrealDB 3.0 or newer. No system
   TLS stack required.
+- Server versions: the crate is built and tested against SurrealDB 3.3,
+  and a 3.0 server works with two exceptions. Values nested more than 16
+  levels deep need 3.1 (`encoding::json::decode`). The 3.3 additions need
+  3.3: `LIGHTWEIGHT` relations, `INLINE` caches and fields, the access
+  `AUDIENCE` and `CONTEXT` clauses, `SELECT ... FOR UPDATE`, the
+  `segment` tokenizer and the gRPC transport.
 
 ## What's next
 

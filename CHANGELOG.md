@@ -17,6 +17,13 @@ behaviour; every change a caller can observe is marked **Breaking**.
 Problems the pass found but did not fix are listed on the
 [Known issues](https://oneiriq.github.io/surql-rs/known-issues/) page.
 
+A follow-up resolves those issues (migration checksums, deeply nested
+values, MTREE, COUNT indexes, union types, access and event comparison,
+Redis reconnects) and brings the crate to SurrealDB 3.3: it requires
+surrealdb 3.3, models the clauses 3.3 adds, reads back what 3.3 echoes,
+and runs its engine tests against a 3.3.0 server. What remains open is on
+the known-issues page.
+
 ### Security
 
 - **Values are always data.** `quote_value` recognised `SurrealFn` and
@@ -150,7 +157,15 @@ Problems the pass found but did not fix are listed on the
   - Two migrations generated in the same second no longer overwrite each
     other, and squash refuses to overwrite its output; a byte-order mark
     no longer hides the metadata block; checksums ignore line endings and
-    the BOM (**Breaking**: such files' checksums change).
+    the BOM (history rows recorded from the raw bytes still match).
+  - **An applied migration edited afterwards is caught.** Its checksum was
+    recorded but never compared, so the edit went unnoticed and the
+    database kept the old schema. `get_migration_status` now lists such
+    migrations in `modified` (`migrate status` shows them as `modified`),
+    and `migrate_up`, `surql migrate up` and orchestration deploys refuse
+    to run while any exist. Rows recorded from a file's raw bytes (earlier
+    releases, surql-py) match on either line ending, with or without a
+    byte-order mark. **Breaking**
   - The schema watcher no longer spins after it is dropped or panics
     outside a runtime, and reports over a bounded channel. **Breaking**
   - Non-ASCII staged files are detected; a corrupt newest snapshot is an
@@ -164,6 +179,37 @@ Problems the pass found but did not fix are listed on the
     and DISKANN tuning, the `ascii` analyzer) as drift. `surql schema
     validate` reads the complete live schema. **Breaking:** `db_edges:
     None` now skips edges, and edge maps take `EdgeDefinition`.
+  - The engine's operator and spacing rewrites are not drift:
+    `normalize_expression` (and so the diff and the validator) reads `&&` /
+    `||` as `AND` / `OR`, `IN` as `INSIDE`, `NOT IN` as `NOTINSIDE`,
+    operator keywords in any case, and `[1,2]` / `{a:1}` as the engine's
+    `[1, 2]` / `{ a: 1 }`. Event conditions, assertions and permissions
+    using them used to warn on every validation and re-apply on every
+    diff.
+  - A COUNT index used to read back as a standard index with no columns,
+    and a union field type as `any`; both now read back as themselves.
+- **A failed transaction reports the error that says why.** The client
+  reported the first "not executed" statement of a failed transaction,
+  and the engine marks the statements before the failure that way too,
+  with a fixed sentence. A failure that is itself "not executed" with a
+  cause (SurrealDB 3.3 refuses a `DEFINE INDEX` while the table's
+  document ids are reclaimed this way) was reported as "The query was not
+  executed due to a failed transaction". The error carrying a cause now
+  wins over the fixed sentences.
+- **The Redis cache reconnects in the background.** A dropped connection
+  was discarded on the error that revealed it and reopened by the next
+  call. `RedisCache` now holds a redis `ConnectionManager` (the
+  `connection-manager` feature of `redis`), which replaces a dropped
+  connection itself; an unreachable server still fails after two
+  connection attempts rather than the manager's default backoff.
+- **Deeply nested values reach the engine.** Values render into the
+  statement as literals, and the engine's parser refuses a literal nested
+  20 levels deep ("Exceeded query recursion depth limit"), so the builder,
+  `insert_many`, `relate_many`, `upsert_many_in_tx` and operator values
+  failed on such data. A value nested more than `MAX_INLINE_DEPTH` (16)
+  levels now renders as its JSON text decoded by the engine
+  (`encoding::json::decode('…')`, SurrealDB 3.1+), which the parser reads
+  as one flat string; the value arrives the same.
   - Theme settings take effect; the registry refuses a table and an edge
     sharing one name.
 - **Connection, settings and cache.**
@@ -194,8 +240,13 @@ Problems the pass found but did not fix are listed on the
 - **MSRV is Rust 1.95.** `rust-version` said 1.90, which never built the
   locked graph; surrealdb 3.3 uses `std::hint::cold_path` (stable since
   1.95) and declares no `rust-version`. CI now checks it.
-- The lockfile moves to surrealdb 3.3.0, which a fresh consumer already
-  resolves.
+- **SurrealDB 3.3.** The `surrealdb` requirement rises from 3.1.5 to
+  3.3.0 (the lockfile and the MSRV already assumed it, and `client-grpc`
+  needs an SDK feature older releases lack). CI's engine tests run
+  against a 3.3.0 server instead of 3.0.5, and the gRPC test with them.
+  Engine tests that need 3.3 syntax skip on older servers; everything
+  else also passes against 3.2.4. **Breaking** for a consumer pinned to
+  an older surrealdb.
 - Destructive CLI commands (`db reset`, `bucket rm`, `bucket delete`,
   `orchestrate deploy`) prompt, and require `--yes` when stdin is not a
   terminal; `orchestrate deploy` gains `--approve`, `--yes` and
@@ -240,6 +291,68 @@ Problems the pass found but did not fix are listed on the
   `INFO` parsers return on arbitrary text.
 - CI jobs for the MSRV, the `client-wasm` build and the no-features
   build; the pre-push hook runs every CI gate.
+- Union, literal and typed-container field types:
+  `FieldDefinition::custom_type` / `with_custom_type` render a type the
+  `FieldType` keywords cannot spell (`array<string> | int`, `'draft' |
+  'published'`, `array<string, 5>`, `set<int>`, `geometry<point>`), and the
+  parser keeps any type it cannot render back from the keywords there
+  instead of reading it as `any`. The diff and the validator compare it
+  through the new `normalize_type` / `type_eq`; `FieldDefinition::type_clause`
+  returns the rendered type. `FieldDefinition` gains `custom_type`
+  (**Breaking** for struct literals).
+- Access comparison: `accesses_equal` and `validate_accesses` compare
+  access definitions with the engine's echo, folding away redacted keys,
+  normalised durations (`duration_nanos`: `24h` is `1d`), the default token
+  duration and the verifier the engine gives a record access declared
+  without one. Accesses stay out of the migration diff (their keys never
+  come back, so no rollback could restore them).
+- SurrealDB 3.3 access clauses: `JwtConfig::with_audience` (`AUDIENCE`) and
+  `AccessDefinition::with_context` (`CONTEXT`), plus
+  `AccessDefinition::with_authenticate` (`AUTHENTICATE`). The parser reads
+  all three; `AUDIENCE` used to run into the preceding key. `JwtConfig`
+  gains `audience` and `AccessDefinition` gains `authenticate` and
+  `context` (**Breaking** for struct literals).
+- `Query::for_update()`: `SELECT ... FOR UPDATE` (SurrealDB 3.3), which
+  locks the selected records until the transaction ends. The engine takes
+  only record id targets, and `to_surql` refuses a table target the same
+  way. `Query` gains `for_update`.
+- The `client-grpc` feature and `Protocol::Grpc` / `Protocol::GrpcSecure`:
+  `grpc://` and `grpcs://` URLs connect over the SurrealDB 3.3 gRPC
+  transport (the server answers on its main port), tested against a 3.3.0
+  server. **Breaking** for exhaustive matches on `Protocol`.
+- Relation flags and SurrealDB 3.3 graph caches: `EdgeDefinition` gains
+  `enforced` (`ENFORCED`, which the parser used to skip), `lightweight`
+  (`LIGHTWEIGHT`, edges with no records), and, like `TableDefinition`,
+  `inline_edges` / `inline_references` (`INLINE EDGES n` / `INLINE
+  REFERENCES n`); `FieldDefinition` gains `inline` (`INLINE`). Each has a
+  `with_*` builder, renders in the engine's order, reads back from the
+  echo, and is compared by the diff and the validator; validation refuses
+  what the engine refuses (a lightweight relation with fields, an `INLINE`
+  field that is nested, `COMPUTED` or on a non-relation table). The new
+  members are **Breaking** for struct literals.
+- `Tokenizer::Segment(SegmentLanguage)`: the SurrealDB 3.3 CJK tokenizer
+  (`segment(chinese)` / `japanese` / `korean`). An analyzer using it used
+  to fail to parse and drop out of `parse_db_info`. **Breaking** for
+  exhaustive matches on `Tokenizer`.
+- COUNT indexes: `IndexType::Count`, `count_index(name)` and
+  `IndexDefinition::with_condition` render `DEFINE INDEX … COUNT [WHERE
+  …]`; the parser reads the engine's echo (it used to read a standard
+  index with no columns), and the diff and validator compare the
+  condition. `IndexDefinition` gains `condition` (**Breaking** for struct
+  literals and exhaustive matches on `IndexType`).
+- `modified_migrations`, `get_modified_migrations`, `rehash_migrations`,
+  `update_migration_checksum` and `ModifiedMigration`;
+  `MigrationStatusReport` gains `modified` (**Breaking** for struct
+  literals); `surql migrate rehash [<VERSION>...]` accepts an edit to an
+  applied migration by recording its current checksum.
+
+### Deprecated
+
+- `mtree_index` and `IndexType::Mtree`. SurrealDB 3 has no MTREE index
+  (every 3.x engine refuses the statement), so `IndexDefinition::validate`
+  now refuses one; use `hnsw_index` or `diskann_index`. The variant stays
+  so existing code and snapshots still load. `IndexType::is_removed`
+  reports it.
 
 ### Removed
 

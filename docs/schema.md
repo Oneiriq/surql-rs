@@ -66,6 +66,28 @@ built definition. The `INFO FOR TABLE` parser round-trips the wrapper
 nullable column diffs against a live database as itself rather than as a
 change.
 
+### Unions, literals and typed containers
+
+A type the keywords above cannot spell goes in verbatim through
+`with_custom_type`, which leaves `field_type` as `Any`:
+
+```rust
+use surql::schema::{FieldDefinition, FieldType};
+
+FieldDefinition::new("status", FieldType::Any)
+    .with_custom_type("'draft' | 'published'");         // TYPE 'draft' | 'published'
+FieldDefinition::new("tags", FieldType::Any)
+    .with_custom_type("array<string, 5> | string")
+    .with_nullable(true);                               // TYPE option<array<string, 5> | string>
+```
+
+The parser keeps every type it cannot render back from the keywords in
+`custom_type` (a union, a literal, `array<string>`, `set<int>`,
+`geometry<point>`), so such a field reads back as itself instead of as
+`any`. Types compare with their spacing, quote style and the engine's
+float suffix (`2.5f`) folded away; write keywords in lower case, as the
+engine echoes them.
+
 ## Permissions
 
 Tables, edges, and fields take a per-action map. The key is an action
@@ -114,9 +136,28 @@ let avatars = bucket_schema("avatars", "memory")
 - `unique_index(name, cols)` -- UNIQUE
 - `search_index(name, [col])` / `bm25_index(name, [col], analyzer)` --
   FULLTEXT, exactly one column
-- `mtree_index(name, col, dimension, distance, vector_type)` -- MTREE
 - `hnsw_index(name, col, dimension, distance, vector_type, efc, m)` -- HNSW
 - `diskann_index(name, col, dimension, distance, vector_type)` -- DISKANN
+- `count_index(name)` -- COUNT, no columns; `.with_condition("active =
+  true")` counts only matching records. `SELECT count() FROM t GROUP ALL`
+  then reads the index instead of scanning.
+- `mtree_index` is deprecated: SurrealDB 3 has no MTREE index, so the
+  engine refuses the statement and `validate()` refuses the definition.
+  Use `hnsw_index` or `diskann_index`.
+
+```rust
+use surql::schema::count_index;
+
+let active = count_index("active_users").with_condition("active = true");
+// DEFINE INDEX active_users ON TABLE user COUNT WHERE active = true;
+```
+
+On SurrealDB 3.3, removing or overwriting an index can start a
+background reclaim of the table's shared document-id space, and a
+non-COUNT `DEFINE INDEX` on that table that arrives while it runs fails
+with "still being reclaimed". The failure leaves the migration unapplied
+and names that cause; run it again once the reclaim has finished (see
+[Known issues](known-issues.md)).
 
 ## Events
 
@@ -151,6 +192,30 @@ let loose = edge_schema("entity_relation").with_mode(EdgeMode::Schemafull);
 The engine echoes the endpoints as `TYPE RELATION IN user OUT post`; the
 parser reads both spellings, `a | b` lists, and backticked names.
 
+A relation can require its endpoints to exist (`with_enforced(true)`,
+`ENFORCED`), and on SurrealDB 3.3 store its edges as adjacency entries on
+the endpoints alone, with no edge records (`with_lightweight(true)`,
+`ENFORCED LIGHTWEIGHT`); a lightweight relation takes no fields, indexes
+or events. Also 3.3: a table or an edge can keep a cache of its records'
+edges and incoming references beside each record
+(`with_inline_edges(n)`, `with_inline_references(n)`), and a top-level
+field of a relation can be copied into the adjacency entries so a
+traversal filters on it without reading the edge
+(`FieldDefinition::with_inline(true)`, `INLINE`).
+
+```rust
+use surql::schema::{typed_edge, FieldDefinition, FieldType};
+
+let follows = typed_edge("follows", "user", "user").with_lightweight(true);
+// DEFINE TABLE follows TYPE RELATION FROM user TO user ENFORCED LIGHTWEIGHT;
+let rated = typed_edge("rated", "user", "film")
+    .with_inline_edges(64)
+    .with_fields([FieldDefinition::new("stars", FieldType::Int).with_inline(true)]);
+```
+
+All of these read back from the echo and are compared by the diff and
+the validator.
+
 ## Access (record + JWT)
 
 ```rust
@@ -183,6 +248,22 @@ other string are escaped as SurrealQL literals. The engine echoes symmetric
 keys and issuer keys as `'[REDACTED]'`, and always echoes its default
 durations; the parser reads `FOR TOKEN 1h` and `FOR SESSION NONE` back as
 unset.
+
+`with_authenticate(expr)` adds an `AUTHENTICATE` clause, and on SurrealDB
+3.3 `JwtConfig::with_audience([...])` restricts the tokens a verifier
+accepts to those naming one of the audiences (`AUDIENCE`), and
+`with_context(expr)` keeps a read-only expression's value as each
+session's data (`CONTEXT`).
+
+`accesses_equal` compares a definition with the engine's echo of it, and
+`validate_accesses` reports the differences between code and database
+access lists. What the engine redacts or fills in is not a difference: a
+redacted key matches any key (so a changed key cannot be detected),
+durations compare by length (`24h` is `1d`), the token duration defaults
+to `1h`, and a record access declared without a verifier matches the
+random `HS512` one the engine gives it. Accesses are not part of the
+migration diff: their keys never come back, so no rollback could restore
+them.
 
 ## Registry + SQL generation
 

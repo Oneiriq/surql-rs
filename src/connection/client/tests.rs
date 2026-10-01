@@ -542,3 +542,35 @@ async fn crud_targets_cannot_inject_statements() {
     let rows: Vec<Value> = client.select("user").await.unwrap();
     assert_eq!(rows.len(), 1, "the injected REMOVE TABLE ran");
 }
+
+/// In a failed transaction the statements before the failure are "not
+/// executed" too, with the engine's fixed sentence. When the failure is
+/// itself a not-executed error with a cause (SurrealDB 3.3's refusal of a
+/// `DEFINE INDEX` while document ids are reclaimed), that cause is what is
+/// reported, not the first fixed sentence.
+#[test]
+fn the_not_executed_error_that_says_why_is_reported() {
+    use super::convert::keep_not_executed;
+    use surrealdb::types::QueryError;
+
+    let not_executed =
+        |message: &str| surrealdb::Error::query(message.to_owned(), QueryError::NotExecuted);
+    let fixed = not_executed("The query was not executed due to a failed transaction");
+    let cause = not_executed(
+        "The shared document-ID space for table `t` is still being reclaimed; retry \
+         DEFINE INDEX after cleanup completes",
+    );
+    let commit = not_executed("Cannot COMMIT: the transaction was aborted due to a prior error");
+
+    let kept = [&fixed, &cause, &commit]
+        .into_iter()
+        .fold(None, keep_not_executed);
+    let (says_why, err) = kept.expect("an error is kept");
+    assert!(says_why);
+    assert!(err.to_string().contains("still being reclaimed"), "{err}");
+
+    let kept = [&fixed, &commit].into_iter().fold(None, keep_not_executed);
+    let (says_why, err) = kept.expect("an error is kept");
+    assert!(!says_why);
+    assert!(err.to_string().contains("failed transaction"), "{err}");
+}

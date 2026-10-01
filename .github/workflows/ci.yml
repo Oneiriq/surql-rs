@@ -263,7 +263,7 @@ jobs:
           docker run -d \
             --name surrealdb \
             -p 8000:8000 \
-            surrealdb/surrealdb:v3.0.5 \
+            surrealdb/surrealdb:v3.3.0 \
             start --user root --pass root memory
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8000/health; then
@@ -293,6 +293,8 @@ jobs:
           fi
         env:
           SURREAL_URL: ws://localhost:8000
+          # 3.3 answers gRPC on the same port (tests/integration_grpc.rs).
+          SURREAL_GRPC_URL: grpc://localhost:8000
           SURREAL_USER: root
           SURREAL_PASS: root
 

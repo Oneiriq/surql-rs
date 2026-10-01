@@ -7,11 +7,12 @@
 
 use super::permissions::{parse_permissions_body, Owner};
 use super::scan::{clause, clauses, define_head, unquote_ident, Clause, Shape};
+use crate::migration::diff::normalize_type;
 use crate::schema::fields::{FieldDefinition, FieldType};
 use crate::schema::reference::ReferenceAction;
 
 /// The clauses of a `DEFINE FIELD` statement. The engine echoes them as
-/// `TYPE … [FLEXIBLE] [DEFAULT …] [READONLY] [VALUE …] [ASSERT …]
+/// `TYPE … [FLEXIBLE] [DEFAULT …] [READONLY] [INLINE] [VALUE …] [ASSERT …]
 /// [COMPUTED …] [REFERENCE …] [COMMENT …] PERMISSIONS …`; this crate renders
 /// a different order, and both are read the same way.
 const FIELD_CLAUSES: &[(&str, Shape)] = &[
@@ -19,6 +20,7 @@ const FIELD_CLAUSES: &[(&str, Shape)] = &[
     ("FLEXIBLE", Shape::Flag),
     ("DEFAULT", Shape::Expr),
     ("READONLY", Shape::Flag),
+    ("INLINE", Shape::Flag),
     ("VALUE", Shape::Expr),
     ("ASSERT", Shape::Expr),
     ("COMPUTED", Shape::Expr),
@@ -90,6 +92,8 @@ pub fn parse_field(name: &str, definition: &str) -> Option<FieldDefinition> {
         nullable: kind.nullable,
         reference: extract_reference(&found),
         computed: expression(&found, "COMPUTED"),
+        custom_type: kind.custom_type,
+        inline: has("INLINE"),
     })
 }
 
@@ -101,6 +105,7 @@ struct Kind {
     field_type: FieldType,
     nullable: bool,
     target_table: Option<String>,
+    custom_type: Option<String>,
 }
 
 impl Default for Kind {
@@ -109,6 +114,7 @@ impl Default for Kind {
             field_type: FieldType::Any,
             nullable: false,
             target_table: None,
+            custom_type: None,
         }
     }
 }
@@ -145,9 +151,10 @@ fn generic_inner(text: &str) -> Option<&str> {
 ///
 /// The engine echoes `option<T>` as `none | T`; the code side renders
 /// `option<T>`. Both read as nullable `T`, nested generics included
-/// (`option<array<record<t>>>` is a nullable array linked to `t`). A union of
-/// several non-`none` types has no [`FieldType`] and reads as
-/// [`FieldType::Any`].
+/// (`option<array<record<t>>>` is a nullable array linked to `t`). A type
+/// the [`FieldType`] keywords cannot render back exactly (a union of several
+/// non-`none` types, a literal, `array<string>`) reads as
+/// [`FieldType::Any`] with the type kept verbatim in `custom_type`.
 fn parse_kind(text: &str) -> Kind {
     let mut nullable = false;
     let mut members: Vec<&str> = split_union(text);
@@ -171,10 +178,19 @@ fn parse_kind(text: &str) -> Kind {
             _ => break,
         }
     }
+    let custom = |members: &[&str]| Kind {
+        nullable,
+        custom_type: Some(members.join(" | ")),
+        ..Kind::default()
+    };
     let [only] = members.as_slice() else {
-        return Kind {
-            nullable,
-            ..Kind::default()
+        return if members.is_empty() {
+            Kind {
+                nullable,
+                ..Kind::default()
+            }
+        } else {
+            custom(&members)
         };
     };
     let base = only
@@ -193,10 +209,21 @@ fn parse_kind(text: &str) -> Kind {
             .and_then(record_targets),
         _ => None,
     };
+    // Keep what the keywords would render differently (`array<string>`,
+    // `geometry<point>`, a literal) verbatim, so it renders back the same.
+    let mut keyword = FieldDefinition::new("", field_type);
+    keyword.target_table.clone_from(&target_table);
+    let renders_back = keyword
+        .type_clause()
+        .is_some_and(|rendered| normalize_type(&rendered) == normalize_type(only));
+    if !renders_back {
+        return custom(&members);
+    }
     Kind {
         field_type,
         nullable,
         target_table,
+        custom_type: None,
     }
 }
 
@@ -354,6 +381,68 @@ mod echo_tests {
         assert_eq!(f.field_type, FieldType::Any);
         let f = super::parse_field("j", "DEFINE FIELD j ON t4 TYPE record<user | post>").unwrap();
         assert_eq!(f.target_table.as_deref(), Some("user | post"));
+        assert_eq!(f.custom_type, None);
+    }
+
+    /// The SurrealDB 3.3 echoes of types the keywords cannot spell: each
+    /// keeps its type verbatim and renders it back.
+    #[test]
+    fn types_the_keywords_cannot_spell_are_kept() {
+        let cases = [
+            ("array<string> | int", "array<string> | int", false),
+            ("none | array<string> | int", "array<string> | int", true),
+            ("'draft' | 'published'", "'draft' | 'published'", false),
+            ("array<string, 5>", "array<string, 5>", false),
+            ("set<int>", "set<int>", false),
+            ("geometry<point>", "geometry<point>", false),
+            ("1 |  2.5f | true", "1 | 2.5f | true", false),
+            (
+                "{ kind: 'x', n: int } | array<record<u>>",
+                "{ kind: 'x', n: int } | array<record<u>>",
+                false,
+            ),
+        ];
+        for (echo, kept, nullable) in cases {
+            let f = super::parse_field(
+                "f",
+                &format!("DEFINE FIELD f ON u TYPE {echo} PERMISSIONS FULL"),
+            )
+            .unwrap();
+            assert_eq!(f.field_type, FieldType::Any, "{echo}");
+            assert_eq!(f.custom_type.as_deref(), Some(kept), "{echo}");
+            assert_eq!(f.nullable, nullable, "{echo}");
+            assert_eq!(f.target_table, None, "{echo}");
+        }
+        for plain in [
+            "string",
+            "none | string",
+            "record<user>",
+            "array<record<a | b>>",
+            "array",
+        ] {
+            let f = super::parse_field("f", &format!("DEFINE FIELD f ON u TYPE {plain}")).unwrap();
+            assert_eq!(f.custom_type, None, "{plain}");
+        }
+    }
+
+    #[test]
+    fn a_custom_type_compares_equal_to_its_echo() {
+        use crate::migration::diff::fields_equal;
+        let code = crate::schema::fields::FieldDefinition::new("f", FieldType::Any)
+            .with_custom_type("\"draft\"|'published'|2.5")
+            .with_nullable(true);
+        assert_eq!(
+            code.to_surql("u"),
+            "DEFINE FIELD f ON TABLE u TYPE option<\"draft\"|'published'|2.5>;"
+        );
+        let echo = super::parse_field(
+            "f",
+            "DEFINE FIELD f ON u TYPE none | 'draft' | 'published' |  2.5f PERMISSIONS FULL",
+        )
+        .unwrap();
+        assert!(fields_equal(&code, &echo), "{code:?} vs {echo:?}");
+        let other = code.clone().with_custom_type("'draft' | 'archived' | 2.5");
+        assert!(!fields_equal(&other, &echo));
     }
 
     /// The engine echoes a bare `REFERENCE` with its default action spelled

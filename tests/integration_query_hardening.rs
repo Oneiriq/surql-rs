@@ -6,7 +6,7 @@
 //! SurrealDB server is reachable. Exercise with:
 //!
 //! ```text
-//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.3.0 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --all-features --test integration_query_hardening -- --test-threads=1
 //! ```
@@ -17,12 +17,12 @@ use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
-use surql::connection::{ConnectionConfig, DatabaseClient};
+use surql::connection::{ConnectionConfig, DatabaseClient, Transaction};
 use surql::query::builder::Query;
 use surql::query::expressions::time_now;
 use surql::query::hints::{IndexHint, QueryHint, TimeoutHint};
 use surql::query::{batch, crud, executor, graph, DataMap, GraphQuery};
-use surql::types::operators::{eq_expr, type_thing};
+use surql::types::operators::{eq, eq_expr, type_thing};
 use surql::types::record_ref;
 
 fn env_url() -> Option<String> {
@@ -817,4 +817,130 @@ async fn every_lexer_word_is_a_usable_table_name() {
     }
     client.disconnect().await.unwrap();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A value nested 40 levels deep, past the parser's limit of 20 for a
+/// literal, through every path that renders values into the statement.
+#[tokio::test]
+async fn deeply_nested_values_reach_the_engine_whole() {
+    let Some(client) = connected_client().await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    let deep = (0..40).fold(
+        json!("it's \\ deep"),
+        |inner, i| json!({ "l": inner, "i": i }),
+    );
+    let stored = |table: &'static str| {
+        let client = &client;
+        async move {
+            executor::execute_raw(client, &format!("SELECT VALUE v FROM {table}"), None)
+                .await
+                .expect("read back")
+        }
+    };
+
+    Query::new()
+        .insert("created", data(&[("v", deep.clone())]))
+        .unwrap()
+        .execute(&client)
+        .await
+        .expect("builder CREATE");
+    assert_eq!(stored("created").await, json!([[deep]]));
+
+    Query::new()
+        .update("created", data(&[("v", json!({ "shallow": true }))]))
+        .unwrap()
+        .execute(&client)
+        .await
+        .expect("builder UPDATE");
+    Query::new()
+        .update("created", data(&[("v", deep.clone())]))
+        .unwrap()
+        .execute(&client)
+        .await
+        .expect("builder UPDATE");
+    assert_eq!(stored("created").await, json!([[deep]]));
+
+    let found = executor::execute_query(
+        &client,
+        &Query::new()
+            .select(None)
+            .from_table("created")
+            .unwrap()
+            .where_op(eq("v", deep.clone())),
+    )
+    .await
+    .expect("WHERE on a deep value");
+    assert_eq!(found[0].as_array().map(Vec::len), Some(1), "{found}");
+
+    batch::insert_many(&client, "inserted", vec![json!({ "v": deep })])
+        .await
+        .expect("insert_many");
+    assert_eq!(stored("inserted").await, json!([[deep]]));
+
+    let edge = serde_json::Map::from_iter([("v".to_owned(), deep.clone())]);
+    batch::relate_many(
+        &client,
+        "created",
+        "linked",
+        "inserted",
+        vec![batch::RelateItem::new("created:a", "inserted:b").with_data(edge)],
+    )
+    .await
+    .expect("relate_many");
+    assert_eq!(stored("linked").await, json!([[deep]]));
+
+    let mut txn = Transaction::begin(&client).await.expect("begin");
+    batch::upsert_many_in_tx(
+        &mut txn,
+        "upserted",
+        vec![json!({ "id": "x", "v": deep })],
+        None,
+    )
+    .await
+    .expect("queue");
+    txn.commit().await.expect("upsert_many_in_tx");
+    assert_eq!(stored("upserted").await, json!([[deep]]));
+
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn select_for_update_runs_inside_a_transaction() {
+    let Some(client) = connected_client().await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    client
+        .query("CREATE account:alice SET balance = 10;")
+        .await
+        .expect("seed");
+    // `FOR UPDATE` is SurrealDB 3.3 syntax.
+    if let Err(err) = client
+        .query("SELECT * FROM account:alice FOR UPDATE;")
+        .await
+    {
+        println!("skipped: the server predates SELECT ... FOR UPDATE: {err}");
+        return;
+    }
+    let locked = Query::new()
+        .select(None)
+        .from_table("account:alice")
+        .unwrap()
+        .for_update()
+        .to_surql()
+        .unwrap();
+    let mut txn = Transaction::begin(&client).await.expect("begin");
+    txn.execute(&locked).await.expect("queue the locking read");
+    txn.execute("UPDATE account:alice SET balance -= 3;")
+        .await
+        .expect("queue the write");
+    txn.commit().await.expect("commit");
+    let rows = executor::execute_raw(&client, "SELECT VALUE balance FROM account:alice", None)
+        .await
+        .expect("read back");
+    assert_eq!(rows, json!([[7]]));
+
+    client.disconnect().await.unwrap();
 }

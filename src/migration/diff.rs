@@ -69,12 +69,14 @@ use crate::schema::sequence::SequenceDefinition;
 use crate::schema::table::{EventDefinition, IndexDefinition, TableDefinition};
 use crate::schema::view::ViewDefinition;
 
+mod access_equality;
 mod equality;
 mod generate;
 mod normalize;
 mod render;
 mod validate;
 
+pub use access_equality::{accesses_equal, duration_nanos};
 pub use equality::{
     events_equal, field_permissions_equal, fields_equal, indexes_equal, permissions_equal,
     table_permissions_equal,
@@ -86,7 +88,7 @@ use generate::{
     generate_drop_table_diffs, generate_modify_event_diff, generate_modify_field_diff,
     generate_modify_index_diff, generate_modify_permissions_diff,
 };
-pub use normalize::{expr_eq, normalize_expression};
+pub use normalize::{expr_eq, normalize_expression, normalize_type, type_eq};
 use render::edge_define_sql;
 pub use validate::{validate_default_value, validate_event_expression};
 
@@ -546,23 +548,39 @@ fn diff_edge_pair_inner(code: &EdgeDefinition, db: &EdgeDefinition) -> Vec<Schem
     out
 }
 
-/// What an edge's own `DEFINE TABLE` says about its shape: the mode and, for
-/// a relation, the two endpoint tables. A non-relation edge renders no
-/// endpoints, so any it carries are not part of its shape.
-fn edge_shape(edge: &EdgeDefinition) -> (EdgeMode, Option<String>, Option<String>) {
-    match edge.mode {
-        EdgeMode::Relation => (
-            edge.mode,
-            edge.from_table.as_deref().map(normalize_expression),
-            edge.to_table.as_deref().map(normalize_expression),
-        ),
-        mode => (mode, None, None),
+/// What an edge's own `DEFINE TABLE` says about its shape.
+#[derive(PartialEq)]
+struct EdgeShape {
+    mode: EdgeMode,
+    from: Option<String>,
+    to: Option<String>,
+    enforced: bool,
+    lightweight: bool,
+    inline_caps: (Option<u32>, Option<u32>),
+}
+
+/// The mode, the inline caps and, for a relation, the two endpoint tables
+/// and the `ENFORCED` / `LIGHTWEIGHT` flags. A non-relation edge renders no
+/// endpoints or flags, so any it carries are not part of its shape.
+fn edge_shape(edge: &EdgeDefinition) -> EdgeShape {
+    let relation = edge.mode == EdgeMode::Relation;
+    EdgeShape {
+        mode: edge.mode,
+        from: relation
+            .then(|| edge.from_table.as_deref().map(normalize_expression))
+            .flatten(),
+        to: relation
+            .then(|| edge.to_table.as_deref().map(normalize_expression))
+            .flatten(),
+        enforced: relation && edge.is_enforced(),
+        lightweight: relation && edge.lightweight,
+        inline_caps: (edge.inline_edges, edge.inline_references),
     }
 }
 
 /// Compare the parts of a `DEFINE TABLE` statement that belong to the table
 /// itself rather than to a field, index, event, or permission rule: the
-/// change feed and the `AS SELECT` view body.
+/// change feed, the `AS SELECT` view body and the inline caps.
 ///
 /// The table mode is deliberately left out. It is carried by the same
 /// `OVERWRITE` statement, so a change to it rides along with any of the other
@@ -577,10 +595,18 @@ fn diff_table_body(code: &TableDefinition, db: &TableDefinition) -> Vec<SchemaDi
         code.view.as_ref().map(ViewDefinition::to_clause).as_deref(),
         db.view.as_ref().map(ViewDefinition::to_clause).as_deref(),
     );
-    if !changefeed_changed && !view_changed {
+    let caps_changed =
+        (code.inline_edges, code.inline_references) != (db.inline_edges, db.inline_references);
+    if !changefeed_changed && !view_changed && !caps_changed {
         return Vec::new();
     }
-    let what = if view_changed { "view" } else { "change feed" };
+    let what = if view_changed {
+        "view"
+    } else if changefeed_changed {
+        "change feed"
+    } else {
+        "inline caches"
+    };
     vec![SchemaDiff {
         operation: DiffOperation::ModifyTable,
         table: code.name.clone(),
@@ -629,4 +655,5 @@ where
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // MTREE stays covered: old snapshots and echoes still load
 mod tests;

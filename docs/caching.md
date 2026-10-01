@@ -124,8 +124,11 @@ let manager = configure_cache(config)?;
 `RedisCache` lazily opens its connection on the first `get` / `set`.
 Values are JSON-encoded on the wire so the backend can be shared with
 non-Rust consumers that adhere to the same prefix and value contract.
-A connection the server drops is discarded on the error that reveals
-it, and the next call connects afresh.
+The connection is a redis `ConnectionManager` shared by every call: when
+the server drops it, the call that finds out fails and a new connection
+is made in the background, so the calls after it succeed again. An
+unreachable server is an error after two connection attempts, not a
+stall.
 
 The manager applies `key_prefix` to every key, so the `RedisCache` it
 builds carries no prefix of its own and `surql:users:active` is stored

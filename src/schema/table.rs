@@ -8,6 +8,7 @@
 //! `schema::table::IndexDefinition` and friends keep resolving.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +20,11 @@ use super::fields::FieldDefinition;
 use super::permissions::{render_permissions_clause, validate_permissions, TABLE_ACTIONS};
 use super::view::ViewDefinition;
 
+#[allow(deprecated)] // re-exports `mtree_index`, kept for existing code
 pub use super::index::{
-    bm25_index, diskann_index, hnsw_index, index, mtree_index, search_index, unique_index,
-    DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType, MTreeDistanceType,
-    MTreeVectorType,
+    bm25_index, count_index, diskann_index, hnsw_index, index, mtree_index, search_index,
+    unique_index, DiskAnnDistanceType, HnswDistanceType, IndexDefinition, IndexType,
+    MTreeDistanceType, MTreeVectorType,
 };
 
 /// Table schema mode.
@@ -208,6 +210,28 @@ pub struct TableDefinition {
     /// one is maintained by the engine and holds no declared fields.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub view: Option<ViewDefinition>,
+    /// Cap on the cache of edges kept beside each record, so a traversal
+    /// from it reads no edge records (`INLINE EDGES <n>`, SurrealDB 3.3+).
+    /// `None` keeps no cache.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inline_edges: Option<u32>,
+    /// Cap on the cache of incoming references kept beside each record
+    /// (`INLINE REFERENCES <n>`, SurrealDB 3.3+). `None` keeps no cache.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inline_references: Option<u32>,
+}
+
+/// Render the `INLINE EDGES` / `INLINE REFERENCES` caps, each with its
+/// leading space, as the engine prints them.
+pub(crate) fn render_inline_caps(edges: Option<u32>, references: Option<u32>) -> String {
+    let mut sql = String::new();
+    if let Some(n) = edges {
+        let _ = write!(sql, " INLINE EDGES {n}");
+    }
+    if let Some(n) = references {
+        let _ = write!(sql, " INLINE REFERENCES {n}");
+    }
+    sql
 }
 
 impl TableDefinition {
@@ -227,7 +251,23 @@ impl TableDefinition {
             drop: false,
             changefeed: None,
             view: None,
+            inline_edges: None,
+            inline_references: None,
         }
+    }
+
+    /// Keep up to `cap` edges beside each record, so a traversal from it
+    /// reads no edge records (`INLINE EDGES`, SurrealDB 3.3+).
+    pub fn with_inline_edges(mut self, cap: u32) -> Self {
+        self.inline_edges = Some(cap);
+        self
+    }
+
+    /// Keep up to `cap` incoming references beside each record (`INLINE
+    /// REFERENCES`, SurrealDB 3.3+).
+    pub fn with_inline_references(mut self, cap: u32) -> Self {
+        self.inline_references = Some(cap);
+        self
     }
 
     /// Set the schema mode.
@@ -312,6 +352,15 @@ impl TableDefinition {
         )?;
         for field in &self.fields {
             field.validate()?;
+            if field.inline {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "Field {:?} on table {:?}: INLINE fields belong to relation \
+                         tables (an EdgeDefinition in RELATION mode)",
+                        field.name, self.name
+                    ),
+                });
+            }
         }
         for index in &self.indexes {
             index.validate()?;
@@ -379,12 +428,13 @@ impl TableDefinition {
             ""
         };
         format!(
-            "DEFINE TABLE{ine} {name} {kind}{drop}{mode}{view}{changefeed}{perms};",
+            "DEFINE TABLE{ine} {name} {kind}{drop}{mode}{inline}{view}{changefeed}{perms};",
             ine = ine,
             name = quote_ident(&self.name),
             kind = kind,
             drop = drop,
             mode = self.mode.as_str(),
+            inline = render_inline_caps(self.inline_edges, self.inline_references),
             view = view,
             changefeed = changefeed,
             perms = perms,

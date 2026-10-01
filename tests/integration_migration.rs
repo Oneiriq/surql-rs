@@ -7,7 +7,7 @@
 //! SurrealDB server is reachable. Exercise with:
 //!
 //! ```text
-//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.3.0 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --all-features --test integration_migration
 //! ```
@@ -23,9 +23,10 @@ use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::migration::{
     create_migration_plan, create_rollback_plan, discover_migrations, ensure_migration_table,
     execute_migration, execute_migration_plan, execute_rollback, get_applied_migrations,
-    get_migration_status, get_pending_migrations, is_migration_applied, migrate_down, migrate_up,
-    record_migration, squash_migrations, MigrateUpOptions, Migration, MigrationDirection,
-    MigrationHistory, MigrationState, SquashOptions,
+    get_migration_status, get_modified_migrations, get_pending_migrations, is_migration_applied,
+    migrate_down, migrate_up, record_migration, rehash_migrations, squash_migrations,
+    MigrateUpOptions, Migration, MigrationDirection, MigrationHistory, MigrationState,
+    SquashOptions,
 };
 
 fn env_url() -> Option<String> {
@@ -474,4 +475,61 @@ async fn a_destructive_rollback_waits_for_approval() {
     let result = execute_rollback(&client, plan.approve()).await.unwrap();
     assert!(result.success, "{result:?}");
     assert!(!table_names(&client).await.contains(&"second".to_string()));
+}
+
+#[tokio::test]
+async fn an_edited_applied_migration_blocks_up_until_rehashed() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    sample_up_down(tmp.path(), "20260101_000001", "fruit");
+    migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+
+    // Edit the applied file, and add a new migration to apply.
+    let path = tmp.path().join("20260101_000001_create_fruit.surql");
+    let edited = std::fs::read_to_string(&path).unwrap().replace(
+        "TYPE string;",
+        "TYPE string; -- a note added after applying",
+    );
+    std::fs::write(&path, edited).unwrap();
+    sample_up_down(tmp.path(), "20260101_000002", "veg");
+
+    let report = get_migration_status(&client, tmp.path()).await.unwrap();
+    assert_eq!(report.applied_count(), 1);
+    assert_eq!(report.pending_count(), 1);
+    assert_eq!(report.modified.len(), 1);
+    assert_eq!(report.modified[0].version, "20260101_000001");
+    assert_eq!(
+        get_modified_migrations(&client, tmp.path()).await.unwrap(),
+        report.modified
+    );
+
+    let err = migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .expect_err("an edited applied migration refuses the run");
+    assert!(err.to_string().contains("20260101_000001"), "{err}");
+    assert!(!table_names(&client).await.contains(&"veg".to_string()));
+
+    let err = rehash_migrations(&client, tmp.path(), &["20260101_000002".into()])
+        .await
+        .expect_err("only a modified applied migration can be re-hashed");
+    assert!(err.to_string().contains("20260101_000002"), "{err}");
+
+    let rehashed = rehash_migrations(&client, tmp.path(), &[]).await.unwrap();
+    assert_eq!(rehashed, report.modified);
+    let history = get_applied_migrations(&client).await.unwrap();
+    assert_eq!(history[0].checksum, rehashed[0].current_checksum);
+    assert!(get_modified_migrations(&client, tmp.path())
+        .await
+        .unwrap()
+        .is_empty());
+
+    let statuses = migrate_up(&client, tmp.path(), MigrateUpOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].migration.version, "20260101_000002");
 }

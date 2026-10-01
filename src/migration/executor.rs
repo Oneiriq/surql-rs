@@ -30,13 +30,14 @@ use chrono::{DateTime, Utc};
 
 use crate::connection::{DatabaseClient, Transaction};
 use crate::error::{Result, SurqlError};
-use crate::migration::discovery::{discover_migrations, order_migrations};
+use crate::migration::discovery::{discover_migrations, modified_migrations, order_migrations};
 use crate::migration::history::{
     ensure_migration_table, get_applied_migrations as history_get_applied, is_migration_applied,
-    record_statement, removal_statement,
+    record_statement, removal_statement, update_migration_checksum,
 };
 use crate::migration::models::{
-    Migration, MigrationDirection, MigrationHistory, MigrationPlan, MigrationState, MigrationStatus,
+    Migration, MigrationDirection, MigrationHistory, MigrationPlan, MigrationState,
+    MigrationStatus, ModifiedMigration,
 };
 
 /// Aggregate status of a migrations directory relative to the database.
@@ -48,6 +49,9 @@ pub struct MigrationStatusReport {
     pub applied: Vec<MigrationStatus>,
     /// Migrations that have not yet been applied.
     pub pending: Vec<MigrationStatus>,
+    /// Applied migrations whose file changed after it was applied (see
+    /// [`modified_migrations`]). Each is also listed in `applied`.
+    pub modified: Vec<ModifiedMigration>,
 }
 
 impl MigrationStatusReport {
@@ -187,9 +191,16 @@ pub async fn execute_migration(
 /// is included in the returned vector but subsequent migrations are
 /// not attempted.
 ///
+/// Nothing is applied while an applied migration's file differs from the
+/// checksum recorded for it (see [`get_modified_migrations`]): the schema
+/// no longer matches the files, so migrations written against them may
+/// not apply as intended. Revert the edit, or accept it with
+/// [`rehash_migrations`].
+///
 /// # Errors
 ///
-/// Returns [`SurqlError::MigrationExecution`] or
+/// Returns [`SurqlError::MigrationExecution`] if an applied migration was
+/// modified, or [`SurqlError::MigrationExecution`] or
 /// [`SurqlError::MigrationDiscovery`] if the directory cannot be
 /// scanned or the history table cannot be ensured.
 pub async fn migrate_up(
@@ -198,7 +209,10 @@ pub async fn migrate_up(
     opts: MigrateUpOptions,
 ) -> Result<Vec<MigrationStatus>> {
     ensure_migration_table(client).await?;
-    let pending = get_pending_migrations(client, migrations_dir).await?;
+    let on_disk = discover_migrations(migrations_dir)?;
+    let history = history_get_applied(client).await?;
+    refuse_modified(&modified_migrations(&on_disk, &history))?;
+    let pending = pending_among(on_disk, &history);
     let to_apply: Vec<Migration> = match opts.steps {
         Some(n) => pending.into_iter().take(n).collect(),
         None => pending,
@@ -382,7 +396,9 @@ pub async fn get_applied_migrations_ordered(
 ///
 /// Both lists follow the order [`discover_migrations`] returns. A squashed
 /// migration whose sources are all applied, and a migration a recorded
-/// squashed migration replaced, are reported as applied.
+/// squashed migration replaced, are reported as applied. Applied
+/// migrations whose file changed since are also listed in
+/// [`MigrationStatusReport::modified`].
 ///
 /// # Errors
 ///
@@ -395,6 +411,7 @@ pub async fn get_migration_status(
     ensure_migration_table(client).await?;
     let on_disk = discover_migrations(migrations_dir)?;
     let history = history_get_applied(client).await?;
+    let modified = modified_migrations(&on_disk, &history);
     let applied_map = effective_applied(&on_disk, &history);
 
     let mut applied = Vec::new();
@@ -421,6 +438,75 @@ pub async fn get_migration_status(
         total: on_disk.len(),
         applied,
         pending,
+        modified,
+    })
+}
+
+/// List the applied migrations in `migrations_dir` whose file no longer
+/// matches the checksum recorded when it was applied (see
+/// [`modified_migrations`]).
+///
+/// # Errors
+///
+/// Returns [`SurqlError::MigrationExecution`] on discovery or history
+/// failure.
+pub async fn get_modified_migrations(
+    client: &DatabaseClient,
+    migrations_dir: &Path,
+) -> Result<Vec<ModifiedMigration>> {
+    ensure_migration_table(client).await?;
+    let on_disk = discover_migrations(migrations_dir)?;
+    let history = history_get_applied(client).await?;
+    Ok(modified_migrations(&on_disk, &history))
+}
+
+/// Accept edits to applied migrations by recording their files' current
+/// checksums, for edits that need no applying (comments, formatting).
+///
+/// Re-hashes every modified migration when `versions` is empty, and only
+/// the listed ones otherwise. Returns the migrations that were re-hashed.
+/// Nothing is executed against the schema.
+///
+/// # Errors
+///
+/// Returns [`SurqlError::MigrationExecution`] when a listed version is not
+/// a modified applied migration, or on discovery or history failure.
+pub async fn rehash_migrations(
+    client: &DatabaseClient,
+    migrations_dir: &Path,
+    versions: &[String],
+) -> Result<Vec<ModifiedMigration>> {
+    let modified = get_modified_migrations(client, migrations_dir).await?;
+    if let Some(unknown) = versions
+        .iter()
+        .find(|v| !modified.iter().any(|m| &m.version == *v))
+    {
+        return Err(SurqlError::MigrationExecution {
+            reason: format!("migration {unknown} is not an applied migration whose file changed"),
+        });
+    }
+    let selected: Vec<ModifiedMigration> = modified
+        .into_iter()
+        .filter(|m| versions.is_empty() || versions.contains(&m.version))
+        .collect();
+    for migration in &selected {
+        update_migration_checksum(client, &migration.version, &migration.current_checksum).await?;
+    }
+    Ok(selected)
+}
+
+/// An error naming every modified migration, or `Ok` when there are none.
+pub(crate) fn refuse_modified(modified: &[ModifiedMigration]) -> Result<()> {
+    if modified.is_empty() {
+        return Ok(());
+    }
+    let versions: Vec<&str> = modified.iter().map(|m| m.version.as_str()).collect();
+    Err(SurqlError::MigrationExecution {
+        reason: format!(
+            "applied migration(s) changed since they were applied: {}; revert the edit, \
+             or accept it with `surql migrate rehash` if it needs no applying",
+            versions.join(", ")
+        ),
     })
 }
 
@@ -663,6 +749,7 @@ mod tests {
                 error: None,
             }],
             pending: Vec::new(),
+            modified: Vec::new(),
         };
         assert_eq!(report.applied_count(), 1);
         assert_eq!(report.pending_count(), 0);

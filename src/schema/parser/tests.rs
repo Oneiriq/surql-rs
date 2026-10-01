@@ -6,8 +6,9 @@ use crate::schema::access::{jwt_access, record_access, AccessType, JwtConfig, Re
 use crate::schema::edge::{typed_edge, EdgeMode};
 use crate::schema::fields::{datetime_field, int_field, string_field, FieldType};
 use crate::schema::table::{
-    diskann_index, mtree_index, search_index, table_schema, unique_index, DiskAnnDistanceType,
-    HnswDistanceType, IndexType, MTreeDistanceType, MTreeVectorType, TableMode,
+    count_index, diskann_index, mtree_index, search_index, table_schema, unique_index,
+    DiskAnnDistanceType, HnswDistanceType, IndexType, MTreeDistanceType, MTreeVectorType,
+    TableMode,
 };
 use serde_json::json;
 
@@ -196,6 +197,39 @@ fn parse_index_mtree() {
     assert_eq!(idx.dimension, Some(1536));
     assert_eq!(idx.distance, Some(MTreeDistanceType::Cosine));
     assert_eq!(idx.vector_type, Some(MTreeVectorType::F32));
+}
+
+/// The SurrealDB 3.3 echoes of a count index, with and without a
+/// condition, and with a comment after one.
+#[test]
+fn parse_index_count() {
+    let all = parse_index("c_all", "DEFINE INDEX c_all ON c COUNT").unwrap();
+    assert_eq!(all.index_type, IndexType::Count);
+    assert!(all.columns.is_empty());
+    assert_eq!(all.condition, None);
+
+    let active = parse_index(
+        "c_act",
+        "DEFINE INDEX c_act ON c COUNT WHERE active = true AND n > 3 COMMENT 'x'",
+    )
+    .unwrap();
+    assert_eq!(active.index_type, IndexType::Count);
+    assert_eq!(active.condition.as_deref(), Some("active = true AND n > 3"));
+
+    // A `COMMENT` inside the condition's string is not the clause.
+    let quoted = parse_index(
+        "c_q",
+        "DEFINE INDEX c_q ON c COUNT WHERE note = 'x COMMENT y';",
+    )
+    .unwrap();
+    assert_eq!(quoted.condition.as_deref(), Some("note = 'x COMMENT y'"));
+
+    let code = count_index("c_act").with_condition("(active = true AND n > 3)");
+    assert!(crate::migration::diff::indexes_equal(&code, &active));
+    assert!(!crate::migration::diff::indexes_equal(
+        &count_index("c_act"),
+        &active
+    ));
 }
 
 #[test]

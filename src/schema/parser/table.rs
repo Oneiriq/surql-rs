@@ -30,6 +30,8 @@ pub(super) struct Relation {
 }
 
 /// The parts of a `DEFINE TABLE` statement the parsers read.
+// One bool per independent flag the statement can carry.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct TableStatement<'a> {
     /// `Some` for a `TYPE RELATION` table.
@@ -44,6 +46,14 @@ pub(super) struct TableStatement<'a> {
     pub view: Option<&'a str>,
     /// The `PERMISSIONS` clause body.
     pub permissions: Option<&'a str>,
+    /// Whether a relation is `ENFORCED` (a lightweight one always is).
+    pub enforced: bool,
+    /// Whether a relation is `LIGHTWEIGHT`.
+    pub lightweight: bool,
+    /// The `INLINE EDGES` cap.
+    pub inline_edges: Option<u32>,
+    /// The `INLINE REFERENCES` cap.
+    pub inline_references: Option<u32>,
 }
 
 /// Clauses that can follow the table mode. The engine echoes them in this
@@ -60,18 +70,36 @@ const TAIL_CLAUSES: &[(&str, Shape)] = &[
 /// Read a `DEFINE TABLE` statement.
 ///
 /// The engine echoes `DEFINE TABLE <name> TYPE <NORMAL | ANY | RELATION IN a
-/// | b OUT c [ENFORCED]> [DROP] <SCHEMAFULL | SCHEMALESS> [COMMENT …] [AS
-/// SELECT …] [CHANGEFEED …] PERMISSIONS …`; the flags are read word by word,
-/// so a table named after a keyword (`IN schemafull`) stays a name, and the
-/// rest is split into clauses outside quotes and brackets.
+/// | b OUT c [ENFORCED] [LIGHTWEIGHT]> [DROP] <SCHEMAFULL | SCHEMALESS>
+/// [INLINE EDGES n] [INLINE REFERENCES n] [COMMENT …] [AS SELECT …]
+/// [CHANGEFEED …] PERMISSIONS …`; the flags are read word by word, so a
+/// table named after a keyword (`IN schemafull`) stays a name, and the rest
+/// is split into clauses outside quotes and brackets.
 pub(super) fn read_table(definition: &str) -> TableStatement<'_> {
     let rest = define_head(definition, "TABLE", false).map_or(definition, |head| head.rest);
     let toks = tokens(rest);
     let mut out = TableStatement::default();
     let mut i = 0;
     while let Some(token) = toks.get(i) {
-        if token.is("TYPE") || token.is("NORMAL") || token.is("ANY") || token.is("ENFORCED") {
+        if token.is("TYPE") || token.is("NORMAL") || token.is("ANY") {
             i += 1;
+        } else if token.is("ENFORCED") {
+            out.enforced = true;
+            i += 1;
+        } else if token.is("LIGHTWEIGHT") {
+            out.lightweight = true;
+            out.enforced = true;
+            i += 1;
+        } else if token.is("INLINE") {
+            let cap = toks
+                .get(i + 2)
+                .and_then(|t| t.text.trim_end_matches(';').parse::<u32>().ok());
+            match toks.get(i + 1) {
+                Some(kind) if kind.is("EDGES") => out.inline_edges = cap,
+                Some(kind) if kind.is("REFERENCES") => out.inline_references = cap,
+                _ => break,
+            }
+            i += 3;
         } else if token.is("RELATION") {
             out.relation.get_or_insert_with(Relation::default);
             i += 1;
@@ -250,6 +278,7 @@ pub fn parse_table_info(
         .map(|v| parse_events(&value_to_string_map(v)))
         .unwrap_or_default();
 
+    let statement = read_table(tb_definition);
     Ok(TableDefinition {
         name: table_name.to_string(),
         mode,
@@ -260,12 +289,50 @@ pub fn parse_table_info(
         drop: false,
         changefeed: parse_changefeed(tb_definition),
         view: parse_view(tb_definition),
+        inline_edges: statement.inline_edges,
+        inline_references: statement.inline_references,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SurrealDB 3.3 echoes of the relation flags and inline caches.
+    #[test]
+    fn relation_flags_and_inline_caps_read_back() {
+        let knows = read_table(
+            "DEFINE TABLE knows TYPE RELATION IN person OUT person ENFORCED LIGHTWEIGHT \
+             SCHEMALESS PERMISSIONS NONE",
+        );
+        assert!(knows.enforced && knows.lightweight);
+        assert_eq!(knows.permissions, Some("NONE"));
+
+        let likes = read_table(
+            "DEFINE TABLE likes TYPE RELATION IN person OUT person ENFORCED SCHEMALESS INLINE \
+             EDGES 8 INLINE REFERENCES 4 PERMISSIONS FULL",
+        );
+        assert!(likes.enforced && !likes.lightweight);
+        assert_eq!(
+            (likes.inline_edges, likes.inline_references),
+            (Some(8), Some(4))
+        );
+        assert_eq!(likes.permissions, Some("FULL"));
+        assert_eq!(
+            likes.relation.map(|r| (r.from, r.to)),
+            Some((vec!["person".to_string()], vec!["person".to_string()]))
+        );
+
+        let doc =
+            read_table("DEFINE TABLE doc TYPE NORMAL SCHEMAFULL INLINE EDGES 16 PERMISSIONS NONE");
+        assert!(doc.schemafull);
+        assert_eq!((doc.inline_edges, doc.inline_references), (Some(16), None));
+
+        // A table named `inline` is a name, not the clause.
+        let named = read_table("DEFINE TABLE inline TYPE NORMAL SCHEMAFULL PERMISSIONS NONE");
+        assert!(named.schemafull);
+        assert_eq!(named.inline_edges, None);
+    }
 
     #[test]
     fn changefeed_without_original() {

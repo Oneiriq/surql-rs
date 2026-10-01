@@ -196,6 +196,18 @@ impl Query {
         if let Some(n) = self.offset_value {
             parts.push(format!("START {n}"));
         }
+        if self.for_update {
+            // The engine locks records, so it refuses a table target.
+            if !self.table_name.as_deref().unwrap_or("").contains(':') {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "SELECT ... FOR UPDATE locks records, so it takes a record id \
+                         target, not the table {table}"
+                    ),
+                });
+            }
+            parts.push("FOR UPDATE".to_string());
+        }
 
         Ok(parts.join(" "))
     }

@@ -19,7 +19,7 @@ use crate::types::escape::quote_ident;
 
 use super::fields::{render_table_list, FieldDefinition};
 use super::permissions::{render_permissions_clause, validate_permissions, TABLE_ACTIONS};
-use super::table::{EventDefinition, IndexDefinition};
+use super::table::{render_inline_caps, EventDefinition, IndexDefinition};
 
 /// Edge table mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +79,24 @@ pub struct EdgeDefinition {
     /// [`TableDefinition::permissions`](super::table::TableDefinition::permissions).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub permissions: Option<BTreeMap<String, String>>,
+    /// Whether the endpoints must exist when an edge is created
+    /// (`ENFORCED`), for `RELATION` mode.
+    #[serde(default)]
+    pub enforced: bool,
+    /// Whether edges are stored as adjacency entries on their endpoints
+    /// alone, with no edge records (`LIGHTWEIGHT`, SurrealDB 3.3+), for
+    /// `RELATION` mode. A lightweight relation is enforced, and holds no
+    /// fields, indexes or events.
+    #[serde(default)]
+    pub lightweight: bool,
+    /// Cap on the cache of edges kept beside each record (`INLINE EDGES`,
+    /// SurrealDB 3.3+); see [`TableDefinition::inline_edges`](super::table::TableDefinition::inline_edges).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inline_edges: Option<u32>,
+    /// Cap on the cache of incoming references kept beside each record
+    /// (`INLINE REFERENCES`, SurrealDB 3.3+).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inline_references: Option<u32>,
 }
 
 impl EdgeDefinition {
@@ -97,7 +115,57 @@ impl EdgeDefinition {
             indexes: Vec::new(),
             events: Vec::new(),
             permissions: None,
+            enforced: false,
+            lightweight: false,
+            inline_edges: None,
+            inline_references: None,
         }
+    }
+
+    /// Require both endpoints to exist when an edge is created
+    /// (`ENFORCED`).
+    pub fn with_enforced(mut self, enforced: bool) -> Self {
+        self.enforced = enforced;
+        self
+    }
+
+    /// Store edges as adjacency entries on their endpoints alone, with no
+    /// edge records (`LIGHTWEIGHT`, SurrealDB 3.3+). Implies `ENFORCED`.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::schema::typed_edge;
+    ///
+    /// let follows = typed_edge("follows", "user", "user").with_lightweight(true);
+    /// assert_eq!(
+    ///     follows.to_surql().unwrap(),
+    ///     "DEFINE TABLE follows TYPE RELATION FROM user TO user ENFORCED LIGHTWEIGHT;"
+    /// );
+    /// ```
+    pub fn with_lightweight(mut self, lightweight: bool) -> Self {
+        self.lightweight = lightweight;
+        self
+    }
+
+    /// Keep up to `cap` edges beside each record (`INLINE EDGES`, SurrealDB
+    /// 3.3+).
+    pub fn with_inline_edges(mut self, cap: u32) -> Self {
+        self.inline_edges = Some(cap);
+        self
+    }
+
+    /// Keep up to `cap` incoming references beside each record (`INLINE
+    /// REFERENCES`, SurrealDB 3.3+).
+    pub fn with_inline_references(mut self, cap: u32) -> Self {
+        self.inline_references = Some(cap);
+        self
+    }
+
+    /// Whether edges must have existing endpoints: declared `ENFORCED`, or
+    /// lightweight, which implies it.
+    pub fn is_enforced(&self) -> bool {
+        self.enforced || self.lightweight
     }
 
     /// Set the edge mode.
@@ -185,8 +253,36 @@ impl EdgeDefinition {
             self.permissions.as_ref(),
             TABLE_ACTIONS,
         )?;
+        let relation = self.mode == EdgeMode::Relation;
+        if (self.enforced || self.lightweight) && !relation {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Edge {:?}: ENFORCED and LIGHTWEIGHT apply to RELATION mode only",
+                    self.name
+                ),
+            });
+        }
+        if self.lightweight
+            && !(self.fields.is_empty() && self.indexes.is_empty() && self.events.is_empty())
+        {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Edge {:?} is LIGHTWEIGHT: its edges have no records, so it takes no \
+                     fields, indexes or events",
+                    self.name
+                ),
+            });
+        }
         for field in &self.fields {
             field.validate()?;
+            if field.inline && !relation {
+                return Err(SurqlError::Validation {
+                    reason: format!(
+                        "Field {:?} on edge {:?}: INLINE fields belong to RELATION mode",
+                        field.name, self.name
+                    ),
+                });
+            }
         }
         for index in &self.indexes {
             index.validate()?;
@@ -218,6 +314,10 @@ impl EdgeDefinition {
         // Table-level PERMISSIONS render inline on the DEFINE TABLE statement
         // (the only valid placement), matching `TableDefinition`.
         let perms = render_permissions_clause(self.permissions.as_ref());
+        let perms = format!(
+            "{}{perms}",
+            render_inline_caps(self.inline_edges, self.inline_references)
+        );
         let name = quote_ident(&self.name);
         match self.mode {
             EdgeMode::Relation => {
@@ -240,13 +340,24 @@ impl EdgeDefinition {
                         ),
                     })?;
                 Ok(format!(
-                    "DEFINE TABLE{ine} {name} TYPE RELATION FROM {from} TO {to}{perms};",
+                    "DEFINE TABLE{ine} {name} TYPE RELATION FROM {from} TO {to}{flags}{perms};",
                     from = render_table_list(from),
                     to = render_table_list(to),
+                    flags = self.relation_flags(),
                 ))
             }
             EdgeMode::Schemafull => Ok(format!("DEFINE TABLE{ine} {name} SCHEMAFULL{perms};")),
             EdgeMode::Schemaless => Ok(format!("DEFINE TABLE{ine} {name} SCHEMALESS{perms};")),
+        }
+    }
+
+    /// The `ENFORCED` / `LIGHTWEIGHT` flags of a relation, with a leading
+    /// space, in the order the engine prints them.
+    pub(crate) fn relation_flags(&self) -> &'static str {
+        match (self.is_enforced(), self.lightweight) {
+            (_, true) => " ENFORCED LIGHTWEIGHT",
+            (true, false) => " ENFORCED",
+            (false, false) => "",
         }
     }
 
@@ -465,5 +576,62 @@ mod tests {
         let e1 = typed_edge("likes", "user", "post");
         let e2 = e1.clone();
         assert_eq!(e1, e2);
+    }
+
+    #[test]
+    fn relation_flags_and_inline_caps_render_as_the_engine_prints_them() {
+        let e = typed_edge("likes", "user", "post")
+            .with_enforced(true)
+            .with_inline_edges(8)
+            .with_inline_references(4)
+            .with_permissions([("select", "FULL")]);
+        assert_eq!(
+            e.to_surql().unwrap(),
+            "DEFINE TABLE likes TYPE RELATION FROM user TO post ENFORCED INLINE EDGES 8 \
+             INLINE REFERENCES 4 PERMISSIONS FOR select FULL;"
+        );
+        let lightweight = typed_edge("knows", "user", "user").with_lightweight(true);
+        assert!(lightweight.is_enforced());
+        assert!(lightweight
+            .to_surql()
+            .unwrap()
+            .ends_with("TO user ENFORCED LIGHTWEIGHT;"));
+    }
+
+    #[test]
+    fn a_lightweight_edge_takes_no_members() {
+        let with_field = typed_edge("knows", "user", "user")
+            .with_lightweight(true)
+            .with_fields([int_field("since").build_unchecked().unwrap()]);
+        let err = with_field.validate().unwrap_err();
+        assert!(err.to_string().contains("LIGHTWEIGHT"), "{err}");
+        let schemaless = EdgeDefinition::new("knows")
+            .with_mode(EdgeMode::Schemaless)
+            .with_lightweight(true);
+        assert!(schemaless.validate().is_err());
+    }
+
+    #[test]
+    fn inline_fields_are_top_level_relation_fields() {
+        use crate::schema::fields::{FieldDefinition, FieldType};
+        let weight = FieldDefinition::new("weight", FieldType::Number).with_inline(true);
+        assert!(typed_edge("likes", "user", "post")
+            .with_fields([weight.clone()])
+            .validate()
+            .is_ok());
+        assert!(weight.to_surql("likes").ends_with("TYPE number INLINE;"));
+        assert!(EdgeDefinition::new("likes")
+            .with_mode(EdgeMode::Schemafull)
+            .with_fields([weight.clone()])
+            .validate()
+            .is_err());
+        assert!(crate::schema::table_schema("t")
+            .with_fields([weight.clone()])
+            .validate()
+            .is_err());
+        let nested = FieldDefinition::new("meta.weight", FieldType::Number).with_inline(true);
+        assert!(nested.validate().is_err());
+        let computed = weight.with_computed("1");
+        assert!(computed.validate().is_err());
     }
 }

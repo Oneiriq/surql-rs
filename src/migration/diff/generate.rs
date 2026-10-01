@@ -89,6 +89,14 @@ fn member_statements(
         .collect()
 }
 
+/// A field's type for a diff's details: its custom type, or the keyword.
+fn type_name(field: &FieldDefinition) -> String {
+    field
+        .custom_type
+        .clone()
+        .unwrap_or_else(|| field.field_type.as_str().to_string())
+}
+
 pub(super) fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> SchemaDiff {
     let mut forward_sql = field_to_sql(table, field);
     if let Some(default) = field.default.as_deref() {
@@ -110,7 +118,7 @@ pub(super) fn generate_add_field_diff(table: &str, field: &FieldDefinition) -> S
     let mut details = BTreeMap::new();
     details.insert(
         "type".to_string(),
-        serde_json::Value::String(field.field_type.as_str().into()),
+        serde_json::Value::String(type_name(field)),
     );
     SchemaDiff {
         operation: DiffOperation::AddField,
@@ -159,11 +167,11 @@ pub(super) fn generate_modify_field_diff(
     let mut details = BTreeMap::new();
     details.insert(
         "old_type".into(),
-        serde_json::Value::String(old_field.field_type.as_str().into()),
+        serde_json::Value::String(type_name(old_field)),
     );
     details.insert(
         "new_type".into(),
-        serde_json::Value::String(new_field.field_type.as_str().into()),
+        serde_json::Value::String(type_name(new_field)),
     );
     let mut description = format!("Modify field {} in {}", new_field.name, table);
     // Gaining REFERENCE is the one field change whose DDL alone leaves

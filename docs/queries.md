@@ -56,7 +56,7 @@ input has one rule:
 | Record-id targets (`from_table`, `update`, `upsert`, `delete`, `relate`, the CRUD and graph helpers) | Parsed and re-rendered as a `RecordID`: the key is escaped (`user:a-b` renders `user:⟨a-b⟩`, and `user:x; DELETE user` targets the record keyed `"x; DELETE user"`). Array, object, range, and generated keys (`user:[1, 2]`, `user:ulid()`) are refused unless quoted. |
 | Fields in `order_by`, `group_by`, `fulltext_search`, `vector_search`, `similarity_score`, `SET` targets, `GraphQuery::select` / `fetch`, `AggregateOpts` aliases | Must be field paths (identifiers joined by `.`). |
 | `search_score` and `reverse_traverse` names | Quoted as identifiers. |
-| Data values (`insert`, `update`, `upsert`, `relate`, `set`, operator values) | Always literals. A JSON object is an object literal at any depth, whatever its keys; keys that are not identifiers are quoted. |
+| Data values (`insert`, `update`, `upsert`, `relate`, `set`, operator values) | Always literals. A JSON object is an object literal, whatever its keys; keys that are not identifiers are quoted. A value nested more than 16 arrays and objects deep (`MAX_INLINE_DEPTH`) renders as its JSON text decoded by the engine, `encoding::json::decode('…')` (SurrealDB 3.1+), since the parser refuses a literal nested 20 levels deep. |
 | Projections passed to `select`, string `WHERE` fragments, `join`, `traverse` paths, `Expression`s | Raw SurrealQL by design: never build them from untrusted text. |
 
 `Query::to_surql` re-checks every name and target it renders, so a

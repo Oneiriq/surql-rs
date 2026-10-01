@@ -42,6 +42,10 @@ pub enum Protocol {
     File,
     /// `surrealkv://`
     SurrealKv,
+    /// `grpc://` (SurrealDB 3.3+; needs the `client-grpc` feature).
+    Grpc,
+    /// `grpcs://` (SurrealDB 3.3+; needs the `client-grpc` feature).
+    GrpcSecure,
 }
 
 impl Protocol {
@@ -66,6 +70,8 @@ impl fmt::Display for Protocol {
             Self::Memory => "memory",
             Self::File => "file",
             Self::SurrealKv => "surrealkv",
+            Self::Grpc => "grpc",
+            Self::GrpcSecure => "grpcs",
         };
         f.write_str(s)
     }
@@ -274,9 +280,15 @@ impl ConnectionConfig {
         if trimmed.starts_with("surrealkv://") {
             return Ok(Protocol::SurrealKv);
         }
+        if trimmed.starts_with("grpc://") {
+            return Ok(Protocol::Grpc);
+        }
+        if trimmed.starts_with("grpcs://") {
+            return Ok(Protocol::GrpcSecure);
+        }
         Err(SurqlError::Validation {
             reason: "URL must use one of: ws://, wss://, http://, https://, \
-                 mem://, memory://, file://, surrealkv://"
+                 mem://, memory://, file://, surrealkv://, grpc://, grpcs://"
                 .into(),
         })
     }
@@ -784,6 +796,8 @@ mod tests {
             ("memory://", Protocol::Memory),
             ("file:///tmp/db", Protocol::File),
             ("surrealkv:///tmp/db", Protocol::SurrealKv),
+            ("grpc://localhost:8000", Protocol::Grpc),
+            ("grpcs://host", Protocol::GrpcSecure),
         ];
         for (url, proto) in cases {
             let cfg = ConnectionConfig {

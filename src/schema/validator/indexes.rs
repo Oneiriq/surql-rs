@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use super::normalize::normalize_expression;
 use super::{presence, ValidationResult, ValidationSeverity};
 use crate::schema::index::{
     DISKANN_DEFAULT_ALPHA, DISKANN_DEFAULT_DEGREE, DISKANN_DEFAULT_L_BUILD,
@@ -124,12 +125,23 @@ pub fn validate_index(
         Some,
     );
 
+    #[allow(deprecated)]
     let kind = match code_index.index_type {
         IndexType::Mtree => "MTREE",
         IndexType::Hnsw => "HNSW",
         IndexType::Diskann => "DISKANN",
         IndexType::Search => {
             check_fulltext(&mut report, code_index, db_index);
+            return report.results;
+        }
+        IndexType::Count => {
+            report.check(
+                ValidationSeverity::Error,
+                "COUNT index condition mismatch",
+                normalize_expression(code_index.condition.as_deref()),
+                normalize_expression(db_index.condition.as_deref()),
+                |condition| condition,
+            );
             return report.results;
         }
         IndexType::Unique | IndexType::Standard => return report.results,
@@ -150,6 +162,7 @@ pub fn validate_index(
         |v| v.map(str::to_string),
     );
 
+    #[allow(deprecated)]
     match code_index.index_type {
         IndexType::Mtree => report.check(
             ValidationSeverity::Warning,

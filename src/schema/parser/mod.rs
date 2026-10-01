@@ -188,4 +188,5 @@ pub struct DatabaseInfo {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // MTREE stays covered: old snapshots and echoes still load
 mod tests;

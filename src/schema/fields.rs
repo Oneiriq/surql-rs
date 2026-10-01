@@ -95,6 +95,9 @@ pub(crate) fn render_table_list(tables: &str) -> String {
 /// let email = FieldDefinition::new("email", FieldType::String);
 /// assert_eq!(email.to_surql("user"), "DEFINE FIELD email ON TABLE user TYPE string;");
 /// ```
+// The bools mirror independent DDL flags (READONLY, FLEXIBLE, INLINE, the
+// `option<...>` wrapper); folding them into enums would only rename them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldDefinition {
     /// Field name (supports dot notation for nested fields).
@@ -149,6 +152,20 @@ pub struct FieldDefinition {
     /// lookup lives.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub computed: Option<String>,
+    /// A SurrealQL type the [`FieldType`] keywords cannot spell, rendered
+    /// verbatim as the `TYPE` clause (inside `option<...>` when
+    /// [`Self::nullable`]): a union (`array<string> | int`), a literal
+    /// (`'draft' | 'published'`), or a typed container (`array<string, 5>`,
+    /// `set<int>`, `geometry<point>`). `field_type` is [`FieldType::Any`]
+    /// when it is set. Set it with [`Self::with_custom_type`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub custom_type: Option<String>,
+    /// Whether the field's value is kept in the edge's adjacency entries
+    /// (`INLINE`, SurrealDB 3.3+), so a traversal can filter on it without
+    /// fetching the edge record. Only a top-level, non-`COMPUTED` field of a
+    /// relation table that is not lightweight may set it.
+    #[serde(default)]
+    pub inline: bool,
 }
 
 impl FieldDefinition {
@@ -170,7 +187,55 @@ impl FieldDefinition {
             nullable: false,
             reference: None,
             computed: None,
+            custom_type: None,
+            inline: false,
         }
+    }
+
+    /// Keep the field's value in the edge's adjacency entries (`INLINE`,
+    /// SurrealDB 3.3+), for a top-level field of a relation table.
+    pub fn with_inline(mut self, inline: bool) -> Self {
+        self.inline = inline;
+        self
+    }
+
+    /// Type the field with a SurrealQL type the [`FieldType`] keywords
+    /// cannot spell (see [`Self::custom_type`]), such as a union. Sets
+    /// `field_type` to [`FieldType::Any`] and clears `target_table`; use
+    /// [`Self::with_nullable`] rather than writing `option<...>` or
+    /// `none | ...` here.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use surql::schema::{FieldDefinition, FieldType};
+    ///
+    /// let status = FieldDefinition::new("status", FieldType::Any)
+    ///     .with_custom_type("'draft' | 'published'");
+    /// assert_eq!(
+    ///     status.to_surql("post"),
+    ///     "DEFINE FIELD status ON TABLE post TYPE 'draft' | 'published';"
+    /// );
+    /// ```
+    pub fn with_custom_type(mut self, ty: impl Into<String>) -> Self {
+        self.custom_type = Some(ty.into());
+        self.field_type = FieldType::Any;
+        self.target_table = None;
+        self
+    }
+
+    /// The `TYPE` clause this field renders, `option<...>` included, or
+    /// `None` for a `COMPUTED` field that declares no type.
+    pub fn type_clause(&self) -> Option<String> {
+        if self.omits_type_clause() {
+            return None;
+        }
+        let (ty, _) = self.resolve_type_clause();
+        Some(if self.nullable {
+            format!("option<{ty}>")
+        } else {
+            ty
+        })
     }
 
     /// Set the assertion expression.
@@ -268,6 +333,14 @@ impl FieldDefinition {
                 self.default.as_deref(),
             )?;
         }
+        if self.inline && (self.computed.is_some() || self.name.contains(['.', '['])) {
+            return Err(SurqlError::Validation {
+                reason: format!(
+                    "Field {:?}: INLINE takes a top-level field that is not COMPUTED",
+                    self.name
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -302,19 +375,14 @@ impl FieldDefinition {
     }
 
     fn render_guard(&self, table: &str, ine: &str) -> String {
-        let (type_clause, drop_value) = self.resolve_type_clause();
-        let type_clause = if self.nullable {
-            format!("option<{type_clause}>")
-        } else {
-            type_clause
-        };
+        let (_, drop_value) = self.resolve_type_clause();
         let mut sql = format!(
             "DEFINE FIELD{ine} {name} ON TABLE {table}",
             ine = ine,
             name = render_field_path(&self.name),
             table = quote_ident(table),
         );
-        if !self.omits_type_clause() {
+        if let Some(type_clause) = self.type_clause() {
             let _ = write!(sql, " TYPE {type_clause}");
         }
         // SurrealDB v3 requires FLEXIBLE immediately after the TYPE
@@ -344,6 +412,9 @@ impl FieldDefinition {
         if self.readonly {
             sql.push_str(" READONLY");
         }
+        if self.inline {
+            sql.push_str(" INLINE");
+        }
         // Field permissions: without this clause the field would get the
         // engine default, FULL, whatever the definition declares.
         sql.push_str(&render_permissions_clause(self.permissions.as_ref()));
@@ -359,13 +430,18 @@ impl FieldDefinition {
             && self.field_type == FieldType::Any
             && !self.nullable
             && self.target_table.is_none()
+            && self.custom_type.is_none()
     }
 
-    /// Resolve the `TYPE` clause, honoring a `target_table` by emitting
-    /// `record<target>` for a RECORD field and `array<record<target>>` for an
-    /// ARRAY field. The returned boolean indicates whether a redundant
-    /// `type::record("target", $value)` VALUE coercion should be dropped.
+    /// Resolve the `TYPE` clause, honoring a `custom_type` verbatim and a
+    /// `target_table` by emitting `record<target>` for a RECORD field and
+    /// `array<record<target>>` for an ARRAY field. The returned boolean
+    /// indicates whether a redundant `type::record("target", $value)` VALUE
+    /// coercion should be dropped.
     fn resolve_type_clause(&self) -> (String, bool) {
+        if let Some(custom) = &self.custom_type {
+            return (custom.clone(), false);
+        }
         let Some(target) = self.target_table.as_deref() else {
             return (self.field_type.as_str().to_string(), false);
         };
