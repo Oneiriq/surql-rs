@@ -7,6 +7,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-10-01
+
 ### Fixed
 
 - **A lone statement that lost a write conflict is sent again.** SurrealDB
