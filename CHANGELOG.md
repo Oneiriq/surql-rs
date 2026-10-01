@@ -7,6 +7,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-09-30
+
 A hardening pass over the whole crate: an adversarial review of every
 module, each finding reproduced by a failing test before it was fixed
 (unit tests, and engine tests against SurrealDB 3.0.5; the escaping rules
