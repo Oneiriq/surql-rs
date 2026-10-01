@@ -17,6 +17,13 @@ behaviour; every change a caller can observe is marked **Breaking**.
 Problems the pass found but did not fix are listed on the
 [Known issues](https://oneiriq.github.io/surql-rs/known-issues/) page.
 
+A follow-up resolves those issues (migration checksums, deeply nested
+values, MTREE, COUNT indexes, union types, access and event comparison,
+Redis reconnects) and brings the crate to SurrealDB 3.3: it requires
+surrealdb 3.3, models the clauses 3.3 adds, reads back what 3.3 echoes,
+and runs its engine tests against a 3.3.0 server. What remains open is on
+the known-issues page.
+
 ### Security
 
 - **Values are always data.** `quote_value` recognised `SurrealFn` and
