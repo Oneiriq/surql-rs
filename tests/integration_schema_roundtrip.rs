@@ -508,7 +508,10 @@ async fn access_definitions_compare_equal_to_their_echo() {
         .filter(|a| a.name != "probe")
         .cloned()
         .collect();
-    assert!(validate_accesses(&accesses, &echoes).is_empty());
+    assert_eq!(
+        validate_accesses(&accesses, &echoes),
+        [] as [surql::schema::ValidationResult; 0]
+    );
 
     let changed = [accesses[2].clone().with_session("12h")];
     let results = validate_accesses(&changed, &echoes);
@@ -582,7 +585,10 @@ async fn relation_flags_and_inline_caches_read_back() {
     }
     let echo = read_table(&client, "doc").await;
     assert_eq!(echo.inline_edges, Some(16));
-    assert!(diff_table_pair(Some(&doc), Some(&echo)).is_empty());
+    assert_eq!(
+        diff_table_pair(Some(&doc), Some(&echo)),
+        [] as [surql::migration::SchemaDiff; 0]
+    );
 
     // A changed cache or flag is drift.
     let echo = read_edge(&client, "likes").await;

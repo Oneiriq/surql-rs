@@ -353,7 +353,7 @@ mod tests {
             .await
             .unwrap();
         r.clear().await;
-        assert!(r.list().await.is_empty());
+        assert_eq!(r.list().await, [] as [std::string::String; 0]);
         assert!(r.default_name().await.is_none());
     }
 

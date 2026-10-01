@@ -428,7 +428,7 @@ mod tests {
     fn parse_history_rows_skips_rows_without_timestamp() {
         let raw = json!([{ "result": [{ "version": "v1", "description": "d", "checksum": "c" }] }]);
         let rows = parse_history_rows(&raw);
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [crate::migration::models::MigrationHistory; 0]);
     }
 
     // `auto_snapshot_flag_roundtrip` moved to `migration::hooks::tests`

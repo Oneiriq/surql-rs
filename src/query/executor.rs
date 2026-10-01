@@ -208,7 +208,7 @@ mod tests {
     fn extract_rows_empty() {
         let raw = json!([]);
         let rows: Vec<Row> = extract_rows(&raw).unwrap();
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [crate::query::executor::tests::Row; 0]);
     }
 
     #[test]

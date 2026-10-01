@@ -205,7 +205,7 @@ fn parse_index_mtree() {
 fn parse_index_count() {
     let all = parse_index("c_all", "DEFINE INDEX c_all ON c COUNT").unwrap();
     assert_eq!(all.index_type, IndexType::Count);
-    assert!(all.columns.is_empty());
+    assert_eq!(all.columns, [] as [std::string::String; 0]);
     assert_eq!(all.condition, None);
 
     let active = parse_index(
@@ -452,7 +452,7 @@ fn parse_table_info_missing_tb_defaults_schemaless() {
     let info = json!({});
     let t = parse_table_info("post", &info, None).unwrap();
     assert_eq!(t.mode, TableMode::Schemaless);
-    assert!(t.fields.is_empty());
+    assert_eq!(t.fields, [] as [crate::schema::fields::FieldDefinition; 0]);
 }
 
 #[test]
@@ -780,7 +780,7 @@ fn parse_table_info_rejects_null_input() {
 #[test]
 fn parse_index_without_columns_returns_empty_list() {
     let idx = parse_index("x", "DEFINE INDEX x ON TABLE t").unwrap();
-    assert!(idx.columns.is_empty());
+    assert_eq!(idx.columns, [] as [std::string::String; 0]);
     assert_eq!(idx.index_type, IndexType::Standard);
 }
 

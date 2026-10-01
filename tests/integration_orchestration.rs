@@ -283,7 +283,7 @@ async fn failed_migration_marks_environment_failed_and_stops() {
     assert_eq!(result.status, DeploymentStatus::Failed, "{result:?}");
     assert_eq!(result.migrations_applied, 0);
     assert!(result.error.as_deref().unwrap_or("").contains("boom"));
-    assert!(applied_versions(&cfg).await.is_empty());
+    assert_eq!(applied_versions(&cfg).await, [] as [std::string::String; 0]);
     assert!(!table_names(&cfg).await.contains(&"after_boom".to_string()));
 }
 
@@ -415,7 +415,10 @@ async fn deploy_applies_only_pending_and_rolls_back_only_this_run() {
     assert_eq!(rows[0].as_array().map(Vec::len), Some(1), "{rows:?}");
 
     // B's partial v1 was reverted; its pre-existing table was not touched.
-    assert!(applied_versions(&cfg_b).await.is_empty());
+    assert_eq!(
+        applied_versions(&cfg_b).await,
+        [] as [std::string::String; 0]
+    );
     let tables_b = table_names(&cfg_b).await;
     assert!(!tables_b.contains(&"keep_me".to_string()), "{tables_b:?}");
     assert!(tables_b.contains(&"clash".to_string()), "{tables_b:?}");
@@ -499,7 +502,7 @@ async fn allow_destructive_false_refuses_a_destructive_auto_rollback() {
 
     let guarded = &results["guarded"];
     assert_eq!(guarded.status, DeploymentStatus::Success, "{guarded:?}");
-    assert!(guarded.rolled_back_versions.is_empty());
+    assert_eq!(guarded.rolled_back_versions, [] as [std::string::String; 0]);
     assert!(
         guarded
             .error

@@ -51,7 +51,7 @@ fn snapshot_builder_sets_version_and_description() {
         .build();
     assert_eq!(s.version, "v1");
     assert_eq!(s.description, "initial");
-    assert!(!s.checksum.is_empty());
+    assert_ne!(s.checksum, "");
 }
 
 #[test]
@@ -256,7 +256,10 @@ fn load_snapshot_errors_for_invalid_json() {
 fn list_snapshots_empty_for_missing_dir() {
     let dir = tempdir().unwrap();
     let missing = dir.path().join("absent");
-    assert!(list_snapshots(&missing).unwrap().is_empty());
+    assert_eq!(
+        list_snapshots(&missing).unwrap(),
+        [] as [crate::migration::versioning::VersionedSnapshot; 0]
+    );
 }
 
 #[test]
@@ -371,7 +374,7 @@ fn graph_remove_child_cleans_parent_children_list() {
     g.add_version(mig("v2"), Some("v1"), None).unwrap();
     g.remove_version("v2").unwrap();
     let parent = g.get("v1").unwrap();
-    assert!(parent.children.is_empty());
+    assert_eq!(parent.children, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -399,7 +402,7 @@ fn graph_ancestors_returns_chain_from_root() {
 fn graph_ancestors_empty_for_root() {
     let mut g = VersionGraph::new();
     g.add_version(mig("v1"), None, None).unwrap();
-    assert!(g.ancestors("v1").is_empty());
+    assert_eq!(g.ancestors("v1"), [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -419,7 +422,7 @@ fn graph_descendants_bfs_order() {
 fn graph_descendants_empty_for_leaf() {
     let mut g = VersionGraph::new();
     g.add_version(mig("v1"), None, None).unwrap();
-    assert!(g.descendants("v1").is_empty());
+    assert_eq!(g.descendants("v1"), [] as [std::string::String; 0]);
 }
 
 // ----- VersionGraph: path -----
@@ -513,7 +516,7 @@ fn compare_snapshots_added_table() {
         .build();
     let diff = compare_snapshots(&from, &to);
     assert_eq!(diff.tables_added, vec!["user"]);
-    assert!(diff.tables_removed.is_empty());
+    assert_eq!(diff.tables_removed, [] as [std::string::String; 0]);
     assert!(!diff.checksum_match);
 }
 

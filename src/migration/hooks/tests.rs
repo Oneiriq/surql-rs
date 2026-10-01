@@ -174,7 +174,7 @@ fn issue_from_diff_carries_fields() {
 fn report_empty_has_no_drift() {
     let r = DriftReport::empty();
     assert!(!r.drift_detected);
-    assert!(r.issues.is_empty());
+    assert_eq!(r.issues, [] as [crate::migration::hooks::DriftIssue; 0]);
     assert!(r.suggested_migration.is_none());
 }
 
@@ -244,7 +244,10 @@ fn drift_from_snapshots_no_change_is_clean() {
     };
     let report = check_schema_drift_from_snapshots(&snap, &snap);
     assert!(!report.drift_detected);
-    assert!(report.issues.is_empty());
+    assert_eq!(
+        report.issues,
+        [] as [crate::migration::hooks::DriftIssue; 0]
+    );
 }
 
 #[test]
@@ -258,7 +261,10 @@ fn drift_from_snapshots_detects_new_table() {
     let recorded = SchemaSnapshot::new();
     let report = check_schema_drift_from_snapshots(&code, &recorded);
     assert!(report.drift_detected);
-    assert!(!report.issues.is_empty());
+    assert_ne!(
+        report.issues,
+        [] as [crate::migration::hooks::DriftIssue; 0]
+    );
     assert!(report
         .issues
         .iter()
@@ -458,7 +464,7 @@ fn staged_returns_empty_when_dir_missing() {
     let missing = std::env::temp_dir().join("surql-hooks-never-exists-xyz");
     let files = get_staged_schema_files(&missing, default_schema_filter)
         .expect("get_staged_schema_files succeeds");
-    assert!(files.is_empty());
+    assert_eq!(files, [] as [std::path::PathBuf; 0]);
 }
 
 #[test]
@@ -467,7 +473,7 @@ fn staged_returns_empty_outside_git_repo() {
     // No `git init` here; call should gracefully return empty.
     let files = get_staged_schema_files(&dir, default_schema_filter)
         .expect("get_staged_schema_files succeeds");
-    assert!(files.is_empty());
+    assert_eq!(files, [] as [std::path::PathBuf; 0]);
 }
 
 #[test]
@@ -481,7 +487,7 @@ fn staged_returns_empty_when_nothing_staged() {
     fs::write(dir.join("untracked.surql"), "-- @up\nSELECT 1;\n").unwrap();
     let files = get_staged_schema_files(&dir, default_schema_filter)
         .expect("get_staged_schema_files succeeds");
-    assert!(files.is_empty());
+    assert_eq!(files, [] as [std::path::PathBuf; 0]);
 }
 
 #[test]
@@ -680,7 +686,7 @@ fn precommit_config_has_expected_yaml_keys() {
 #[test]
 fn precommit_config_is_nonempty() {
     let yaml = generate_precommit_config("schemas/", true);
-    assert!(!yaml.is_empty());
+    assert_ne!(yaml, "");
     assert!(yaml.len() > 100);
 }
 

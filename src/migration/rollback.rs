@@ -510,7 +510,7 @@ mod tests {
     fn safe_rollback_for_index_drop() {
         let mig = m("v1", &["REMOVE INDEX idx_user_email ON TABLE user"]);
         let issues = analyse_migration(&mig);
-        assert!(issues.is_empty());
+        assert_eq!(issues, [] as [crate::migration::rollback::RollbackIssue; 0]);
     }
 
     #[test]
@@ -692,7 +692,7 @@ mod tests {
         )
         .unwrap();
         let issues = analyze_rollback_safety(tmp.path(), "v1").await.unwrap();
-        assert!(!issues.is_empty());
+        assert_ne!(issues, [] as [crate::migration::rollback::RollbackIssue; 0]);
         assert!(issues.iter().any(|i| i.safety == RollbackSafety::Danger));
     }
 }

@@ -112,7 +112,7 @@ fn a_dropped_unique_index_comes_back_unique() {
 fn diff_tables_identical_produces_no_diff() {
     let a = tbl("user").with_fields([f("email", FieldType::String)]);
     let diffs = diff_tables(std::slice::from_ref(&a), std::slice::from_ref(&a));
-    assert!(diffs.is_empty());
+    assert_eq!(diffs, [] as [crate::migration::models::SchemaDiff; 0]);
 }
 
 #[test]
@@ -132,7 +132,10 @@ fn snapshot_without_buckets_key_deserialises() {
     // must let them load with an empty bucket list.
     let json = r#"{ "tables": [], "edges": [] }"#;
     let snap: SchemaSnapshot = serde_json::from_str(json).unwrap();
-    assert!(snap.buckets.is_empty());
+    assert_eq!(
+        snap.buckets,
+        [] as [crate::schema::bucket::BucketDefinition; 0]
+    );
 }
 
 // ----- change feeds -----
@@ -185,7 +188,10 @@ fn diff_tables_detects_a_changed_retention_window() {
 fn diff_tables_ignores_an_unchanged_changefeed() {
     use crate::schema::ChangeFeed;
     let t = table_schema("audit").with_changefeed(ChangeFeed::new("1d"));
-    assert!(diff_tables(std::slice::from_ref(&t), std::slice::from_ref(&t)).is_empty());
+    assert_eq!(
+        diff_tables(std::slice::from_ref(&t), std::slice::from_ref(&t)),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 // ----- views -----
@@ -240,7 +246,10 @@ fn diff_tables_ignores_view_whitespace_reformatting() {
 fn diff_schemas_empty_snapshots_are_equal() {
     let a = SchemaSnapshot::default();
     let b = SchemaSnapshot::default();
-    assert!(diff_schemas(&a, &b).is_empty());
+    assert_eq!(
+        diff_schemas(&a, &b),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
@@ -376,12 +385,18 @@ fn diff_table_pair_drop_is_same_as_slice_form() {
 
 #[test]
 fn diff_table_pair_none_none_is_empty() {
-    assert!(diff_table_pair(None, None).is_empty());
+    assert_eq!(
+        diff_table_pair(None, None),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
 fn diff_edge_pair_none_none_is_empty() {
-    assert!(diff_edge_pair(None, None).is_empty());
+    assert_eq!(
+        diff_edge_pair(None, None),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
@@ -465,8 +480,8 @@ fn snapshot_serde_roundtrip() {
 #[test]
 fn snapshot_default_is_empty() {
     let s = SchemaSnapshot::default();
-    assert!(s.tables.is_empty());
-    assert!(s.edges.is_empty());
+    assert_eq!(s.tables, [] as [crate::schema::table::TableDefinition; 0]);
+    assert_eq!(s.edges, [] as [crate::schema::edge::EdgeDefinition; 0]);
 }
 
 #[test]
@@ -499,12 +514,18 @@ fn diff_tables_sort_stable_across_multiple_adds_drops() {
 fn field_expr_comparison_treats_value_whitespace() {
     let a = vec![f("x", FieldType::String).with_value("a  +  b")];
     let b = vec![f("x", FieldType::String).with_value("a + b")];
-    assert!(diff_fields("t", &a, &b).is_empty());
+    assert_eq!(
+        diff_fields("t", &a, &b),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
 fn field_expr_comparison_treats_default_whitespace() {
     let a = vec![f("x", FieldType::Int).with_default("42  ")];
     let b = vec![f("x", FieldType::Int).with_default("42")];
-    assert!(diff_fields("t", &a, &b).is_empty());
+    assert_eq!(
+        diff_fields("t", &a, &b),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }

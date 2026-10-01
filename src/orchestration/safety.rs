@@ -101,7 +101,10 @@ mod tests {
     #[test]
     fn destructive_statements_reads_the_requested_direction() {
         let m = migration(&["DEFINE TABLE t"], &["REMOVE TABLE t"]);
-        assert!(destructive_statements(&[&m], MigrationDirection::Up).is_empty());
+        assert_eq!(
+            destructive_statements(&[&m], MigrationDirection::Up),
+            [] as [std::string::String; 0]
+        );
         let down = destructive_statements(&[&m], MigrationDirection::Down);
         assert_eq!(down.len(), 1);
         assert!(down[0].starts_with("v1 ("), "{down:?}");

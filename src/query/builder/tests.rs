@@ -171,7 +171,7 @@ fn chaining_produces_full_select() {
 fn immutability_preserved_across_chain() {
     let base = Query::new().select(None).from_table("user").unwrap();
     let extended = base.clone().where_str("age > 18");
-    assert!(base.conditions.is_empty());
+    assert_eq!(base.conditions, [] as [std::string::String; 0]);
     assert_eq!(extended.conditions.len(), 1);
     assert_eq!(base.to_surql().unwrap(), "SELECT * FROM user");
     assert_eq!(

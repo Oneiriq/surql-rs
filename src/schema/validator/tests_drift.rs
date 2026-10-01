@@ -27,7 +27,10 @@ fn edge_missing_from_database() {
         .iter()
         .filter(|r| r.table == "likes" && r.message.to_lowercase().contains("missing"))
         .collect();
-    assert!(!missing.is_empty());
+    assert_ne!(
+        missing,
+        [] as [&crate::schema::validator::ValidationResult; 0]
+    );
     assert_eq!(missing[0].severity, ValidationSeverity::Error);
 }
 
@@ -54,7 +57,10 @@ fn edge_field_mismatch() {
         .iter()
         .filter(|r| r.field.as_deref() == Some("weight"))
         .collect();
-    assert!(!field_issues.is_empty());
+    assert_ne!(
+        field_issues,
+        [] as [&crate::schema::validator::ValidationResult; 0]
+    );
 }
 
 #[test]
@@ -293,7 +299,10 @@ fn field_permissions_default_full_matches_explicit_full() {
         ("create", "FULL"),
         ("update", "WHERE true"),
     ]);
-    assert!(validate_field("t", &code, &db).is_empty());
+    assert_eq!(
+        validate_field("t", &code, &db),
+        [] as [crate::schema::validator::ValidationResult; 0]
+    );
 }
 
 #[test]
@@ -313,7 +322,10 @@ fn table_permissions_grouped_actions_match_split_echo() {
         ("select", "owner  =  $auth.id"),
         ("update", "owner = $auth.id"),
     ]);
-    assert!(validate_table(&code, &db).is_empty());
+    assert_eq!(
+        validate_table(&code, &db),
+        [] as [crate::schema::validator::ValidationResult; 0]
+    );
 }
 
 #[test]
@@ -397,7 +409,10 @@ fn hnsw_engine_default_efc_and_m_match_unset() {
         Some(150),
         Some(12),
     );
-    assert!(validate_index("t", &code, &db).is_empty());
+    assert_eq!(
+        validate_index("t", &code, &db),
+        [] as [crate::schema::validator::ValidationResult; 0]
+    );
 }
 
 #[test]
@@ -421,7 +436,10 @@ fn engine_array_child_fields_are_not_extra() {
         FieldDefinition::new("tags", FieldType::Array),
         FieldDefinition::new("tags.*", FieldType::String),
     ]);
-    assert!(validate_table(&code, &db).is_empty());
+    assert_eq!(
+        validate_table(&code, &db),
+        [] as [crate::schema::validator::ValidationResult; 0]
+    );
 }
 
 // -- normalize_expression --------------------------------------------------

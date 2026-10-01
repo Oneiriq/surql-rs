@@ -99,7 +99,7 @@ async fn ensure_migration_table_is_idempotent() {
     ensure_migration_table(&client).await.unwrap();
     // Running three times back-to-back should be a no-op on the schema.
     let applied = get_applied_migrations(&client).await.unwrap();
-    assert!(applied.is_empty());
+    assert_eq!(applied, [] as [surql::migration::MigrationHistory; 0]);
 }
 
 #[tokio::test]
@@ -150,7 +150,7 @@ async fn migrate_up_applies_pending_migration() {
     assert_eq!(applied[0].version, "20260101_000001");
 
     let pending = get_pending_migrations(&client, tmp.path()).await.unwrap();
-    assert!(pending.is_empty());
+    assert_eq!(pending, [] as [surql::migration::Migration; 0]);
 
     let report = get_migration_status(&client, tmp.path()).await.unwrap();
     assert_eq!(report.total, 1);
@@ -522,10 +522,10 @@ async fn an_edited_applied_migration_blocks_up_until_rehashed() {
     assert_eq!(rehashed, report.modified);
     let history = get_applied_migrations(&client).await.unwrap();
     assert_eq!(history[0].checksum, rehashed[0].current_checksum);
-    assert!(get_modified_migrations(&client, tmp.path())
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        get_modified_migrations(&client, tmp.path()).await.unwrap(),
+        [] as [surql::migration::ModifiedMigration; 0]
+    );
 
     let statuses = migrate_up(&client, tmp.path(), MigrateUpOptions::default())
         .await

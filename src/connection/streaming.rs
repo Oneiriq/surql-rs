@@ -446,7 +446,10 @@ mod tests {
     async fn manager_starts_empty() {
         let m = StreamingManager::new();
         assert_eq!(m.count().await, 0);
-        assert!(m.ids().await.is_empty());
+        assert_eq!(
+            m.ids().await,
+            [] as [crate::connection::streaming::SubscriptionId; 0]
+        );
         assert!(!m.kill(SubscriptionId::new()).await);
     }
 
@@ -489,7 +492,10 @@ mod tests {
         let b = SubscriptionId::new();
         m.inner.tasks.lock().await.insert(b, ended_task().await);
         assert_eq!(m.count().await, 0);
-        assert!(m.ids().await.is_empty());
+        assert_eq!(
+            m.ids().await,
+            [] as [crate::connection::streaming::SubscriptionId; 0]
+        );
     }
 
     #[tokio::test]
@@ -543,6 +549,6 @@ mod tests {
         let a = SubscriptionId::new();
         let b = SubscriptionId::new();
         assert_ne!(a, b);
-        assert!(!a.to_string().is_empty());
+        assert_ne!(a.to_string(), "");
     }
 }

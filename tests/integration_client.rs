@@ -130,7 +130,7 @@ async fn crud_round_trip() {
     assert_eq!(deleted.len(), 1);
 
     let empty: Vec<User> = client.select("user:alice").await.expect("select empty");
-    assert!(empty.is_empty());
+    assert_eq!(empty, [] as [User; 0]);
 
     client.disconnect().await.unwrap();
 }
@@ -383,7 +383,7 @@ async fn crud_target_cannot_inject_statements() {
         .select("user:x; REMOVE TABLE user")
         .await
         .expect("a strange key is still just a key");
-    assert!(none.is_empty());
+    assert_eq!(none, [] as [User; 0]);
     assert!(client
         .select::<User>("user; REMOVE TABLE user")
         .await

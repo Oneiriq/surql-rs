@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(diffs[0].bucket.as_deref(), Some("avatars"));
         assert!(diffs[0].forward_sql.starts_with("DEFINE BUCKET avatars"));
         assert_eq!(diffs[0].backward_sql, "REMOVE BUCKET avatars;");
-        assert!(diffs[0].table.is_empty());
+        assert_eq!(diffs[0].table, "");
     }
 
     #[test]
@@ -502,7 +502,10 @@ mod tests {
     fn diff_buckets_identical_yields_nothing() {
         use crate::schema::bucket::memory_bucket;
         let a = vec![memory_bucket("b").with_comment("c")];
-        assert!(diff_buckets(&a, &a).is_empty());
+        assert_eq!(
+            diff_buckets(&a, &a),
+            [] as [crate::migration::models::SchemaDiff; 0]
+        );
     }
 
     #[test]
@@ -542,7 +545,10 @@ mod tests {
     fn the_engine_echo_of_a_param_is_not_a_modification() {
         let code = vec![ParamDefinition::new("P", "'hello'")];
         let db = vec![ParamDefinition::new("P", "'hello'").with_permissions("FULL")];
-        assert!(diff_params(&code, &db).is_empty());
+        assert_eq!(
+            diff_params(&code, &db),
+            [] as [crate::migration::models::SchemaDiff; 0]
+        );
     }
 
     #[test]
@@ -599,7 +605,10 @@ mod tests {
                 .build()
                 .unwrap(),
         ];
-        assert!(diff_functions(&code, &db).is_empty());
+        assert_eq!(
+            diff_functions(&code, &db),
+            [] as [crate::migration::models::SchemaDiff; 0]
+        );
     }
 
     #[test]
@@ -609,7 +618,7 @@ mod tests {
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].operation, DiffOperation::AddSequence);
         assert_eq!(diffs[0].object.as_deref(), Some("s"));
-        assert!(diffs[0].table.is_empty());
+        assert_eq!(diffs[0].table, "");
         assert_eq!(
             diffs[0].forward_sql,
             "DEFINE SEQUENCE s BATCH 1000 START 0;"
@@ -647,7 +656,10 @@ mod tests {
     #[test]
     fn identical_sequences_produce_nothing() {
         let s = vec![SequenceDefinition::new("s").with_timeout("1s")];
-        assert!(diff_sequences(&s, &s).is_empty());
+        assert_eq!(
+            diff_sequences(&s, &s),
+            [] as [crate::migration::models::SchemaDiff; 0]
+        );
     }
 
     #[test]

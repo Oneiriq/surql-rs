@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(m.up.len(), 1);
         assert_eq!(m.down.len(), 1);
         assert_eq!(m.checksum.as_deref(), Some("deadbeef"));
-        assert!(m.depends_on.is_empty());
+        assert_eq!(m.depends_on, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -581,7 +581,7 @@ mod tests {
             "checksum": null
         }"#;
         let m: Migration = serde_json::from_str(j).unwrap();
-        assert!(m.depends_on.is_empty());
+        assert_eq!(m.depends_on, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -657,7 +657,7 @@ mod tests {
         let j = r#"{"version":"v1","description":"d"}"#;
         let meta: MigrationMetadata = serde_json::from_str(j).unwrap();
         assert_eq!(meta.author, "surql");
-        assert!(meta.depends_on.is_empty());
+        assert_eq!(meta.depends_on, [] as [std::string::String; 0]);
     }
 
     #[test]
