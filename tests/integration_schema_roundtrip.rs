@@ -6,7 +6,7 @@
 //! from. The echo is the authority: a shape the parser misreads makes a
 //! reconcile re-apply (or silently weaken) a definition forever.
 //!
-//! Runs against `SURREAL_URL` when it is set (CI uses v3.0.5), otherwise
+//! Runs against `SURREAL_URL` when it is set (CI uses v3.3.0), otherwise
 //! against the in-process `mem://` engine:
 //!
 //! ```text

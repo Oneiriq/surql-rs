@@ -225,8 +225,13 @@ Problems the pass found but did not fix are listed on the
 - **MSRV is Rust 1.95.** `rust-version` said 1.90, which never built the
   locked graph; surrealdb 3.3 uses `std::hint::cold_path` (stable since
   1.95) and declares no `rust-version`. CI now checks it.
-- The lockfile moves to surrealdb 3.3.0, which a fresh consumer already
-  resolves.
+- **SurrealDB 3.3.** The `surrealdb` requirement rises from 3.1.5 to
+  3.3.0 (the lockfile and the MSRV already assumed it, and `client-grpc`
+  needs an SDK feature older releases lack). CI's engine tests run
+  against a 3.3.0 server instead of 3.0.5, and the gRPC test with them.
+  Engine tests that need 3.3 syntax skip on older servers; everything
+  else also passes against 3.2.4. **Breaking** for a consumer pinned to
+  an older surrealdb.
 - Destructive CLI commands (`db reset`, `bucket rm`, `bucket delete`,
   `orchestrate deploy`) prompt, and require `--yes` when stdin is not a
   terminal; `orchestrate deploy` gains `--approve`, `--yes` and

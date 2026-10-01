@@ -1,14 +1,14 @@
 //! Integration coverage for the connection extension layer.
 //!
 //! Exercises [`ConnectionRegistry`], [`AuthManager`], the [`context`]
-//! helpers, and [`StreamingManager`] against a running SurrealDB v3.0.5
+//! helpers, and [`StreamingManager`] against a running SurrealDB v3.3.0
 //! instance. Follows the same `SURREAL_URL`-gated pattern as the other
 //! integration suites so `cargo test` stays green in environments
 //! without a server.
 //!
 //! ```text
 //! docker run -d -p 8000:8000 --name surrealdb \
-//!   surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+//!   surrealdb/surrealdb:v3.3.0 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --test integration_connection_ext --features client -- --test-threads=1
 //! ```

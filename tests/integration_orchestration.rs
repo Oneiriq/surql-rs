@@ -1,14 +1,14 @@
 //! Integration tests for the `orchestration` module.
 //!
 //! Runs a real sequential deployment against a live SurrealDB instance
-//! (defaults to the `v3.0.5` container the umbrella issue pins for CI).
+//! (CI runs the `v3.3.0` container).
 //! The test is gated on the `SURREAL_URL` environment variable so the
 //! rest of `cargo test` stays green on machines without a server.
 //!
 //! To exercise locally:
 //!
 //! ```text
-//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.0.5 start --user root --pass root memory
+//! docker run -d -p 8000:8000 surrealdb/surrealdb:v3.3.0 start --user root --pass root memory
 //! SURREAL_URL=ws://localhost:8000 SURREAL_USER=root SURREAL_PASS=root \
 //!   cargo test --all-features --test integration_orchestration -- --test-threads=1
 //! ```

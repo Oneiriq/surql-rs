@@ -59,6 +59,12 @@ Subcommand reference: [CLI](cli.md).
   TLS stack (`libssl-dev` on Linux, `Security.framework` on macOS).
 - For the `client-rustls` feature: SurrealDB 3.0 or newer. No system
   TLS stack required.
+- Server versions: the crate is built and tested against SurrealDB 3.3,
+  and a 3.0 server works with two exceptions. Values nested more than 16
+  levels deep need 3.1 (`encoding::json::decode`). The 3.3 additions need
+  3.3: `LIGHTWEIGHT` relations, `INLINE` caches and fields, the access
+  `AUDIENCE` and `CONTEXT` clauses, `SELECT ... FOR UPDATE`, the
+  `segment` tokenizer and the gRPC transport.
 
 ## What's next
 
