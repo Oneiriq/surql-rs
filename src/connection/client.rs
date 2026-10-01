@@ -919,12 +919,17 @@ mod tests {
             .unwrap();
         let client = DatabaseClient::new(cfg).unwrap();
         client.connect().await.unwrap();
+        // The test needs a valid password for the short-lived user, not a
+        // particular one, so each run generates its own.
+        let password = format!("pw-{}", ulid::Ulid::generate());
         client
-            .query("DEFINE USER brief ON ROOT PASSWORD 'pw' ROLES OWNER DURATION FOR SESSION 1s;")
+            .query(&format!(
+                "DEFINE USER brief ON ROOT PASSWORD '{password}' ROLES OWNER DURATION FOR SESSION 1s;"
+            ))
             .await
             .unwrap();
         client
-            .signin(&RootCredentials::new("brief", "pw"))
+            .signin(&RootCredentials::new("brief", password.as_str()))
             .await
             .unwrap();
         sleep(Duration::from_millis(2500)).await;
