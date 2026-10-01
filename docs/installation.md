@@ -24,6 +24,7 @@ Short overview; the full matrix and recipes live on the
 |-----------------|---------|-----------------------------------------------------------|
 | `client`        | yes     | Async SurrealDB client (`tokio`, `surrealdb` 3.x) with `native-tls`. |
 | `client-rustls` | no      | Same client surface but with pure-Rust TLS (no `openssl-sys`). |
+| `client-grpc`   | no      | The gRPC transport (`grpc://`, `grpcs://`, SurrealDB 3.3+), on top of `client-rustls`. |
 | `cli`           | no      | `surql` binary (implies `client`, `orchestration`, `settings`). |
 | `cache`         | no      | In-process `MemoryCache` backend + `CacheManager`.        |
 | `cache-redis`   | no      | Redis backend for the cache manager (implies `cache`).    |

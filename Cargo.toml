@@ -61,6 +61,12 @@ client-rustls = [
     "dep:futures",
     "surrealdb/rustls",
 ]
+# gRPC transport (`grpc://` / `grpcs://`, SurrealDB 3.3+), on top of
+# `client-rustls`. Opt-in: it adds tonic and its HTTP/2 stack.
+client-grpc = [
+    "client-rustls",
+    "surrealdb/protocol-grpc",
+]
 # Wasm-friendly client surface (Oneiriq/surql-rs#115). Enables the same
 # `DatabaseClient` / `executor` / `crud` / `graph` query API as
 # `client-rustls`, but with a dependency set that compiles cleanly to

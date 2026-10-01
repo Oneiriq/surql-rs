@@ -905,3 +905,42 @@ async fn deeply_nested_values_reach_the_engine_whole() {
 
     client.disconnect().await.unwrap();
 }
+
+#[tokio::test]
+async fn select_for_update_runs_inside_a_transaction() {
+    let Some(client) = connected_client().await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    client
+        .query("CREATE account:alice SET balance = 10;")
+        .await
+        .expect("seed");
+    // `FOR UPDATE` is SurrealDB 3.3 syntax.
+    if let Err(err) = client
+        .query("SELECT * FROM account:alice FOR UPDATE;")
+        .await
+    {
+        println!("skipped: the server predates SELECT ... FOR UPDATE: {err}");
+        return;
+    }
+    let locked = Query::new()
+        .select(None)
+        .from_table("account:alice")
+        .unwrap()
+        .for_update()
+        .to_surql()
+        .unwrap();
+    let mut txn = Transaction::begin(&client).await.expect("begin");
+    txn.execute(&locked).await.expect("queue the locking read");
+    txn.execute("UPDATE account:alice SET balance -= 3;")
+        .await
+        .expect("queue the write");
+    txn.commit().await.expect("commit");
+    let rows = executor::execute_raw(&client, "SELECT VALUE balance FROM account:alice", None)
+        .await
+        .expect("read back");
+    assert_eq!(rows, json!([[7]]));
+
+    client.disconnect().await.unwrap();
+}

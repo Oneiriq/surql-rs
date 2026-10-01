@@ -292,6 +292,14 @@ Problems the pass found but did not fix are listed on the
   all three; `AUDIENCE` used to run into the preceding key. `JwtConfig`
   gains `audience` and `AccessDefinition` gains `authenticate` and
   `context` (**Breaking** for struct literals).
+- `Query::for_update()`: `SELECT ... FOR UPDATE` (SurrealDB 3.3), which
+  locks the selected records until the transaction ends. The engine takes
+  only record id targets, and `to_surql` refuses a table target the same
+  way. `Query` gains `for_update`.
+- The `client-grpc` feature and `Protocol::Grpc` / `Protocol::GrpcSecure`:
+  `grpc://` and `grpcs://` URLs connect over the SurrealDB 3.3 gRPC
+  transport (the server answers on its main port), tested against a 3.3.0
+  server. **Breaking** for exhaustive matches on `Protocol`.
 - Relation flags and SurrealDB 3.3 graph caches: `EdgeDefinition` gains
   `enforced` (`ENFORCED`, which the parser used to skip), `lightweight`
   (`LIGHTWEIGHT`, edges with no records), and, like `TableDefinition`,
