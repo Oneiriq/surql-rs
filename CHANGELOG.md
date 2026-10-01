@@ -7,6 +7,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **A lone statement that lost a write conflict is sent again.** SurrealDB
+  3.3 compacts indexes in the background after writes, and an ordinary
+  single-statement write to the same index can lose a write conflict to
+  that pass, failing with "This transaction can be retried". The query
+  funnel behind `query`, `query_with_vars`, `query_with_surreal_vars` and
+  the typed CRUD methods now sends such a statement again, up to the
+  connection's `retry_max_attempts`, waiting its retry backoff between
+  attempts. The conflict is read from the engine's structured
+  `TransactionConflict` kind, with the engine's fixed wording as a
+  fallback; a statement's own `THROW` text is never read as one. Only a
+  request of one statement is retried: each statement commits on its own,
+  so in a longer request the statements before a conflict may already have
+  written, while a conflicted statement committed nothing.
+
 ## [0.34.0] - 2026-09-30
 
 A hardening pass over the whole crate: an adversarial review of every

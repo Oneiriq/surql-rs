@@ -357,6 +357,31 @@ fn session_expiry_is_read_from_the_request_error_only() {
 }
 
 #[test]
+fn only_a_lost_write_conflict_is_sent_again() {
+    use surrealdb::types::QueryError;
+    let structured = surrealdb::Error::query(
+        "Transaction conflict".into(),
+        QueryError::TransactionConflict,
+    );
+    assert!(is_retryable_conflict(&structured));
+    // A peer that sends the engine's wording without the details.
+    let worded = surrealdb::Error::query(
+        "There was a problem with the key-value store: Transaction conflict: Write conflict,          retry the transaction. This transaction can be retried"
+            .into(),
+        None,
+    );
+    assert!(is_retryable_conflict(&worded));
+    let not_executed = surrealdb::Error::query(
+        "The query was not executed due to a failed transaction".into(),
+        QueryError::NotExecuted,
+    );
+    assert!(!is_retryable_conflict(&not_executed));
+    let thrown =
+        surrealdb::Error::thrown("Transaction conflict: This transaction can be retried".into());
+    assert!(!is_retryable_conflict(&thrown));
+}
+
+#[test]
 fn render_target_accepts_tables_and_record_ids_only() {
     assert_eq!(render_target("user").unwrap(), "user");
     assert_eq!(render_target(" user ").unwrap(), "user");
@@ -573,4 +598,47 @@ fn the_not_executed_error_that_says_why_is_reported() {
     let (says_why, err) = kept.expect("an error is kept");
     assert!(!says_why);
     assert!(err.to_string().contains("failed transaction"), "{err}");
+}
+
+/// SurrealDB 3.3 compacts an index in the background after writes to it,
+/// and a write to the same index can lose a conflict to that pass. Rows are
+/// written to a full-text index and deleted again at once, over and over,
+/// each write a single statement: every conflict lost is sent again, and
+/// every cycle completes.
+#[tokio::test]
+async fn a_lone_statement_that_lost_a_write_conflict_is_sent_again() {
+    const ATTEMPTS: u32 = 10;
+    let config = ConnectionConfig::builder()
+        .url("mem://")
+        .namespace("t")
+        .database("t")
+        .retry_max_attempts(ATTEMPTS)
+        .retry_min_wait(0.1)
+        .retry_max_wait(1.0)
+        .build()
+        .unwrap();
+    let client = DatabaseClient::new(config).unwrap();
+    client.connect().await.unwrap();
+    client
+        .query(
+            "DEFINE ANALYZER words TOKENIZERS blank FILTERS lowercase;              DEFINE TABLE doc SCHEMALESS;              DEFINE INDEX doc_text ON doc FIELDS text FULLTEXT ANALYZER words BM25;",
+        )
+        .await
+        .unwrap();
+    for cycle in 0..20 {
+        for row in 0..20 {
+            client
+                .query(&format!(
+                    "UPSERT doc:c{cycle}r{row} SET title = 'routes', text = 'get the orders by id'"
+                ))
+                .await
+                .unwrap();
+        }
+        client
+            .query("DELETE doc WHERE title = 'routes'")
+            .await
+            .unwrap();
+    }
+    let left = client.query("SELECT * FROM doc").await.unwrap();
+    assert_eq!(left, serde_json::json!([[]]));
 }

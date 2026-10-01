@@ -80,6 +80,29 @@ pub(super) fn request_says_session_expired(err: &surrealdb::Error) -> bool {
     structured || fixed_message
 }
 
+/// A statement the engine refused because its transaction lost a write
+/// conflict to another one. A conflicted transaction committed nothing, so
+/// the statement can be sent again. SurrealDB 3.3 reports these on
+/// ordinary single-statement writes under its optimistic engines (an
+/// in-place replacement of indexed rows conflicted in two of five runs).
+/// Read from the structured details, with a match on the engine's fixed
+/// wording for a peer that sends the text without them.
+pub(super) fn is_retryable_conflict(err: &surrealdb::Error) -> bool {
+    if let Some(details) = err.query_details() {
+        return matches!(details, QueryError::TransactionConflict);
+    }
+    // A statement's own `THROW` carries user text, never the engine's.
+    if err.is_thrown() {
+        return false;
+    }
+    let message = err
+        .message()
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    message.contains("transaction conflict") && message.ends_with("this transaction can be retried")
+}
+
 /// A statement the engine skipped because another statement of the same
 /// transaction failed. It carries no cause of its own, so it must never be
 /// the error a caller sees when the failing statement's error is available.

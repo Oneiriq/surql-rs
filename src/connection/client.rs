@@ -44,7 +44,10 @@ mod tests;
 
 pub(crate) use convert::render_target;
 use convert::{first_row_typed, flatten_rows_typed, payload_str, seconds, statement_results};
-use errors::{connection_err, query_err, request_says_session_expired, sdk_says_already_connected};
+use errors::{
+    connection_err, is_retryable_conflict, query_err, request_says_session_expired,
+    sdk_says_already_connected,
+};
 
 /// Async SurrealDB client with connection + retry management.
 ///
@@ -474,17 +477,53 @@ impl DatabaseClient {
     }
 
     /// The query funnel behind both public variants: send, heal an expired
-    /// session once where that is safe, then unpack every statement.
-    async fn run_query<V>(&self, surql: &str, vars: BTreeMap<String, V>) -> Result<Value>
+    /// session once where that is safe, send a lone statement again when
+    /// it lost a write conflict, then unpack every statement.
+    ///
+    /// Only a request of one statement is sent again. Each statement of a
+    /// request commits on its own, so in a longer one the statements before
+    /// a conflict may already have written; a conflicted statement
+    /// committed nothing, so sending it alone again cannot repeat a write.
+    /// The attempts and the wait between them are the connection's retry
+    /// settings.
+    async fn run_query<V>(&self, surql: &str, mut vars: BTreeMap<String, V>) -> Result<Value>
     where
         V: SurrealValue + Clone,
     {
         self.require_connected()?;
+        let attempts = self.config.retry_max_attempts().max(1);
+        let mut attempt = 1;
+        loop {
+            // The variables again, should the statement need sending again.
+            let spare = (attempt < attempts).then(|| vars.clone());
+            let mut response = self.send_healed(surql, vars).await?;
+            if response.num_statements() == 1 {
+                if let Some(err) = response.take_errors().remove(&0) {
+                    match spare {
+                        Some(again) if is_retryable_conflict(&err) => {
+                            sleep(self.backoff_for(attempt)).await;
+                            vars = again;
+                            attempt += 1;
+                            continue;
+                        }
+                        _ => return Err(query_err(&err)),
+                    }
+                }
+            }
+            return statement_results(response);
+        }
+    }
+
+    /// Send one request, healing an expired session once where that is safe.
+    async fn send_healed<V>(&self, surql: &str, vars: BTreeMap<String, V>) -> Result<IndexedResults>
+    where
+        V: SurrealValue + Clone,
+    {
         // Cloned up front only where a replay is possible, because the
         // retry needs the variables after the first attempt consumed them
         // (and they can carry `Value::Bytes` payloads).
         let retry_vars = self.can_replay_session().then(|| vars.clone());
-        let response = match self.send_query(surql, vars).await {
+        match self.send_query(surql, vars).await {
             Err(err) if request_says_session_expired(&err) => {
                 // The replay re-checks the authority: a signin on another
                 // clone while the request was in flight changed whose
@@ -499,8 +538,7 @@ impl DatabaseClient {
             }
             other => other,
         }
-        .map_err(|e| query_err(&e))?;
-        statement_results(response)
+        .map_err(|e| query_err(&e))
     }
 
     /// Send one request. `Err` here is the engine refusing the request as
