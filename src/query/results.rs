@@ -576,13 +576,19 @@ mod tests {
     #[test]
     fn extract_empty() {
         let v = json!([]);
-        assert!(extract_result(&v).is_empty());
+        assert_eq!(
+            extract_result(&v),
+            [] as [serde_json::Map<std::string::String, serde_json::Value>; 0]
+        );
     }
 
     #[test]
     fn extract_null() {
         let v = Value::Null;
-        assert!(extract_result(&v).is_empty());
+        assert_eq!(
+            extract_result(&v),
+            [] as [serde_json::Map<std::string::String, serde_json::Value>; 0]
+        );
     }
 
     #[test]
@@ -654,8 +660,11 @@ mod tests {
 
     #[test]
     fn extract_many_empty() {
-        assert!(extract_many(&json!([])).is_empty());
-        assert!(extract_many(&json!([{"result": []}])).is_empty());
+        assert_eq!(extract_many(&json!([])), [] as [serde_json::Value; 0]);
+        assert_eq!(
+            extract_many(&json!([{"result": []}])),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]

@@ -147,7 +147,10 @@ fn every_rendered_field_clause_is_compared() {
 fn a_target_table_the_type_ignores_is_not_a_change() {
     let code = f("name", FieldType::String).with_target_table("user");
     let db = f("name", FieldType::String);
-    assert!(diff_fields("t", &[code], &[db]).is_empty());
+    assert_eq!(
+        diff_fields("t", &[code], &[db]),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 /// The engine spells out `FULL` for every action a field's rules leave
@@ -160,22 +163,34 @@ fn default_field_permissions_are_not_a_change() {
         ("create", "FULL"),
         ("update", "FULL"),
     ]);
-    assert!(diff_fields("t", &[code], &[db]).is_empty());
+    assert_eq!(
+        diff_fields("t", &[code], &[db]),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
     let full = f("x", FieldType::Int).with_permissions([("select, create, update", "FULL")]);
-    assert!(diff_fields("t", &[f("x", FieldType::Int)], &[full]).is_empty());
+    assert_eq!(
+        diff_fields("t", &[f("x", FieldType::Int)], &[full]),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
 fn diff_fields_identical_yields_nothing() {
     let a = vec![f("x", FieldType::Int)];
-    assert!(diff_fields("t", &a, &a).is_empty());
+    assert_eq!(
+        diff_fields("t", &a, &a),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
 fn diff_fields_whitespace_different_assertion_is_not_a_diff() {
     let code = vec![f("x", FieldType::Int).with_assertion("$value  > 0")];
     let db = vec![f("x", FieldType::Int).with_assertion("$value > 0")];
-    assert!(diff_fields("t", &code, &db).is_empty());
+    assert_eq!(
+        diff_fields("t", &code, &db),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
@@ -247,7 +262,10 @@ fn diff_indexes_detects_dropped() {
 #[test]
 fn diff_indexes_identical_yields_nothing() {
     let a = vec![index("x", ["a"])];
-    assert!(diff_indexes("t", &a, &a).is_empty());
+    assert_eq!(
+        diff_indexes("t", &a, &a),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
@@ -413,7 +431,10 @@ fn index_defaults_and_directives_are_not_changes() {
     ));
 
     let concurrent = unique_index("u", ["a"]).with_concurrently(true);
-    assert!(diff_indexes("t", &[concurrent], &[unique_index("u", ["a"])]).is_empty());
+    assert_eq!(
+        diff_indexes("t", &[concurrent], &[unique_index("u", ["a"])]),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
@@ -471,10 +492,16 @@ fn the_engine_echo_of_an_event_is_not_a_change() {
         "$before.a != $after.a",
         "{ LET $x = 1; CREATE log SET x = $x; }",
     );
-    assert!(diff_events("t", &[code], &[echo]).is_empty());
+    assert_eq!(
+        diff_events("t", &[code], &[echo]),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
     let bare = event("e", "true", "CREATE log SET n = 1");
     let bare_echo = event("e", "true", "(CREATE log SET n = 1)");
-    assert!(diff_events("t", &[bare], &[bare_echo]).is_empty());
+    assert_eq!(
+        diff_events("t", &[bare], &[bare_echo]),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
@@ -500,7 +527,10 @@ fn diff_events_detects_dropped() {
 fn diff_events_identical_yields_nothing() {
     let ev = event("on_upd", "true", "RETURN 1");
     let a = vec![ev];
-    assert!(diff_events("t", &a, &a).is_empty());
+    assert_eq!(
+        diff_events("t", &a, &a),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 // ----- diff_permissions -----
@@ -551,7 +581,10 @@ fn diff_permissions_modified_carries_old_in_backward() {
 fn diff_permissions_identical_yields_nothing() {
     let mut p = BTreeMap::new();
     p.insert("select".into(), "true".into());
-    assert!(diff_permissions("t", Some(&p), Some(&p)).is_empty());
+    assert_eq!(
+        diff_permissions("t", Some(&p), Some(&p)),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
@@ -560,14 +593,23 @@ fn diff_permissions_whitespace_variance_is_equal() {
     code.insert("select".into(), "$auth.id  =  id".into());
     let mut db = BTreeMap::new();
     db.insert("select".into(), "$auth.id = id".into());
-    assert!(diff_permissions("t", Some(&code), Some(&db)).is_empty());
+    assert_eq!(
+        diff_permissions("t", Some(&code), Some(&db)),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
 fn diff_permissions_none_and_empty_are_equal() {
     let empty: BTreeMap<String, String> = BTreeMap::new();
-    assert!(diff_permissions("t", Some(&empty), None).is_empty());
-    assert!(diff_permissions("t", None, Some(&empty)).is_empty());
+    assert_eq!(
+        diff_permissions("t", Some(&empty), None),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
+    assert_eq!(
+        diff_permissions("t", None, Some(&empty)),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 /// `NONE` is a table's default, so an action set to it is an action left
@@ -575,7 +617,10 @@ fn diff_permissions_none_and_empty_are_equal() {
 #[test]
 fn table_permission_postures() {
     let explicit_none = BTreeMap::from([("delete".to_owned(), "none".to_owned())]);
-    assert!(diff_permissions("t", Some(&explicit_none), None).is_empty());
+    assert_eq!(
+        diff_permissions("t", Some(&explicit_none), None),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 
     let full = BTreeMap::from([("select, create".to_owned(), "FULL".to_owned())]);
     let diffs = diff_permissions("t", Some(&full), None);
@@ -587,7 +632,10 @@ fn table_permission_postures() {
         ("select".to_owned(), "full".to_owned()),
         ("create".to_owned(), "FULL".to_owned()),
     ]);
-    assert!(diff_permissions("t", Some(&full), Some(&echo)).is_empty());
+    assert_eq!(
+        diff_permissions("t", Some(&full), Some(&echo)),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 /// A name the engine would read as a keyword is quoted in every
@@ -624,7 +672,7 @@ fn removals_quote_names_like_the_definitions_do() {
 fn diff_edges_detects_added_relation() {
     let code = vec![relation_edge("likes")];
     let diffs = diff_edges(&code, &[]);
-    assert!(!diffs.is_empty());
+    assert_ne!(diffs, [] as [crate::migration::models::SchemaDiff; 0]);
     assert_eq!(diffs[0].operation, DiffOperation::AddTable);
     assert!(diffs[0].forward_sql.contains("TYPE RELATION"));
     assert!(diffs[0].forward_sql.contains("FROM user"));
@@ -757,11 +805,17 @@ fn a_changed_edge_shape_is_redefined_both_ways() {
 fn endpoints_off_a_relation_are_not_a_change() {
     let plain = EdgeDefinition::new("rel").with_mode(EdgeMode::Schemafull);
     let stray = plain.clone().with_from_table("user");
-    assert!(diff_edges(&[stray], &[plain]).is_empty());
+    assert_eq!(
+        diff_edges(&[stray], &[plain]),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }
 
 #[test]
 fn diff_edges_identical_yields_nothing() {
     let e = relation_edge("likes").with_fields([f("weight", FieldType::Int)]);
-    assert!(diff_edges(std::slice::from_ref(&e), std::slice::from_ref(&e)).is_empty());
+    assert_eq!(
+        diff_edges(std::slice::from_ref(&e), std::slice::from_ref(&e)),
+        [] as [crate::migration::models::SchemaDiff; 0]
+    );
 }

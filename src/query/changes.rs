@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(sets.len(), 2);
         assert_eq!(sets[0].versionstamp, 12);
         assert_eq!(sets[0].changes.len(), 1);
-        assert!(sets[1].changes.is_empty());
+        assert_eq!(sets[1].changes, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -235,8 +235,14 @@ mod tests {
     #[test]
     fn entries_without_a_versionstamp_are_skipped() {
         let response = serde_json::json!([{ "changes": [] }]);
-        assert!(ChangeSet::from_response(&response).is_empty());
-        assert!(ChangeSet::from_response(&serde_json::json!({})).is_empty());
+        assert_eq!(
+            ChangeSet::from_response(&response),
+            [] as [crate::query::changes::ChangeSet; 0]
+        );
+        assert_eq!(
+            ChangeSet::from_response(&serde_json::json!({})),
+            [] as [crate::query::changes::ChangeSet; 0]
+        );
     }
 
     #[test]

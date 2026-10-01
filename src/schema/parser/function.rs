@@ -181,7 +181,7 @@ mod tests {
             "DEFINE FUNCTION fn::noargs() { RETURN 1 } PERMISSIONS WHERE $auth",
         )
         .expect("function");
-        assert!(f.args.is_empty());
+        assert_eq!(f.args, [] as [crate::schema::function::FunctionArg; 0]);
         assert_eq!(f.permissions.as_deref(), Some("WHERE $auth"));
     }
 

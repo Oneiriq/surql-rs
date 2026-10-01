@@ -114,6 +114,6 @@ mod tests {
     fn a_lost_task_is_a_failure_with_nothing_to_roll_back() {
         let result = task_lost(&env("prod"));
         assert_eq!(result.status, DeploymentStatus::Failed);
-        assert!(result.applied_versions.is_empty());
+        assert_eq!(result.applied_versions, [] as [std::string::String; 0]);
     }
 }

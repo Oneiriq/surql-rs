@@ -655,7 +655,7 @@ mod tests {
     async fn validate_migrations_empty_dir_returns_empty_errors() {
         let tmp = tempdir().unwrap();
         let errors = validate_migrations(tmp.path()).await.unwrap();
-        assert!(errors.is_empty());
+        assert_eq!(errors, [] as [std::string::String; 0]);
     }
 
     fn mig(version: &str, squashed_from: &[&str]) -> Migration {
@@ -694,7 +694,10 @@ mod tests {
     #[test]
     fn a_squash_of_applied_migrations_is_not_pending() {
         let disk = || vec![mig("v1", &[]), mig("v2", &[]), mig("v3", &["v1", "v2"])];
-        assert!(pending_versions(disk(), &[row("v1"), row("v2")]).is_empty());
+        assert_eq!(
+            pending_versions(disk(), &[row("v1"), row("v2")]),
+            [] as [std::string::String; 0]
+        );
         // Sources that will be applied first cover it as well.
         assert_eq!(pending_versions(disk(), &[]), vec!["v1", "v2"]);
         assert_eq!(pending_versions(disk(), &[row("v1")]), vec!["v2"]);
@@ -703,7 +706,10 @@ mod tests {
     #[test]
     fn the_sources_of_an_applied_squash_are_not_pending() {
         let disk = vec![mig("v1", &[]), mig("v2", &[]), mig("v3", &["v1", "v2"])];
-        assert!(pending_versions(disk, &[row("v3")]).is_empty());
+        assert_eq!(
+            pending_versions(disk, &[row("v3")]),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -723,8 +729,14 @@ mod tests {
                 mig("v5", &["v3", "v4"]),
             ]
         };
-        assert!(pending_versions(disk(), &[row("v1"), row("v2"), row("v4")]).is_empty());
-        assert!(pending_versions(disk(), &[row("v5")]).is_empty());
+        assert_eq!(
+            pending_versions(disk(), &[row("v1"), row("v2"), row("v4")]),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            pending_versions(disk(), &[row("v5")]),
+            [] as [std::string::String; 0]
+        );
         let applied = effective_applied(&disk(), &[row("v5")]);
         assert!(applied.contains_key("v1"), "{applied:?}");
     }

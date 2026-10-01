@@ -191,7 +191,10 @@ fn schemas_match_returns_empty() {
     db.insert("user".into(), user_with_name());
 
     let results = validate_schema(&code, &db, None, None);
-    assert!(results.is_empty());
+    assert_eq!(
+        results,
+        [] as [crate::schema::validator::ValidationResult; 0]
+    );
 }
 
 // -- Field mismatches ------------------------------------------------------
@@ -213,7 +216,10 @@ fn field_type_mismatch() {
         .iter()
         .filter(|r| r.message.to_lowercase().contains("type mismatch"))
         .collect();
-    assert!(!mismatches.is_empty());
+    assert_ne!(
+        mismatches,
+        [] as [&crate::schema::validator::ValidationResult; 0]
+    );
     assert_eq!(mismatches[0].severity, ValidationSeverity::Error);
 }
 
@@ -285,7 +291,10 @@ fn field_assertion_mismatch() {
         .iter()
         .filter(|r| r.message.to_lowercase().contains("assertion"))
         .collect();
-    assert!(!assertions.is_empty());
+    assert_ne!(
+        assertions,
+        [] as [&crate::schema::validator::ValidationResult; 0]
+    );
     assert_eq!(assertions[0].severity, ValidationSeverity::Warning);
 }
 
@@ -437,7 +446,10 @@ fn index_type_mismatch() {
         .iter()
         .filter(|r| r.message.contains("Index type mismatch"))
         .collect();
-    assert!(!mismatches.is_empty());
+    assert_ne!(
+        mismatches,
+        [] as [&crate::schema::validator::ValidationResult; 0]
+    );
     assert_eq!(mismatches[0].severity, ValidationSeverity::Error);
 }
 
@@ -460,7 +472,10 @@ fn index_columns_mismatch() {
         .iter()
         .filter(|r| r.message.contains("columns mismatch"))
         .collect();
-    assert!(!mismatches.is_empty());
+    assert_ne!(
+        mismatches,
+        [] as [&crate::schema::validator::ValidationResult; 0]
+    );
     assert_eq!(mismatches[0].severity, ValidationSeverity::Error);
 }
 
@@ -491,7 +506,7 @@ fn mtree_index_dimension_mismatch() {
         .iter()
         .filter(|r| r.message.contains("dimension mismatch"))
         .collect();
-    assert!(!dims.is_empty());
+    assert_ne!(dims, [] as [&crate::schema::validator::ValidationResult; 0]);
     assert_eq!(dims[0].severity, ValidationSeverity::Error);
 }
 
@@ -649,7 +664,10 @@ fn table_mode_mismatch_schemafull_vs_schemaless() {
         .iter()
         .filter(|r| r.message.to_lowercase().contains("mode mismatch"))
         .collect();
-    assert!(!modes.is_empty());
+    assert_ne!(
+        modes,
+        [] as [&crate::schema::validator::ValidationResult; 0]
+    );
     assert_eq!(modes[0].severity, ValidationSeverity::Error);
 }
 

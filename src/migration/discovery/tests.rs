@@ -287,7 +287,7 @@ fn load_migration_reads_squashed_from() {
 
     let m = load_migration(&path).unwrap();
     assert_eq!(m.squashed_from, vec!["20260101_000000", "20260102_000000"]);
-    assert!(m.down.is_empty());
+    assert_eq!(m.down, [] as [std::string::String; 0]);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -319,7 +319,10 @@ fn an_edited_applied_migration_is_modified() {
     let recorded = applied.checksum.clone().unwrap();
 
     let history = [history_row("20260101_000000", &recorded)];
-    assert!(modified_migrations(std::slice::from_ref(&applied), &history).is_empty());
+    assert_eq!(
+        modified_migrations(std::slice::from_ref(&applied), &history),
+        [] as [crate::migration::models::ModifiedMigration; 0]
+    );
 
     fs::write(&path, "-- @up\nSELECT 3;\n-- @down\nSELECT 2;\n").unwrap();
     let edited = load_migration(&path).unwrap();
@@ -373,11 +376,20 @@ fn rows_without_a_checksum_or_a_file_are_not_compared() {
     fs::write(&path, "-- @up\nSELECT 1;\n-- @down\nSELECT 2;\n").unwrap();
     let on_disk = [load_migration(&path).unwrap()];
 
-    assert!(modified_migrations(&on_disk, &[history_row("20260101_000000", "")]).is_empty());
-    assert!(modified_migrations(&on_disk, &[history_row("20250101_000000", "x")]).is_empty());
+    assert_eq!(
+        modified_migrations(&on_disk, &[history_row("20260101_000000", "")]),
+        [] as [crate::migration::models::ModifiedMigration; 0]
+    );
+    assert_eq!(
+        modified_migrations(&on_disk, &[history_row("20250101_000000", "x")]),
+        [] as [crate::migration::models::ModifiedMigration; 0]
+    );
     let mut unhashed = on_disk[0].clone();
     unhashed.checksum = None;
-    assert!(modified_migrations(&[unhashed], &[history_row("20260101_000000", "x")]).is_empty());
+    assert_eq!(
+        modified_migrations(&[unhashed], &[history_row("20260101_000000", "x")]),
+        [] as [crate::migration::models::ModifiedMigration; 0]
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -432,7 +444,7 @@ fn load_migration_happy_path() {
     assert_eq!(m.down.len(), 1);
     assert!(m.down[0].starts_with("REMOVE TABLE user"));
     assert!(m.checksum.as_ref().is_some_and(|c| c.len() == 64));
-    assert!(m.depends_on.is_empty());
+    assert_eq!(m.depends_on, [] as [std::string::String; 0]);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -600,7 +612,7 @@ fn load_migration_checksum_changes_with_content() {
 fn discover_returns_empty_for_missing_directory() {
     let path = std::env::temp_dir().join("surql-mig-does-not-exist-xyzzy-123");
     let migrations = discover_migrations(&path).unwrap();
-    assert!(migrations.is_empty());
+    assert_eq!(migrations, [] as [crate::migration::models::Migration; 0]);
 }
 
 #[test]
@@ -619,7 +631,7 @@ fn discover_errors_when_path_is_file() {
 fn discover_empty_directory_returns_empty() {
     let dir = unique_temp_dir("disc-empty");
     let migrations = discover_migrations(&dir).unwrap();
-    assert!(migrations.is_empty());
+    assert_eq!(migrations, [] as [crate::migration::models::Migration; 0]);
 
     fs::remove_dir_all(&dir).ok();
 }

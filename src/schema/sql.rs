@@ -547,7 +547,7 @@ mod tests {
     fn generate_edge_sql_schemafull_does_not_require_tables() {
         let e = edge_schema("entity_rel").with_mode(EdgeMode::Schemafull);
         let stmts = generate_edge_sql(&e, false).unwrap();
-        assert!(!stmts.is_empty());
+        assert_ne!(stmts, [] as [std::string::String; 0]);
     }
 
     #[test]

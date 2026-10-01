@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn build_upsert_query_returns_empty_string_for_empty_items() {
         let sql = build_upsert_query("user", &[], None).unwrap();
-        assert!(sql.is_empty());
+        assert_eq!(sql, "");
     }
 
     #[test]

@@ -379,10 +379,13 @@ mod tests {
 
     #[test]
     fn split_drops_comment_only_pieces() {
-        assert!(split_statements("-- nothing here\n/* or here */\n").is_empty());
+        assert_eq!(
+            split_statements("-- nothing here\n/* or here */\n"),
+            [] as [std::string::String; 0]
+        );
         let stmts = split_statements("SELECT 1;\n-- trailing note");
         assert_eq!(stmts, vec!["SELECT 1;".to_owned()]);
-        assert!(split_statements(" ; ;; ").is_empty());
+        assert_eq!(split_statements(" ; ;; "), [] as [std::string::String; 0]);
     }
 
     #[test]

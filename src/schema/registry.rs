@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(r.table_count(), 0);
         assert_eq!(r.edge_count(), 0);
         assert_eq!(r.bucket_count(), 0);
-        assert!(r.schema_files().is_empty());
+        assert_eq!(r.schema_files(), [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn local_empty_schema_file_list() {
         let r = SchemaRegistry::new();
-        assert!(r.schema_files().is_empty());
+        assert_eq!(r.schema_files(), [] as [std::path::PathBuf; 0]);
     }
 
     // ---- Global singleton ----

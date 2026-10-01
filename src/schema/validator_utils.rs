@@ -246,13 +246,19 @@ mod tests {
     #[test]
     fn filter_empty_results() {
         let results: Vec<ValidationResult> = Vec::new();
-        assert!(filter_by_severity(&results, ValidationSeverity::Error).is_empty());
+        assert_eq!(
+            filter_by_severity(&results, ValidationSeverity::Error),
+            [] as [crate::schema::validator::ValidationResult; 0]
+        );
     }
 
     #[test]
     fn filter_no_matches() {
         let results = vec![mk(ValidationSeverity::Error, "user", Some("email"))];
-        assert!(filter_by_severity(&results, ValidationSeverity::Info).is_empty());
+        assert_eq!(
+            filter_by_severity(&results, ValidationSeverity::Info),
+            [] as [crate::schema::validator::ValidationResult; 0]
+        );
     }
 
     // -- filter_errors / filter_warnings --------------------------------------

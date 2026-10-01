@@ -446,7 +446,10 @@ mod tests {
         assert!(rendered.starts_with("/* ") && rendered.ends_with(" */"));
         let body = &rendered[3..rendered.len() - 3];
         assert!(!body.contains("*/"), "{rendered}");
-        assert!(!validate_hint(&QueryHint::Index(hint), None).is_empty());
+        assert_ne!(
+            validate_hint(&QueryHint::Index(hint), None),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -510,7 +513,10 @@ mod tests {
     #[test]
     fn validate_hint_checks_table() {
         let idx = QueryHint::Index(IndexHint::new("user", "email_idx"));
-        assert!(validate_hint(&idx, Some("user")).is_empty());
+        assert_eq!(
+            validate_hint(&idx, Some("user")),
+            [] as [std::string::String; 0]
+        );
         let errs = validate_hint(&idx, Some("post"));
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("user"));

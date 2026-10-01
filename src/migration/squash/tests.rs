@@ -159,7 +159,7 @@ fn strings(stmts: &[&str]) -> Vec<String> {
 #[test]
 fn optimise_empty_list() {
     let (out, count) = optimize_statements(&[]);
-    assert!(out.is_empty());
+    assert_eq!(out, [] as [std::string::String; 0]);
     assert_eq!(count, 0);
 }
 
@@ -197,7 +197,7 @@ fn optimise_removes_event_define_remove_pair() {
     ];
     let (out, count) = optimize_statements(&stmts);
     assert_eq!(count, 2);
-    assert!(out.is_empty());
+    assert_eq!(out, [] as [std::string::String; 0]);
 }
 
 #[test]

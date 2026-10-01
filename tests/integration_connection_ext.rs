@@ -93,7 +93,7 @@ async fn registry_round_trip_against_live_server() {
         )
         .await
         .expect("signin via auth manager");
-    assert!(!token.token.is_empty());
+    assert_ne!(token.token, "");
     assert!(am.is_authenticated().await);
     assert_eq!(am.current_token().await.map(|t| t.token), Some(token.token));
 
@@ -127,7 +127,7 @@ async fn registry_round_trip_against_live_server() {
 
     // clean up the registry
     registry.clear().await;
-    assert!(registry.list().await.is_empty());
+    assert_eq!(registry.list().await, [] as [std::string::String; 0]);
 }
 
 #[tokio::test]

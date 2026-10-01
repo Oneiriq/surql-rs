@@ -315,8 +315,8 @@ fn generate_migration_writes_metadata_section() {
 fn generate_migration_empty_statements_round_trip_to_empty_vectors() {
     let dir = unique_temp_dir("empty");
     let m = generate_migration("noop", &[], &[], &dir).unwrap();
-    assert!(m.up.is_empty());
-    assert!(m.down.is_empty());
+    assert_eq!(m.up, [] as [std::string::String; 0]);
+    assert_eq!(m.down, [] as [std::string::String; 0]);
 
     cleanup(&dir);
 }
@@ -367,8 +367,8 @@ fn atomic_write_rejects_when_directory_is_a_file() {
 fn blank_migration_round_trips_to_empty_statements() {
     let dir = unique_temp_dir("blank");
     let m = create_blank_migration("manual_fix", "Manual data fix", &dir).unwrap();
-    assert!(m.up.is_empty());
-    assert!(m.down.is_empty());
+    assert_eq!(m.up, [] as [std::string::String; 0]);
+    assert_eq!(m.down, [] as [std::string::String; 0]);
     assert_eq!(m.description, "Manual data fix");
 
     let reloaded = load_migration(&m.path).unwrap();
