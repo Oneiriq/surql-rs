@@ -7,6 +7,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.34.2] - 2026-10-03
+
+### Fixed
+
+- **The aggregate helpers render SurrealQL the server accepts.** They
+  rendered SQL forms that SurrealDB rejects at parse time, so any query
+  built with them failed before it ran:
+  - `count(None)` rendered `COUNT(*)`, and the parser refuses the `*`. It
+    now renders `count()`, as `count_all()` does, and `count(Some(f))`
+    renders `count(f)`.
+  - `sum_`, `avg`, `min_` and `max_` rendered `SUM()`, `AVG()`, `MIN()` and
+    `MAX()`, which SurrealQL does not define. They now render
+    `math::sum`, `math::mean`, `math::min` and `math::max`.
+
+  An integration test runs every one of them in a grouped query against
+  SurrealDB 3.3.
+
 ## [0.34.1] - 2026-10-01
 
 ### Fixed

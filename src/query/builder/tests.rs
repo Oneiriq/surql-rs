@@ -276,13 +276,13 @@ fn order_by_multiple_fields() {
 #[test]
 fn group_by_renders() {
     let q = Query::new()
-        .select(Some(vec!["status".into(), "COUNT(*)".into()]))
+        .select(Some(vec!["status".into(), "count()".into()]))
         .from_table("user")
         .unwrap()
         .group_by(["status"]);
     assert_eq!(
         q.to_surql().unwrap(),
-        "SELECT status, COUNT(*) FROM user GROUP BY status"
+        "SELECT status, count() FROM user GROUP BY status"
     );
 }
 
