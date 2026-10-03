@@ -35,7 +35,7 @@ pub enum ExpressionKind {
     Field,
     /// Literal value (already quoted via [`quote_value_public`]).
     Value,
-    /// Function call (e.g. `COUNT(*)`).
+    /// Function call (e.g. `count()`).
     Function,
 }
 
@@ -209,29 +209,35 @@ impl From<String> for ExprArg {
 // Aggregate functions
 // ---------------------------------------------------------------------------
 
-/// `COUNT(*)` or `COUNT(field)`.
+/// `count()`, every row, or `count(field)`, the rows where `field` is
+/// truthy.
+///
+/// SurrealQL has no `COUNT(*)`: the parser rejects the `*`.
 pub fn count(field_name: Option<&str>) -> Expression {
-    Expression::function(format!("COUNT({})", field_name.unwrap_or("*")))
+    match field_name {
+        Some(field) => Expression::function(format!("count({field})")),
+        None => Expression::function("count()".to_string()),
+    }
 }
 
-/// `SUM(field)`.
+/// `math::sum(field)`. SurrealQL has no SQL-style `SUM()`.
 pub fn sum_(field_name: &str) -> Expression {
-    Expression::function(format!("SUM({field_name})"))
+    Expression::function(format!("math::sum({field_name})"))
 }
 
-/// `AVG(field)`.
+/// `math::mean(field)`. SurrealQL has no SQL-style `AVG()`.
 pub fn avg(field_name: &str) -> Expression {
-    Expression::function(format!("AVG({field_name})"))
+    Expression::function(format!("math::mean({field_name})"))
 }
 
-/// `MIN(field)`.
+/// `math::min(field)`. SurrealQL has no SQL-style `MIN()`.
 pub fn min_(field_name: &str) -> Expression {
-    Expression::function(format!("MIN({field_name})"))
+    Expression::function(format!("math::min({field_name})"))
 }
 
-/// `MAX(field)`.
+/// `math::max(field)`. SurrealQL has no SQL-style `MAX()`.
 pub fn max_(field_name: &str) -> Expression {
-    Expression::function(format!("MAX({field_name})"))
+    Expression::function(format!("math::max({field_name})"))
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +366,7 @@ pub fn cast(field_name: &str, target_type: &str) -> Expression {
 // Composition
 // ---------------------------------------------------------------------------
 
-/// Alias an expression: `as_(&count(None), "total")` ⇒ `COUNT(*) AS total`.
+/// Alias an expression: `as_(&count(None), "total")` ⇒ `count() AS total`.
 pub fn as_(expr: &Expression, alias: &str) -> Expression {
     Expression::raw(format!("{} AS {alias}", expr.to_surql()))
 }
@@ -473,8 +479,9 @@ mod tests {
 
     #[test]
     fn count_renders() {
-        assert_eq!(count(None).to_surql(), "COUNT(*)");
-        assert_eq!(count(Some("id")).to_surql(), "COUNT(id)");
+        assert_eq!(count(None).to_surql(), "count()");
+        assert_eq!(count(Some("id")).to_surql(), "count(id)");
+        assert_eq!(count(None).to_surql(), count_all().to_surql());
     }
 
     #[test]
@@ -493,10 +500,10 @@ mod tests {
 
     #[test]
     fn aggregate_functions() {
-        assert_eq!(sum_("price").to_surql(), "SUM(price)");
-        assert_eq!(avg("age").to_surql(), "AVG(age)");
-        assert_eq!(min_("price").to_surql(), "MIN(price)");
-        assert_eq!(max_("price").to_surql(), "MAX(price)");
+        assert_eq!(sum_("price").to_surql(), "math::sum(price)");
+        assert_eq!(avg("age").to_surql(), "math::mean(age)");
+        assert_eq!(min_("price").to_surql(), "math::min(price)");
+        assert_eq!(max_("price").to_surql(), "math::max(price)");
     }
 
     #[test]
@@ -565,7 +572,7 @@ mod tests {
 
     #[test]
     fn as_aliases_expressions() {
-        assert_eq!(as_(&count(None), "total").to_surql(), "COUNT(*) AS total");
+        assert_eq!(as_(&count(None), "total").to_surql(), "count() AS total");
         let inner = concat::<ExprArg>([field("first").into(), field("last").into()]);
         assert_eq!(
             as_(&inner, "full_name").to_surql(),

@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surql::connection::{ConnectionConfig, DatabaseClient};
 use surql::query::builder::Query;
-use surql::query::expressions::{as_, count_all, math_mean, math_sum};
+use surql::query::expressions::{
+    as_, avg, count, count_all, math_mean, math_sum, max_, min_, sum_,
+};
 use surql::query::results::{extract_many, extract_one, extract_scalar, has_result};
 use surql::query::{crud, executor, typed, AggregateOpts};
 use surql::types::operators::{eq, gt, type_record, type_thing};
@@ -417,6 +419,56 @@ async fn extract_helpers_round_trip_against_raw_response() {
             .expect("count raw");
     let total = extract_scalar(&count_raw, "count", json!(0));
     assert_eq!(total.as_i64(), Some(2));
+
+    client.disconnect().await.unwrap();
+}
+
+/// The aggregate helpers render SurrealQL the server parses and computes:
+/// `count()` and `count(field)`, and `math::sum` / `mean` / `min` / `max`.
+/// The SQL-style `COUNT(*)`, `SUM()`, `AVG()`, `MIN()` and `MAX()` are
+/// rejected at parse time.
+#[tokio::test]
+async fn aggregate_helpers_execute() {
+    let Some(client) = connected_client(&unique_db()).await else {
+        println!("skipped: SURREAL_URL not set");
+        return;
+    };
+    client
+        .query(
+            "CREATE item:1 SET kind = 'a', price = 3, tag = 'x';              CREATE item:2 SET kind = 'a', price = 5;              CREATE item:3 SET kind = 'b', price = 4, tag = 'y';",
+        )
+        .await
+        .expect("seed items");
+
+    let rows = Query::new()
+        .select_expr(vec![
+            surql::query::expressions::field("kind"),
+            as_(&count(None), "rows"),
+            as_(&count(Some("tag")), "tagged"),
+            as_(&sum_("price"), "total"),
+            as_(&avg("price"), "mean"),
+            as_(&min_("price"), "low"),
+            as_(&max_("price"), "high"),
+        ])
+        .from_table("item")
+        .unwrap()
+        .group_by(["kind"])
+        .order_by("kind", "ASC")
+        .unwrap()
+        .execute(&client)
+        .await
+        .expect("aggregates parse and run");
+    let rows = extract_many(&rows);
+    assert_eq!(rows.len(), 2);
+    let a = &rows[0];
+    assert_eq!(a["kind"], "a");
+    assert_eq!(a["rows"].as_i64(), Some(2));
+    assert_eq!(a["tagged"].as_i64(), Some(1));
+    assert_eq!(a["total"].as_i64(), Some(8));
+    assert_eq!(a["mean"].as_f64(), Some(4.0));
+    assert_eq!(a["low"].as_i64(), Some(3));
+    assert_eq!(a["high"].as_i64(), Some(5));
+    assert_eq!(rows[1]["rows"].as_i64(), Some(1));
 
     client.disconnect().await.unwrap();
 }
