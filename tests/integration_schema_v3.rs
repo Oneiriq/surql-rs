@@ -648,11 +648,14 @@ async fn parse_db_info_reads_the_raw_query_response() {
     assert!(parsed.tables.contains_key("user"), "{parsed:?}");
 }
 
-/// The engine backfills nothing when a field gains `REFERENCE`, and a
+/// A 3.x server backfills nothing when a field gains `REFERENCE`, and a
 /// self-assignment registers nothing either: after the DDL alone every
 /// pre-existing row is invisible to `<~`. The diff knows this and
-/// carries the rewrite; applying both halves makes the tracking true,
-/// and the result round-trips with no residual change.
+/// carries the rewrite. The embedded engine here is SurrealDB 4.0, which
+/// registers the pre-existing rows on the DDL alone; the rewrite stays,
+/// because the 4.x SDK still talks to 3.x servers, so on 4.0 it has to
+/// be harmless: the tracking stays exactly the one row, and the result
+/// round-trips with no residual change.
 #[tokio::test]
 async fn a_gained_reference_backfills_pre_existing_rows() {
     let client = memory_client().await;
@@ -689,28 +692,29 @@ async fn a_gained_reference_backfills_pre_existing_rows() {
         .expect("a gained reference carries its backfill")
         .to_owned();
 
-    // The DDL alone: the pre-existing row is invisible. This is the
-    // engine behaviour the rewrite exists for; if this half ever fails,
-    // the engine learned to backfill and the rewrite can retire.
+    // The DDL alone: SurrealDB 4.0 registers the pre-existing row. A 3.x
+    // server leaves it invisible here, which is what the rewrite is for.
     apply(&client, &[diffs[0].forward_sql.clone()]).await;
-    let unseen = client
+    let seen_by_ddl = client
         .query("SELECT VALUE <~f FROM b:one;")
         .await
         .expect("reverse read");
     assert_eq!(
-        serde_json::to_string(&unseen).unwrap(),
-        "[[[]]]",
-        "the engine now backfills on its own; retire the rewrite",
+        serde_json::to_string(&seen_by_ddl).unwrap(),
+        r#"[[["f:alpha"]]]"#,
+        "a 4.0 engine registers a pre-existing row when its field gains REFERENCE",
     );
 
-    // The rewrite the diff carries makes the tracking true.
+    // The rewrite the diff carries for 3.x servers changes nothing here:
+    // the row is tracked once, not twice.
     apply(&client, &[backfill]).await;
     let seen = client
         .query("SELECT VALUE <~f FROM b:one;")
         .await
         .expect("reverse read");
-    assert!(
-        serde_json::to_string(&seen).unwrap().contains("f:alpha"),
+    assert_eq!(
+        serde_json::to_string(&seen).unwrap(),
+        r#"[[["f:alpha"]]]"#,
         "{seen:?}"
     );
 
