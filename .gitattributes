@@ -1,0 +1,2 @@
+# Datastore files written by an engine, compared byte for byte by the tests.
+tests/fixtures/surrealkv-*/** binary

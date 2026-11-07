@@ -10,10 +10,10 @@ any binary-only dependencies.
 
 | Feature         | Default | Implies                | Pulls in                                                   | What you get                                                                 |
 |-----------------|---------|------------------------|------------------------------------------------------------|------------------------------------------------------------------------------|
-| `client-rustls` | yes     | -                      | `tokio`, `surrealdb` 3.x (`rustls`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). The default backend since 0.2.3. See [Picking a TLS backend](#picking-a-tls-backend). |
-| `client`        | no      | -                      | `tokio`, `surrealdb` 3.x (`native-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
-| `client-wasm`   | no      | -                      | `tokio` (wasm subset), `surrealdb` 3.x (`protocol-ws`, `kv-mem`), `futures` | Wasm-friendly variant. Same `DatabaseClient` API, no TLS / `rt-multi-thread`. See [WebAssembly support](#webassembly-support). |
-| `client-grpc`   | no      | `client-rustls`        | `surrealdb` 3.x (`protocol-grpc`): `tonic`, `surrealdb-protocol` | The gRPC transport: `grpc://` and `grpcs://` URLs (SurrealDB 3.3+; the server answers on its main port). Live queries work over it. |
+| `client-rustls` | yes     | -                      | `tokio`, `surrealdb` 4.x (`rustls`), `futures` | Same surface as `client` but with pure-Rust TLS (no `openssl-sys`). The default backend since 0.2.3. See [Picking a TLS backend](#picking-a-tls-backend). |
+| `client`        | no      | -                      | `tokio`, `surrealdb` 4.x (`native-tls`), `futures` | `DatabaseClient`, async CRUD, executor, graph helpers, transaction buffer. Uses the system `native-tls` stack (`openssl-sys` on Linux). |
+| `client-wasm`   | no      | -                      | `tokio` (wasm subset), `surrealdb` 4.x (`protocol-ws`, `kv-mem`), `futures` | Wasm-friendly variant. Same `DatabaseClient` API, no TLS / `rt-multi-thread`. See [WebAssembly support](#webassembly-support). |
+| `client-grpc`   | no      | `client-rustls`        | `surrealdb` 4.x (`protocol-grpc`): `tonic`, `surrealdb-protocol` | The gRPC transport: `grpc://` and `grpcs://` URLs (SurrealDB 3.3+; the server answers on its main port). Live queries work over it. |
 | `cli`           | no      | `client-rustls`, `orchestration`, `settings` | `clap`, `tracing-subscriber`, `comfy-table`, `colored` | The `surql` binary (`migrate`, `schema`, `db`, `orchestrate`).              |
 | `cache`         | no      | -                      | `tokio`, `async-trait`                                     | `MemoryCache` backend, `CacheManager`, global cache registry.                |
 | `cache-redis`   | no      | `cache`                | `redis`                                                    | `RedisCache` backend for the cache manager.                                  |
@@ -159,7 +159,7 @@ Tracks Oneiriq/surql-rs#115. Enables the same
 
 #### Build prerequisites
 
-`surrealdb-core 3.x` pulls `ring 0.17` with its
+`surrealdb-core 4.x` pulls `ring 0.17` with its
 `wasm32_unknown_unknown_js` feature, but `ring`'s build script still
 invokes the system C compiler with `--target=wasm32-unknown-unknown`.
 On macOS, Apple's `/usr/bin/clang` does not include a wasm32 backend;

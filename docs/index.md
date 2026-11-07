@@ -25,7 +25,7 @@ Define schemas, generate migrations, build queries, and perform typed CRUD
   relationships and [v3-compatible arrow chains](v3-patterns.md).
 - **Schema Visualization** -- Mermaid, GraphViz, and ASCII diagrams with
   modern / dark / forest / minimal themes.
-- **Async-First** -- Tokio-based client on `surrealdb` 3.x with
+- **Async-First** -- Tokio-based client on `surrealdb` 4.x with
   connection pooling, retry logic, and buffered transactions.
 - **CLI Tools** -- Full `surql` binary (`migrate`, `schema`, `db`,
   `orchestrate`) under the `cli` feature.

@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::connection::config::{ConnectionConfig, ENV_PREFIX};
+use crate::connection::config::{set_upgrade_from_3x, ConnectionConfig, ENV_PREFIX};
 use crate::error::{Result, SurqlError};
 
 /// Application environment.
@@ -669,6 +669,11 @@ fn apply_env_overrides(cfg: &mut ConnectionConfig, lookup: &impl Fn(&str) -> Opt
             cfg.enable_live_queries = parsed;
         }
     }
+    if let Some(v) = first_env(lookup, &["SURQL_EXPERIMENTAL_UPGRADE_FROM_3X"]) {
+        if let Ok(parsed) = parse_bool(&v) {
+            set_upgrade_from_3x(&mut cfg.datastore_options, parsed);
+        }
+    }
 }
 
 fn first_env(lookup: &impl Fn(&str) -> Option<String>, keys: &[&str]) -> Option<String> {
@@ -912,6 +917,17 @@ enable_live_queries = true
             ..DatabaseTable::default()
         };
         assert!(build_connection_config(None, &|_: &str| None, Some(&toml_db)).is_err());
+    }
+
+    #[test]
+    fn the_upgrade_opt_in_is_read_from_the_environment() {
+        let unset = build_connection_config(None, &|_: &str| None, None).unwrap();
+        assert!(!unset.experimental_upgrade_from_3x());
+        assert!(unset.datastore_options.is_empty());
+        let lookup =
+            |key: &str| (key == "SURQL_EXPERIMENTAL_UPGRADE_FROM_3X").then(|| "true".to_owned());
+        let set = build_connection_config(None, &lookup, None).unwrap();
+        assert!(set.experimental_upgrade_from_3x());
     }
 
     /// Regression: `Settings` (and its builder) derived `Debug` over the

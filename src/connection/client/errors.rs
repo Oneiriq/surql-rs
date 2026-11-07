@@ -17,6 +17,9 @@ impl From<surrealdb::Error> for SurqlError {
 }
 
 fn classify_surrealdb_error(err: &surrealdb::Error, msg: String) -> SurqlError {
+    if engine_refuses_upgrade_from_3x(err) {
+        return SurqlError::DatastoreUpgradeRefused { reason: msg };
+    }
     if err.is_connection() {
         return SurqlError::Connection { reason: msg };
     }
@@ -42,9 +45,35 @@ fn classify_surrealdb_error(err: &surrealdb::Error, msg: String) -> SurqlError {
 }
 
 pub(super) fn connection_err(err: &surrealdb::Error) -> SurqlError {
+    if engine_refuses_upgrade_from_3x(err) {
+        return SurqlError::DatastoreUpgradeRefused {
+            reason: err.to_string(),
+        };
+    }
     SurqlError::Connection {
         reason: err.to_string(),
     }
+}
+
+/// An embedded SurrealDB 4 engine's refusal to open a datastore a 3.x
+/// release wrote, without the `experimental_upgrade_from_3x` opt-in.
+///
+/// SurrealDB 4.0 gives the refusal no structured details: the embedded
+/// engine reports every startup failure as an internal error carrying the
+/// datastore's message. Two messages refuse it, one from the datastore
+/// (`The data stored on disk was last written by SurrealDB 3.x ...`) and one
+/// from the storage engine when a directory still holds 3.x files (`The
+/// directory ... written by SurrealDB 3.x ...`), and both end by naming the
+/// `SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X` opt-in it refused without, which
+/// is what is matched, along with the refusal itself. Only an internal or
+/// configuration error is read this way (the datastore's own error kind is
+/// configuration), so a statement's `THROW` text never matches.
+pub(super) fn engine_refuses_upgrade_from_3x(err: &surrealdb::Error) -> bool {
+    if !(err.is_internal() || err.is_configuration()) {
+        return false;
+    }
+    let message = err.message().to_ascii_lowercase();
+    message.contains("experimental_upgrade_from_3x") && message.contains("refused")
 }
 
 /// The SDK's rejection of a second `connect` on an already-connected handle.

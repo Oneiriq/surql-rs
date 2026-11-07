@@ -1,16 +1,53 @@
-//! Shaping values between the SDK and the typed client API: statement
-//! results, typed rows, CRUD targets, credential payloads and durations.
+//! Shaping values between the SDK and the typed client API: endpoint
+//! config, statement results, typed rows, CRUD targets, credential payloads
+//! and durations.
 
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use surrealdb::opt::auth::Root as SdkRoot;
+use surrealdb::opt::Config as SdkConfig;
 use surrealdb::IndexedResults;
 
 use super::errors::{not_executed_says_why, query_err, statement_was_not_executed};
+use crate::connection::config::ConnectionConfig;
 use crate::error::{Result, SurqlError};
 use crate::query::results::response_rows;
 use crate::query::validate::render_target as query_target;
+
+/// The endpoint config a connect hands the SDK, or `None` when the config
+/// has nothing for the engine.
+///
+/// Credentials reach the engine at build time. An embedded datastore built
+/// without a root user treats every anonymous session as owner, so locking
+/// the engine needs the user to exist before the first session. Remote
+/// engines ignore the endpoint credentials and authenticate through the
+/// signin that follows the connect.
+///
+/// Datastore options go to an embedded engine only, which reads them from
+/// this config and nowhere else (not from the URL, not from the
+/// environment). A remote URL never gets them: a server takes its
+/// datastore settings from its own environment.
+pub(super) fn endpoint_config(config: &ConnectionConfig) -> Result<Option<SdkConfig>> {
+    let mut endpoint = None;
+    if let (Some(user), Some(pass)) = (config.username(), config.password()) {
+        endpoint = Some(SdkConfig::new().user(SdkRoot {
+            username: user.to_owned(),
+            password: pass.to_owned(),
+        }));
+    }
+    if config.protocol()?.is_embedded() {
+        for (key, value) in &config.datastore_options {
+            endpoint = Some(
+                endpoint
+                    .unwrap_or_default()
+                    .datastore_option(key.as_str(), value),
+            );
+        }
+    }
+    Ok(endpoint)
+}
 
 /// Unpack every statement of a response into one JSON array entry each.
 ///
