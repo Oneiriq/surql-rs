@@ -111,11 +111,12 @@ jobs:
           prefix-key: "v1-rust-ubuntu-latest-stable"
 
       # SurrealDB 4's engine OOM-kills the aur0 runner pod at full width,
-      # with no log: two compiles at a time and no debuginfo keep it inside.
+      # with no log, even two compiles at a time without debuginfo: one
+      # compile at a time and no debuginfo.
       - name: cargo test --lib
         run: cargo test --lib --all-features
         env:
-          CARGO_BUILD_JOBS: "2"
+          CARGO_BUILD_JOBS: "1"
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
 
@@ -124,13 +125,13 @@ jobs:
       # parallel; at full width that exhausts the runner pod's memory and
       # the job dies without a log. No debuginfo and four at a time keeps
       # it inside the pod.
-      # SurrealDB 4's engine OOM-kills the pod at full width, so two compiles
+      # SurrealDB 4's engine OOM-kills the pod at full width, so one compile
       # at a time; the profile matches the step above so its build is reused.
       - name: cargo test --doc
         run: cargo test --doc --all-features -- --test-threads=4
         env:
           RUSTDOCFLAGS: "-C debuginfo=0"
-          CARGO_BUILD_JOBS: "2"
+          CARGO_BUILD_JOBS: "1"
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
 
@@ -233,13 +234,14 @@ jobs:
           prefix-key: "v1-rust-wasm"
 
       # SurrealDB 4's engine OOM-kills the aur0 runner pod at full width,
-      # with no log: two compiles at a time and no debuginfo keep it inside.
+      # with no log, even two compiles at a time without debuginfo: one
+      # compile at a time and no debuginfo.
       - name: scripts/check-wasm.sh
         run: ./scripts/check-wasm.sh
         env:
           CC_wasm32_unknown_unknown: clang
           AR_wasm32_unknown_unknown: llvm-ar
-          CARGO_BUILD_JOBS: "2"
+          CARGO_BUILD_JOBS: "1"
           CARGO_PROFILE_DEV_DEBUG: "0"
 
   audit:
