@@ -25,4 +25,16 @@ ignore = [
     # verifies tokens rather than signing them. Re-evaluate whenever
     # surrealdb or jsonwebtoken move off the unfixed crate.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0387 (crypto-bigint 0.5.5: timing variability in
+    # operations meant to be constant-time) is fixed only in 0.7.6. It
+    # reaches the lockfile through the engine's JWT stack,
+    # `jsonwebtoken 10.4 -> p256 0.13 -> elliptic-curve 0.13 ->
+    # crypto-bigint 0.5`, and elliptic-curve 0.13 cannot take 0.7, so
+    # no bump clears it; main carries it too. The leak needs secret
+    # P-256 scalar operations to time. SurrealDB uses p256 only for an
+    # access method configured with an ES algorithm, and this crate
+    # defines none. Drop this when surrealdb or jsonwebtoken moves to
+    # elliptic-curve 0.14.
+    "RUSTSEC-2026-0387",
 ]
