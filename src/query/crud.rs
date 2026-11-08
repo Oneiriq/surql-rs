@@ -252,6 +252,10 @@ pub async fn exists<T>(client: &DatabaseClient, record_id: &RecordID<T>) -> Resu
 ///
 /// Composes with the builder's own `LIMIT` if set; if the query has no
 /// explicit limit, this helper appends `LIMIT 1` for efficiency.
+///
+/// "First" is in the query's `ORDER BY`. Without one, SurrealDB 4 returns
+/// any matching row (3.x usually returned the first in key order), so give
+/// the query an `order_by` when it matters which row comes back.
 pub async fn first<T: DeserializeOwned>(
     client: &DatabaseClient,
     query: &Query,

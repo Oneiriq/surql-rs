@@ -27,6 +27,7 @@ use serde_json::Value;
 
 use crate::connection::DatabaseClient;
 use crate::error::{Result, SurqlError};
+use crate::migration::discovery::compare_versions;
 use crate::migration::hooks::is_auto_snapshot_enabled;
 use crate::migration::models::MigrationHistory;
 use crate::migration::versioning::{create_snapshot, store_snapshot};
@@ -206,21 +207,47 @@ pub async fn update_migration_checksum(
 
 /// Fetch every applied migration, ordered by `applied_at` ascending.
 ///
+/// Migrations applied at the same instant come in version order (runs of
+/// digits compared as numbers, as [`discover_migrations`] orders files),
+/// so the order is the same on every read.
+///
+/// [`discover_migrations`]: crate::migration::discovery::discover_migrations
+///
 /// # Errors
 ///
 /// Returns [`SurqlError::MigrationHistory`] if the query fails or rows
 /// cannot be decoded.
 pub async fn get_applied_migrations(client: &DatabaseClient) -> Result<Vec<MigrationHistory>> {
     ensure_migration_table(client).await?;
-    let surql = format!("SELECT * FROM {MIGRATION_TABLE_NAME} ORDER BY applied_at ASC;");
     let raw = client
-        .query(&surql)
+        .query(&applied_migrations_statement())
         .await
         .map_err(|e| SurqlError::MigrationHistory {
             reason: format!("failed to fetch applied migrations: {e}"),
         })?;
 
-    Ok(parse_history_rows(&raw))
+    let mut rows = parse_history_rows(&raw);
+    order_history(&mut rows);
+    Ok(rows)
+}
+
+/// The query behind [`get_applied_migrations`]. The order is explicit:
+/// SurrealDB 4 returns a statement without `ORDER BY` in no particular
+/// order, and `version` settles rows that share an `applied_at`.
+fn applied_migrations_statement() -> String {
+    format!("SELECT * FROM {MIGRATION_TABLE_NAME} ORDER BY applied_at ASC, version ASC;")
+}
+
+/// Put history rows in apply order: `applied_at`, then version as
+/// migration files are ordered. The query already orders by `applied_at`;
+/// this settles ties the way the runner applied them (`v9` before `v10`),
+/// which the server's string order of `version` does not.
+fn order_history(rows: &mut [MigrationHistory]) {
+    rows.sort_by(|a, b| {
+        a.applied_at
+            .cmp(&b.applied_at)
+            .then_with(|| compare_versions(&a.version, &b.version))
+    });
 }
 
 /// `true` if the given version is recorded as applied.
@@ -448,5 +475,67 @@ mod tests {
     #[test]
     fn migration_table_name_constant_matches_python() {
         assert_eq!(MIGRATION_TABLE_NAME, "_migration_history");
+    }
+
+    /// SurrealDB 4 returns a statement without `ORDER BY` in no particular
+    /// order, so the history query has to ask for apply order itself.
+    #[test]
+    fn the_history_query_asks_for_apply_order() {
+        assert_eq!(
+            applied_migrations_statement(),
+            "SELECT * FROM _migration_history ORDER BY applied_at ASC, version ASC;"
+        );
+    }
+
+    fn applied(version: &str, second: u32) -> MigrationHistory {
+        MigrationHistory {
+            version: version.into(),
+            description: String::new(),
+            applied_at: Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, second).unwrap(),
+            checksum: String::new(),
+            execution_time_ms: None,
+        }
+    }
+
+    #[test]
+    fn rows_come_back_in_apply_order_with_ties_in_version_order() {
+        // As an unordered read could hand them back: shuffled, two at one
+        // instant, and string order would put v10 before v9.
+        let mut rows = vec![
+            applied("v10", 5),
+            applied("v2", 1),
+            applied("v1", 9),
+            applied("v9", 5),
+        ];
+        order_history(&mut rows);
+        let versions: Vec<&str> = rows.iter().map(|r| r.version.as_str()).collect();
+        assert_eq!(versions, ["v2", "v9", "v10", "v1"]);
+    }
+
+    /// End to end on an embedded engine: rows recorded in an order that is
+    /// neither id order nor apply order read back in apply order.
+    #[tokio::test]
+    async fn applied_migrations_read_back_in_apply_order() {
+        let config = crate::connection::ConnectionConfig::builder()
+            .url("mem://")
+            .namespace("history")
+            .database("history")
+            .retry_max_attempts(1)
+            .build()
+            .unwrap();
+        let client = DatabaseClient::new(config).unwrap();
+        client.connect().await.unwrap();
+        // Recorded newest version first, applied oldest first: id order
+        // (`v1` < `v2` < ...) and apply order disagree everywhere.
+        let total = 40u32;
+        for n in 1..=total {
+            record_migration(&client, &applied(&format!("v{n}"), total - n))
+                .await
+                .unwrap();
+        }
+        let rows = get_applied_migrations(&client).await.unwrap();
+        let versions: Vec<String> = rows.into_iter().map(|r| r.version).collect();
+        let expected: Vec<String> = (1..=total).rev().map(|n| format!("v{n}")).collect();
+        assert_eq!(versions, expected);
     }
 }

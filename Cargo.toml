@@ -1,6 +1,6 @@
 [package]
 name = "oneiriq-surql"
-version = "0.34.2"
+version = "0.35.0"
 edition = "2021"
 rust-version = "1.95"
 authors = ["Shon Thomas <shon@oneiriq.com>"]
@@ -124,7 +124,7 @@ ulid = { version = "3.0", features = ["serde"] }
 # explicitly by the `client` / `client-rustls` feature flags. Its
 # default-feature set includes `rustls`; we prefer to be explicit so
 # downstream consumers know which TLS stack they are pulling.
-surrealdb = { version = "3.3.0", default-features = false, features = ["protocol-ws"], optional = true }
+surrealdb = { version = "4.0.0", default-features = false, features = ["protocol-ws"], optional = true }
 futures = { version = "0.3", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
@@ -160,9 +160,11 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tokio = { version = "1.48", features = ["full", "test-util"] }
 # Feature-unifies `kv-mem` into the client's `surrealdb` so connection tests
-# can run a real embedded engine (`mem://`) without a server. Test-only; the
-# published feature set stays ws-only.
-surrealdb = { version = "3.3.0", default-features = false, features = ["kv-mem"] }
+# can run a real embedded engine (`mem://`) without a server, and
+# `kv-surrealkv` so `tests/embedded_upgrade_from_3x.rs` can open the
+# SurrealKV directory SurrealDB 3.3.5 wrote. Test-only; the published
+# feature set stays ws-only.
+surrealdb = { version = "4.0.0", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
 pretty_assertions = "1.4"
 tempfile = "3.13"
 assert_cmd = "2.2"

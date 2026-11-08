@@ -44,6 +44,24 @@ pub enum SurqlError {
         /// Human-readable explanation.
         reason: String,
     },
+    /// An embedded SurrealDB 4 engine refused to open a datastore that a
+    /// 3.x release wrote, because the connection did not opt in to the
+    /// experimental in-place upgrade. `reason` is SurrealDB's own message.
+    ///
+    /// The opt-in for an embedded engine is
+    /// `ConnectionConfig::builder().experimental_upgrade_from_3x(true)`
+    /// (or `SURQL_EXPERIMENTAL_UPGRADE_FROM_3X=true` with
+    /// `ConnectionConfig::from_env`); the `SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X`
+    /// variable SurrealDB's message names is read only by a server. The
+    /// upgrade is one-way, so take a backup of the datastore first. The
+    /// refusal itself leaves the datastore as it was.
+    /// [`SurqlError::is_datastore_upgrade_refused`] also finds it under
+    /// [`SurqlError::WithContext`].
+    DatastoreUpgradeRefused {
+        /// SurrealDB's message, naming the version that last wrote the
+        /// datastore.
+        reason: String,
+    },
     /// A query failed at the database or during result decoding.
     Query {
         /// Human-readable explanation.
@@ -143,6 +161,12 @@ impl fmt::Display for SurqlError {
         match self {
             Self::Database { reason } => write!(f, "database error: {reason}"),
             Self::Connection { reason } => write!(f, "connection error: {reason}"),
+            Self::DatastoreUpgradeRefused { reason } => write!(
+                f,
+                "datastore upgrade refused: {reason} (an embedded engine opts in with \
+                 ConnectionConfigBuilder::experimental_upgrade_from_3x(true), not through \
+                 the environment)"
+            ),
             Self::Query { reason } => write!(f, "query error: {reason}"),
             Self::Transaction { reason } => write!(f, "transaction error: {reason}"),
             Self::Context { reason } => write!(f, "context error: {reason}"),
@@ -167,6 +191,19 @@ impl fmt::Display for SurqlError {
             Self::Serialization { reason } => write!(f, "serialization error: {reason}"),
             Self::Io { reason } => write!(f, "io error: {reason}"),
             Self::WithContext { source, context } => write!(f, "{context}: {source}"),
+        }
+    }
+}
+
+impl SurqlError {
+    /// `true` when this error, or the error under any
+    /// [`SurqlError::WithContext`] layers, is
+    /// [`SurqlError::DatastoreUpgradeRefused`].
+    pub fn is_datastore_upgrade_refused(&self) -> bool {
+        match self {
+            Self::DatastoreUpgradeRefused { .. } => true,
+            Self::WithContext { source, .. } => source.is_datastore_upgrade_refused(),
+            _ => false,
         }
     }
 }

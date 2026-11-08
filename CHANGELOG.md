@@ -7,6 +7,95 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-06
+
+The crate moves to the SurrealDB 4 Rust SDK. SurrealDB 4.0 is the only
+line with fixes for RUSTSEC-2026-0454 (`reblessive` in `surrealdb-core`,
+unsound `Send` / `Sync`) and RUSTSEC-2026-0452 (`surrealkv` 0.21
+out-of-bounds read; 4.0 ships `surrealkv` 1.2); no 3.x release fixes
+either. A SurrealDB major is a breaking change for this 0.x crate, hence
+the minor bump.
+
+### Changed
+
+- **Requires the SurrealDB 4 SDK.** `surrealdb` is now `4.0.0` (still
+  `default-features = false` with `protocol-ws`, and the same `client`,
+  `client-rustls`, `client-grpc` and `client-wasm` feature mapping). The
+  4.x SDK still connects to SurrealDB 3.x servers, so a deployment can move
+  the crate first and the server after; a 3.x SDK refuses a 4.0 server.
+  Embedded engines (`mem://`, and `surrealkv://` with the SDK's
+  `kv-surrealkv` feature) now run SurrealDB 4.0. **Breaking**
+- **SurrealDB types in the public API are the 4.x types.**
+  `DatabaseClient::inner` returns `surrealdb::Surreal<Any>`,
+  `query_with_surreal_vars` takes `surrealdb::types::Value`, `LiveQuery`
+  yields `surrealdb::Notification<T>` with
+  `T: surrealdb::types::SurrealValue`, and `From<surrealdb::Error> for
+  SurqlError` takes the 4.x error, all from `surrealdb` 4. Code that names
+  them needs `surrealdb` 4 too. **Breaking**
+- **`ConnectionConfig` has a new public field, `datastore_options`.** A
+  struct literal without `..Default::default()` needs it. A config
+  serialised by an earlier release still deserialises (the field defaults
+  to empty), and an empty map is not serialised. **Breaking**
+- **`SurqlError` has a new variant, `DatastoreUpgradeRefused`.** An
+  exhaustive `match` on `SurqlError` needs an arm for it. **Breaking**
+
+### Added
+
+- **Embedded datastores can opt in to SurrealDB 4's upgrade from 3.x.**
+  A 4.0 engine refuses a datastore that a 3.x release wrote unless the
+  `experimental_upgrade_from_3x` datastore option is set, and an embedded
+  engine reads that option only from its connection config, not from the
+  URL or the environment.
+  `ConnectionConfigBuilder::experimental_upgrade_from_3x(bool)` (default
+  `false`; `SURQL_EXPERIMENTAL_UPGRADE_FROM_3X` with `from_env` and the
+  settings loader) sets it, and
+  `ConnectionConfig::experimental_upgrade_from_3x()` reads it back. The
+  upgrade is experimental in SurrealDB 4.0 and one-way, so back the
+  datastore up first. An engine test opens a SurrealKV directory that
+  SurrealDB 3.3.5 wrote (`tests/fixtures/surrealkv-3.3.5`): refused and
+  left byte for byte as it was by default, upgraded and readable with the
+  opt-in.
+- **`ConnectionConfigBuilder::datastore_option(key, value)`** sets any
+  datastore option an embedded engine reads (as SurrealDB reads
+  `SURREAL_<KEY>`, for example `surrealkv_block_cache_capacity`). Keys are
+  stored lowercase, and `build` refuses a key that is not ASCII letters,
+  digits and `_`. `connect` hands the options to an embedded engine
+  (`mem://`, `memory://`, `surrealkv://`) and never to a remote one
+  (`ws`, `wss`, `http`, `https`, `grpc`, `grpcs`), whose server reads its
+  own environment. A config that sets none sends the engine none.
+- **A refused 3.x datastore is its own error.** When an embedded engine
+  refuses a 3.x datastore, `connect` returns
+  `SurqlError::DatastoreUpgradeRefused`, whose `reason` is SurrealDB's own
+  message and whose `Display` names the surql opt-in (SurrealDB's message
+  names the server's environment variable, which an embedded engine does
+  not read). `connect` does not retry it, and
+  `SurqlError::is_datastore_upgrade_refused()` finds it under `context`
+  layers too. The refusal leaves the datastore as it was.
+
+### Fixed
+
+- **Reads that promise an order ask for it.** SurrealDB 4 can split a
+  statement's scan into parts that run at the same time, so a statement
+  without `ORDER BY` returns its records in no particular order, on every
+  engine including `mem://`; 3.x usually returned key order.
+  - `DatabaseClient::select` now renders
+    `SELECT * FROM <target> ORDER BY id`, so rows come back in record id
+    order. Its test reads 5000 rows from an engine set to cut every scan
+    into small parts; without the `ORDER BY` it fails on the first read.
+  - The migration history (`get_applied_migrations`,
+    `get_migration_history`, and through them `migrate_down`, the status
+    report and the rollback planner) is read with
+    `ORDER BY applied_at ASC, version ASC`, and rows applied at the same
+    instant are put in version order the way migration files are ordered
+    (`v9` before `v10`), so `migrate_down` always rolls back the most
+    recently applied migration first.
+  - Queries built with `Query` carry only the order they are given: give
+    one an `order_by` wherever the order matters, including before
+    `limit` / `offset` and for `crud::first`. `crud::last` already
+    reversed only an explicit `ORDER BY`. Live queries (`LiveQuery`,
+    `StreamingManager`) deliver notifications as they happen and are
+    unaffected.
+
 ## [0.34.2] - 2026-10-03
 
 ### Fixed

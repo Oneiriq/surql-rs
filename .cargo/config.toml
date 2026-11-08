@@ -28,3 +28,13 @@
 # invocation and the README's "WebAssembly support" section.
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
+
+# The unit and integration tests run the embedded SurrealDB engine on the
+# test harness's threads, whose stack is 2 MiB unless `RUST_MIN_STACK` says
+# otherwise. SurrealDB asks for a 10 MiB stack for an embedded engine (the
+# `surrealdb::engine::local` docs), and a debug build of the 4.0 engine
+# overflows 2 MiB: on Windows, the full-text write-conflict test in
+# `connection::client::tests` does. This gives every thread the tests start
+# the size SurrealDB asks for. A value already in the environment wins.
+[env]
+RUST_MIN_STACK = "10485760"

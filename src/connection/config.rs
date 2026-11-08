@@ -4,7 +4,7 @@
 //! WebSocket/HTTP and embedded engines), namespace/database identifier
 //! checks, timeout/retry defaults, and live-query gating.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
 
@@ -24,6 +24,11 @@ pub const MAX_RETRY_WAIT_SECS: f64 = 3_600.0;
 
 /// Largest accepted [`ConnectionConfig::db_retry_multiplier`].
 pub const MAX_RETRY_MULTIPLIER: f64 = 100.0;
+
+/// The datastore option that lets an embedded SurrealDB 4 engine upgrade,
+/// in place, a datastore that a 3.x release wrote. See
+/// [`ConnectionConfigBuilder::experimental_upgrade_from_3x`].
+pub const EXPERIMENTAL_UPGRADE_FROM_3X: &str = "experimental_upgrade_from_3x";
 
 /// Protocol implied by the configured URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,6 +132,14 @@ pub struct ConnectionConfig {
     pub db_retry_multiplier: f64,
     /// Enable live query support. Requires WebSocket or embedded URL.
     pub enable_live_queries: bool,
+    /// Datastore options for an embedded engine (`mem://`, `surrealkv://`),
+    /// keyed as SurrealDB reads them from `SURREAL_<KEY>` (lowercase, such
+    /// as `surrealkv_block_cache_capacity` or
+    /// [`EXPERIMENTAL_UPGRADE_FROM_3X`]). Passed to the engine when the
+    /// client connects; a remote URL ignores them, because a server takes
+    /// its datastore settings from its own environment. Empty by default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub datastore_options: BTreeMap<String, String>,
 }
 
 impl fmt::Debug for ConnectionConfig {
@@ -144,6 +157,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("db_retry_max_wait", &self.db_retry_max_wait)
             .field("db_retry_multiplier", &self.db_retry_multiplier)
             .field("enable_live_queries", &self.enable_live_queries)
+            .field("datastore_options", &self.datastore_options)
             .finish()
     }
 }
@@ -180,6 +194,7 @@ impl Default for ConnectionConfig {
             db_retry_max_wait: 10.0,
             db_retry_multiplier: 2.0,
             enable_live_queries: true,
+            datastore_options: BTreeMap::new(),
         }
     }
 }
@@ -244,7 +259,21 @@ impl ConnectionConfig {
                     .into(),
             });
         }
+        for key in self.datastore_options.keys() {
+            validate_datastore_option_key(key)?;
+        }
         Ok(())
+    }
+
+    /// Whether an embedded engine may upgrade a datastore a SurrealDB 3.x
+    /// release wrote: the [`EXPERIMENTAL_UPGRADE_FROM_3X`] datastore
+    /// option, `false` unless set. See
+    /// [`ConnectionConfigBuilder::experimental_upgrade_from_3x`].
+    pub fn experimental_upgrade_from_3x(&self) -> bool {
+        self.datastore_options
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(EXPERIMENTAL_UPGRADE_FROM_3X))
+            .any(|(_, value)| parse_bool(value).unwrap_or(false))
     }
 
     /// Infer the [`Protocol`] used by this configuration's URL.
@@ -300,7 +329,7 @@ impl ConnectionConfig {
     /// `SURQL_PASSWORD`, `SURQL_TIMEOUT`, `SURQL_MAX_CONNECTIONS`,
     /// `SURQL_RETRY_MAX_ATTEMPTS`, `SURQL_RETRY_MIN_WAIT`,
     /// `SURQL_RETRY_MAX_WAIT`, `SURQL_RETRY_MULTIPLIER`,
-    /// `SURQL_ENABLE_LIVE_QUERIES`.
+    /// `SURQL_ENABLE_LIVE_QUERIES`, `SURQL_EXPERIMENTAL_UPGRADE_FROM_3X`.
     ///
     /// Missing values fall back to [`ConnectionConfig::default`]; on
     /// success, the built config is validated before return.
@@ -374,6 +403,9 @@ impl ConnectionConfig {
         }
         if let Some(v) = lookup_with_aliases(&mut lookup, p, &["ENABLE_LIVE_QUERIES"]) {
             cfg.enable_live_queries = parse_bool(&v)?;
+        }
+        if let Some(v) = lookup_with_aliases(&mut lookup, p, &["EXPERIMENTAL_UPGRADE_FROM_3X"]) {
+            set_upgrade_from_3x(&mut cfg.datastore_options, parse_bool(&v)?);
         }
 
         cfg.validate()?;
@@ -551,6 +583,43 @@ impl ConnectionConfigBuilder {
         self
     }
 
+    /// Let an embedded engine upgrade, in place, a datastore that a
+    /// SurrealDB 3.x release wrote (default `false`).
+    ///
+    /// SurrealDB 4 refuses to open such a datastore unless the
+    /// [`EXPERIMENTAL_UPGRADE_FROM_3X`] datastore option is set, and an
+    /// embedded engine reads that option only from its connection config,
+    /// never from the URL or the environment. Without it,
+    /// `DatabaseClient::connect` fails with
+    /// [`SurqlError::DatastoreUpgradeRefused`]. The upgrade is
+    /// experimental in SurrealDB 4.0 and one-way: once it has run, a 3.x
+    /// release can no longer open the datastore, so take a backup first.
+    /// A remote URL ignores the setting; a server opts in with
+    /// `SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X=true` in its own environment.
+    ///
+    /// `false` removes the option, so a connect sends nothing for it.
+    pub fn experimental_upgrade_from_3x(mut self, on: bool) -> Self {
+        let mut inner = self.inner.unwrap_or_default();
+        set_upgrade_from_3x(&mut inner.datastore_options, on);
+        self.inner = Some(inner);
+        self
+    }
+
+    /// Set a datastore option for an embedded engine, as SurrealDB reads it
+    /// from the environment variable `SURREAL_<KEY>` (for example
+    /// `surrealkv_block_cache_capacity`). The key is stored lowercase, and
+    /// a later call for the same key replaces the earlier value. A remote
+    /// URL ignores datastore options. [`build`](Self::build) refuses a key
+    /// that is empty or holds anything but ASCII letters, digits and `_`.
+    pub fn datastore_option(mut self, key: impl Into<String>, value: impl fmt::Display) -> Self {
+        let mut inner = self.inner.unwrap_or_default();
+        inner
+            .datastore_options
+            .insert(key.into().to_ascii_lowercase(), value.to_string());
+        self.inner = Some(inner);
+        self
+    }
+
     /// Finalise the builder and validate the result.
     pub fn build(self) -> Result<ConnectionConfig> {
         let cfg = self.inner.unwrap_or_default();
@@ -625,6 +694,28 @@ fn validate_identifier(value: &str, context: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// A datastore option key is the tail of a `SURREAL_<KEY>` variable name.
+fn validate_datastore_option_key(key: &str) -> Result<()> {
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(SurqlError::Validation {
+            reason: format!(
+                "datastore option key {key:?} must be non-empty ASCII letters, digits and `_`"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Set or clear [`EXPERIMENTAL_UPGRADE_FROM_3X`], whatever case the key was
+/// written in. Cleared rather than set to `false`, so a config that does
+/// not opt in sends the engine nothing for it.
+pub(crate) fn set_upgrade_from_3x(options: &mut BTreeMap<String, String>, on: bool) {
+    options.retain(|key, _| !key.eq_ignore_ascii_case(EXPERIMENTAL_UPGRADE_FROM_3X));
+    if on {
+        options.insert(EXPERIMENTAL_UPGRADE_FROM_3X.to_owned(), "true".to_owned());
+    }
 }
 
 fn validate_numeric_range(name: &str, value: f64, min: f64, max: f64) -> Result<()> {
@@ -962,5 +1053,91 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+
+        let cfg = ConnectionConfig::builder()
+            .url("surrealkv://data")
+            .experimental_upgrade_from_3x(true)
+            .build()
+            .unwrap();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: ConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    /// A config serialised before `datastore_options` existed still loads.
+    #[test]
+    fn serde_reads_a_config_without_datastore_options() {
+        let mut json = serde_json::to_value(ConnectionConfig::default()).unwrap();
+        json.as_object_mut().unwrap().remove("datastore_options");
+        let back: ConnectionConfig = serde_json::from_value(json).unwrap();
+        assert!(back.datastore_options.is_empty());
+    }
+
+    #[test]
+    fn a_default_config_sets_no_datastore_option() {
+        let cfg = ConnectionConfig::default();
+        assert!(cfg.datastore_options.is_empty());
+        assert!(!cfg.experimental_upgrade_from_3x());
+        let built = ConnectionConfig::builder().url("mem://").build().unwrap();
+        assert!(built.datastore_options.is_empty());
+        let from_env = ConnectionConfig::from_map_with_prefix("SURQL_", &HashMap::new()).unwrap();
+        assert!(from_env.datastore_options.is_empty());
+    }
+
+    #[test]
+    fn experimental_upgrade_from_3x_sets_and_clears_the_option() {
+        let on = ConnectionConfig::builder()
+            .url("surrealkv://data")
+            .experimental_upgrade_from_3x(true)
+            .build()
+            .unwrap();
+        assert!(on.experimental_upgrade_from_3x());
+        assert_eq!(
+            on.datastore_options.get(EXPERIMENTAL_UPGRADE_FROM_3X),
+            Some(&"true".to_owned())
+        );
+
+        // `false` removes the key, whichever setter wrote it.
+        let off = ConnectionConfig::builder()
+            .url("surrealkv://data")
+            .datastore_option("EXPERIMENTAL_UPGRADE_FROM_3X", true)
+            .experimental_upgrade_from_3x(false)
+            .build()
+            .unwrap();
+        assert!(!off.experimental_upgrade_from_3x());
+        assert!(off.datastore_options.is_empty(), "{off:?}");
+
+        let env: HashMap<String, String> = [(
+            "SURQL_EXPERIMENTAL_UPGRADE_FROM_3X".to_owned(),
+            "true".to_owned(),
+        )]
+        .into();
+        let from_env = ConnectionConfig::from_map_with_prefix("SURQL_", &env).unwrap();
+        assert!(from_env.experimental_upgrade_from_3x());
+    }
+
+    #[test]
+    fn datastore_option_keys_are_lowercase_and_checked() {
+        let cfg = ConnectionConfig::builder()
+            .url("mem://")
+            .datastore_option("SurrealKV_Block_Cache_Capacity", 268_435_456)
+            .datastore_option("surrealkv_block_cache_capacity", 1024)
+            .build()
+            .unwrap();
+        assert_eq!(
+            cfg.datastore_options,
+            BTreeMap::from([(
+                "surrealkv_block_cache_capacity".to_owned(),
+                "1024".to_owned()
+            )])
+        );
+        for bad in ["", "has space", "SURREAL-KEY", "key=1"] {
+            let err = ConnectionConfig::builder()
+                .url("mem://")
+                .datastore_option(bad, 1)
+                .build()
+                .unwrap_err();
+            assert!(matches!(err, SurqlError::Validation { .. }), "{bad:?}");
+        }
     }
 }

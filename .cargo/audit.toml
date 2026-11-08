@@ -3,14 +3,17 @@
 #
 # `cargo audit` reads `Cargo.lock`, which lists every package the
 # resolver considered. A package in the lockfile is not necessarily a
-# package that gets compiled, and one of the two below is exactly that
-# case. Both entries name what would have to change for the entry to
-# come out, so this file stays a decision rather than a habit.
+# package that gets compiled. Each entry names what would have to change
+# for it to come out, so this file stays a decision rather than a habit.
 #
 # This file governs THIS repository's own audit. It is not published
 # with the crate and does not travel to anyone who depends on it: a
-# consumer running `cargo audit` sees both advisories and makes their
-# own call, which is the right way round.
+# consumer running `cargo audit` sees the advisory and makes their own
+# call, which is the right way round.
+#
+# The move to surrealdb 4.0 retired three entries: RUSTSEC-2026-0235
+# (rkyv, now 0.8.18 in the lockfile) and RUSTSEC-2026-0194 / -0195
+# (quick-xml, now 0.41 through object_store 0.14).
 
 [advisories]
 ignore = [
@@ -23,28 +26,15 @@ ignore = [
     # surrealdb or jsonwebtoken move off the unfixed crate.
     "RUSTSEC-2023-0071",
 
-    # RUSTSEC-2026-0235 (rkyv: out-of-bounds reads validating archives
-    # holding Rc/Arc) is fixed in 0.8.17, which rust_decimal 1.41
-    # cannot take and surrealdb-core pins. It reaches the lockfile
-    # through rust_decimal's OPTIONAL `rkyv` feature, which nothing in
-    # this graph turns on: `cargo tree -i rkyv --all-features --target
-    # all` prints nothing, so the vulnerable code is never compiled
-    # here and no archive is ever deserialised. Re-evaluate whenever
-    # surrealdb moves to a rust_decimal built on rkyv 0.8.
-    "RUSTSEC-2026-0235",
-
-    # RUSTSEC-2026-0194 and RUSTSEC-2026-0195 (quick-xml < 0.41:
-    # quadratic duplicate-attribute check, unbounded namespace allocation
-    # in NsReader) reach the lockfile through object_store 0.13.2's `aws`
-    # backend, which surrealdb-core 3.3.0 enables unconditionally on native
-    # targets. No object_store 0.13 release takes quick-xml 0.41;
-    # object_store 0.14 does (it requires ^0.41), but surrealdb-core pins
-    # 0.13. Only the embedded engine pulls it in (`client-wasm`'s `kv-mem`,
-    # and the test-only `kv-mem` dev-dependency): `cargo tree -i quick-xml
-    # -e normal` with the default, `client-rustls`, `cli`, cache and watcher
-    # features prints nothing. It parses XML responses from an S3 endpoint,
-    # which an in-memory engine never talks to. Remove both entries when
-    # surrealdb-core moves to object_store 0.14 or stops enabling `aws`.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    # RUSTSEC-2026-0387 (crypto-bigint 0.5.5: timing variability in
+    # operations meant to be constant-time) is fixed only in 0.7.6. It
+    # reaches the lockfile through the engine's JWT stack,
+    # `jsonwebtoken 10.4 -> p256 0.13 -> elliptic-curve 0.13 ->
+    # crypto-bigint 0.5`, and elliptic-curve 0.13 cannot take 0.7, so
+    # no bump clears it; main carries it too. The leak needs secret
+    # P-256 scalar operations to time. SurrealDB uses p256 only for an
+    # access method configured with an ES algorithm, and this crate
+    # defines none. Drop this when surrealdb or jsonwebtoken moves to
+    # elliptic-curve 0.14.
+    "RUSTSEC-2026-0387",
 ]

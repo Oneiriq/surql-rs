@@ -27,7 +27,6 @@ use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::{
     Database as SdkDatabase, Namespace as SdkNamespace, Record as SdkRecord, Root as SdkRoot, Token,
 };
-use surrealdb::opt::Config as SdkConfig;
 use surrealdb::types::SurrealValue;
 use surrealdb::{IndexedResults, Surreal};
 use tokio::sync::{Mutex, RwLock};
@@ -43,7 +42,9 @@ mod errors;
 mod tests;
 
 pub(crate) use convert::render_target;
-use convert::{first_row_typed, flatten_rows_typed, payload_str, seconds, statement_results};
+use convert::{
+    endpoint_config, first_row_typed, flatten_rows_typed, payload_str, seconds, statement_results,
+};
 use errors::{
     connection_err, is_retryable_conflict, query_err, request_says_session_expired,
     sdk_says_already_connected,
@@ -160,12 +161,21 @@ impl DatabaseClient {
     /// session from the config credentials (see
     /// [`DatabaseClient::query_with_vars`]).
     ///
+    /// An embedded URL (`mem://`, `surrealkv://`) hands the engine the
+    /// config's [`datastore_options`](ConnectionConfig::datastore_options);
+    /// a remote URL ignores them.
+    ///
     /// # Errors
     ///
     /// Returns [`SurqlError::Connection`] on a
     /// [`DatabaseClient::caller_session`]: connecting signs the session in
     /// with the config credentials, which would hand the caller the
     /// service's authority.
+    ///
+    /// Returns [`SurqlError::DatastoreUpgradeRefused`], without retrying,
+    /// when an embedded engine refuses a datastore a SurrealDB 3.x release
+    /// wrote because the config does not opt in with
+    /// [`experimental_upgrade_from_3x`](crate::connection::config::ConnectionConfigBuilder::experimental_upgrade_from_3x).
     pub async fn connect(&self) -> Result<()> {
         if self.caller_bound {
             return Err(SurqlError::Connection {
@@ -196,6 +206,7 @@ impl DatabaseClient {
                     *self.connected.write().await = true;
                     return Ok(());
                 }
+                Err(err) if Self::connect_failure_is_final(&err) => return Err(err),
                 Err(err) => {
                     last_err = Some(err);
                     if attempt < attempts {
@@ -563,6 +574,10 @@ impl DatabaseClient {
 
     /// Typed `SELECT` against a table or record ID (`"user"` / `"user:alice"`).
     ///
+    /// Rows come back in record id order (`ORDER BY id`). SurrealDB 4 returns
+    /// a statement without `ORDER BY` in no particular order, where 3.x
+    /// usually returned key order, so the order is asked for explicitly.
+    ///
     /// Internally routes through raw SurrealQL + `serde_json::Value`
     /// so callers only need `serde::de::DeserializeOwned`; the 3.x
     /// SDK's typed `select` would force a `SurrealValue` bound on
@@ -586,8 +601,7 @@ impl DatabaseClient {
     /// a `table:key` record id.
     pub async fn select<T: DeserializeOwned>(&self, target: &str) -> Result<Vec<T>> {
         self.require_connected()?;
-        let surql = format!("SELECT * FROM {};", render_target(target)?);
-        let raw = self.query(&surql).await?;
+        let raw = self.query(&select_statement(target)?).await?;
         flatten_rows_typed(&raw)
     }
 
@@ -724,21 +738,10 @@ impl DatabaseClient {
         {
             let mut engine_up = self.engine_connected.write().await;
             if !*engine_up {
-                // Credentials also reach the engine at build time. An
-                // embedded datastore built without a root user treats
-                // every anonymous session as owner, so locking the
-                // engine needs the user to exist before the first
-                // session. Remote engines ignore the endpoint config
-                // and authenticate through the signin below.
-                let connect = match (self.config.username(), self.config.password()) {
-                    (Some(user), Some(pass)) => self.inner.connect((
-                        self.config.url().to_owned(),
-                        SdkConfig::new().user(SdkRoot {
-                            username: user.to_owned(),
-                            password: pass.to_owned(),
-                        }),
-                    )),
-                    _ => self.inner.connect(self.config.url().to_owned()),
+                let url = self.config.url().to_owned();
+                let connect = match endpoint_config(&self.config)? {
+                    Some(config) => self.inner.connect((url, config)),
+                    None => self.inner.connect(url),
                 };
                 match tokio::time::timeout(timeout, connect).await {
                     Err(_) => {
@@ -774,6 +777,12 @@ impl DatabaseClient {
         Ok(())
     }
 
+    /// Whether a failed connect attempt can be worth repeating. A datastore
+    /// the engine refuses to upgrade stays refused until the config opts in.
+    fn connect_failure_is_final(err: &SurqlError) -> bool {
+        err.is_datastore_upgrade_refused()
+    }
+
     fn backoff_for(&self, attempt: u32) -> Duration {
         let min = self.config.retry_min_wait();
         let max = self.config.retry_max_wait();
@@ -794,4 +803,13 @@ impl DatabaseClient {
             })
         }
     }
+}
+
+/// The statement behind [`DatabaseClient::select`]: every row of `target`,
+/// in record id order.
+fn select_statement(target: &str) -> Result<String> {
+    Ok(format!(
+        "SELECT * FROM {} ORDER BY id;",
+        render_target(target)?
+    ))
 }

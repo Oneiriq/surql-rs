@@ -435,6 +435,224 @@ fn surrealdb_error_maps_to_surql_error() {
     assert!(matches!(internal, SurqlError::Database { .. }));
 }
 
+/// The SDK keeps the endpoint config's datastore options private, so the
+/// tests read them from its `Debug` output.
+fn datastore_options_shown(config: &surrealdb::opt::Config) -> String {
+    let shown = format!("{config:?}");
+    let start = shown
+        .find("datastore_options: ")
+        .expect("the SDK config shows its datastore options");
+    shown[start..].to_owned()
+}
+
+#[test]
+fn a_default_connect_hands_the_engine_no_datastore_option() {
+    let bare = ConnectionConfig::builder().url("mem://").build().unwrap();
+    assert!(
+        endpoint_config(&bare).unwrap().is_none(),
+        "nothing to configure: the SDK gets the bare URL"
+    );
+    let credentialed = endpoint_config(&root_mem_config("plain"))
+        .unwrap()
+        .expect("credentials make an endpoint config");
+    assert!(
+        datastore_options_shown(&credentialed).starts_with("datastore_options: []"),
+        "a config that sets no datastore option sends none"
+    );
+}
+
+#[test]
+fn the_upgrade_opt_in_reaches_an_embedded_engine_only() {
+    for url in ["mem://", "memory://", "surrealkv://data/app.skv"] {
+        let config = ConnectionConfig::builder()
+            .url(url)
+            .experimental_upgrade_from_3x(true)
+            .build()
+            .unwrap();
+        let endpoint = endpoint_config(&config)
+            .unwrap()
+            .expect("an opt-in makes an endpoint config");
+        assert!(
+            datastore_options_shown(&endpoint)
+                .starts_with(r#"datastore_options: [("experimental_upgrade_from_3x", "true")]"#),
+            "{url}: {}",
+            datastore_options_shown(&endpoint)
+        );
+    }
+    for url in [
+        "ws://localhost:8000",
+        "wss://db.example/rpc",
+        "http://localhost:8000",
+        "https://db.example",
+        "grpc://localhost:8000",
+    ] {
+        let config = ConnectionConfig::builder()
+            .url(url)
+            .enable_live_queries(false)
+            .experimental_upgrade_from_3x(true)
+            .datastore_option("surrealkv_block_cache_capacity", 1024)
+            .build()
+            .unwrap();
+        assert!(
+            endpoint_config(&config).unwrap().is_none(),
+            "{url}: a remote engine gets no datastore option"
+        );
+    }
+}
+
+/// The options reach the datastore itself, not just the SDK config: the
+/// embedded engine refuses a key it sets through a dedicated option.
+#[tokio::test]
+async fn datastore_options_reach_the_embedded_engine() {
+    let config = ConnectionConfig::builder()
+        .url("mem://")
+        .namespace("options")
+        .database("options")
+        .retry_max_attempts(1)
+        .datastore_option("bucket_folder_allowlist", "anywhere")
+        .build()
+        .unwrap();
+    let err = DatabaseClient::new(config)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("bucket folder allowlist"),
+        "the engine saw the option: {err}"
+    );
+
+    // A new datastore is never refused, so the opt-in is harmless on one.
+    let config = ConnectionConfig::builder()
+        .url("mem://")
+        .namespace("options")
+        .database("options")
+        .retry_max_attempts(1)
+        .experimental_upgrade_from_3x(true)
+        .build()
+        .unwrap();
+    let client = DatabaseClient::new(config).unwrap();
+    client.connect().await.unwrap();
+    client.query("INFO FOR DB").await.unwrap();
+}
+
+/// SurrealDB 4.0's two refusals of a datastore a 3.x release wrote, as the
+/// embedded engine reports them: from the datastore, and from `SurrealKV`
+/// when a directory still holds 3.x files.
+fn refused_3x_datastores() -> [surrealdb::Error; 2] {
+    [
+        surrealdb::Error::internal(
+            "The data stored on disk was last written by SurrealDB 3.3.2. Upgrading it in \
+             place to SurrealDB 4.0.0 is experimental and is refused by default: the upgrade \
+             rewrites stored data, and the datastore cannot be opened by a 3.x release \
+             afterwards. Keep running a 3.x release, or take a backup and set \
+             SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X=true to opt in to the experimental upgrade"
+                .into(),
+        ),
+        surrealdb::Error::internal(
+            "The directory /path/to/data holds a SurrealKV database written by SurrealDB 3.x. \
+             Upgrading it in place to SurrealDB 4 is experimental and is refused by default: \
+             the upgrade converts the files, and a 3.x release cannot open them afterwards. \
+             Keep running a 3.x release, or take a backup and set \
+             SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X=true to opt in to the experimental upgrade"
+                .into(),
+        ),
+    ]
+}
+
+#[test]
+fn a_refused_3x_datastore_is_its_own_error() {
+    for refused in refused_3x_datastores() {
+        let err = connection_err(&refused);
+        assert!(
+            matches!(&err, SurqlError::DatastoreUpgradeRefused { reason } if reason == refused.message()),
+            "{err:?}"
+        );
+        assert!(err.is_datastore_upgrade_refused());
+        assert!(err
+            .to_string()
+            .contains("experimental_upgrade_from_3x(true)"));
+        assert!(SurqlError::from(refused.clone()).is_datastore_upgrade_refused());
+        let wrapped: Result<()> = Err(err);
+        let wrapped = crate::error::Context::context(wrapped, "opening the store").unwrap_err();
+        assert!(wrapped.is_datastore_upgrade_refused());
+    }
+    // A statement's own THROW of the same words is the statement's error.
+    let thrown = surrealdb::Error::thrown(refused_3x_datastores()[0].message().to_owned());
+    assert!(matches!(SurqlError::from(thrown), SurqlError::Query { .. }));
+    // Neither is any other startup failure.
+    let other = surrealdb::Error::internal("The data stored on disk is out-of-date".into());
+    assert!(!connection_err(&other).is_datastore_upgrade_refused());
+}
+
+#[test]
+fn a_refused_datastore_is_not_retried() {
+    for refused in refused_3x_datastores() {
+        assert!(DatabaseClient::connect_failure_is_final(&connection_err(
+            &refused
+        )));
+    }
+    let down = surrealdb::Error::connection("refused".into(), None);
+    assert!(!DatabaseClient::connect_failure_is_final(&connection_err(
+        &down
+    )));
+}
+
+/// SurrealDB 4 returns a statement without `ORDER BY` in no particular
+/// order, so the statement behind `select` asks for id order.
+#[test]
+fn select_asks_for_id_order() {
+    assert_eq!(
+        select_statement("user").unwrap(),
+        "SELECT * FROM user ORDER BY id;"
+    );
+    assert_eq!(
+        select_statement("user:alice").unwrap(),
+        "SELECT * FROM user:alice ORDER BY id;"
+    );
+}
+
+/// A `SurrealKV` engine whose datastore settings cut a table scan into many
+/// small morsels as early as the engine allows. On it SurrealDB 4.0 hands
+/// back a statement without `ORDER BY` out of key order: with `select`'s
+/// `ORDER BY id` taken out, the test below failed on its first read in
+/// each of three runs.
+fn split_scan_config(dir: &std::path::Path) -> ConnectionConfig {
+    ConnectionConfig::builder()
+        .url(format!("surrealkv://{}", dir.display()))
+        .namespace("order")
+        .database("order")
+        .retry_max_attempts(1)
+        .datastore_option("morsel_needs_view", false)
+        .datastore_option("morsel_split_pass_ppm", 1_000_000)
+        .datastore_option("morsel_split_rows", 8)
+        .datastore_option("morsel_target_bytes", 256)
+        .datastore_option("morsel_oltp_reserve", 0)
+        .datastore_option("morsel_steal_always", true)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn select_returns_rows_in_id_order_from_a_split_scan() {
+    const ROWS: i64 = 5000;
+    let tmp = tempfile::tempdir().unwrap();
+    let client = DatabaseClient::new(split_scan_config(&tmp.path().join("order"))).unwrap();
+    client.connect().await.unwrap();
+    client
+        .query(&format!(
+            "FOR $n IN 1..={ROWS} {{ CREATE type::record('item', $n) SET n = $n; }};"
+        ))
+        .await
+        .unwrap();
+    let expected: Vec<i64> = (1..=ROWS).collect();
+    for read in 0..12 {
+        let rows: Vec<Value> = client.select("item").await.unwrap();
+        let seen: Vec<i64> = rows.iter().filter_map(|r| r["n"].as_i64()).collect();
+        assert!(seen == expected, "read {read}: rows out of id order");
+    }
+}
+
 fn root_mem_config(ns: &str) -> ConnectionConfig {
     ConnectionConfig::builder()
         .url("mem://")

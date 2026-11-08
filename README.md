@@ -11,7 +11,7 @@ A code-first database toolkit for [SurrealDB](https://surrealdb.com/). Define sc
 - **Code-First Migrations** - Schema changes defined in code with automatic migration generation (auto-diff, `.surql` file output with `-- @up` / `-- @down` sections, squash, hooks).
 - **Type-Safe Query Builder** - Immutable fluent API with operator-typed `where_`, expression helpers, serde integration, and first-class `Query::execute` / `Query::select_expr`.
 - **Query UX Helpers** - `type_record` / `type_thing`, `extract_many` / `has_result`, `aggregate_records` + `AggregateOpts` hoisted to the crate root.
-- **Async-First** - Tokio-based client on `surrealdb` 3.x with connection pooling, retry logic, and buffered transactions.
+- **Async-First** - Tokio-based client on `surrealdb` 4.x with connection pooling, retry logic, and buffered transactions.
 - **Vector Search** - HNSW and DISKANN index support with 8 distance metrics and EFC/M tuning.
 - **Graph Traversal** - Native SurrealDB graph features with edge relationships (v3-compatible arrow chains).
 - **Files & Buckets** - SurrealDB v3 object storage: code-first `DEFINE BUCKET` schema + migration diffing, a `FileRef` value type, and a runtime `client.bucket(name)` handle for put/get/head/delete/copy/rename/list.
@@ -181,7 +181,7 @@ Selected pages:
 ## Requirements
 
 - Rust 1.95+
-- SurrealDB 3.0+
+- SurrealDB 3.0+ server (the client is the SurrealDB 4 SDK, which connects to 3.x and 4.x servers)
 
 ## License
 

@@ -22,7 +22,7 @@ Short overview; the full matrix and recipes live on the
 
 | Feature         | Default | What it adds                                              |
 |-----------------|---------|-----------------------------------------------------------|
-| `client`        | yes     | Async SurrealDB client (`tokio`, `surrealdb` 3.x) with `native-tls`. |
+| `client`        | yes     | Async SurrealDB client (`tokio`, `surrealdb` 4.x) with `native-tls`. |
 | `client-rustls` | no      | Same client surface but with pure-Rust TLS (no `openssl-sys`). |
 | `client-grpc`   | no      | The gRPC transport (`grpc://`, `grpcs://`, SurrealDB 3.3+), on top of `client-rustls`. |
 | `cli`           | no      | `surql` binary (implies `client`, `orchestration`, `settings`). |
@@ -59,12 +59,26 @@ Subcommand reference: [CLI](cli.md).
   TLS stack (`libssl-dev` on Linux, `Security.framework` on macOS).
 - For the `client-rustls` feature: SurrealDB 3.0 or newer. No system
   TLS stack required.
+- The client is the SurrealDB 4 Rust SDK (`surrealdb` 4.0), which
+  connects to 3.x and 4.x servers alike. A 3.x SDK refuses a 4.0 server,
+  so upgrade the crate before the server.
 - Server versions: the crate is built and tested against SurrealDB 3.3,
   and a 3.0 server works with two exceptions. Values nested more than 16
   levels deep need 3.1 (`encoding::json::decode`). The 3.3 additions need
   3.3: `LIGHTWEIGHT` relations, `INLINE` caches and fields, the access
   `AUDIENCE` and `CONTEXT` clauses, `SELECT ... FOR UPDATE`, the
   `segment` tokenizer and the gRPC transport.
+- Embedded engines (`mem://`, and `surrealkv://` with the SDK's
+  `kv-surrealkv` feature) run SurrealDB 4.0. A 4.0 engine refuses a
+  datastore that a 3.x release wrote unless the connection opts in with
+  `ConnectionConfig::builder().experimental_upgrade_from_3x(true)`;
+  without it, `connect` fails with `SurqlError::DatastoreUpgradeRefused`
+  and leaves the datastore as it was. The upgrade is experimental in
+  SurrealDB 4.0 and one-way, so back the datastore up first.
+- SurrealDB 4 returns a statement without `ORDER BY` in no particular
+  order. The crate's own reads that promise an order ask for it; a query
+  you build yourself needs `order_by` wherever the order matters,
+  including before `limit` and `offset`.
 
 ## What's next
 
